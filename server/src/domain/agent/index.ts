@@ -48,6 +48,7 @@ export type {
   AgentEventType,
   EmitAgentEventInput,
 } from "./events.js";
+export type { AgentTurnExecutor } from "./executor.js";
 export type {
   AgentHandoffContext,
   AgentAccountScopeChangePlan,

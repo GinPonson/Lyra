@@ -23,6 +23,8 @@ export {
 } from "./mcp-http-config.js";
 export { startAgentCliProcess } from "./process-runtime.js";
 export { createAgentSessionWorkspace } from "./session-workspace.js";
+export { createAgentTurnExecutors } from "./turn-executors.js";
+export type { AgentTurnExecutorFactoryOptions } from "./turn-executors.js";
 export {
   OPENCODE_ACP_PROTOCOL_VERSION,
   OpenCodeAcpProtocolError,

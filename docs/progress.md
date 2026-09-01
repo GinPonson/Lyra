@@ -106,7 +106,8 @@
 | Phase 4 | Agent 工具调用写仓储与审计持久化 | 已完成 | 1 项真实 DuckDB 写侧测试通过；TypeScript strict 编译及完整回归累计 259 项通过 | 2026-09-01 | started/成功/失败/拒绝四路径各自原子落库；每次写入以 CAS 校验会话处于 running 且事件序号连续，重复计划或漂移序号整体回滚；拒绝记录与 `agent.tool_rejected` 审计事件同事务写入，请求参数不进入任何记录 |
 | Phase 4 | Agent 回合编排器（orchestrator 内核） | 已完成 | 2 项真实 DuckDB 编排测试通过（成功、失败、取消三回合与越权/合法工具调用）；累计 261 项通过 | 2026-09-01 | 统一流信号执行器边界隔离供应商协议；事件序号全局单调，持久化序号允许单调跳过未落库的流式 delta，结算与工具写入 CAS 相应放宽为单调推进；工具调用绑定当前回合已持久化用户消息；取消先固化 cancelling 再中止执行器并经统一失败路径收口；MCP 短期凭据随回合签发、终态撤销；事件有界内存缓冲支持按游标续传，缺口强制重新取快照 |
 | Phase 4 | Agent MCP 生产装配与服务入口启用 | 已完成 | 1 项真实 DuckDB + 完整 HTTP 服务集成测试通过（凭据签发→工具发现→真实账本调用→撤销拒绝）；真实进程 smoke 健康返回 schema 11、`GET /mcp` 405、缺失与未知凭据均 401、SIGTERM 安全关闭；累计 262 项通过 | 2026-09-01 | `main` 经 `assembleAgentMcpRuntime` 装配共享金融工具注册表、进程内短期凭据存储与真实会话恢复；不构造任何持久化或长期凭据，凭据仅由编排器在回合运行期签发，服务重启即全部失效 |
-| Phase 4 | MCP 生产入口与 Agent 回合编排 | 进行中 | 官方 transport、短期凭据、完整 17 工具注册表、会话/回合/工具调用写仓储、回合编排内核与生产入口 `/mcp` 启用均已通过测试 | 2026-09-01 | 下一步实现三个供应商的真实子进程执行器并接入编排器，再补会话 REST 与 WebSocket 事件表面；不得绕过生命周期直接在启动时构造虚假 running 会话或长期凭据 |
+| Phase 4 | Claude/Pi/OpenCode 回合执行器与编排器接入 | 已完成 | 5 项受控假进程契约测试通过：Claude 成功翻译与越权权限拒绝、取消按 cancelled 收口、协议异常按 failed 收口、Pi 持久进程结算后回收、OpenCode ACP 握手并校验 Lyra MCP Bearer 绑定；累计 267 项通过 | 2026-09-01 | `AgentTurnExecutor` 契约下沉到领域层；执行器复用最小权限启动计划、受控 JSON Lines 进程运行时与三个协议适配器，只做进程编排与协议翻译；Claude 权限请求一律回 deny、OpenCode 客户端能力请求回 cancelled/disabled，工具调用不经执行器（由 CLI 经 MCP HTTP 调用并在 orchestrator 持久化）；协议结算后回收仍存活的持久进程，进程在结算前退出按取消/失败收口；契约测试使用假 CLI，不启动真实模型会话 |
+| Phase 4 | MCP 生产入口与 Agent 回合编排 | 进行中 | 官方 transport、短期凭据、完整 17 工具注册表、会话/回合/工具调用写仓储、回合编排内核、生产入口 `/mcp` 启用与三供应商回合执行器均已通过测试 | 2026-09-01 | 下一步把 orchestrator 与执行器装配进 `main` 并实现会话 REST 路由与 WebSocket 事件表面；不得绕过生命周期直接在启动时构造虚假 running 会话或长期凭据 |
 | Phase 4 | Pi Lyra 工具扩展桥接 | 阻塞 | 项目缺少 `@earendil-works/pi-ai` 与 `@earendil-works/pi-coding-agent` | 2026-08-31 | Pi RPC 适配器与受限启动计划已完成；实际 `pi.registerTool` 扩展需官方 TypeBox/ExtensionAPI 运行时，不复制主机全局安装目录进项目 |
 | Phase 4 | Claude/Pi/OpenCode 最小权限启动计划 | 已完成 | 2 项新增测试通过；累计 136 项通过；本机 CLI help 协议核对 | 2026-08-31 | Claude 使用 bare、双向 stream-json 和 strict MCP；Pi 使用 RPC、关闭内建工具与自动发现、仅加载 Lyra 扩展；OpenCode 使用 pure ACP 和隔离目录；prompt 不进入 argv，运行环境只允许显式凭据 |
 | Phase 4 | Agent 会话回合生命周期门禁 | 已完成 | 2 项新增测试通过；累计 138 项通过 | 2026-08-31 | idle→running→cancelling/idle→closed 显式转换；相同状态重放幂等；只有 idle 可关闭，closed 不可恢复；每次真实转换递增 revision；新增 AGENT_SESSION_STATE_CONFLICT |
@@ -329,6 +330,7 @@
 | 2026-09-01 | `npm run check` | 通过 | 新增 Agent 工具调用写仓储测试 1 项，验证 started/成功/失败/拒绝原子持久化、事件序号 CAS 连续推进、重复计划冲突回滚，以及拒绝与 `agent.tool_rejected` 审计事件同事务落库；117 个测试套件、累计 259 项测试全部通过 |
 | 2026-09-01 | `npm run check` | 通过 | 新增 Agent 回合编排器测试 2 项，验证假执行器驱动成功/失败/取消回合、越权与合法工具调用经编排器持久化并含审计、流事件与工具事件序号全局连续、持久化序号单调跳过临时 delta 且取消空部分不伪造消息；118 个测试套件、累计 261 项测试全部通过 |
 | 2026-09-01 | `npm run check` | 通过 | 新增 Agent MCP 生产装配集成测试 1 项：进程内凭据 + 真实 DuckDB 会话恢复授权，完成工具发现、真实账本 `accounts` 调用与撤销后拒绝；119 个测试套件、累计 262 项测试全部通过 |
+| 2026-09-01 | `npm run check` | 通过 | 新增三供应商回合执行器受控假进程契约测试 5 项：Claude stream-json 翻译与权限拒绝、取消 cancelled 收口、协议异常 failed 收口、Pi RPC 持久进程回收、OpenCode ACP 握手与 Bearer 绑定；`AgentTurnExecutor` 下沉领域层，编排器执行器异常在已取消时按 cancelled 收口；120 个测试套件、累计 267 项测试全部通过；未启动真实模型会话 |
 | 2026-09-01 | `LYRA_PORT=3143 LYRA_DATABASE_PATH=<临时文件> npm start` + loopback smoke | 通过 | 单服务入口完成 v1–v11 迁移并监听本机端口；健康端点返回 200 与 schema 11；`GET /mcp` 明确 405；无凭据与未知凭据的 `tools/list` 均返回 401 稳定 JSON-RPC 错误；SIGTERM 后写队列关闭、进程干净退出 |
 
 ## 当前环境事项

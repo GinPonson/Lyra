@@ -6,6 +6,7 @@ import type {
   AgentProvider,
   AgentSessionSnapshot,
   AgentToolSummary,
+  AgentTurnExecutor,
   AgentTurnStreamSignal,
   AgentTurnStreamState,
   FinancialToolRegistry,
@@ -40,22 +41,6 @@ import {
 import type { LyraDatabase } from "../infrastructure/db/database.js";
 import { ApplicationError } from "./app-error.js";
 import type { WriteCoordinator } from "./write-coordinator.js";
-
-/**
- * 单个供应商回合的执行边界。
- *
- * Orchestrator 只认统一流信号：执行器把 Claude/Pi/OpenCode 的协议帧翻译为
- * 信号并保证以 `turn_settled` 结束；取消通过 abortSignal 请求，执行器据此
- * 中断子进程并发送 `message_failed(cancelled)`。工具调用不经过执行器，由
- * CLI 通过 MCP HTTP 独立到达 orchestrator。
- */
-export type AgentTurnExecutor = (input: {
-  session: AgentSessionSnapshot;
-  adapterInput: { messageId: string; content: string };
-  mcp: { endpoint: string; bearer: string };
-  emitSignal: (signal: AgentTurnStreamSignal) => void;
-  abortSignal: AbortSignal;
-}) => Promise<void>;
 
 export interface AgentTurnOrchestratorOptions {
   database: LyraDatabase;
@@ -230,10 +215,11 @@ export class AgentTurnOrchestrator {
         abortSignal: turn.abortController.signal,
       });
     } catch {
-      // 执行器抛出代表供应商进程异常退出；仍按失败回合收口，不暴露底层原因。
+      // 执行器抛出代表供应商进程异常退出；用户已请求取消时按取消收口，
+      // 其余按失败收口，均不把底层错误文本暴露给客户端。
       this.#applySignalIfUnsettled(runtime, turn, {
         kind: "message_failed",
-        outcome: "failed",
+        outcome: turn.abortController.signal.aborted ? "cancelled" : "failed",
       });
       this.#applySignalIfUnsettled(runtime, turn, { kind: "turn_settled" });
     }

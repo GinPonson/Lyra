@@ -146,10 +146,8 @@ export type {
 export { WriteCoordinator } from "./write-coordinator.js";
 export type { WriteCoordinatorStatus } from "./write-coordinator.js";
 export { AgentTurnOrchestrator } from "./agent-turn-orchestrator.js";
-export type {
-  AgentTurnExecutor,
-  AgentTurnRunResult,
-} from "./agent-turn-orchestrator.js";
+export type { AgentTurnRunResult } from "./agent-turn-orchestrator.js";
+export type { AgentTurnExecutor } from "../domain/agent/index.js";
 export { assembleAgentMcpRuntime } from "./agent-mcp-assembly.js";
 export type {
   AgentMcpAuthorization,
