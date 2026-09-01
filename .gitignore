@@ -1,0 +1,30 @@
+# Node.js / TypeScript build output
+node_modules/
+dist/
+coverage/
+
+# Flutter / Dart generated output
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+
+# Lyra runtime data and temporary imports
+data/
+uploads/
+*.duckdb
+*.duckdb.wal
+
+# Local secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+application-gin.yml
+
+# IDE and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.iml
+

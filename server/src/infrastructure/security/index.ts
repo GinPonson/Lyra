@@ -1,0 +1,41 @@
+/** 服务端秘密存储基础设施公共导出。 */
+export {
+  SecretCipher,
+  SecretDecryptionError,
+  parseSecretEncryptionKey,
+} from "./secret-cipher.js";
+export {
+  DEFAULT_DEVICE_ACTIVITY_UPDATE_INTERVAL_MS,
+  DeviceAuthError,
+  authenticateDeviceAccessToken,
+  consumePairingChallenge,
+  createPairedDeviceRecord,
+  createOpaqueCredential,
+  createPairingChallenge,
+  hashOpaqueCredential,
+  issueDeviceAccessToken,
+  issueDeviceRefreshCredential,
+  normalizeDevicePublicKey,
+  planDeviceRevocation,
+  planDeviceAccessTokenRevocation,
+  planPairedDeviceActivityUpdate,
+  planRefreshCredentialReuseRevocation,
+  rotateDeviceRefreshCredential,
+  verifyOpaqueCredential,
+} from "./device-auth.js";
+export type {
+  CreatedOpaqueCredential,
+  CreatedPairingChallenge,
+  DeviceAccessTokenRecord,
+  DeviceAuthErrorCode,
+  DeviceRefreshCredentialRecord,
+  DeviceRevocationPlan,
+  IssuedDeviceAccessToken,
+  IssuedDeviceRefreshCredential,
+  NormalizedDevicePublicKey,
+  PairedDeviceAuthRecord,
+  PairedDeviceRecord,
+  PairingChallengeRecord,
+  RefreshCredentialFamilyRevocationPlan,
+  RotatedDeviceRefreshCredential,
+} from "./device-auth.js";

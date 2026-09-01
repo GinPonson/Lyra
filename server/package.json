@@ -1,0 +1,30 @@
+{
+  "name": "@lyra/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-sql.mjs",
+    "test": "node --test dist/test/*.test.js",
+    "check": "npm run build && npm run test",
+    "start": "node dist/src/main.js"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.4",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "csv-parse": "7.0.2",
+    "decimal.js": "10.6.0",
+    "exceljs": "4.4.0",
+    "fastify": "5.12.1",
+    "mailparser": "3.9.17",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/mailparser": "3.4.6",
+    "@types/node": "22.19.19",
+    "typescript": "5.8.3"
+  }
+}
