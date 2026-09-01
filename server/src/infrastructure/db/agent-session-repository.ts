@@ -325,6 +325,78 @@ export async function persistAgentTurnFailure(
   });
 }
 
+/**
+ * 把 running 会话 CAS 固化为 cancelling，记录用户取消请求。
+ *
+ * 只推进状态与 revision，不追加消息或事件；取消意图由中止的供应商适配器以
+ * `message_failed(cancelled)` 流信号呈现，随后仍由失败收口事务恢复 idle。
+ *
+ * @param database - 单一服务进程持有的 DuckDB。
+ * @param input.session - `transitionAgentSession` 生成的 cancelling 快照。
+ */
+export async function persistAgentSessionCancelling(
+  database: LyraDatabase,
+  input: {
+    session: AgentSessionSnapshot;
+    cancelledAt: string;
+  },
+): Promise<void> {
+  if (input.session.status !== "cancelling" || input.session.revision <= 1) {
+    throw new RangeError("Agent 取消计划必须是递增 revision 的 cancelling 快照");
+  }
+  const cancelledAt = parseTimestamp(input.cancelledAt, "Agent 取消时间");
+  const connection = database.connection;
+  await connection.run("BEGIN TRANSACTION");
+  try {
+    const accountId = input.session.accountScope.kind === "account"
+      ? input.session.accountScope.account
+      : null;
+    const updated = await connection.run(`
+      UPDATE agent_sessions
+      SET status = 'cancelling',
+          revision = $next_revision,
+          updated_at = CAST($cancelled_at AS TIMESTAMPTZ)
+      WHERE id = CAST($session_id AS UUID)
+        AND status = 'running'
+        AND provider = $provider
+        AND revision = $expected_revision
+        AND ledger_version = $ledger_version
+        AND as_of = CAST($as_of AS TIMESTAMPTZ)
+        AND account_scope_kind = $account_scope_kind
+        AND (
+          ($account_scope_kind = 'all' AND account_id IS NULL)
+          OR ($account_scope_kind = 'account' AND account_id = CAST($account_id AS UUID))
+        )
+    `, {
+      next_revision: input.session.revision,
+      cancelled_at: cancelledAt,
+      session_id: input.session.id,
+      provider: input.session.provider,
+      expected_revision: input.session.revision - 1,
+      ledger_version: input.session.ledgerVersion,
+      as_of: input.session.asOf,
+      account_scope_kind: input.session.accountScope.kind,
+      account_id: accountId,
+    });
+    if (updated.rowsChanged !== 1) {
+      throw new ApplicationError({
+        code: "AGENT_SESSION_STATE_CONFLICT",
+        message: "Agent 会话已变化，取消请求未生效",
+        statusCode: 409,
+        retryable: false,
+      });
+    }
+    await connection.run("COMMIT");
+  } catch (error: unknown) {
+    try {
+      await connection.run("ROLLBACK");
+    } catch (rollbackError: unknown) {
+      throw new AggregateError([error, rollbackError], "Agent 取消持久化失败且回滚失败");
+    }
+    throw error;
+  }
+}
+
 /** 成功与失败共用的持久化终态输入。 */
 interface AgentTurnSettlementInput {
   session: AgentSessionSnapshot;
@@ -334,7 +406,12 @@ interface AgentTurnSettlementInput {
   expectedEventType: "message.completed" | "message.failed";
 }
 
-/** 以一次 CAS 和可选助手消息插入完成回合终态事务。 */
+/**
+ * 以一次 CAS 和可选助手消息插入完成回合终态事务。
+ *
+ * 事件序号采用单调推进：流式 delta 只存在于内存与客户端事件流，不逐条落库，
+ * 因此持久化序号允许跳过这些临时事件，但绝不允许回退或重复收敛。
+ */
 async function persistAgentTurnSettlement(
   database: LyraDatabase,
   input: AgentTurnSettlementInput,
@@ -356,7 +433,7 @@ async function persistAgentTurnSettlement(
         AND status = $expected_status
         AND provider = $provider
         AND revision = $expected_revision
-        AND last_event_sequence = $expected_event_sequence
+        AND last_event_sequence < $next_event_sequence
         AND ledger_version = $ledger_version
         AND as_of = CAST($as_of AS TIMESTAMPTZ)
         AND account_scope_kind = $account_scope_kind
@@ -372,7 +449,6 @@ async function persistAgentTurnSettlement(
       expected_status: input.expectedStatus,
       provider: input.session.provider,
       expected_revision: input.session.revision - 1,
-      expected_event_sequence: input.event.sequence - 1,
       ledger_version: input.session.ledgerVersion,
       as_of: input.session.asOf,
       account_scope_kind: input.session.accountScope.kind,

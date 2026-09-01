@@ -145,6 +145,11 @@ export type {
 } from "./import-preview-auth.js";
 export { WriteCoordinator } from "./write-coordinator.js";
 export type { WriteCoordinatorStatus } from "./write-coordinator.js";
+export { AgentTurnOrchestrator } from "./agent-turn-orchestrator.js";
+export type {
+  AgentTurnExecutor,
+  AgentTurnRunResult,
+} from "./agent-turn-orchestrator.js";
 export { invokeAuthenticatedAgentTool } from "./agent-tool-invocation.js";
 export { createFinancialToolRegistry } from "./financial-tool-runtime.js";
 export {

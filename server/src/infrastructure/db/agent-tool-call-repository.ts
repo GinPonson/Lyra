@@ -211,10 +211,10 @@ function assertToolCallPlan(
 }
 
 /**
- * 以 CAS 把会话事件序号推进到计划序号。
+ * 以单调 CAS 把会话事件序号推进到计划序号。
  *
- * 期望值始终是计划序号的前一位：序号漂移、会话不在 running 或重复写入都会
- * 冲突，不产生事件缺口或重复序号。
+ * 流式 delta 只推进内存计数器，不逐条落库；持久化序号因此允许跳过临时事件，
+ * 但重复写入（序号不高于已持久化位置）一律冲突，不产生回退或重复序号。
  */
 async function advanceSessionEventSequence(
   connection: LyraDatabase["connection"],
@@ -225,11 +225,10 @@ async function advanceSessionEventSequence(
     SET last_event_sequence = $next_sequence
     WHERE id = CAST($session_id AS UUID)
       AND status = 'running'
-      AND last_event_sequence = $expected_sequence
+      AND last_event_sequence < $next_sequence
   `, {
     next_sequence: input.nextSequence,
     session_id: input.sessionId,
-    expected_sequence: input.nextSequence - 1,
   });
   if (updated.rowsChanged !== 1) {
     throw sessionConflict("Agent 会话已变化，无法推进事件序号");
