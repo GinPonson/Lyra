@@ -44,6 +44,10 @@ async function seedAgentSession(databasePath: string): Promise<void> {
       )
     `, { device_id: DEVICE_ID });
     await database.connection.run(`
+      INSERT INTO agent_session_identities (id)
+      VALUES (CAST($session_id AS UUID))
+    `, { session_id: SESSION_ID });
+    await database.connection.run(`
       INSERT INTO agent_sessions (
         id, device_id, provider, status, account_scope_kind, account_id,
         ledger_version, as_of, revision, last_event_sequence, summary,

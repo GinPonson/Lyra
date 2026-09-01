@@ -34,7 +34,7 @@ export interface AgentSessionRuntimeRecord {
  * 持久化 ordinal 排序。账户范围保留 Lyra 账户 UUID，后续查询用例再通过
  * `resolveAccountScope` 映射旧账本键。
  *
- * @param database - 已完成 v1–v10 migration 的数据库。
+ * @param database - 已完成 v1–v11 migration 的数据库。
  * @param sessionId - 服务端生成的 Agent 会话 UUID。
  * @returns 会话不存在时返回 null，否则返回规范快照。
  */
@@ -121,7 +121,7 @@ export async function loadAgentSessionRuntime(
  * 当前账本版本与设备状态在同一事务中核对；只保存规范会话，不创建子进程、
  * 工作目录或 MCP 凭据。调用方应通过 `WriteCoordinator` 串行执行本函数。
  *
- * @param database - 已完成 v1–v10 migration 的数据库。
+ * @param database - 已完成 v1–v11 migration 的数据库。
  * @param input.session - `createAgentSession` 返回的 idle 空会话。
  * @param input.deviceId - 已认证且仍为 active 的配对设备 UUID。
  * @param input.createdAt - 服务端可信创建时间。
@@ -160,6 +160,12 @@ export async function persistNewAgentSession(
       });
     }
     await assertActiveDevice(database, deviceId);
+    // 消息外键指向不可变身份表；新会话必须同时登记身份行，
+    // 之后 agent_sessions 才能在已存在消息时继续更新回合状态。
+    await connection.run(`
+      INSERT INTO agent_session_identities (id)
+      VALUES (CAST($session_id AS UUID))
+    `, { session_id: input.session.id });
     await connection.run(`
       INSERT INTO agent_sessions (
         id, device_id, provider, status, account_scope_kind, account_id,

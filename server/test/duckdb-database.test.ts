@@ -7,20 +7,20 @@ import { describe, it } from "node:test";
 import { openLyraDatabase } from "../src/infrastructure/db/database.js";
 
 describe("DuckDB Node database", () => {
-  it("在文件数据库中原子执行 v1-v10，并可重复打开", async () => {
+  it("在文件数据库中原子执行 v1-v11，并可重复打开", async () => {
     const directory = await mkdtemp(join(tmpdir(), "lyra-duckdb-node-"));
     const databasePath = join(directory, "ledger.duckdb");
     try {
       const first = await openLyraDatabase(databasePath);
       assert.deepEqual(await first.readHealth(), {
         status: "available",
-        schemaVersion: 10,
+        schemaVersion: 11,
         ledgerVersion: 0,
       });
       const firstHistory = await first.connection.runAndReadAll(
         "SELECT count(*)::INTEGER AS count FROM schema_migrations",
       );
-      assert.equal(firstHistory.getRowObjectsJson()[0]?.count, 10);
+      assert.equal(firstHistory.getRowObjectsJson()[0]?.count, 11);
       await assert.rejects(
         () => access(`${databasePath}.wal`),
         (error: unknown) => error instanceof Error
@@ -32,7 +32,7 @@ describe("DuckDB Node database", () => {
       const reopened = await openLyraDatabase(databasePath);
       assert.deepEqual(await reopened.readHealth(), {
         status: "available",
-        schemaVersion: 10,
+        schemaVersion: 11,
         ledgerVersion: 0,
       });
       reopened.close();
@@ -47,7 +47,7 @@ describe("DuckDB Node database", () => {
     try {
       const database = await openLyraDatabase(databasePath);
       await database.connection.run(
-        "INSERT INTO schema_migrations (version, description) VALUES (11, 'future schema')",
+        "INSERT INTO schema_migrations (version, description) VALUES (12, 'future schema')",
       );
       database.close();
 
