@@ -103,7 +103,8 @@
 | Phase 4 | Agent 会话创建与用户回合原子启动仓储 | 已完成 | 1 项真实 DuckDB 写侧测试通过；累计 258 项测试通过 | 2026-08-31 | 新会话在事务内校验 active 设备与当前账本版本；用户回合以 CAS 同时固化 `idle→running`、revision、用户规范消息和最后事件序号，提交后才允许发送供应商输入；事件只持久化序号，正文不复制到事件表；重复计划明确冲突并整体回滚 |
 | Phase 4 | Agent 会话不可变身份 schema 与 DuckDB v11 | 已完成 | DuckDB 1.5.5 文件库 v1–v11 迁移、重复打开与未来版本拒绝测试通过；累计 258 项通过 | 2026-09-01 | 消息外键改指不可变 `agent_session_identities`，`agent_sessions` 保留可变回合状态；tool_calls 只保留对 messages 的复合外键；v11 以无约束 staging 表原位重建完成表交换，绕开 DuckDB 拒绝重命名被外键依赖父表的限制；新会话由仓储在同一事务登记身份行 |
 | Phase 4 | Agent 成功与失败回合收口写仓储 | 已完成 | 1 项真实 DuckDB 写侧测试通过（创建、启动、成功收口、二次启动、失败收口全流程）；累计 258 项通过 | 2026-09-01 | `persistAgentTurnCompletion`/`persistAgentTurnFailure` 以单次 CAS 把 running/cancelling 收口为 idle、原子追加助手终态消息并递增事件序号；空部分回答不伪造助手消息；重复计划 CAS 失败整体回滚 |
-| Phase 4 | MCP 生产入口与 Agent 回合编排 | 进行中 | 官方 transport、短期凭据、完整 17 工具注册表、会话创建/回合启动写仓储与成功/失败回合收口写仓储均已通过测试；`main` 尚未启用 MCP | 2026-09-01 | 下一步实现工具调用写仓储，再组装 orchestrator，由单一服务入口按真实生命周期启用 `/mcp`；不得绕过生命周期直接在启动时构造虚假 running 会话或长期凭据 |
+| Phase 4 | Agent 工具调用写仓储与审计持久化 | 已完成 | 1 项真实 DuckDB 写侧测试通过；TypeScript strict 编译及完整回归累计 259 项通过 | 2026-09-01 | started/成功/失败/拒绝四路径各自原子落库；每次写入以 CAS 校验会话处于 running 且事件序号连续，重复计划或漂移序号整体回滚；拒绝记录与 `agent.tool_rejected` 审计事件同事务写入，请求参数不进入任何记录 |
+| Phase 4 | MCP 生产入口与 Agent 回合编排 | 进行中 | 官方 transport、短期凭据、完整 17 工具注册表、会话/回合/工具调用写仓储均已通过测试；`main` 尚未启用 MCP | 2026-09-01 | 下一步组装 orchestrator，由单一服务入口按真实生命周期启用 `/mcp`；不得绕过生命周期直接在启动时构造虚假 running 会话或长期凭据 |
 | Phase 4 | Pi Lyra 工具扩展桥接 | 阻塞 | 项目缺少 `@earendil-works/pi-ai` 与 `@earendil-works/pi-coding-agent` | 2026-08-31 | Pi RPC 适配器与受限启动计划已完成；实际 `pi.registerTool` 扩展需官方 TypeBox/ExtensionAPI 运行时，不复制主机全局安装目录进项目 |
 | Phase 4 | Claude/Pi/OpenCode 最小权限启动计划 | 已完成 | 2 项新增测试通过；累计 136 项通过；本机 CLI help 协议核对 | 2026-08-31 | Claude 使用 bare、双向 stream-json 和 strict MCP；Pi 使用 RPC、关闭内建工具与自动发现、仅加载 Lyra 扩展；OpenCode 使用 pure ACP 和隔离目录；prompt 不进入 argv，运行环境只允许显式凭据 |
 | Phase 4 | Agent 会话回合生命周期门禁 | 已完成 | 2 项新增测试通过；累计 138 项通过 | 2026-08-31 | idle→running→cancelling/idle→closed 显式转换；相同状态重放幂等；只有 idle 可关闭，closed 不可恢复；每次真实转换递增 revision；新增 AGENT_SESSION_STATE_CONFLICT |
@@ -323,6 +324,7 @@
 | 2026-08-31 | `npm run build` + `node --test dist/test/agent-session-write.test.js dist/test/agent-runtime-store.test.js` | 通过 | Agent 写仓储聚焦测试 3 项通过：新会话与事件游标可从真实 DuckDB 恢复；用户回合原子写入 running 状态、revision、完成态用户消息和序号；重复计划 CAS 失败且不产生重复消息 |
 | 2026-08-31 | `npm run check` | 通过 | Agent 会话创建与用户回合原子启动仓储接入后 TypeScript strict 编译成功；116 个测试套件、累计 258 项测试全部通过 |
 | 2026-09-01 | `npm run check` | 通过 | 修复上一会话遗留的 v11 迁移：`agent_messages`/`agent_tool_calls` 经无约束 staging 表原位重建，消息外键改指不可变 `agent_session_identities`，会话写路径同步登记身份行；真实 DuckDB 会话写侧测试覆盖成功/失败回合收口；修复前 8 项真实数据库测试失败，修复后 116 个测试套件、累计 258 项测试全部通过 |
+| 2026-09-01 | `npm run check` | 通过 | 新增 Agent 工具调用写仓储测试 1 项，验证 started/成功/失败/拒绝原子持久化、事件序号 CAS 连续推进、重复计划冲突回滚，以及拒绝与 `agent.tool_rejected` 审计事件同事务落库；117 个测试套件、累计 259 项测试全部通过 |
 
 ## 当前环境事项
 
