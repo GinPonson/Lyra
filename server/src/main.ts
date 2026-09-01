@@ -5,8 +5,10 @@ import { z } from "zod";
 
 import {
   WriteCoordinator,
+  assembleAgentMcpRuntime,
   createServiceHealthSnapshot,
 } from "./application/index.js";
+import { AgentMcpCredentialStore } from "./infrastructure/agents/index.js";
 import { openLyraDatabase } from "./infrastructure/db/database.js";
 import { CURRENT_SCHEMA_VERSION } from "./infrastructure/db/schema-version.js";
 import {
@@ -32,6 +34,11 @@ async function start(): Promise<void> {
   ));
   const database = await openLyraDatabase(environment.LYRA_DATABASE_PATH);
   const writeCoordinator = new WriteCoordinator();
+  // MCP 短期凭据只在 Agent 回合运行期间存在于进程内；服务重启即失效。
+  const mcpRuntime = assembleAgentMcpRuntime({
+    database,
+    mcpCredentials: new AgentMcpCredentialStore(),
+  });
   const app = buildHttpServer({
     logger: true,
     protocolMetadata: createServerProtocolMetadata(
@@ -45,6 +52,11 @@ async function start(): Promise<void> {
       agentAvailability: null,
       checkedAt: new Date(),
     }),
+    mcp: {
+      registry: mcpRuntime.registry,
+      loadAuthorization: mcpRuntime.loadAuthorization,
+      persistCredentialRecord: mcpRuntime.persistCredentialRecord,
+    },
   });
   app.addHook("onClose", async () => {
     await writeCoordinator.close();

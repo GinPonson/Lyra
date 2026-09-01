@@ -150,6 +150,11 @@ export type {
   AgentTurnExecutor,
   AgentTurnRunResult,
 } from "./agent-turn-orchestrator.js";
+export { assembleAgentMcpRuntime } from "./agent-mcp-assembly.js";
+export type {
+  AgentMcpAuthorization,
+  AgentMcpRuntimeAssembly,
+} from "./agent-mcp-assembly.js";
 export { invokeAuthenticatedAgentTool } from "./agent-tool-invocation.js";
 export { createFinancialToolRegistry } from "./financial-tool-runtime.js";
 export {
