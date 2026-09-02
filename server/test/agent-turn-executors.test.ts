@@ -165,6 +165,7 @@ describe("provider turn executors", () => {
       await withTimeout(executors.claude({
         session: fakeSession("claude"),
         adapterInput: { messageId: "m-1", content: "分析当前持仓" },
+        handoffContext: null,
         mcp: { endpoint: MCP_ENDPOINT, bearer: MCP_BEARER },
         emitSignal: (signal) => {
           signals.push(signal);
@@ -203,6 +204,7 @@ describe("provider turn executors", () => {
       const run = executors.claude({
         session: fakeSession("claude"),
         adapterInput: { messageId: "m-1", content: "长时间分析" },
+        handoffContext: null,
         mcp: { endpoint: MCP_ENDPOINT, bearer: MCP_BEARER },
         emitSignal: (signal) => {
           signals.push(signal);
@@ -240,6 +242,7 @@ describe("provider turn executors", () => {
       await withTimeout(executors.claude({
         session: fakeSession("claude"),
         adapterInput: { messageId: "m-1", content: "分析" },
+        handoffContext: null,
         mcp: { endpoint: MCP_ENDPOINT, bearer: MCP_BEARER },
         emitSignal: (signal) => {
           signals.push(signal);
@@ -274,6 +277,7 @@ describe("provider turn executors", () => {
       await withTimeout(executors.pi({
         session: fakeSession("pi"),
         adapterInput: { messageId: "m-1", content: "解释风险" },
+        handoffContext: null,
         mcp: { endpoint: MCP_ENDPOINT, bearer: MCP_BEARER },
         emitSignal: (signal) => {
           signals.push(signal);
@@ -311,6 +315,7 @@ describe("provider turn executors", () => {
       await withTimeout(executors.opencode({
         session: fakeSession("opencode"),
         adapterInput: { messageId: "m-1", content: "总结持仓" },
+        handoffContext: null,
         mcp: { endpoint: MCP_ENDPOINT, bearer: MCP_BEARER },
         emitSignal: (signal) => {
           signals.push(signal);

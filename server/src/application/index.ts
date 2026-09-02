@@ -156,6 +156,7 @@ export type {
 export {
   closeAgentSessionForRequest,
   createAgentSessionForRequest,
+  switchAgentSessionForRequest,
 } from "./agent-session-commands.js";
 export type { CreateAgentSessionRequest } from "./agent-session-commands.js";
 export { createDeviceAuthGate } from "./device-auth-gate.js";

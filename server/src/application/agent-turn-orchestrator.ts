@@ -73,6 +73,8 @@ interface AgentSessionRuntime {
   lastEventSequence: number;
   bufferedEvents: AgentEvent[];
   turn: ActiveAgentTurn | null;
+  /** 跨供应商切换后待投递的一次性 handoff 上下文。 */
+  pendingHandoff: string | null;
 }
 
 /** 一次已完成回合的编排结果。 */
@@ -162,8 +164,30 @@ export class AgentTurnOrchestrator {
       lastEventSequence: record.lastEventSequence,
       bufferedEvents: [],
       turn: null,
+      pendingHandoff: null,
     });
     return record.snapshot;
+  }
+
+  /**
+   * 采纳切换命令已持久化的新会话快照，并把 handoff 上下文留给下一回合。
+   *
+   * 切换后 revision 递增本身会使用于旧凭据失效，这里仍按卫生策略撤销全部
+   * 该会话的 MCP 短期凭据。进程重启会丢失待投递上下文，但切换边界消息已
+   * 持久化，属于可接受的一次性损失。
+   */
+  adoptSwitchedSession(
+    sessionId: string,
+    nextSession: AgentSessionSnapshot,
+    handoffContext: string,
+  ): void {
+    const runtime = this.#requireRuntime(sessionId);
+    if (nextSession.revision <= runtime.snapshot.revision) {
+      throw this.#stateConflict("Agent 切换快照 revision 未递增");
+    }
+    runtime.snapshot = nextSession;
+    runtime.pendingHandoff = handoffContext;
+    this.#mcpCredentials.revokeSession(runtime.snapshot.id, this.#now());
   }
 
   /**
@@ -212,9 +236,13 @@ export class AgentTurnOrchestrator {
     this.#bufferEvent(runtime, plan.event);
 
     try {
+      // handoff 上下文只在切换后首个回合投递一次；回合已成功启动才清除。
+      const handoffContext = runtime.pendingHandoff;
+      runtime.pendingHandoff = null;
       await this.#executors[plan.session.provider]({
         session: plan.session,
         adapterInput: plan.adapterInput,
+        handoffContext,
         mcp: { endpoint: this.#mcpEndpoint, bearer: issued.token },
         emitSignal: (signal) => this.#applySignal(runtime, turn, signal),
         abortSignal: turn.abortController.signal,

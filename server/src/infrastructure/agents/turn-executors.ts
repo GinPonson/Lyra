@@ -179,7 +179,9 @@ function createClaudeTurnExecutor(
         abortSignal: input.abortSignal,
         sink,
         start: async (handle) => {
-          await handle.sendFrame(buildClaudeUserMessage(input.adapterInput.content));
+          await handle.sendFrame(buildClaudeUserMessage(
+            withHandoffPrefix(input.handoffContext, input.adapterInput.content),
+          ));
         },
         onFrame: (frame, handle) => {
           for (const signal of parseClaudeStreamFrame(frame)) {
@@ -256,7 +258,10 @@ function createPiTurnExecutor(
         sink,
         start: async (handle) => {
           await handle.sendFrame(
-            buildPiPromptCommand(randomUUID(), input.adapterInput.content),
+            buildPiPromptCommand(
+              randomUUID(),
+              withHandoffPrefix(input.handoffContext, input.adapterInput.content),
+            ),
           );
         },
         onFrame: (frame) => {
@@ -358,7 +363,7 @@ function createOpenCodeTurnExecutor(
           await handle.sendFrame(buildOpenCodePromptRequest({
             requestId: promptId,
             sessionId: openCodeSession.sessionId,
-            content: input.adapterInput.content,
+            content: withHandoffPrefix(input.handoffContext, input.adapterInput.content),
           }));
         },
         onFrame: (frame) => {
@@ -393,4 +398,9 @@ function handshakeResponseId(frame: unknown): string | null {
   }
   const id = (frame as Record<string, unknown>).id;
   return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+/** 切换后首个回合把一次性 handoff 上下文并入用户 prompt 前缀。 */
+function withHandoffPrefix(handoffContext: string | null, content: string): string {
+  return handoffContext === null ? content : `${handoffContext}\n\n${content}`;
 }

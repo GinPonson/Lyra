@@ -397,6 +397,100 @@ export async function persistAgentSessionCancelling(
   }
 }
 
+/**
+ * 原子持久化回合边界的跨供应商切换：更新 provider 与 revision，并写入显式
+ * 切换边界 system 消息。
+ *
+ * revision 递增使既有 MCP 单会话凭据失效；切换消息是规范快照的一部分，必须
+ * 与会话状态在同一事务落库。
+ */
+export async function persistAgentSessionSwitch(
+  database: LyraDatabase,
+  input: {
+    session: AgentSessionSnapshot;
+    previousProvider: string;
+  },
+): Promise<void> {
+  const switched = input.session;
+  const boundary = switched.messages.at(-1);
+  if (
+    switched.status !== "idle"
+    || switched.provider === input.previousProvider
+    || boundary === undefined
+    || boundary.role !== "system"
+    || boundary.id !== switched.messages.at(-1)?.id
+  ) {
+    throw new RangeError("Agent 切换计划必须是含边界消息的已切换快照");
+  }
+  const connection = database.connection;
+  await connection.run("BEGIN TRANSACTION");
+  try {
+    const accountId = switched.accountScope.kind === "account"
+      ? switched.accountScope.account
+      : null;
+    const updated = await connection.run(`
+      UPDATE agent_sessions
+      SET provider = $next_provider,
+          revision = $next_revision,
+          updated_at = CAST($switched_at AS TIMESTAMPTZ)
+      WHERE id = CAST($session_id AS UUID)
+        AND status = 'idle'
+        AND provider = $previous_provider
+        AND revision = $expected_revision
+        AND ledger_version = $ledger_version
+        AND as_of = CAST($as_of AS TIMESTAMPTZ)
+        AND account_scope_kind = $account_scope_kind
+        AND (
+          ($account_scope_kind = 'all' AND account_id IS NULL)
+          OR ($account_scope_kind = 'account' AND account_id = CAST($account_id AS UUID))
+        )
+    `, {
+      next_provider: switched.provider,
+      next_revision: switched.revision,
+      switched_at: boundary.createdAt,
+      session_id: switched.id,
+      previous_provider: input.previousProvider,
+      expected_revision: switched.revision - 1,
+      ledger_version: switched.ledgerVersion,
+      as_of: switched.asOf,
+      account_scope_kind: switched.accountScope.kind,
+      account_id: accountId,
+    });
+    if (updated.rowsChanged !== 1) {
+      throw new ApplicationError({
+        code: "AGENT_SESSION_STATE_CONFLICT",
+        message: "Agent 会话已变化，切换未生效",
+        statusCode: 409,
+        retryable: false,
+      });
+    }
+    await connection.run(`
+      INSERT INTO agent_messages (
+        id, session_id, ordinal, role, provider, status, content, error_code,
+        created_at, completed_at
+      ) VALUES (
+        CAST($message_id AS UUID), CAST($session_id AS UUID), $ordinal,
+        'system', NULL, 'completed', $content, NULL,
+        CAST($created_at AS TIMESTAMPTZ), CAST($created_at AS TIMESTAMPTZ)
+      )
+    `, {
+      message_id: boundary.id,
+      session_id: switched.id,
+      ordinal: switched.messages.length,
+      content: boundary.content,
+      created_at: boundary.createdAt,
+    });
+    await connection.run("COMMIT");
+  } catch (error: unknown) {
+    try {
+      await connection.run("ROLLBACK");
+    } catch (rollbackError: unknown) {
+      throw new AggregateError([error, rollbackError], "Agent 切换持久化失败且回滚失败");
+    }
+    throw error;
+  }
+}
+
 /** 成功与失败共用的持久化终态输入。 */
 interface AgentTurnSettlementInput {
   session: AgentSessionSnapshot;

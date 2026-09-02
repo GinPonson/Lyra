@@ -10,6 +10,7 @@ import {
   closeAgentSessionForRequest,
   createAgentSessionForRequest,
   createPublicAgentSession,
+  switchAgentSessionForRequest,
 } from "../application/index.js";
 import { ApplicationError } from "../application/index.js";
 import type { PairedDeviceAuthRecord } from "../infrastructure/security/device-auth.js";
@@ -44,6 +45,10 @@ const createSessionSchema = z.object({
 
 const sendMessageSchema = z.object({
   content: z.string().trim().min(1).max(8_192),
+});
+
+const switchSchema = z.object({
+  provider: z.enum(["claude", "pi", "opencode"]),
 });
 
 const sessionIdSchema = z.object({
@@ -154,6 +159,24 @@ export function registerAgentRoutes(
       throw invalidArgument("Agent 会话 ID 无效");
     }
     const snapshot = await options.orchestrator.cancelTurn(params.data.sessionId);
+    return { session: createPublicAgentSession(snapshot) };
+  });
+
+  app.post("/v1/agent/sessions/:sessionId/switch", { preHandler: authenticate }, async (request) => {
+    const params = sessionIdSchema.safeParse(request.params);
+    const body = switchSchema.safeParse(request.body);
+    if (!params.success || !body.success) {
+      throw invalidArgument("Agent 切换参数无效");
+    }
+    const snapshot = await switchAgentSessionForRequest({
+      orchestrator: options.orchestrator,
+      writeCoordinator: options.writeCoordinator,
+      database: options.database,
+      availability: await options.availability(),
+      sessionId: params.data.sessionId,
+      targetProvider: body.data.provider,
+      now: now(),
+    });
     return { session: createPublicAgentSession(snapshot) };
   });
 

@@ -1,8 +1,15 @@
 import { randomUUID } from "node:crypto";
 
-import type { AgentProvider, AgentSessionSnapshot } from "../domain/agent/index.js";
+import type {
+  AgentProvider,
+  AgentProviderAvailability,
+  AgentSessionSnapshot,
+  AgentSwitchPlan,
+} from "../domain/agent/index.js";
 import {
+  AgentSwitchError,
   createAgentSession,
+  prepareAgentSwitch,
   transitionAgentSession,
 } from "../domain/agent/index.js";
 import type { AgentAvailabilitySnapshot } from "./agent-availability.js";
@@ -12,6 +19,7 @@ import type { WriteCoordinator } from "./write-coordinator.js";
 import {
   assertActiveAccountExists,
   persistAgentSessionClosed,
+  persistAgentSessionSwitch,
   persistNewAgentSession,
   readCurrentLedgerVersion,
 } from "../infrastructure/db/agent-session-repository.js";
@@ -110,4 +118,93 @@ export async function closeAgentSessionForRequest(input: {
     closedAt: input.now.toISOString(),
   }));
   return closed;
+}
+
+/**
+ * 在 idle 回合边界执行跨供应商切换并持久化切换边界。
+ *
+ * 目标供应商必须在最近一次探测批次中可用；切换后 provider、revision 与边界
+ * system 消息在同一事务落库，orchestrator 采纳新快照并把 handoff 上下文留给
+ * 切换后的首个回合一次性投递。
+ */
+export async function switchAgentSessionForRequest(input: {
+  orchestrator: AgentTurnOrchestrator;
+  writeCoordinator: WriteCoordinator;
+  database: LyraDatabase;
+  availability: AgentAvailabilitySnapshot;
+  sessionId: string;
+  targetProvider: AgentProvider;
+  now: Date;
+}): Promise<AgentSessionSnapshot> {
+  const snapshot = await input.orchestrator.openSession(input.sessionId);
+  const availability = input.availability.providers.find(
+    (candidate) => candidate.provider === input.targetProvider,
+  );
+  if (availability === undefined) {
+    throw new ApplicationError({
+      code: "AGENT_UNAVAILABLE",
+      message: "目标 Agent 当前不可用",
+      statusCode: 409,
+      retryable: false,
+    });
+  }
+  const providerAvailability: AgentProviderAvailability = availability.status === "available"
+    ? { provider: input.targetProvider, status: "available" }
+    : { provider: input.targetProvider, status: "unavailable", reason: availability.reason };
+  let plan: AgentSwitchPlan;
+  try {
+    plan = prepareAgentSwitch(
+      snapshot,
+      input.targetProvider,
+      providerAvailability,
+      randomUUID(),
+      input.now.toISOString(),
+    );
+  } catch (error: unknown) {
+    if (error instanceof AgentSwitchError) {
+      throw new ApplicationError({
+        code: error.code,
+        message: error.message,
+        statusCode: 409,
+        retryable: false,
+      });
+    }
+    if (error instanceof RangeError) {
+      throw new ApplicationError({
+        code: "INVALID_ARGUMENT",
+        message: "Agent 切换目标无效",
+        statusCode: 400,
+        retryable: false,
+      });
+    }
+    throw error;
+  }
+  await input.writeCoordinator.enqueue(() => persistAgentSessionSwitch(input.database, {
+    session: plan.nextSession,
+    previousProvider: snapshot.provider,
+  }));
+  input.orchestrator.adoptSwitchedSession(
+    input.sessionId,
+    plan.nextSession,
+    formatHandoffContext(plan.handoff),
+  );
+  return plan.nextSession;
+}
+
+/** 把有界 handoff 上下文压缩为目标 CLI 可读的纯文本前缀。 */
+function formatHandoffContext(handoff: AgentSwitchPlan["handoff"]): string {
+  const lines: string[] = [
+    `[Agent 切换] 本会话由 ${handoff.fromProvider} 切换到 ${handoff.toProvider}；`
+      + `账户范围与账本版本 ${handoff.ledgerVersion}、数据截止 ${handoff.asOf} 保持不变。`,
+  ];
+  if (handoff.omittedMessageCount > 0) {
+    lines.push(`较早的 ${handoff.omittedMessageCount} 条消息已被省略。`);
+  }
+  if (handoff.summary !== null) {
+    lines.push(`会话摘要：${handoff.summary}`);
+  }
+  for (const message of handoff.messages) {
+    lines.push(`[${message.role}] ${message.content}`);
+  }
+  return lines.join("\n");
 }
