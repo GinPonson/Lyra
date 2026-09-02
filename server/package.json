@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.4",
+    "@fastify/websocket": "11.1.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "csv-parse": "7.0.2",
     "decimal.js": "10.6.0",
@@ -25,6 +26,8 @@
   "devDependencies": {
     "@types/mailparser": "3.4.6",
     "@types/node": "22.19.19",
-    "typescript": "5.8.3"
+    "@types/ws": "8.18.1",
+    "typescript": "5.8.3",
+    "ws": "8.18.3"
   }
 }

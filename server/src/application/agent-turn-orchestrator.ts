@@ -52,6 +52,8 @@ export interface AgentTurnOrchestratorOptions {
   /** 供应商子进程访问 Lyra MCP 的回环端点。 */
   mcpEndpoint: string;
   mcpCredentialTtlMilliseconds: number;
+  /** 每个持久化事件产生时的外发钩子；WebSocket 层也可改用 subscribe 订阅。 */
+  onEvent?: (event: AgentEvent) => void;
   now?: () => Date;
 }
 
@@ -101,6 +103,8 @@ export class AgentTurnOrchestrator {
   readonly #mcpEndpoint: string;
   readonly #mcpCredentialTtlMilliseconds: number;
   readonly #now: () => Date;
+  readonly #onEvent: ((event: AgentEvent) => void) | null;
+  readonly #subscribers = new Map<string, Set<(event: AgentEvent) => void>>();
   readonly #runtimes = new Map<string, AgentSessionRuntime>();
 
   constructor(options: AgentTurnOrchestratorOptions) {
@@ -121,6 +125,7 @@ export class AgentTurnOrchestrator {
     this.#mcpEndpoint = options.mcpEndpoint;
     this.#mcpCredentialTtlMilliseconds = options.mcpCredentialTtlMilliseconds;
     this.#now = options.now ?? (() => new Date());
+    this.#onEvent = options.onEvent ?? null;
   }
 
   /**
@@ -445,11 +450,43 @@ export class AgentTurnOrchestrator {
     }
   }
 
+  /**
+   * 订阅一个会话的后续持久化事件；只推送新事件，不回放历史缓冲。
+   *
+   * @returns 幂等退订函数；重复调用安全。
+   */
+  subscribe(sessionId: string, push: (event: AgentEvent) => void): () => void {
+    const normalizedId = sessionId.trim();
+    let subscribers = this.#subscribers.get(normalizedId);
+    if (subscribers === undefined) {
+      subscribers = new Set();
+      this.#subscribers.set(normalizedId, subscribers);
+    }
+    subscribers.add(push);
+    return () => {
+      const current = this.#subscribers.get(normalizedId);
+      if (current === undefined) {
+        return;
+      }
+      current.delete(push);
+      if (current.size === 0) {
+        this.#subscribers.delete(normalizedId);
+      }
+    };
+  }
+
   #bufferEvent(runtime: AgentSessionRuntime, event: AgentEvent): void {
     runtime.bufferedEvents.push(event);
     runtime.turn?.events.push(event);
     if (runtime.bufferedEvents.length > MAX_BUFFERED_EVENTS) {
       runtime.bufferedEvents.shift();
+    }
+    this.#onEvent?.(event);
+    const subscribers = this.#subscribers.get(runtime.snapshot.id);
+    if (subscribers !== undefined) {
+      for (const push of subscribers) {
+        push(event);
+      }
     }
   }
 

@@ -14,5 +14,9 @@ export type {
   AgentMcpAuthorizationSnapshot,
   AgentMcpHttpOptions,
 } from "./agent-mcp-http.js";
+export { registerAgentRoutes } from "./agent-routes.js";
+export type { AgentRouteOptions } from "./agent-routes.js";
+export { registerAgentEventsRoute } from "./agent-events.js";
+export type { AgentEventsRouteOptions } from "./agent-events.js";
 export type { HttpServerOptions } from "./http-server.js";
 export type { ServerProtocolMetadata } from "./protocol-version.js";

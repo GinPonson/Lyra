@@ -556,11 +556,98 @@ function assertTurnStartPlan(plan: AgentTurnStartPlan): void {
 }
 
 /** 新会话只能绑定当前账本版本。 */
-async function readCurrentLedgerVersion(database: LyraDatabase): Promise<number> {
+export async function readCurrentLedgerVersion(database: LyraDatabase): Promise<number> {
   const reader = await database.connection.runAndReadAll(
     "SELECT coalesce(max(version), 0) AS version FROM ledger_versions",
   );
   return parseNonNegativeInteger(reader.getRowObjectsJson()[0]?.version, "当前账本版本");
+}
+
+/** 新会话只能绑定活跃账户；未知或已归档账户明确拒绝，不进入外键错误。 */
+export async function assertActiveAccountExists(
+  database: LyraDatabase,
+  accountId: string,
+): Promise<void> {
+  const normalizedId = requireNonEmptyText(accountId, "Agent 账户 ID");
+  const reader = await database.connection.runAndReadAll(`
+    SELECT status
+    FROM accounts
+    WHERE id = CAST($account_id AS UUID)
+  `, { account_id: normalizedId });
+  const status = reader.getRowObjectsJson()[0]?.status;
+  if (status !== "active") {
+    throw new ApplicationError({
+      code: "ACCOUNT_SCOPE_REQUIRED",
+      message: status === "archived" ? "目标账户已归档" : "目标账户不存在",
+      statusCode: 409,
+      retryable: false,
+    });
+  }
+}
+
+/** 会话只能在 idle 回合边界显式关闭；closed 会话不可恢复。 */
+export async function persistAgentSessionClosed(
+  database: LyraDatabase,
+  input: {
+    session: AgentSessionSnapshot;
+    closedAt: string;
+  },
+): Promise<void> {
+  if (input.session.status !== "closed" || input.session.revision <= 1) {
+    throw new RangeError("Agent 关闭计划必须是递增 revision 的 closed 快照");
+  }
+  const closedAt = parseTimestamp(input.closedAt, "Agent 关闭时间");
+  const connection = database.connection;
+  await connection.run("BEGIN TRANSACTION");
+  try {
+    const accountId = input.session.accountScope.kind === "account"
+      ? input.session.accountScope.account
+      : null;
+    const updated = await connection.run(`
+      UPDATE agent_sessions
+      SET status = 'closed',
+          revision = $next_revision,
+          closed_at = CAST($closed_at AS TIMESTAMPTZ),
+          updated_at = CAST($closed_at AS TIMESTAMPTZ)
+      WHERE id = CAST($session_id AS UUID)
+        AND status = 'idle'
+        AND provider = $provider
+        AND revision = $expected_revision
+        AND ledger_version = $ledger_version
+        AND as_of = CAST($as_of AS TIMESTAMPTZ)
+        AND account_scope_kind = $account_scope_kind
+        AND (
+          ($account_scope_kind = 'all' AND account_id IS NULL)
+          OR ($account_scope_kind = 'account' AND account_id = CAST($account_id AS UUID))
+        )
+    `, {
+      next_revision: input.session.revision,
+      closed_at: closedAt,
+      session_id: input.session.id,
+      provider: input.session.provider,
+      expected_revision: input.session.revision - 1,
+      ledger_version: input.session.ledgerVersion,
+      as_of: input.session.asOf,
+      account_scope_kind: input.session.accountScope.kind,
+      account_id: accountId,
+    });
+    if (updated.rowsChanged !== 1) {
+      throw new ApplicationError({
+        code: "AGENT_SESSION_STATE_CONFLICT",
+        message: "Agent 会话已变化，关闭请求未生效",
+        statusCode: 409,
+        retryable: false,
+      });
+    }
+    await connection.run("COMMIT");
+  } catch (error: unknown) {
+    try {
+      await connection.run("ROLLBACK");
+    } catch (rollbackError: unknown) {
+      throw new AggregateError([error, rollbackError], "Agent 会话关闭失败且回滚失败");
+    }
+    throw error;
+  }
 }
 
 /** 会话创建时设备必须仍处于 active，撤销设备不得产生新会话。 */

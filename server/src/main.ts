@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import process from "node:process";
 
 import { z } from "zod";
@@ -6,21 +6,40 @@ import { z } from "zod";
 import {
   WriteCoordinator,
   assembleAgentMcpRuntime,
+  createAgentAvailabilityProvider,
+  createDeviceAuthGate,
   createServiceHealthSnapshot,
 } from "./application/index.js";
-import { AgentMcpCredentialStore } from "./infrastructure/agents/index.js";
+import { AgentTurnOrchestrator } from "./application/index.js";
+import { AgentMcpCredentialStore, createAgentTurnExecutors } from "./infrastructure/agents/index.js";
 import { openLyraDatabase } from "./infrastructure/db/database.js";
 import { CURRENT_SCHEMA_VERSION } from "./infrastructure/db/schema-version.js";
 import {
   buildHttpServer,
   createServerProtocolMetadata,
 } from "./transport/index.js";
+import { registerAgentRoutes } from "./transport/agent-routes.js";
+import { registerAgentEventsRoute } from "./transport/agent-events.js";
 
 const environmentSchema = z.object({
   LYRA_HOST: z.string().trim().min(1).default("127.0.0.1"),
   LYRA_PORT: z.coerce.number().int().min(1).max(65_535).default(3_141),
   LYRA_DATABASE_PATH: z.string().trim().min(1),
+  LYRA_AGENT_WORKSPACE_ROOT: z.string().trim().min(1),
+  LYRA_AGENT_CLAUDE_PATH: z.string().trim().min(1),
+  LYRA_AGENT_PI_PATH: z.string().trim().min(1),
+  LYRA_AGENT_OPENCODE_PATH: z.string().trim().min(1),
+  LYRA_AGENT_PI_EXTENSION_PATH: z.string().trim().min(1),
+  LYRA_AGENT_TURN_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(900_000),
+  LYRA_AGENT_PROBE_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(10_000),
+  /** JSON 对象：{"claude":["2.1.233"],"pi":["0.84.2"],"opencode":["1.18.21"]}。 */
+  LYRA_AGENT_ALLOWED_VERSIONS: z.string().trim().min(1),
 });
+
+const allowedVersionsSchema = z.record(
+  z.enum(["claude", "pi", "opencode"]),
+  z.array(z.string().trim().min(1)).min(1),
+);
 
 const packageSchema = z.object({
   version: z.string().trim().min(1),
@@ -35,10 +54,38 @@ async function start(): Promise<void> {
   const database = await openLyraDatabase(environment.LYRA_DATABASE_PATH);
   const writeCoordinator = new WriteCoordinator();
   // MCP 短期凭据只在 Agent 回合运行期间存在于进程内；服务重启即失效。
-  const mcpRuntime = assembleAgentMcpRuntime({
+  const mcpCredentials = new AgentMcpCredentialStore();
+  const mcpRuntime = assembleAgentMcpRuntime({ database, mcpCredentials });
+  // 会话工作目录在受信根路径下随机创建；根目录本身按配置在启动时准备。
+  mkdirSync(environment.LYRA_AGENT_WORKSPACE_ROOT, { recursive: true });
+  const executables = {
+    claude: environment.LYRA_AGENT_CLAUDE_PATH,
+    pi: environment.LYRA_AGENT_PI_PATH,
+    opencode: environment.LYRA_AGENT_OPENCODE_PATH,
+  } as const;
+  const orchestrator = new AgentTurnOrchestrator({
     database,
-    mcpCredentials: new AgentMcpCredentialStore(),
+    writeCoordinator,
+    mcpCredentials,
+    registry: mcpRuntime.registry,
+    executors: createAgentTurnExecutors({
+      workspaceRoot: environment.LYRA_AGENT_WORKSPACE_ROOT,
+      clientVersion: packageJson.version,
+      executables,
+      piExtensionPath: environment.LYRA_AGENT_PI_EXTENSION_PATH,
+      turnTimeoutMilliseconds: environment.LYRA_AGENT_TURN_TIMEOUT_MS,
+    }),
+    mcpEndpoint: `http://127.0.0.1:${environment.LYRA_PORT}/mcp`,
+    mcpCredentialTtlMilliseconds: 120_000,
   });
+  const availability = createAgentAvailabilityProvider({
+    executables,
+    allowedVersions: allowedVersionsSchema.parse(
+      JSON.parse(environment.LYRA_AGENT_ALLOWED_VERSIONS),
+    ),
+    probeTimeoutMilliseconds: environment.LYRA_AGENT_PROBE_TIMEOUT_MS,
+  });
+  const authenticateDevice = createDeviceAuthGate(database);
   const app = buildHttpServer({
     logger: true,
     protocolMetadata: createServerProtocolMetadata(
@@ -58,6 +105,14 @@ async function start(): Promise<void> {
       persistCredentialRecord: mcpRuntime.persistCredentialRecord,
     },
   });
+  registerAgentRoutes(app, {
+    orchestrator,
+    writeCoordinator,
+    database,
+    availability,
+    authenticateDevice,
+  });
+  await registerAgentEventsRoute(app, { orchestrator, authenticateDevice });
   app.addHook("onClose", async () => {
     await writeCoordinator.close();
     database.close();

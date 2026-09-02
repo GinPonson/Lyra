@@ -153,6 +153,13 @@ export type {
   AgentMcpAuthorization,
   AgentMcpRuntimeAssembly,
 } from "./agent-mcp-assembly.js";
+export {
+  closeAgentSessionForRequest,
+  createAgentSessionForRequest,
+} from "./agent-session-commands.js";
+export type { CreateAgentSessionRequest } from "./agent-session-commands.js";
+export { createDeviceAuthGate } from "./device-auth-gate.js";
+export { createAgentAvailabilityProvider } from "./agent-availability-cache.js";
 export { invokeAuthenticatedAgentTool } from "./agent-tool-invocation.js";
 export { createFinancialToolRegistry } from "./financial-tool-runtime.js";
 export {
