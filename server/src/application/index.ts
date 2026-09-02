@@ -162,6 +162,14 @@ export {
 export type { CreateAgentSessionRequest } from "./agent-session-commands.js";
 export { createDeviceAuthGate } from "./device-auth-gate.js";
 export { createAgentAvailabilityProvider } from "./agent-availability-cache.js";
+export {
+  IMPORT_PARSER_VERSION,
+  ImportService,
+} from "./import-service.js";
+export type {
+  ImportCommitHttpResponse,
+  ImportPreviewHttpResponse,
+} from "./import-service.js";
 export { invokeAuthenticatedAgentTool } from "./agent-tool-invocation.js";
 export { createFinancialToolRegistry } from "./financial-tool-runtime.js";
 export {

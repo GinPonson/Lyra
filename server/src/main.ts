@@ -21,6 +21,8 @@ import {
 import { registerAgentRoutes } from "./transport/agent-routes.js";
 import { registerAgentEventsRoute } from "./transport/agent-events.js";
 import { registerLedgerRoutes } from "./transport/ledger-routes.js";
+import { registerImportRoutes } from "./transport/import-routes.js";
+import { ImportService } from "./application/index.js";
 
 const environmentSchema = z.object({
   LYRA_HOST: z.string().trim().min(1).default("127.0.0.1"),
@@ -33,6 +35,7 @@ const environmentSchema = z.object({
   LYRA_AGENT_PI_EXTENSION_PATH: z.string().trim().min(1),
   LYRA_AGENT_TURN_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(900_000),
   LYRA_AGENT_PROBE_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(10_000),
+  LYRA_IMPORT_STAGING_DIR: z.string().trim().min(1),
   /** JSON 对象：{"claude":["2.1.233"],"pi":["0.84.2"],"opencode":["1.18.21"]}。 */
   LYRA_AGENT_ALLOWED_VERSIONS: z.string().trim().min(1),
 });
@@ -59,6 +62,12 @@ async function start(): Promise<void> {
   const mcpRuntime = assembleAgentMcpRuntime({ database, mcpCredentials });
   // 会话工作目录在受信根路径下随机创建；根目录本身按配置在启动时准备。
   mkdirSync(environment.LYRA_AGENT_WORKSPACE_ROOT, { recursive: true });
+  mkdirSync(environment.LYRA_IMPORT_STAGING_DIR, { recursive: true });
+  const importService = new ImportService({
+    database,
+    writeCoordinator,
+    stagingDirectory: environment.LYRA_IMPORT_STAGING_DIR,
+  });
   const executables = {
     claude: environment.LYRA_AGENT_CLAUDE_PATH,
     pi: environment.LYRA_AGENT_PI_PATH,
@@ -117,6 +126,10 @@ async function start(): Promise<void> {
   registerLedgerRoutes(app, {
     registry: mcpRuntime.registry,
     database,
+    authenticateDevice,
+  });
+  registerImportRoutes(app, {
+    importService,
     authenticateDevice,
   });
   app.addHook("onClose", async () => {

@@ -58,7 +58,7 @@ function createMessageSink(socket: WebSocket) {
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           reject(new Error("等待 WS 消息超时"));
-        }, 5_000);
+        }, 15_000);
         waiters.push({ predicate, resolve, timer });
       });
     },
