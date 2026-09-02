@@ -18,5 +18,7 @@ export { registerAgentRoutes } from "./agent-routes.js";
 export type { AgentRouteOptions } from "./agent-routes.js";
 export { registerAgentEventsRoute } from "./agent-events.js";
 export type { AgentEventsRouteOptions } from "./agent-events.js";
+export { registerLedgerRoutes } from "./ledger-routes.js";
+export type { LedgerRouteOptions } from "./ledger-routes.js";
 export type { HttpServerOptions } from "./http-server.js";
 export type { ServerProtocolMetadata } from "./protocol-version.js";

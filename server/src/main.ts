@@ -20,6 +20,7 @@ import {
 } from "./transport/index.js";
 import { registerAgentRoutes } from "./transport/agent-routes.js";
 import { registerAgentEventsRoute } from "./transport/agent-events.js";
+import { registerLedgerRoutes } from "./transport/ledger-routes.js";
 
 const environmentSchema = z.object({
   LYRA_HOST: z.string().trim().min(1).default("127.0.0.1"),
@@ -113,6 +114,11 @@ async function start(): Promise<void> {
     authenticateDevice,
   });
   await registerAgentEventsRoute(app, { orchestrator, authenticateDevice });
+  registerLedgerRoutes(app, {
+    registry: mcpRuntime.registry,
+    database,
+    authenticateDevice,
+  });
   app.addHook("onClose", async () => {
     await writeCoordinator.close();
     database.close();

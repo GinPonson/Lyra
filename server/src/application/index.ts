@@ -3,6 +3,7 @@ export { API_ERROR_CODES, ApplicationError } from "./app-error.js";
 export { resolveAccountScope } from "./account-scope.js";
 export { createPublicAccountList } from "./account-view.js";
 export { createLedgerReadResult } from "./ledger-read-result.js";
+export { resolveLedgerReadScope } from "./ledger-read-context.js";
 export {
   createPublicCashflowQuery,
   createPublicExpiringPositions,
