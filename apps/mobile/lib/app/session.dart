@@ -126,18 +126,18 @@ class SessionController extends AsyncNotifier<SessionState> {
       tokenRefresher: () async {
         final dio = dependencies.clientFactory?.call(snapshot.serverUrl) ??
             Dio(BaseOptions(baseUrl: snapshot.serverUrl));
-        final credentials = await PairingRepository(
+        final tokens = await PairingRepository(
           dio: dio,
         ).refresh(refreshToken: snapshot.refreshToken);
         final updated = CredentialSnapshot(
           serverUrl: snapshot.serverUrl,
-          deviceId: credentials.deviceId,
-          accessToken: credentials.accessToken,
-          refreshToken: credentials.refreshToken,
+          deviceId: snapshot.deviceId,
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
           devicePrivateKey: snapshot.devicePrivateKey,
         );
         await dependencies.credentialStore.write(updated);
-        return credentials.accessToken;
+        return tokens.accessToken;
       },
     );
   }
