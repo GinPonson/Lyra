@@ -171,20 +171,14 @@ class AgentController extends Notifier<AgentUiState> {
       return;
     }
     _lastSequence = 0;
-    AgentLiveEvents? live;
-    live = AgentLiveEvents(
+    // 意外断开由 AgentLiveEvents 按指数退避自动重连（游标续传），
+    // 控制器保留句柄，下一回合会带最新游标重新订阅。
+    _live = AgentLiveEvents(
       serverUrl: paired.snapshot.serverUrl,
       accessToken: paired.snapshot.accessToken,
       onFrame: handleFrame,
-      onDone: () {
-        // 连接断开：保留游标，等待下一次回合或手动交互时重订阅。
-        if (identical(_live, live)) {
-          _live = null;
-        }
-      },
     );
-    _live = live;
-    live.subscribe(sessionId: sessionId, afterSequence: _lastSequence);
+    _live!.subscribe(sessionId: sessionId, afterSequence: _lastSequence);
   }
 
   /// 统一事件帧处理：delta 实时预览，缺口或要求时重取权威快照。

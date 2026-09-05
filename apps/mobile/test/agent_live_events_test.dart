@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -12,6 +13,8 @@ import 'package:lyra_mobile/features/agent/agent_live_events.dart';
 import 'package:lyra_mobile/features/agent/agent_repository.dart';
 import 'package:lyra_mobile/features/agent/agent_screen.dart';
 import 'package:lyra_mobile/features/agent/agent_session_store.dart';
+import 'package:stream_channel/stream_channel.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 /// 按请求路径返回固定响应的假 HTTP 适配器；不触达真实网络。
 class FakeFrameAdapter implements HttpClientAdapter {
@@ -30,6 +33,59 @@ class FakeFrameAdapter implements HttpClientAdapter {
 
   @override
   void close({bool force = false}) {}
+}
+
+/// 基于 [StreamChannelController] 的假 WebSocket 通道。
+///
+/// `foreign` 端由被测对象读写（本测试通过 local 端注入服务端帧并观察
+/// 客户端 subscribe 帧）；close 外端时被测对象看到连接断开。
+class ChannelMock extends StreamChannelMixin<dynamic>
+    implements WebSocketChannel {
+  ChannelMock(this._controller);
+
+  final StreamChannelController<dynamic> _controller;
+
+  @override
+  Future<void> get ready => Future<void>.value();
+
+  @override
+  int? get closeCode => null;
+
+  @override
+  String? get closeReason => null;
+
+  @override
+  String? get protocol => null;
+
+  @override
+  WebSocketSink get sink => _MockWebSocketSink(_controller.foreign.sink);
+
+  @override
+  Stream<dynamic> get stream => _controller.foreign.stream;
+}
+
+/// 转发 close 到外端 sink 的假 WebSocket sink。
+class _MockWebSocketSink implements WebSocketSink {
+  _MockWebSocketSink(this._sink);
+
+  final StreamSink<dynamic> _sink;
+
+  @override
+  void add(dynamic data) => _sink.add(data);
+
+  @override
+  void addError(Object error, [StackTrace? stackTrace]) =>
+      _sink.addError(error, stackTrace);
+
+  @override
+  Future<dynamic> addStream(Stream<dynamic> stream) => _sink.addStream(stream);
+
+  @override
+  Future<dynamic> close([int? closeCode, String? closeReason]) =>
+      _sink.close();
+
+  @override
+  Future<dynamic> get done => _sink.done;
 }
 
 ResponseBody _jsonResponse(String body, int status) {
@@ -519,6 +575,157 @@ void main() {
       expect(calls[1].resultSummary, isNull);
       expect(calls[1].durationMs, isNull);
       expect(calls[2].errorCode, 'AGENT_TOOL_EXECUTION_FAILED');
+    });
+  });
+
+  group('AgentLiveEvents 重连退避', () {
+    test('意外断开按指数退避自动重连并带最新游标', () async {
+      final channels = <StreamChannelController<dynamic>>[];
+      final subscribeFrames = <Map<String, Object?>>[];
+      WebSocketChannel createChannel(Uri uri, Iterable<String> protocols) {
+        final controller = StreamChannelController<dynamic>(
+          allowForeignErrors: false,
+        );
+        channels.add(controller);
+        // 捕获 subscribe 帧。
+        controller.local.stream.listen((message) {
+          subscribeFrames.add(jsonDecode(message) as Map<String, Object?>);
+        });
+        return ChannelMock(controller);
+      }
+
+      final received = <AgentLiveFrame>[];
+      final live = AgentLiveEvents(
+        serverUrl: 'http://127.0.0.1:3141',
+        accessToken: 'token-1',
+        onFrame: received.add,
+        reconnectDelay: const Duration(milliseconds: 10),
+        maxReconnectDelay: const Duration(milliseconds: 40),
+        channelFactory: createChannel,
+      );
+      addTearDown(live.dispose);
+      live.subscribe(sessionId: 'a1000000-0000-4000-8000-000000000001', afterSequence: 5);
+      expect(channels, hasLength(1));
+      await pumpEventQueue();
+
+      // 首次连接确认后推送事件 6，随后意外断开。
+      channels[0].local.sink.add(jsonEncode(<String, Object?>{
+        'type': 'subscribed', 'mode': 'events', 'events': <Object?>[],
+      }));
+      channels[0].local.sink.add(jsonEncode(<String, Object?>{
+        'type': 'event',
+        'event': <String, Object?>{
+          'type': 'message.delta',
+          'sessionId': 'a1000000-0000-4000-8000-000000000001',
+          'messageId': 'm1',
+          'sequence': 6,
+          'occurredAt': '2026-09-05T10:00:06.000Z',
+          'payload': <String, Object?>{'text': 'A'},
+        },
+      }));
+      await pumpEventQueue();
+      expect(live.lastSequence, 6);
+
+      // 模拟服务器断开。
+      await channels[0].local.sink.close();
+      await pumpEventQueue();
+      expect(live.isConnected, isFalse);
+      expect(subscribeFrames, hasLength(1));
+
+      // 退避后自动重连：第二通道出现，subscribe 帧带最新游标 6。
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      await pumpEventQueue();
+      expect(channels, hasLength(2));
+      expect(subscribeFrames, hasLength(2));
+      expect(subscribeFrames[1]['afterSequence'], 6);
+
+      // 重连确认后游标推进。
+      channels[1].local.sink.add(jsonEncode(<String, Object?>{
+        'type': 'subscribed', 'mode': 'events', 'events': <Object?>[],
+      }));
+      await pumpEventQueue();
+      expect(received.whereType<AgentSubscribedFrame>(), hasLength(2));
+    });
+
+    test('主动 close 不触发重连，dispose 后完全静默', () async {
+      final channels = <StreamChannelController<dynamic>>[];
+      WebSocketChannel createChannel(Uri uri, Iterable<String> protocols) {
+        final controller = StreamChannelController<dynamic>(
+          allowForeignErrors: false,
+        );
+        channels.add(controller);
+        return ChannelMock(controller);
+      }
+
+      final live = AgentLiveEvents(
+        serverUrl: 'http://127.0.0.1:3141',
+        accessToken: 'token-1',
+        onFrame: (AgentLiveFrame frame) {},
+        reconnectDelay: const Duration(milliseconds: 5),
+        maxReconnectDelay: const Duration(milliseconds: 20),
+        channelFactory: createChannel,
+      );
+      addTearDown(live.dispose);
+      live.subscribe(sessionId: 'a1000000-0000-4000-8000-000000000001', afterSequence: 0);
+      await pumpEventQueue();
+      expect(channels, hasLength(1));
+
+      // 主动关闭：断开不排重连。
+      live.close();
+      await pumpEventQueue();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await pumpEventQueue();
+      expect(channels, hasLength(1));
+      expect(live.isConnected, isFalse);
+
+      // dispose 后 subscribe 无效果。
+      live.dispose();
+      live.subscribe(sessionId: 'a1000000-0000-4000-8000-000000000001', afterSequence: 0);
+      await pumpEventQueue();
+      expect(channels, hasLength(1));
+    });
+
+    test('连续失败退避封顶且 subscribed 确认后重置', () async {
+      final channels = <StreamChannelController<dynamic>>[];
+      final delays = <Duration>[];
+      WebSocketChannel createChannel(Uri uri, Iterable<String> protocols) {
+        final controller = StreamChannelController<dynamic>(
+          allowForeignErrors: false,
+        );
+        channels.add(controller);
+        return ChannelMock(controller);
+      }
+
+      final received = <AgentLiveFrame>[];
+      final live = AgentLiveEvents(
+        serverUrl: 'http://127.0.0.1:3141',
+        accessToken: 'token-1',
+        onFrame: received.add,
+        reconnectDelay: const Duration(milliseconds: 10),
+        maxReconnectDelay: const Duration(milliseconds: 25),
+        channelFactory: createChannel,
+      );
+      addTearDown(live.dispose);
+      live.subscribe(sessionId: 'a1000000-0000-4000-8000-000000000001', afterSequence: 0);
+
+      // 连续三次断开：等待三段重连时间，全部封顶在 25ms。
+      for (var round = 0; round < 3; round++) {
+        final index = channels.length - 1;
+        await pumpEventQueue();
+        await channels[index].local.sink.close();
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+        await pumpEventQueue();
+        expect(channels.length, round + 2, reason: 'round $round 应重连');
+      }
+
+      // 第三次重连确认后计数重置：再断开仍按基础延迟快速重连。
+      final lastIndex = channels.length - 1;
+      channels[lastIndex].local.sink.add(jsonEncode(<String, Object?>{
+        'type': 'subscribed', 'mode': 'events', 'events': <Object?>[],
+      }));
+      await pumpEventQueue();
+      expect(received.whereType<AgentSubscribedFrame>(), hasLength(1));
+      expect(delays, isEmpty);
     });
   });
 

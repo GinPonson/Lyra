@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -54,33 +56,65 @@ class AgentUnknownFrame extends AgentLiveFrame {
   const AgentUnknownFrame();
 }
 
+/// 连接工厂；生产用真实 WebSocket，测试注入假通道。
+typedef AgentChannelFactory = WebSocketChannel Function(
+  Uri uri,
+  Iterable<String> protocols,
+);
+
+WebSocketChannel _defaultChannelFactory(Uri uri, Iterable<String> protocols) {
+  return WebSocketChannel.connect(uri, protocols: protocols);
+}
+
 /// `/v1/events` WebSocket 事件流客户端。
 ///
-/// 连接建立后发送一条 `subscribe` 帧绑定会话与游标；断开时通过 [onDone]
-/// 通知上层重连。序号缺口不在此补造：上层收到缺口必须重取规范快照。
+/// 连接建立后发送一条 `subscribe` 帧绑定会话与游标；意外断开时按指数退避
+/// 自动重连，重连带上游标续传，缺口由上层快照解决。退避计数只在收到服务端
+/// `subscribed` 确认帧后重置，连续失败按 [reconnectDelay] 翻倍直至
+/// [maxReconnectDelay]。主动 [close] 或 [dispose] 后不再重连。
 class AgentLiveEvents {
   AgentLiveEvents({
     required this.serverUrl,
     required this.accessToken,
     required this.onFrame,
     this.onDone,
+    this.reconnectDelay = _defaultReconnectDelay,
+    this.maxReconnectDelay = _defaultMaxReconnectDelay,
+    this.channelFactory = _defaultChannelFactory,
   });
 
   final String serverUrl;
   final String accessToken;
   final void Function(AgentLiveFrame frame) onFrame;
+
+  /// 意外断开时的通知回调；重连由客户端内部完成，回调只用于上层提示。
   final void Function()? onDone;
 
-  WebSocketChannel? _channel;
-  bool _disposed = false;
-  int? _lastSequence;
+  /// 首次重连等待时间；每次连续失败翻倍直至 [maxReconnectDelay]。
+  final Duration reconnectDelay;
+  final Duration maxReconnectDelay;
+  final AgentChannelFactory channelFactory;
 
-  /// 当前订阅游标；发送 subscribe 帧后递增。
+  static const Duration _defaultReconnectDelay = Duration(seconds: 1);
+  static const Duration _defaultMaxReconnectDelay = Duration(seconds: 30);
+
+  WebSocketChannel? _channel;
+  Timer? _reconnectTimer;
+  bool _disposed = false;
+  bool _closedByUser = false;
+  bool _reconnectPending = false;
+  int _reconnectAttempt = 0;
+  int? _lastSequence;
+  String? _sessionId;
+
+  /// 当前订阅游标；发送 subscribe 帧后随事件递增。
   int? get lastSequence => _lastSequence;
 
   bool get isConnected => _channel != null;
 
   /// 建立连接并发送订阅帧；[afterSequence] 为已消费的最大事件序号。
+  ///
+  /// 已在线时只更新游标不重复建连；等待重连期间调用会取消定时器立即重连。
   void subscribe({
     required String sessionId,
     required int afterSequence,
@@ -88,30 +122,33 @@ class AgentLiveEvents {
     if (_disposed) {
       return;
     }
+    _closedByUser = false;
+    _reconnectPending = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempt = 0;
+    _sessionId = sessionId;
     _lastSequence = afterSequence;
+    _connect(sessionId, afterSequence);
+  }
+
+  void _connect(String sessionId, int afterSequence) {
+    if (_disposed || _channel != null) {
+      return;
+    }
     final wsUri = Uri.parse(serverUrl).replace(
       scheme: serverUrl.startsWith('https') ? 'wss' : 'ws',
       path: '/v1/events',
     );
-    final channel = WebSocketChannel.connect(
+    final channel = channelFactory(
       wsUri,
-      protocols: <String>['bearer', accessToken],
+      <String>['bearer', accessToken],
     );
     _channel = channel;
     channel.stream.listen(
       _handleMessage,
-      onDone: () {
-        _channel = null;
-        if (!_disposed) {
-          onDone?.call();
-        }
-      },
-      onError: (Object error) {
-        _channel = null;
-        if (!_disposed) {
-          onDone?.call();
-        }
-      },
+      onDone: _handleDisconnect,
+      onError: (Object error) => _handleDisconnect(),
       cancelOnError: true,
     );
     // subscribe 帧在连接建立后由底层队列发送。
@@ -122,15 +159,62 @@ class AgentLiveEvents {
     }));
   }
 
-  /// 关闭连接；不再触发 onDone。
+  /// 断开处理：主动关闭不重连；意外断开按指数退避自动重连。
+  ///
+  /// onError 与 onDone 可能对同一次断开先后触发，用 [_reconnectPending]
+  /// 保证只排一次重连。
+  void _handleDisconnect() {
+    _channel = null;
+    if (_disposed || _closedByUser || _reconnectPending) {
+      return;
+    }
+    final sessionId = _sessionId;
+    if (sessionId == null) {
+      return;
+    }
+    onDone?.call();
+    final attempt = math.min(_reconnectAttempt, 20);
+    final delay = reconnectDelay * (1 << attempt) > maxReconnectDelay
+        ? maxReconnectDelay
+        : reconnectDelay * (1 << attempt);
+    _reconnectAttempt += 1;
+    _reconnectPending = true;
+    _reconnectTimer = Timer(delay, () {
+      _reconnectPending = false;
+      if (_disposed || _closedByUser || _channel != null) {
+        return;
+      }
+      // 用最新游标重连；服务端据此续传缓冲或要求快照。
+      _connect(sessionId, _lastSequence ?? 0);
+    });
+  }
+
+  /// 主动关闭：不再自动重连；后续 subscribe 可恢复。
+  void close() {
+    _closedByUser = true;
+    _reconnectPending = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _channel?.sink.close();
+    _channel = null;
+  }
+
+  /// 销毁：关闭连接且不再重连。
   void dispose() {
     _disposed = true;
+    _reconnectPending = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     _channel?.sink.close();
     _channel = null;
   }
 
   void _handleMessage(Object? message) {
     final frame = parseAgentLiveFrame(message);
+    if (frame is AgentSubscribedFrame) {
+      // 服务端确认订阅成功：重置退避计数。
+      _reconnectAttempt = 0;
+    }
     if (frame is AgentEventFrame) {
       _lastSequence = frame.event.sequence;
     }
