@@ -6,6 +6,9 @@ import {
 } from "../../application/index.js";
 import type { Lot, RealizedRecord } from "../../domain/fifo/index.js";
 import type { ParsedTransaction } from "../../domain/ledger/index.js";
+import {
+  completeMutationIdempotencyRecordInTransaction,
+} from "./mutation-idempotency-repository.js";
 import type { LyraDatabase } from "./database.js";
 
 /** 执行一次已授权导入提交所需的事务前置条件。 */
@@ -17,6 +20,12 @@ export interface PersistImportCommitInput {
   previewFingerprint: string;
   expectedLedgerVersion: number;
   committedAt: Date;
+  /** 存在幂等键时，在业务事务内把 in_progress 记录收口为 completed。 */
+  idempotencyCompletion?: {
+    recordId: string;
+    resultResourceId: string;
+    responseStatusCode: number;
+  };
 }
 
 /** 导入提交完成后可返回应用层的稳定结果。 */
@@ -62,6 +71,17 @@ export async function persistImportCommit(
 
     if (!input.plan.changed) {
       await completeImportJob(connection, input, currentLedgerVersion);
+      if (input.idempotencyCompletion !== undefined) {
+        await completeMutationIdempotencyRecordInTransaction(
+          connection,
+          {
+            recordId: input.idempotencyCompletion.recordId,
+            resultResourceId: input.idempotencyCompletion.resultResourceId,
+            responseStatusCode: input.idempotencyCompletion.responseStatusCode,
+            completedAt: input.committedAt,
+          },
+        );
+      }
       await connection.run("COMMIT");
       return {
         changed: false,
@@ -107,6 +127,17 @@ export async function persistImportCommit(
       INSERT INTO ledger_version_accounts (ledger_version, account_id)
       VALUES ($ledger_version, CAST($account_id AS UUID))
     `, { ledger_version: ledgerVersion, account_id: input.accountId });
+    if (input.idempotencyCompletion !== undefined) {
+      await completeMutationIdempotencyRecordInTransaction(
+        connection,
+        {
+          recordId: input.idempotencyCompletion.recordId,
+          resultResourceId: input.idempotencyCompletion.resultResourceId,
+          responseStatusCode: input.idempotencyCompletion.responseStatusCode,
+          completedAt: input.committedAt,
+        },
+      );
+    }
     await connection.run("COMMIT");
     return {
       changed: true,

@@ -128,6 +128,9 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
       final result = await repository.commit(
         importId: preview.importId,
         confirmToken: preview.confirmToken,
+        // 同一预览的重试共用一个幂等键：网络超时重放返回持久化结果，
+        // 换新预览则生成新键。键值只含安全字符，明文不进入任何存储。
+        idempotencyKey: 'commit-${preview.importId}',
       );
       setState(() {
         _result = result;

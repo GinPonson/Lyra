@@ -22,6 +22,9 @@ const commitSchema = z.object({
   confirmToken: z.string().trim().min(1).max(512),
 });
 
+/** 明文幂等键只允许安全字符，与领域散列规则保持一致。 */
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{16,200}$/;
+
 function unauthorized(): ApplicationError {
   return new ApplicationError({
     code: "DEVICE_CREDENTIAL_INVALID",
@@ -57,6 +60,19 @@ function readUploadFileName(request: FastifyRequest): string {
   const value = Array.isArray(header) ? header[0] : header;
   if (typeof value !== "string" || value.trim().length === 0 || value.length > 256) {
     throw invalidArgument("上传请求必须携带有效的 x-lyra-file-name 头");
+  }
+  return value;
+}
+
+/** 读取可选的 Idempotency-Key 头；缺失返回 null，格式非法明确拒绝。 */
+function readOptionalIdempotencyKey(request: FastifyRequest): string | null {
+  const header = request.headers["idempotency-key"];
+  const value = Array.isArray(header) ? header[0] : header;
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "string" || !IDEMPOTENCY_KEY_PATTERN.test(value)) {
+    throw invalidArgument("幂等键必须是 16 至 200 位安全字符");
   }
   return value;
 }
@@ -131,9 +147,23 @@ export function registerImportRoutes(
     if (!params.success || !body.success) {
       throw invalidArgument("导入提交参数无效");
     }
+    // 幂等提交需要设备作用域；认证已在 preHandler 完成，这里补充解析设备身份。
+    const authorizationHeader = request.headers.authorization;
+    const deviceToken = typeof authorizationHeader === "string"
+      && authorizationHeader.startsWith("Bearer ")
+      ? authorizationHeader.slice("Bearer ".length)
+      : null;
+    if (deviceToken === null) {
+      throw unauthorized();
+    }
+    const device = await options.authenticateDevice(deviceToken);
+    const idempotencyKey = readOptionalIdempotencyKey(request);
     return options.importService.commitImport({
       importId: params.data.importId,
       confirmToken: body.data.confirmToken,
+      idempotency: idempotencyKey === null
+        ? null
+        : { deviceId: device.id, key: idempotencyKey },
     });
   });
 

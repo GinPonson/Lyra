@@ -25,6 +25,16 @@ import type { TransactionBatchInput } from "../domain/ledger/index.js";
 import type { PersistImportCommitInput } from "../infrastructure/db/import-commit-repository.js";
 import { persistImportCommit } from "../infrastructure/db/import-commit-repository.js";
 import {
+  createIdempotentRequestHash,
+  hashIdempotencyKey,
+  planIdempotentMutation,
+} from "./idempotent-mutation.js";
+import {
+  loadMutationIdempotencyRecord,
+  releaseMutationIdempotencyRecord,
+  startMutationIdempotencyRecord,
+} from "../infrastructure/db/mutation-idempotency-repository.js";
+import {
   casImportJobStatus,
   createImportJobRecord,
   loadImportAccounts,
@@ -197,7 +207,54 @@ export class ImportService {
   async commitImport(input: {
     importId: string;
     confirmToken: string;
+    /** 设备作用域幂等上下文；缺省时保持既有非幂等提交行为。 */
+    idempotency?: { deviceId: string; key: string } | null;
   }): Promise<ImportCommitHttpResponse> {
+    // 幂等判定必须先于进程内 entry 检查：成功提交后解析结果已被丢弃，
+    // 客户端网络超时重试时只能依靠持久化的幂等记录重建安全响应。
+    const operation = "import.commit";
+    const requestHash = createIdempotentRequestHash(operation, {
+      importId: input.importId,
+      // 确认令牌只以单向散列参与指纹，明文不进入任何持久化记录。
+      confirmToken: input.confirmToken,
+    });
+    const idempotencyPlan = input.idempotency === undefined || input.idempotency === null
+      ? null
+      : planIdempotentMutation({
+        recordId: randomUUID(),
+        deviceId: input.idempotency.deviceId,
+        operation,
+        key: input.idempotency.key,
+        requestHash,
+        existingRecord: await loadMutationIdempotencyRecord(this.#database, {
+          deviceId: input.idempotency.deviceId,
+          operation,
+          keyHash: hashIdempotencyKey(input.idempotency.key),
+        }),
+        now: this.#now(),
+      });
+    if (idempotencyPlan?.kind === "replay") {
+      const replayRecord = await loadImportJobRecord(
+        this.#database,
+        idempotencyPlan.resultResourceId,
+      );
+      if (replayRecord === null || replayRecord.status !== "committed") {
+        throw new ApplicationError({
+          code: "IDEMPOTENCY_KEY_REUSED",
+          message: "幂等键已用于其他请求，请生成新的幂等键",
+          statusCode: 409,
+          retryable: false,
+        });
+      }
+      const job = createPublicImportJob(replayRecord);
+      return {
+        changed: job.insertedRows !== null && job.insertedRows > 0,
+        ledgerVersion: job.committedLedgerVersion ?? job.baseLedgerVersion ?? 0,
+        insertedRows: job.insertedRows ?? 0,
+        skippedRows: job.skippedRows ?? 0,
+      };
+    }
+
     const entry = this.#entries.get(input.importId);
     if (entry === undefined) {
       throw new ApplicationError({
@@ -239,36 +296,63 @@ export class ImportService {
       now: this.#now(),
     });
 
-    const committed = await this.#writeCoordinator.enqueue(async () => {
-      const snapshot = await loadLedgerAnalysisSnapshot(
-        this.#database,
-        entry.preview.baseLedgerVersion,
-      );
-      const accountTransactions = snapshot.transactions.filter(
-        (transaction) => transaction.account === entry.preview.account,
-      );
-      const plan: ImportCommitPlan = buildImportCommitPlan(
-        entry.preview,
-        accountTransactions,
-      );
-      const commitInput: PersistImportCommitInput = {
-        plan,
-        importId: input.importId,
-        accountId: entry.accountId,
-        parserVersion: entry.preview.parserVersion,
-        previewFingerprint: entry.preview.previewFingerprint,
-        expectedLedgerVersion: entry.preview.baseLedgerVersion,
-        committedAt: this.#now(),
+    try {
+      if (idempotencyPlan?.kind === "start") {
+        // in_progress 记录先于写队列落库：并发同键请求在计划阶段就能读到
+        // IDEMPOTENCY_REQUEST_IN_PROGRESS，不会重复进入提交事务。
+        await startMutationIdempotencyRecord(this.#database, {
+          record: idempotencyPlan.record,
+          replacesExpiredRecordId: idempotencyPlan.replacesExpiredRecordId,
+        });
+      }
+      const committed = await this.#writeCoordinator.enqueue(async () => {
+        const snapshot = await loadLedgerAnalysisSnapshot(
+          this.#database,
+          entry.preview.baseLedgerVersion,
+        );
+        const accountTransactions = snapshot.transactions.filter(
+          (transaction) => transaction.account === entry.preview.account,
+        );
+        const plan: ImportCommitPlan = buildImportCommitPlan(
+          entry.preview,
+          accountTransactions,
+        );
+        const commitInput: PersistImportCommitInput = {
+          plan,
+          importId: input.importId,
+          accountId: entry.accountId,
+          parserVersion: entry.preview.parserVersion,
+          previewFingerprint: entry.preview.previewFingerprint,
+          expectedLedgerVersion: entry.preview.baseLedgerVersion,
+          committedAt: this.#now(),
+        };
+        if (idempotencyPlan?.kind === "start") {
+          commitInput.idempotencyCompletion = {
+            recordId: idempotencyPlan.record.id,
+            resultResourceId: input.importId,
+            responseStatusCode: 200,
+          };
+        }
+        return persistImportCommit(this.#database, commitInput);
+      });
+      await this.#discardEntry(input.importId);
+      return {
+        changed: committed.changed,
+        ledgerVersion: committed.ledgerVersion,
+        insertedRows: committed.insertedRows,
+        skippedRows: committed.skippedRows,
       };
-      return persistImportCommit(this.#database, commitInput);
-    });
-    await this.#discardEntry(input.importId);
-    return {
-      changed: committed.changed,
-      ledgerVersion: committed.ledgerVersion,
-      insertedRows: committed.insertedRows,
-      skippedRows: committed.skippedRows,
-    };
+    } catch (error: unknown) {
+      // 业务失败释放 in_progress 记录：同一逻辑重试可重新开始，已完成记录
+      // 是重放依据，永远不会被释放路径触碰。
+      if (idempotencyPlan?.kind === "start") {
+        await releaseMutationIdempotencyRecord(
+          this.#database,
+          idempotencyPlan.record.id,
+        );
+      }
+      throw error;
+    }
   }
 
   /** 取消 uploaded/preview_ready 作业并清理进程内解析结果。 */

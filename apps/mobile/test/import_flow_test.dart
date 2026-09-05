@@ -132,6 +132,11 @@ Future<ResponseBody> _routeImportRequest(RequestOptions options) async {
     return _jsonResponse(_mappingRequiredResponse(), 409);
   }
   if (path.endsWith('/commit')) {
+    // 提交必须携带设备幂等键，供服务端网络超时重放持久化结果。
+    expect(
+      options.headers['idempotency-key'],
+      'commit-i1000000-0000-4000-8000-000000000001',
+    );
     return _jsonResponse(_commitResponse, 200);
   }
   return _jsonResponse('unexpected', 404);
@@ -228,6 +233,7 @@ void main() {
     final commit = await repository.commit(
       importId: preview.importId,
       confirmToken: preview.confirmToken,
+      idempotencyKey: 'commit-${preview.importId}',
     );
     expect(commit.changed, true);
     expect(commit.ledgerVersion, 2);

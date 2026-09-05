@@ -167,6 +167,7 @@
 | Phase 0 | 导入、Gmail、Agent 状态错误类型化 | 已完成 | 相关既有测试升级为错误码断言；累计 90 项通过 | 2026-08-30 | 导入预览失效携带 changed_fields；Gmail 重扫确认/游标/授权/连接状态与 Agent 回合边界/不可用均使用稳定错误码，不再依赖消息字符串分支 |
 | Phase 0 | App/服务端协议版本门禁 | 已完成 | 2 项新增测试通过；累计 94 项通过 | 2026-08-30 | 协议版本 1；缺失、非法、过旧或过新统一返回 426/CLIENT_VERSION_INCOMPATIBLE；握手元数据仅公开版本范围和 schema 版本 |
 | Phase 0 | 设备级敏感修改幂等键与 DuckDB v10 | 已完成 | 2 项新增测试及 DuckDB v1-v10 migration smoke 通过；累计 236 项通过 | 2026-08-31 | 同设备、同操作、同幂等键按规范 JSON 请求指纹开始或重放；对象字段顺序不影响指纹；明文 Idempotency-Key 仅在请求内存中散列，数据库只保存 key/request SHA-256、状态、资源引用和 2xx 状态，不缓存响应正文或一次性凭据；有效键用于不同请求返回 IDEMPOTENCY_KEY_REUSED，处理中返回可重试 IDEMPOTENCY_REQUEST_IN_PROGRESS；默认 24 小时后允许仓储原子替换过期记录 |
+| Phase 0 | 导入提交幂等键路由接线 | 已完成 | 新增导入路由集成测试 1 项：非法幂等键 400、业务事务内失败（注入 LEDGER_VERSION_CONFLICT）后 in_progress 记录释放并可同键重试、带键首次提交完成记录（result_resource_id 指向 importId）、进程内解析结果丢弃后同键重放返回持久化结果、同键不同请求 409 IDEMPOTENCY_KEY_REUSED、处理中同键请求 409 IDEMPOTENCY_REQUEST_IN_PROGRESS（retryable）；TypeScript strict 编译及完整回归累计 276 项通过 | 2026-09-05 | 新增 `mutation-idempotency-repository`（v10 表读写、过期替换、事务内 CAS 收口、失败释放）；`ImportService.commitImport` 接受设备作用域幂等上下文：幂等判定先于进程内 entry 检查（成功后重放不依赖易失解析结果）、请求指纹为 importId+令牌散列、in_progress 先于写队列落库、完成收口在提交事务内与业务写入同生共死；`POST /v1/imports/:id/commit` 接受可选 `Idempotency-Key` 头（16–200 位安全字符，非法明确 400）；App 端 `commit` 发送 `commit-<importId>` 幂等键并经假适配器断言 |
 | Phase 0 | 服务健康与外部集成降级快照 | 已完成 | 2 项新增测试通过；累计 229 项通过 | 2026-08-31 | 健康快照区分进程存活、数据库/schema/账本版本、写队列 readiness、Gmail 需处理连接数和 Agent 可用数量；数据库不可用或写队列 draining 标记 unavailable，Gmail/Agent 故障只标记 degraded，不阻断账本只读；未探测 Agent 明确 unknown；不公开邮箱、CLI 版本、路径或失败详情 |
 
 ## 验证记录
@@ -353,6 +354,8 @@
 | 2026-09-02 | `LYRA_PORT=3144 LYRA_DATABASE_PATH=<临时文件> LYRA_AGENT_*=<隔离目录与路径> npm start` + loopback smoke | 通过 | 单服务入口完成 v1–v11 迁移并携带完整 Agent 装配监听本机端口；`GET /v1/agents`、`POST /v1/agent/sessions`、`DELETE /v1/agent/sessions/:id` 在缺失与无效设备令牌下均返回 401 稳定 `DEVICE_CREDENTIAL_INVALID`；SIGTERM 后进程干净退出 |
 | 2026-09-05 | `npm run check` | 通过 | 账本只读路由表新增 `/v1/ledger/accounts` 并扩展集成测试断言（空账本权威语境与空行集合）；TypeScript strict 编译成功；127 个测试套件、累计 275 项测试全部通过 |
 | 2026-09-05 | `flutter analyze` / `flutter test` | 通过 | 静态分析无问题；7 项 Flutter 测试全部通过：导入仓储账户列表读取与归档账户过滤、`ACCOUNT_MAPPING_REQUIRED` 错误模型保留候选 details、显式 `accountId` 预览与提交解析、导入面板 409→账户选择→重新预览→提交全流程、未配对提示；既有导航与会话流程测试无回归 |
+| 2026-09-05 | `npm run check` | 通过 | 导入提交幂等键接线：新增 `mutation-idempotency-repository`、`ImportService.commitImport` 幂等编排与 `Idempotency-Key` 路由头；新增集成测试 1 项覆盖非法键、事务内失败释放、重放、键复用冲突与处理中冲突；TypeScript strict 编译成功；127 个测试套件、累计 276 项测试全部通过 |
+| 2026-09-05 | `flutter analyze` / `flutter test` | 通过 | 静态分析无问题；7 项 Flutter 测试全部通过：提交请求携带 `commit-<importId>` 幂等键头（假适配器断言）、既有导入全流程与导航/会话测试无回归 |
 | 2026-09-01 | `LYRA_PORT=3143 LYRA_DATABASE_PATH=<临时文件> npm start` + loopback smoke | 通过 | 单服务入口完成 v1–v11 迁移并监听本机端口；健康端点返回 200 与 schema 11；`GET /mcp` 明确 405；无凭据与未知凭据的 `tools/list` 均返回 401 稳定 JSON-RPC 错误；SIGTERM 后写队列关闭、进程干净退出 |
 
 ## 当前环境事项

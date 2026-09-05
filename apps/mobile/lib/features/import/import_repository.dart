@@ -208,13 +208,22 @@ class ImportRepository {
   }
 
   /// 用一次性确认令牌提交导入；重复提交返回 409 IMPORT_PREVIEW_STALE。
+  ///
+  /// 携带设备生成的 [idempotencyKey]（16–200 位安全字符）时，服务端在
+  /// 网络超时重试后按幂等记录重放持久化结果，不产生重复账本变更。
   Future<ImportCommitResult> commit({
     required String importId,
     required String confirmToken,
+    String? idempotencyKey,
   }) async {
-    final response = await _client.post<Map<String, Object?>>(
+    final response = await _dio.post<Map<String, Object?>>(
       '/v1/imports/$importId/commit',
-      <String, Object?>{'confirmToken': confirmToken},
+      data: <String, Object?>{'confirmToken': confirmToken},
+      options: idempotencyKey == null
+          ? null
+          : Options(headers: <String, Object?>{
+              'idempotency-key': idempotencyKey,
+            }),
     );
     final data = response.data;
     if (data is! Map<String, Object?>) {

@@ -181,8 +181,13 @@ export function completeIdempotentMutation(
   };
 }
 
-/** 明文幂等键只在当前请求内散列，禁止进入持久化记录。 */
-function hashIdempotencyKey(key: string): string {
+/**
+ * 明文幂等键只在当前请求内散列，禁止进入持久化记录。
+ *
+ * 仓储按 `device_id + operation + key_hash` 查询唯一记录，因此调用方在
+ * `planIdempotentMutation` 之前也需要用同一规则散列明文键。
+ */
+export function hashIdempotencyKey(key: string): string {
   if (
     key !== key.trim()
     || !/^[A-Za-z0-9._:-]{16,200}$/.test(key)

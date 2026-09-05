@@ -30,6 +30,7 @@ export {
   DEFAULT_IDEMPOTENCY_TTL_HOURS,
   completeIdempotentMutation,
   createIdempotentRequestHash,
+  hashIdempotencyKey,
   planIdempotentMutation,
 } from "./idempotent-mutation.js";
 export { resolveImportAccount } from "./import-account.js";
