@@ -280,6 +280,110 @@ describe("Agent session REST routes", () => {
     }
   });
 
+  it("公开会话工具调用列表并排除内部授权判定", async () => {
+    const fixture = await createAgentRoutesFixture();
+    try {
+      const headers = {
+        authorization: `Bearer ${fixture.token}`,
+        "x-lyra-protocol-version": "1",
+      };
+      const created = await fixture.app.inject({
+        method: "POST",
+        url: "/v1/agent/sessions",
+        headers,
+        payload: { provider: "claude", accountScope: { kind: "all" } },
+      });
+      assert.equal(created.statusCode, 201);
+      const sessionId = created.json().session.id as string;
+
+      // 跑一个回合产生规范消息，作为工具调用的消息外键。
+      const turn = await fixture.app.inject({
+        method: "POST",
+        url: `/v1/agent/sessions/${sessionId}/messages`,
+        headers,
+        payload: { content: "查询现金余额" },
+      });
+      assert.equal(turn.statusCode, 200);
+      const messageRows = await fixture.database.connection.runAndReadAll(`
+        SELECT CAST(id AS VARCHAR) AS message_id
+        FROM agent_messages
+        WHERE session_id = CAST($session_id AS UUID)
+        ORDER BY ordinal DESC
+        LIMIT 1
+      `, { session_id: sessionId });
+      const messageId = messageRows.getRowObjectsJson()[0]!.message_id as string;
+
+      await fixture.database.connection.run(`
+        INSERT INTO agent_tool_calls (
+          id, session_id, message_id, ordinal, tool_name, authorization_decision,
+          status, arguments_summary, result_summary, ledger_version, duration_ms,
+          error_code, started_at, completed_at
+        ) VALUES (
+          CAST('c1000000-0000-4000-8000-000000000001' AS UUID),
+          CAST($session_id AS UUID), CAST($message_id AS UUID), 1,
+          'accounts', 'allowed', 'completed',
+          CAST('{"accountScope":"all"}' AS JSON),
+          CAST('{"count":3}' AS JSON), 1, 42, NULL,
+          CAST('2026-09-01T09:00:01Z' AS TIMESTAMPTZ),
+          CAST('2026-09-01T09:00:01.042Z' AS TIMESTAMPTZ)
+        )
+      `, { session_id: sessionId, message_id: messageId });
+      await fixture.database.connection.run(`
+        INSERT INTO agent_tool_calls (
+          id, session_id, message_id, ordinal, tool_name, authorization_decision,
+          status, arguments_summary, result_summary, ledger_version, duration_ms,
+          error_code, started_at, completed_at
+        ) VALUES (
+          CAST('c1000000-0000-4000-8000-000000000002' AS UUID),
+          CAST($session_id AS UUID), CAST($message_id AS UUID), 2,
+          'transactions', 'allowed', 'started',
+          CAST('{"accountScope":"all"}' AS JSON),
+          NULL, 1, NULL, NULL,
+          CAST('2026-09-01T09:00:02Z' AS TIMESTAMPTZ), NULL
+        )
+      `, { session_id: sessionId, message_id: messageId });
+
+      const listed = await fixture.app.inject({
+        method: "GET",
+        url: `/v1/agent/sessions/${sessionId}/tool-calls`,
+        headers,
+      });
+      assert.equal(listed.statusCode, 200);
+      const toolCalls = listed.json().toolCalls;
+      assert.equal(toolCalls.length, 2);
+      assert.deepEqual(
+        toolCalls.map((call: { toolName: string }) => call.toolName),
+        ["accounts", "transactions"],
+      );
+      const completed = toolCalls[0];
+      assert.equal(completed.status, "completed");
+      assert.deepEqual(completed.argumentsSummary, { accountScope: "all" });
+      assert.deepEqual(completed.resultSummary, { count: 3 });
+      assert.equal(completed.durationMs, 42);
+      assert.equal(completed.startedAt, "2026-09-01T09:00:01.000Z");
+      assert.equal(completed.completedAt, "2026-09-01T09:00:01.042Z");
+      assert.equal(completed.errorCode, null);
+      // 内部授权判定与会话 ID 由路由上下文确定，不进入公开记录。
+      assert.equal("authorizationDecision" in completed, false);
+      assert.equal("sessionId" in completed, false);
+      const started = toolCalls[1];
+      assert.equal(started.status, "started");
+      assert.equal(started.resultSummary, null);
+      assert.equal(started.completedAt, null);
+
+      const unknown = await fixture.app.inject({
+        method: "GET",
+        url:
+          "/v1/agent/sessions/9f000000-0000-4000-8000-000000000099/tool-calls",
+        headers,
+      });
+      assert.equal(unknown.statusCode, 404);
+      assert.equal(unknown.json().code, "AGENT_SESSION_STATE_CONFLICT");
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("在回合边界切换供应商并持久化边界消息与 handoff", async () => {
     const fixture = await createAgentRoutesFixture();
     try {

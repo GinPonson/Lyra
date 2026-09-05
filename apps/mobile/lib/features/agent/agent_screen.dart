@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -30,6 +31,7 @@ class AgentSessionActive extends AgentUiState {
     this.pendingMessage,
     this.streamingText,
     this.errorMessage,
+    this.toolCalls = const <AgentToolCallView>[],
   });
 
   final AgentAvailabilitySnapshotView availability;
@@ -43,6 +45,9 @@ class AgentSessionActive extends AgentUiState {
   final String? streamingText;
   final String? errorMessage;
 
+  /// 会话内工具调用公开列表；按开始时间稳定排序。
+  final List<AgentToolCallView> toolCalls;
+
   AgentSessionActive copyWith({
     AgentSessionView? session,
     bool? turnInProgress,
@@ -52,6 +57,7 @@ class AgentSessionActive extends AgentUiState {
     bool clearStreamingText = false,
     String? errorMessage,
     bool clearError = false,
+    List<AgentToolCallView>? toolCalls,
   }) {
     return AgentSessionActive(
       availability: availability,
@@ -64,6 +70,7 @@ class AgentSessionActive extends AgentUiState {
           ? null
           : (streamingText ?? this.streamingText),
       errorMessage: clearError ? null : (errorMessage ?? this.errorMessage),
+      toolCalls: toolCalls ?? this.toolCalls,
     );
   }
 }
@@ -147,6 +154,7 @@ class AgentController extends Notifier<AgentUiState> {
         turnInProgress: false,
       );
       _subscribeLive(session.id);
+      await _refreshToolCalls();
     } on LyraApiError {
       // 可用性暂不可得：保留本地 ID，下次进入再试。
       return;
@@ -243,6 +251,8 @@ class AgentController extends Notifier<AgentUiState> {
         session: session,
         clearStreamingText: true,
       );
+      // 权威快照变化后同步工具调用列表。
+      unawaited(_refreshToolCalls());
     } on LyraApiError {
       // 快照刷新失败保持现有状态；下一帧或下次回合会再触发。
     }
@@ -282,8 +292,31 @@ class AgentController extends Notifier<AgentUiState> {
       );
       await ref.read(agentSessionStoreProvider).write(session.id);
       _subscribeLive(session.id);
+      await _refreshToolCalls();
     } on LyraApiError catch (error) {
       state = AgentError('${error.message}（${error.code}）');
+    }
+  }
+
+  /// 拉取会话工具调用公开列表；失败不阻塞会话流。
+  Future<void> _refreshToolCalls() async {
+    final repository = _repository;
+    final current = state;
+    if (repository == null || current is! AgentSessionActive) {
+      return;
+    }
+    try {
+      final calls = await repository.toolCalls(current.session.id);
+      if (!ref.mounted) {
+        return;
+      }
+      final latest = state;
+      if (latest is! AgentSessionActive) {
+        return;
+      }
+      state = latest.copyWith(toolCalls: calls);
+    } on LyraApiError {
+      // 工具调用列表是增强信息；拉取失败保持现状。
     }
   }
 
@@ -347,6 +380,7 @@ class AgentController extends Notifier<AgentUiState> {
         clearPendingMessage: true,
         clearStreamingText: true,
       );
+      await _refreshToolCalls();
     } on LyraApiError catch (error) {
       state = current.copyWith(
         turnInProgress: false,
@@ -559,6 +593,16 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                     style: TextStyle(color: Theme.of(context).colorScheme.error),
                   ),
                 ),
+              if (state.toolCalls.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 8),
+                Text(
+                  '工具调用',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 6),
+                for (final call in state.toolCalls)
+                  _ToolCallTile(call: call),
+              ],
               const SizedBox(height: 12),
             ],
           ),
@@ -815,6 +859,85 @@ class _StatusChip extends StatelessWidget {
       child: Text(
         label,
         style: Theme.of(context).textTheme.labelSmall,
+      ),
+    );
+  }
+}
+
+/// 单条工具调用的折叠卡片；只显示公开摘要，不伪造结果。
+class _ToolCallTile extends StatelessWidget {
+  const _ToolCallTile({required this.call});
+
+  final AgentToolCallView call;
+
+  @override
+  Widget build(BuildContext context) {
+    final statusLabel = switch (call.status) {
+      'started' => '运行中',
+      'completed' => '完成',
+      'failed' => '失败',
+      'cancelled' => '已取消',
+      'rejected' => '被拒绝',
+      _ => call.status,
+    };
+    final arguments = call.argumentsSummary.entries
+        .map((entry) => '${entry.key}: ${entry.value}')
+        .join('，');
+    final result = call.resultSummary?.entries
+        .map((entry) => '${entry.key}: ${entry.value}')
+        .join('，');
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: LyraColors.elevated,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: LyraColors.divider),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  call.toolName,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+              Text(
+                call.durationMs == null
+                    ? statusLabel
+                    : '$statusLabel · ${call.durationMs}ms',
+                style: Theme.of(context).textTheme.labelSmall
+                    ?.copyWith(color: LyraColors.muted),
+              ),
+            ],
+          ),
+          if (arguments.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 4),
+            Text(
+              '参数：$arguments',
+              style: Theme.of(context).textTheme.bodySmall
+                  ?.copyWith(color: LyraColors.muted),
+            ),
+          ],
+          if (result != null && result.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 2),
+            Text(
+              '结果：$result',
+              style: Theme.of(context).textTheme.bodySmall
+                  ?.copyWith(color: LyraColors.muted),
+            ),
+          ],
+          if (call.errorCode != null) ...<Widget>[
+            const SizedBox(height: 2),
+            Text(
+              call.errorCode!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ],
+        ],
       ),
     );
   }

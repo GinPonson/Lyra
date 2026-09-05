@@ -10,11 +10,13 @@ import {
   closeAgentSessionForRequest,
   createAgentSessionForRequest,
   createPublicAgentSession,
+  createPublicAgentToolCallList,
   switchAgentSessionForRequest,
 } from "../application/index.js";
 import { ApplicationError } from "../application/index.js";
 import type { PairedDeviceAuthRecord } from "../infrastructure/security/device-auth.js";
 import { loadAgentSession } from "../infrastructure/db/agent-session-repository.js";
+import { loadAgentToolCalls } from "../infrastructure/db/agent-tool-call-repository.js";
 import type { LyraDatabase } from "../infrastructure/db/database.js";
 
 declare module "fastify" {
@@ -138,6 +140,23 @@ export function registerAgentRoutes(
       });
     }
     return { session: createPublicAgentSession(session) };
+  });
+
+  app.get("/v1/agent/sessions/:sessionId/tool-calls", { preHandler: authenticate }, async (request, reply) => {
+    const parsed = sessionIdSchema.safeParse(request.params);
+    if (!parsed.success) {
+      throw invalidArgument("Agent 会话 ID 无效");
+    }
+    const calls = await loadAgentToolCalls(options.database, parsed.data.sessionId);
+    if (calls === null) {
+      return reply.code(404).send({
+        request_id: request.id,
+        code: "AGENT_SESSION_STATE_CONFLICT",
+        message: "Agent 会话不存在",
+        retryable: false,
+      });
+    }
+    return { toolCalls: createPublicAgentToolCallList(calls) };
   });
 
   app.post("/v1/agent/sessions/:sessionId/messages", { preHandler: authenticate }, async (request) => {

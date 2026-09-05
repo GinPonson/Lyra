@@ -1,10 +1,21 @@
 import type {
   AgentToolCallCompletionPlan,
+  AgentToolCallRecord,
   AgentToolCallRejectionPlan,
   AgentToolCallStartPlan,
 } from "../../domain/agent/index.js";
 import { ApplicationError } from "../../application/app-error.js";
 import type { LyraDatabase } from "./database.js";
+
+const TOOL_CALL_STATUSES = new Set<AgentToolCallRecord["status"]>([
+  "started", "completed", "failed", "cancelled", "rejected",
+]);
+const TOOL_AUTHORIZATION_DECISIONS = new Set<
+  AgentToolCallRecord["authorizationDecision"]
+>(["allowed", "denied"]);
+const TOOL_ERROR_CODES = new Set<NonNullable<AgentToolCallRecord["errorCode"]>>([
+  "AGENT_TOOL_EXECUTION_FAILED", "AGENT_TOOL_CANCELLED", "AGENT_TOOL_FORBIDDEN",
+]);
 
 /** 会话写侧统一使用的稳定状态冲突。 */
 function sessionConflict(message: string): ApplicationError {
@@ -247,4 +258,152 @@ async function rollbackTurnWrite(
     throw new AggregateError([originalError, rollbackError], message);
   }
   throw originalError;
+}
+
+/** 规范调用边界的必填文本；空文本意味着数据库形态与预期不符。 */
+function requireToolText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new RangeError(`${label} 与数据库 schema 不一致`);
+  }
+  return value;
+}
+
+/** 把 DuckDB JSON 行归一为扁平摘要对象。 */
+function parseToolSummary(value: unknown): Record<string, string | number | boolean | null> {
+  if (value === null || value === undefined) {
+    return {};
+  }
+  if (typeof value !== "string") {
+    throw new RangeError("Agent 工具摘要必须是 JSON 文本");
+  }
+  const parsed: unknown = JSON.parse(value);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new RangeError("Agent 工具摘要必须是 JSON 对象");
+  }
+  const summary: Record<string, string | number | boolean | null> = {};
+  for (const [key, entry] of Object.entries(parsed)) {
+    if (
+      entry === null
+      || typeof entry === "string"
+      || typeof entry === "number"
+      || typeof entry === "boolean"
+    ) {
+      summary[key] = entry;
+    }
+  }
+  return summary;
+}
+
+/** 把 TIMESTAMPTZ JSON 文本规范为 UTC ISO。 */
+function parseToolTimestamp(value: unknown, label: string): string {
+  if (typeof value !== "string") {
+    throw new RangeError(`${label} 必须是时间字符串`);
+  }
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    throw new RangeError(`${label} 无效`);
+  }
+  return timestamp.toISOString();
+}
+
+/**
+ * 读取单个 Agent 会话内的全部规范工具调用记录。
+ *
+ * 只做只读投影：状态与错误码命中闭域集合，摘要保持领域层验证后的扁平
+ * 有界形态；会话不存在时返回 null，供路由层决定 404。
+ *
+ * @param database - 单一服务进程持有的 DuckDB。
+ * @param sessionId - 已认证请求中的会话 UUID。
+ */
+export async function loadAgentToolCalls(
+  database: LyraDatabase,
+  sessionId: string,
+): Promise<readonly AgentToolCallRecord[] | null> {
+  const normalizedId = sessionId.trim();
+  if (normalizedId.length === 0) {
+    throw new RangeError("Agent 会话 ID 不能为空");
+  }
+  const reader = await database.connection.runAndReadAll(`
+    SELECT
+      CAST(t.id AS VARCHAR) AS call_id,
+      CAST(t.session_id AS VARCHAR) AS session_id,
+      CAST(t.message_id AS VARCHAR) AS message_id,
+      t.ordinal,
+      t.tool_name,
+      t.authorization_decision,
+      t.status,
+      t.arguments_summary,
+      t.result_summary,
+      t.ledger_version,
+      t.duration_ms,
+      t.error_code,
+      t.started_at,
+      t.completed_at
+    FROM agent_tool_calls t
+    WHERE t.session_id = CAST($session_id AS UUID)
+    ORDER BY t.started_at, t.ordinal, t.id
+  `, { session_id: normalizedId });
+  const rows = reader.getRowObjectsJson();
+  if (rows.length === 0) {
+    // 会话本身可能不存在，也可能只是没有工具调用；用身份表区分。
+    const session = await database.connection.runAndReadAll(`
+      SELECT 1 AS present
+      FROM agent_sessions s
+      WHERE s.id = CAST($session_id AS UUID)
+    `, { session_id: normalizedId });
+    if (session.getRowObjectsJson().length === 0) {
+      return null;
+    }
+    return [];
+  }
+  return rows.map((row): AgentToolCallRecord => {
+    const statusValue = requireToolText(row.status, "Agent 工具调用状态");
+    if (!TOOL_CALL_STATUSES.has(statusValue as AgentToolCallRecord["status"])) {
+      throw new RangeError(`Agent 工具调用状态越界: ${statusValue}`);
+    }
+    const decisionValue = requireToolText(
+      row.authorization_decision,
+      "Agent 工具授权判定",
+    );
+    if (
+      !TOOL_AUTHORIZATION_DECISIONS.has(
+        decisionValue as AgentToolCallRecord["authorizationDecision"],
+      )
+    ) {
+      throw new RangeError(`Agent 工具授权判定越界: ${decisionValue}`);
+    }
+    const errorCodeValue = row.error_code === null
+      ? null
+      : requireToolText(row.error_code, "Agent 工具错误码");
+    if (
+      errorCodeValue !== null
+      && !TOOL_ERROR_CODES.has(
+        errorCodeValue as NonNullable<AgentToolCallRecord["errorCode"]>,
+      )
+    ) {
+      throw new RangeError(`Agent 工具错误码越界: ${errorCodeValue}`);
+    }
+    return {
+      id: requireToolText(row.call_id, "Agent 工具调用 ID"),
+      sessionId: requireToolText(row.session_id, "Agent 会话 ID"),
+      messageId: requireToolText(row.message_id, "Agent 消息 ID"),
+      ordinal: Number(row.ordinal),
+      toolName: requireToolText(row.tool_name, "Agent 工具名"),
+      authorizationDecision:
+        decisionValue as AgentToolCallRecord["authorizationDecision"],
+      status: statusValue as AgentToolCallRecord["status"],
+      argumentsSummary: parseToolSummary(row.arguments_summary),
+      resultSummary: row.result_summary === null
+        ? null
+        : parseToolSummary(row.result_summary),
+      ledgerVersion: Number(row.ledger_version),
+      durationMs: row.duration_ms === null ? null : Number(row.duration_ms),
+      errorCode:
+        errorCodeValue as AgentToolCallRecord["errorCode"],
+      startedAt: parseToolTimestamp(row.started_at, "Agent 工具开始时间"),
+      completedAt: row.completed_at === null
+        ? null
+        : parseToolTimestamp(row.completed_at, "Agent 工具完成时间"),
+    };
+  });
 }

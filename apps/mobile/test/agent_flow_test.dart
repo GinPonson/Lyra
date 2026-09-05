@@ -146,6 +146,42 @@ String _providerLabelOf(String provider) {
   };
 }
 
+/// 会话工具调用公开列表：一条完成、一条失败。
+String _toolCallsResponse() {
+  return jsonEncode(<String, Object?>{
+    'toolCalls': <Map<String, Object?>>[
+      <String, Object?>{
+        'id': 'c1000000-0000-4000-8000-000000000001',
+        'messageId': 'm1000000-0000-4000-8000-000000000002',
+        'ordinal': 1,
+        'toolName': 'accounts',
+        'status': 'completed',
+        'argumentsSummary': <String, Object?>{'accountScope': 'all'},
+        'resultSummary': <String, Object?>{'count': 3},
+        'ledgerVersion': 1,
+        'durationMs': 42,
+        'errorCode': null,
+        'startedAt': '2026-09-01T09:00:01.000Z',
+        'completedAt': '2026-09-01T09:00:01.042Z',
+      },
+      <String, Object?>{
+        'id': 'c1000000-0000-4000-8000-000000000002',
+        'messageId': 'm1000000-0000-4000-8000-000000000002',
+        'ordinal': 2,
+        'toolName': 'summary',
+        'status': 'failed',
+        'argumentsSummary': <String, Object?>{},
+        'resultSummary': null,
+        'ledgerVersion': 1,
+        'durationMs': 15,
+        'errorCode': 'AGENT_TOOL_EXECUTION_FAILED',
+        'startedAt': '2026-09-01T09:00:03.000Z',
+        'completedAt': '2026-09-01T09:00:03.015Z',
+      },
+    ],
+  });
+}
+
 const String _createdSessionJson = '''
 {
   "session": {
@@ -230,6 +266,9 @@ Future<ResponseBody> _routeAgentRequest(
     final body = _decodeBody(options);
     expect(body['content'], '我的现金余额是多少？');
     return _jsonResponse(_turnResponse(), 200);
+  }
+  if (path.endsWith('/tool-calls')) {
+    return _jsonResponse(_toolCallsResponse(), 200);
   }
   if (path.endsWith('/cancel')) {
     return _jsonResponse(
@@ -356,6 +395,14 @@ void main() {
     // 终态快照渲染用户与助手消息。
     expect(find.text('我的现金余额是多少？'), findsOneWidget);
     expect(find.text('USD 现金余额为 12,345.67。'), findsOneWidget);
+
+    // 回合结束后拉取并渲染工具调用公开列表。
+    await tester.pumpAndSettle();
+    expect(find.text('工具调用'), findsOneWidget);
+    expect(find.text('accounts'), findsOneWidget);
+    expect(find.text('完成 · 42ms'), findsOneWidget);
+    expect(find.text('summary'), findsOneWidget);
+    expect(find.text('AGENT_TOOL_EXECUTION_FAILED'), findsOneWidget);
   });
 
   testWidgets('idle 会话可切换供应商并渲染边界消息', (WidgetTester tester) async {

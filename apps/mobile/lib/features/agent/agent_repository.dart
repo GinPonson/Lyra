@@ -128,6 +128,64 @@ class AgentSessionView {
   }
 }
 
+/// 会话内单条工具调用的安全公开视图；不含内部授权判定与会话 ID。
+class AgentToolCallView {
+  const AgentToolCallView({
+    required this.id,
+    required this.messageId,
+    required this.ordinal,
+    required this.toolName,
+    required this.status,
+    required this.argumentsSummary,
+    required this.resultSummary,
+    required this.ledgerVersion,
+    required this.durationMs,
+    required this.errorCode,
+    required this.startedAt,
+    required this.completedAt,
+  });
+
+  final String id;
+  final String messageId;
+  final int ordinal;
+  final String toolName;
+  final String status;
+  final Map<String, Object?> argumentsSummary;
+  final Map<String, Object?>? resultSummary;
+  final int ledgerVersion;
+  final int? durationMs;
+  final String? errorCode;
+  final String startedAt;
+  final String? completedAt;
+
+  factory AgentToolCallView.fromJson(Map<String, Object?> json) {
+    Map<String, Object?>? parseSummary(Object? raw) {
+      if (raw == null) {
+        return null;
+      }
+      return (raw as Map).cast<String, Object?>();
+    }
+
+    return AgentToolCallView(
+      id: json['id'] as String,
+      messageId: json['messageId'] as String,
+      ordinal: (json['ordinal'] as num).toInt(),
+      toolName: json['toolName'] as String,
+      status: json['status'] as String,
+      argumentsSummary:
+          parseSummary(json['argumentsSummary']) ?? const <String, Object?>{},
+      resultSummary: parseSummary(json['resultSummary']),
+      ledgerVersion: (json['ledgerVersion'] as num).toInt(),
+      durationMs: json['durationMs'] == null
+          ? null
+          : (json['durationMs'] as num).toInt(),
+      errorCode: json['errorCode'] as String?,
+      startedAt: json['startedAt'] as String,
+      completedAt: json['completedAt'] as String?,
+    );
+  }
+}
+
 /// Agent 数据层：可用性快照、会话创建、读取、回合与取消。
 ///
 /// 复用 [LyraApiClient] 的协议头、令牌注入与 401 刷新重放；响应解析只消费
@@ -209,6 +267,20 @@ class AgentRepository {
     return AgentSessionView.fromJson(
       _data(response)['session'] as Map<String, Object?>,
     );
+  }
+
+  /// 读取会话内工具调用公开列表；按开始时间稳定排序。
+  Future<List<AgentToolCallView>> toolCalls(String sessionId) async {
+    final response = await _client.get<Map<String, Object?>>(
+      '/v1/agent/sessions/$sessionId/tool-calls',
+      const <String, String>{},
+    );
+    final raw = _data(response)['toolCalls'] as List<Object?>? ??
+        const <Object?>[];
+    return raw
+        .map((call) =>
+            AgentToolCallView.fromJson(call as Map<String, Object?>))
+        .toList(growable: false);
   }
 
   /// 在 idle 回合边界把会话切换到目标供应商；409 时带可用供应商候选。

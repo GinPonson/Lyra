@@ -439,6 +439,89 @@ void main() {
     });
   });
 
+  group('工具调用公开列表', () {
+    test('仓库层解析 tool-calls 路由响应', () async {
+      final adapter = FakeFrameAdapter((RequestOptions options) async {
+        expect(
+          options.uri.path,
+          '/v1/agent/sessions/a1000000-0000-4000-8000-000000000001/tool-calls',
+        );
+        return _jsonResponse(
+          jsonEncode(<String, Object?>{
+            'toolCalls': <Map<String, Object?>>[
+              <String, Object?>{
+                'id': 'c1000000-0000-4000-8000-000000000001',
+                'messageId': 'm1000000-0000-4000-8000-000000000002',
+                'ordinal': 1,
+                'toolName': 'accounts',
+                'status': 'completed',
+                'argumentsSummary': <String, Object?>{'accountScope': 'all'},
+                'resultSummary': <String, Object?>{'count': 3},
+                'ledgerVersion': 1,
+                'durationMs': 42,
+                'errorCode': null,
+                'startedAt': '2026-09-01T09:00:01.000Z',
+                'completedAt': '2026-09-01T09:00:01.042Z',
+              },
+              <String, Object?>{
+                'id': 'c1000000-0000-4000-8000-000000000002',
+                'messageId': 'm1000000-0000-4000-8000-000000000002',
+                'ordinal': 2,
+                'toolName': 'transactions',
+                'status': 'started',
+                'argumentsSummary': <String, Object?>{'accountScope': 'all'},
+                'resultSummary': null,
+                'ledgerVersion': 1,
+                'durationMs': null,
+                'errorCode': null,
+                'startedAt': '2026-09-01T09:00:02.000Z',
+                'completedAt': null,
+              },
+              <String, Object?>{
+                'id': 'c1000000-0000-4000-8000-000000000003',
+                'messageId': 'm1000000-0000-4000-8000-000000000002',
+                'ordinal': 3,
+                'toolName': 'summary',
+                'status': 'failed',
+                'argumentsSummary': <String, Object?>{},
+                'resultSummary': null,
+                'ledgerVersion': 1,
+                'durationMs': 15,
+                'errorCode': 'AGENT_TOOL_EXECUTION_FAILED',
+                'startedAt': '2026-09-01T09:00:03.000Z',
+                'completedAt': '2026-09-01T09:00:03.015Z',
+              },
+            ],
+          }),
+          200,
+        );
+      });
+      final repository = AgentRepository(
+        client: LyraApiClient(
+          serverUrl: 'http://127.0.0.1:3141',
+          credentialStore: MemoryCredentialStore(),
+          tokenRefresher: () async => null,
+          dio: Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3141'))
+            ..httpClientAdapter = adapter,
+        ),
+      );
+      final calls = await repository.toolCalls(
+        'a1000000-0000-4000-8000-000000000001',
+      );
+      expect(calls, hasLength(3));
+      expect(calls[0].toolName, 'accounts');
+      expect(calls[0].argumentsSummary, <String, Object?>{
+        'accountScope': 'all',
+      });
+      expect(calls[0].resultSummary, <String, Object?>{'count': 3});
+      expect(calls[0].durationMs, 42);
+      expect(calls[1].status, 'started');
+      expect(calls[1].resultSummary, isNull);
+      expect(calls[1].durationMs, isNull);
+      expect(calls[2].errorCode, 'AGENT_TOOL_EXECUTION_FAILED');
+    });
+  });
+
   group('回合边界切换', () {
     test('仓库层发送 switch 请求并解析新供应商快照', () async {
       final adapter = FakeFrameAdapter((RequestOptions options) async {
