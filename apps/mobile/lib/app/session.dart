@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/api/lyra_api_client.dart';
 import '../core/security/credential_store.dart';
+import '../features/agent/agent_session_store.dart';
 import '../features/ledger/ledger_models.dart';
 import '../features/ledger/ledger_repository.dart';
 import '../features/pairing/pairing_repository.dart';
@@ -16,9 +17,13 @@ class SessionDependencies {
   const SessionDependencies({
     required this.credentialStore,
     this.clientFactory,
+    this.agentSessionStore,
   });
 
   final CredentialStore credentialStore;
+
+  /// Agent 活跃会话 ID 的持久化；缺省为系统安全存储。
+  final AgentSessionStore? agentSessionStore;
 
   /// 由 [serverUrl] 构建裸 Dio；生产用 Dio()，测试注入假适配器。
   final DioFactory? clientFactory;
@@ -168,7 +173,10 @@ String _spkiPem(List<int> publicKeyBytes) {
 /// 会话依赖的注入点；默认使用系统安全存储，测试用内存实现覆盖。
 final Provider<SessionDependencies> sessionDependenciesProvider =
     Provider<SessionDependencies>(
-  (ref) => SessionDependencies(credentialStore: SecureCredentialStore()),
+  (ref) => SessionDependencies(
+    credentialStore: SecureCredentialStore(),
+    agentSessionStore: const SecureAgentSessionStore(),
+  ),
 );
 
 final AsyncNotifierProvider<SessionController, SessionState> sessionProvider =

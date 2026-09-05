@@ -211,6 +211,20 @@ class AgentRepository {
     );
   }
 
+  /// 在 idle 回合边界把会话切换到目标供应商；409 时带可用供应商候选。
+  Future<AgentSessionView> switchSession({
+    required String sessionId,
+    required String targetProvider,
+  }) async {
+    final response = await _client.post<Map<String, Object?>>(
+      '/v1/agent/sessions/$sessionId/switch',
+      <String, Object?>{'provider': targetProvider},
+    );
+    return AgentSessionView.fromJson(
+      _data(response)['session'] as Map<String, Object?>,
+    );
+  }
+
   Map<String, Object?> _data(Response<Map<String, Object?>> response) {
     final body = response.data;
     if (body == null) {

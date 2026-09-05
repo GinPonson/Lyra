@@ -114,6 +114,38 @@ String _turnResponse() {
   });
 }
 
+/// 回合边界切换后的会话快照：同会话 ID、revision 递增、边界 system 消息。
+String _switchedSessionJson(String target) {
+  return jsonEncode(<String, Object?>{
+    'session': <String, Object?>{
+      'id': 'a1000000-0000-4000-8000-000000000001',
+      'provider': target,
+      'status': 'idle',
+      'accountScope': <String, Object?>{'kind': 'all'},
+      'ledgerVersion': 1,
+      'asOf': '2026-09-05T10:00:05.000Z',
+      'revision': 4,
+      'messages': <Map<String, Object?>>[
+        <String, Object?>{
+          'id': 'm1000000-0000-4000-8000-000000000003',
+          'role': 'system',
+          'content': '已切换到 ${_providerLabelOf(target)}。上下文已交接，历史结论仅供参考。',
+          'createdAt': '2026-09-05T10:00:05.000Z',
+        },
+      ],
+    },
+  });
+}
+
+String _providerLabelOf(String provider) {
+  return switch (provider) {
+    'claude' => 'Claude',
+    'pi' => 'Pi',
+    'opencode' => 'OpenCode',
+    _ => provider,
+  };
+}
+
 const String _createdSessionJson = '''
 {
   "session": {
@@ -164,13 +196,19 @@ Map<String, Object?> _decodeBody(RequestOptions options) {
   return const <String, Object?>{};
 }
 
-Future<ResponseBody> _routeAgentRequest(RequestOptions options) async {
+Future<ResponseBody> _routeAgentRequest(
+  RequestOptions options, {
+  String switchTarget = 'opencode',
+}) async {
   final path = options.uri.path;
   if (path == '/v1/agents') {
     return _jsonResponse(_availabilityResponse, 200);
   }
   if (path == '/v1/ledger/summary') {
     return _jsonResponse(_summaryResponse, 200);
+  }
+  if (path.endsWith('/switch')) {
+    return _jsonResponse(_switchedSessionJson(switchTarget), 200);
   }
   if (path == '/v1/agent/sessions') {
     final body = _decodeBody(options);
@@ -318,6 +356,50 @@ void main() {
     // 终态快照渲染用户与助手消息。
     expect(find.text('我的现金余额是多少？'), findsOneWidget);
     expect(find.text('USD 现金余额为 12,345.67。'), findsOneWidget);
+  });
+
+  testWidgets('idle 会话可切换供应商并渲染边界消息', (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final store = MemoryCredentialStore();
+    await store.write(_snapshot);
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          sessionDependenciesProvider.overrideWithValue(
+            SessionDependencies(
+              credentialStore: store,
+              clientFactory: (String serverUrl) {
+                return Dio(BaseOptions(baseUrl: serverUrl))
+                  ..httpClientAdapter = FakeAgentAdapter(_routeAgentRequest);
+              },
+            ),
+          ),
+        ],
+        child: const MaterialApp(home: Scaffold(body: AgentScreen())),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('开始 Claude 会话'));
+    await tester.pumpAndSettle();
+
+    // 打开切换菜单并选择 OpenCode。
+    await tester.tap(find.byTooltip('切换 Agent'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('切换到 OpenCode'));
+    await tester.pumpAndSettle();
+
+    // 切换后：同会话、新供应商、边界 system 消息上屏。
+    expect(find.text('Agent · OpenCode'), findsOneWidget);
+    expect(
+      find.text('已切换到 OpenCode。上下文已交接，历史结论仅供参考。'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('未配对时 Agent 页不提供会话入口', (WidgetTester tester) async {

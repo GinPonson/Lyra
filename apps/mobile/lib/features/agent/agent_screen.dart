@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -5,7 +7,9 @@ import '../../app/session.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
+import '../agent/agent_live_events.dart';
 import '../agent/agent_repository.dart';
+import '../agent/agent_session_store.dart';
 
 /// Agent 页状态：可用性 → 会话 → 回合。
 sealed class AgentUiState {
@@ -24,6 +28,7 @@ class AgentSessionActive extends AgentUiState {
     required this.session,
     required this.turnInProgress,
     this.pendingMessage,
+    this.streamingText,
     this.errorMessage,
   });
 
@@ -33,6 +38,9 @@ class AgentSessionActive extends AgentUiState {
 
   /// 回合运行中已上屏的乐观用户消息；终态快照到达后被规范消息替代。
   final String? pendingMessage;
+
+  /// 事件流 delta 累积的助手实时预览；快照到达后清空。
+  final String? streamingText;
   final String? errorMessage;
 
   AgentSessionActive copyWith({
@@ -40,6 +48,8 @@ class AgentSessionActive extends AgentUiState {
     bool? turnInProgress,
     String? pendingMessage,
     bool clearPendingMessage = false,
+    String? streamingText,
+    bool clearStreamingText = false,
     String? errorMessage,
     bool clearError = false,
   }) {
@@ -50,6 +60,9 @@ class AgentSessionActive extends AgentUiState {
       pendingMessage: clearPendingMessage
           ? null
           : (pendingMessage ?? this.pendingMessage),
+      streamingText: clearStreamingText
+          ? null
+          : (streamingText ?? this.streamingText),
       errorMessage: clearError ? null : (errorMessage ?? this.errorMessage),
     );
   }
@@ -65,6 +78,8 @@ class AgentError extends AgentUiState {
 /// Agent 页控制器：会话生命周期与回合交互。
 class AgentController extends Notifier<AgentUiState> {
   AgentRepository? _repository;
+  AgentLiveEvents? _live;
+  int _lastSequence = 0;
 
   AgentRepository? _resolve() {
     if (_repository != null) {
@@ -79,7 +94,158 @@ class AgentController extends Notifier<AgentUiState> {
 
   @override
   AgentUiState build() {
+    ref.onDispose(() {
+      _live?.dispose();
+      _live = null;
+    });
+    // 进入 Agent 页时尝试恢复上次活跃会话；失败静默回到创建视图。
+    Future<void>.microtask(_restoreLastSession);
     return const AgentIdle();
+  }
+
+  /// 读取本地会话 ID 并用服务端权威快照恢复会话视图。
+  Future<void> _restoreLastSession() async {
+    if (state is! AgentIdle) {
+      return;
+    }
+    // 等待会话控制器完成配对恢复；未配对则无从恢复。
+    final sessionState = await ref.read(sessionProvider.future);
+    if (sessionState is! SessionPaired) {
+      return;
+    }
+    if (state is! AgentIdle) {
+      return;
+    }
+    final repository = _resolve();
+    if (repository == null) {
+      return;
+    }
+    final store = ref.read(agentSessionStoreProvider);
+    final sessionId = await store.read();
+    if (sessionId == null || sessionId.isEmpty || state is! AgentIdle) {
+      return;
+    }
+    final AgentSessionView session;
+    try {
+      session = await repository.getSession(sessionId);
+    } on LyraApiError {
+      // 会话已关闭或不存在：清掉本地 ID，回到创建视图。
+      await store.clear();
+      return;
+    }
+    if (!ref.mounted || state is! AgentIdle) {
+      return;
+    }
+    try {
+      final availability = await repository.availability();
+      if (!ref.mounted || state is! AgentIdle) {
+        return;
+      }
+      state = AgentSessionActive(
+        availability: availability,
+        session: session,
+        turnInProgress: false,
+      );
+      _subscribeLive(session.id);
+    } on LyraApiError {
+      // 可用性暂不可得：保留本地 ID，下次进入再试。
+      return;
+    }
+  }
+
+  /// 订阅会话事件流；游标从 0 开始，续传与实时事件统一进入帧处理。
+  void _subscribeLive(String sessionId) {
+    _live?.dispose();
+    _live = null;
+    final sessionState = ref.read(sessionProvider);
+    final paired = sessionState.value;
+    if (paired is! SessionPaired) {
+      return;
+    }
+    _lastSequence = 0;
+    AgentLiveEvents? live;
+    live = AgentLiveEvents(
+      serverUrl: paired.snapshot.serverUrl,
+      accessToken: paired.snapshot.accessToken,
+      onFrame: handleFrame,
+      onDone: () {
+        // 连接断开：保留游标，等待下一次回合或手动交互时重订阅。
+        if (identical(_live, live)) {
+          _live = null;
+        }
+      },
+    );
+    _live = live;
+    live.subscribe(sessionId: sessionId, afterSequence: _lastSequence);
+  }
+
+  /// 统一事件帧处理：delta 实时预览，缺口或要求时重取权威快照。
+  ///
+  /// 公开为事件入口以便测试直接注入帧序列。
+  void handleFrame(AgentLiveFrame frame) {
+    final current = state;
+    if (current is! AgentSessionActive) {
+      return;
+    }
+    switch (frame) {
+      case AgentEventFrame(:final event):
+        if (event.sequence <= _lastSequence) {
+          return; // 重复事件：忽略。
+        }
+        if (event.sequence > _lastSequence + 1) {
+          _refreshSnapshot('sequence-gap');
+          return;
+        }
+        _lastSequence = event.sequence;
+        if (event.type == 'message.delta') {
+          final text = event.payload['text'];
+          if (text is String && text.isNotEmpty) {
+            state = current.copyWith(
+              streamingText: (current.streamingText ?? '') + text,
+            );
+          }
+        } else if (event.type == 'message.completed'
+            || event.type == 'message.failed'
+            || event.type == 'session.completed') {
+          state = current.copyWith(clearStreamingText: true);
+          _refreshSnapshot('terminal-${event.type}');
+        }
+      case AgentSubscribedFrame(:final mode):
+        if (mode == 'snapshot_required') {
+          _refreshSnapshot('subscribed-snapshot');
+        }
+      case AgentErrorFrame():
+        state = current.copyWith(
+          errorMessage: '${frame.message}（${frame.code}）',
+        );
+      case AgentUnknownFrame():
+        break;
+    }
+  }
+
+  /// 从服务端重取权威会话快照；事件流只负责提示，快照永远是唯一事实。
+  Future<void> _refreshSnapshot(String reason) async {
+    final repository = _resolve();
+    final current = state;
+    if (repository == null || current is! AgentSessionActive) {
+      return;
+    }
+    try {
+      final session = await repository.getSession(current.session.id);
+      if (!ref.mounted) {
+        return;
+      }
+      final latest = state;
+      if (latest is! AgentSessionActive) {
+        return;
+      }
+      state = latest.copyWith(
+        session: session,
+        clearStreamingText: true,
+      );
+    } on LyraApiError {
+      // 快照刷新失败保持现有状态；下一帧或下次回合会再触发。
+    }
   }
 
   /// 加载供应商可用性；未配对时保持 idle。
@@ -114,8 +280,35 @@ class AgentController extends Notifier<AgentUiState> {
         session: session,
         turnInProgress: false,
       );
+      await ref.read(agentSessionStoreProvider).write(session.id);
+      _subscribeLive(session.id);
     } on LyraApiError catch (error) {
       state = AgentError('${error.message}（${error.code}）');
+    }
+  }
+
+  /// 在回合边界把会话切换到目标供应商；运行中或目标不可用返回稳定 409。
+  Future<void> switchProvider(String targetProvider) async {
+    final current = state;
+    if (current is! AgentSessionActive || current.turnInProgress) {
+      return;
+    }
+    if (current.session.provider == targetProvider) {
+      return;
+    }
+    try {
+      final session = await _repository!.switchSession(
+        sessionId: current.session.id,
+        targetProvider: targetProvider,
+      );
+      state = current.copyWith(
+        session: session,
+        clearError: true,
+      );
+    } on LyraApiError catch (error) {
+      state = current.copyWith(
+        errorMessage: '${error.message}（${error.code}）',
+      );
     }
   }
 
@@ -124,6 +317,15 @@ class AgentController extends Notifier<AgentUiState> {
     final current = state;
     if (current is! AgentSessionActive || current.turnInProgress) {
       return;
+    }
+    // 回合窗口重连事件流，保证本回合增量不缺。
+    if (_live == null) {
+      _subscribeLive(current.session.id);
+    } else {
+      _live!.subscribe(
+        sessionId: current.session.id,
+        afterSequence: _lastSequence,
+      );
     }
     state = current.copyWith(
       turnInProgress: true,
@@ -135,15 +337,21 @@ class AgentController extends Notifier<AgentUiState> {
         sessionId: current.session.id,
         content: content,
       );
+      final maxSequence = result.events.isEmpty
+          ? _lastSequence
+          : result.events.map((event) => event.sequence).reduce(math.max);
+      _lastSequence = math.max(_lastSequence, maxSequence);
       state = current.copyWith(
         session: result.session,
         turnInProgress: false,
         clearPendingMessage: true,
+        clearStreamingText: true,
       );
     } on LyraApiError catch (error) {
       state = current.copyWith(
         turnInProgress: false,
         clearPendingMessage: true,
+        clearStreamingText: true,
         errorMessage: '${error.message}（${error.code}）',
       );
     }
@@ -161,6 +369,7 @@ class AgentController extends Notifier<AgentUiState> {
         session: session,
         turnInProgress: false,
         clearPendingMessage: true,
+        clearStreamingText: true,
       );
     } on LyraApiError catch (error) {
       state = current.copyWith(
@@ -175,6 +384,13 @@ final agentControllerProvider =
     NotifierProvider.autoDispose<AgentController, AgentUiState>(
   AgentController.new,
 );
+
+/// Agent 活跃会话 ID 持久化；由会话依赖注入，测试可覆盖。
+final Provider<AgentSessionStore> agentSessionStoreProvider =
+    Provider<AgentSessionStore>((ref) {
+  return ref.watch(sessionDependenciesProvider).agentSessionStore ??
+      const SecureAgentSessionStore();
+});
 
 /// Agent 页：供应商可用状态、会话消息流与回合输入。
 ///
@@ -289,6 +505,8 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                     ),
                   ),
                   _StatusChip(session: session),
+                  const SizedBox(width: 8),
+                  _SwitchMenu(state: state),
                 ],
               ),
               const SizedBox(height: 4),
@@ -312,7 +530,13 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                 ),
               if (state.pendingMessage != null)
                 _MessageBubble(role: 'user', content: state.pendingMessage!),
-              if (state.turnInProgress)
+              if (state.streamingText != null)
+                _MessageBubble(
+                  role: 'assistant',
+                  content: state.streamingText!,
+                  isStreaming: true,
+                ),
+              if (state.turnInProgress && state.streamingText == null)
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 10),
                   child: Row(
@@ -496,11 +720,13 @@ class _MessageBubble extends StatelessWidget {
     required this.role,
     required this.content,
     this.isFailed = false,
+    this.isStreaming = false,
   });
 
   final String role;
   final String content;
   final bool isFailed;
+  final bool isStreaming;
 
   @override
   Widget build(BuildContext context) {
@@ -514,16 +740,53 @@ class _MessageBubble extends StatelessWidget {
         decoration: BoxDecoration(
           color: isUser ? LyraColors.brandPrimary : LyraColors.elevated,
           borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: LyraColors.divider),
+          border: Border.all(
+            color: isStreaming ? LyraColors.brandBright : LyraColors.divider,
+          ),
         ),
         child: Text(
-          content,
+          isStreaming ? '$content▍' : content,
           style: TextStyle(
             color: isUser ? Colors.white : LyraColors.ink,
             height: 1.5,
           ),
         ),
       ),
+    );
+  }
+}
+
+/// 回合边界切换菜单：仅 idle 且目标为其他供应商时可用。
+class _SwitchMenu extends ConsumerWidget {
+  const _SwitchMenu({required this.state});
+
+  final AgentSessionActive state;
+
+  static const List<(String, String)> _providers = <(String, String)>[
+    ('claude', 'Claude'),
+    ('pi', 'Pi'),
+    ('opencode', 'OpenCode'),
+  ];
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final canSwitch = !state.turnInProgress
+        && state.session.status == 'idle';
+    return PopupMenuButton<String>(
+      tooltip: '切换 Agent',
+      enabled: canSwitch,
+      icon: const Icon(LyraIcons.disclosure),
+      onSelected: (String target) => ref
+          .read(agentControllerProvider.notifier)
+          .switchProvider(target),
+      itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+        for (final (provider, label) in _providers)
+          if (provider != state.session.provider)
+            PopupMenuItem<String>(
+              value: provider,
+              child: Text('切换到 $label'),
+            ),
+      ],
     );
   }
 }
