@@ -35,6 +35,12 @@ dependencies:
   flutter_secure_storage: 9.2.4
   web_socket_channel: ^3.0.3
 
+dependency_overrides:
+  # file_selector_android 0.5.2+10 的 Kotlin DSL 构建脚本在 Flutter 3.47.2
+  # (AGP 9.1.0 / Gradle 9.3) 下无法编译(kotlin{}/android{} 访问器无法解析),
+  # 全新模板项目同样复现,等待上游修复;临时钉回 groovy 构建的 0.5.1+9。
+  file_selector_android: 0.5.1+9
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

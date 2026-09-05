@@ -122,13 +122,13 @@ packages:
     source: hosted
     version: "1.1.0"
   file_selector_android:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
       name: file_selector_android
-      sha256: "7c76473740e33a11343c8fce88166049230850d2f19cd8a652ea935fcb8c9206"
+      sha256: "00aafa9ae05a8663d0b4f17abd2a02316911ca0f46f9b9dacb9578b324d99590"
       url: "https://pub.dev"
     source: hosted
-    version: "0.5.2+10"
+    version: "0.5.1+9"
   file_selector_ios:
     dependency: transitive
     description:
@@ -655,4 +655,4 @@ packages:
     version: "3.1.4"
 sdks:
   dart: ">=3.13.2 <4.0.0"
-  flutter: ">=3.44.0"
+  flutter: ">=3.38.4"
