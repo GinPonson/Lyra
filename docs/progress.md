@@ -174,6 +174,11 @@
 | Phase 0 | 导入提交幂等键路由接线 | 已完成 | 新增导入路由集成测试 1 项：非法幂等键 400、业务事务内失败（注入 LEDGER_VERSION_CONFLICT）后 in_progress 记录释放并可同键重试、带键首次提交完成记录（result_resource_id 指向 importId）、进程内解析结果丢弃后同键重放返回持久化结果、同键不同请求 409 IDEMPOTENCY_KEY_REUSED、处理中同键请求 409 IDEMPOTENCY_REQUEST_IN_PROGRESS（retryable）；TypeScript strict 编译及完整回归累计 276 项通过 | 2026-09-05 | 新增 `mutation-idempotency-repository`（v10 表读写、过期替换、事务内 CAS 收口、失败释放）；`ImportService.commitImport` 接受设备作用域幂等上下文：幂等判定先于进程内 entry 检查（成功后重放不依赖易失解析结果）、请求指纹为 importId+令牌散列、in_progress 先于写队列落库、完成收口在提交事务内与业务写入同生共死；`POST /v1/imports/:id/commit` 接受可选 `Idempotency-Key` 头（16–200 位安全字符，非法明确 400）；App 端 `commit` 发送 `commit-<importId>` 幂等键并经假适配器断言 |
 | Phase 0 | 服务健康与外部集成降级快照 | 已完成 | 2 项新增测试通过；累计 229 项通过 | 2026-08-31 | 健康快照区分进程存活、数据库/schema/账本版本、写队列 readiness、Gmail 需处理连接数和 Agent 可用数量；数据库不可用或写队列 draining 标记 unavailable，Gmail/Agent 故障只标记 degraded，不阻断账本只读；未探测 Agent 明确 unknown；不公开邮箱、CLI 版本、路径或失败详情 |
 
+| Phase 2 | App 设备配对与令牌刷新真机修复 | 已完成 | `flutter analyze` 无问题;`flutter test` 26 项全部通过(新增配对/刷新响应形状解析回归 2 项);`flutter build apk --debug` 成功;Medium_Phone 模拟器配对真实服务端成功并加载空账本权威语境 | 2026-09-05 | `PairingRepository` 配对与刷新请求统一携带 `x-lyra-protocol-version`(裸 Dio 此前缺协议头,真实服务端 426 拒绝配对);刷新响应改用独立四字段 `RefreshedDeviceTokens` 模型(服务端 `/v1/devices/tokens` 不含 deviceId/displayName,原共用六字段模型在 401 刷新时 Null 强转抛未捕获异常并中断请求重放);刷新后设备身份沿用本地安全存储快照 |
+| Phase 2 | 服务端配对码消费顺序修复 | 已完成 | `npm run check` 127 套件 278 项全部通过(新增回归 1 项:过期记录不阻塞其他配对码匹配);修复后真实配对链路复验成功 | 2026-09-05 | `consumePairingChallenge` 改为先做哈希等值比较再检查 used/expired 状态;原实现下服务端遍历挑战记录时,任意一条过期记录会先行抛 410,首个过期配对码即永久阻塞后续所有设备配对直至进程重启(模拟器联调中发现) |
+| Phase 4 | Agent 事件流连接失败安全收口 | 已完成 | `flutter analyze` 无问题;`flutter test` 26 项在服务端运行与停止两种环境下均全部通过(含干净 HEAD 上即失败的既有 4 项编排测试);`flutter build apk --debug` 成功 | 2026-09-05 | `WebSocketChannel.connect` 的 `ready` Future 失败此前无人处理,连接被拒或升级失败时成为未处理异步异常(干净 HEAD 复测确认既有缺陷,与本次改动无关);显式吞掉 `ready` 错误,断开重连统一由 stream 的 onError/onDone 驱动 |
+| Phase 2 | Medium_Phone 模拟器端到端 smoke | 已完成 | 全新 Flutter 模板项目复现 file_selector_android 0.5.2+10 构建失败,dependency_overrides 钉回 0.5.1+9(groovy 构建)后 `flutter build apk --debug` 成功;模拟器安装启动无崩溃、五导航完整;配对→空账本权威语境(已同步)→导入面板→系统文件选择器选 CSV→octet-stream 上传→`ACCOUNT_MAPPING_REQUIRED` 稳定错误展示→Agent 页三供应商会话入口按固定顺序渲染→Claude 会话创建成功(空闲、账本版本语境);截图存档 `plans/assets/smoke-20260905-*.png` | 2026-09-05 | 0.5.2+10 的 Kotlin DSL 构建脚本在 Flutter 3.47.2(AGP 9.1.0/Gradle 9.3)下 `kotlin{}`/`android{}` 访问器无法解析且与项目配置无关,上游修复前保留钉版;导入提交与 Agent 真实回合不在 smoke 范围(空账本无账户可映射,账户创建路由待排期;真实模型会话按既有纪律不启动) |
+
 ## 验证记录
 
 | 日期 | 命令 | 结果 | 说明 |
@@ -365,6 +370,12 @@
 | 2026-09-05 | `npm run check` / `flutter analyze` / `flutter test` | 通过 | 服务端 127 套件 277 项全部通过（新增工具调用公开列表路由集成测试）；App 静态分析无问题、21 项全部通过（新增 tool-calls 三态解析与工具调用卡片渲染 widget 测试） |
 | 2026-09-05 | `flutter analyze` / `flutter test` | 通过 | 静态分析无问题；24 项 Flutter 测试全部通过：新增 3 项重连退避测试（意外断开自动重连带最新游标、close/dispose 静默、退避封顶与 subscribed 重置），既有 21 项无回归 |
 | 2026-09-05 | `npm run check`（5 连跑） | 通过 | 服务端 277 项测试在 `--test-concurrency=2` 下 5 次连续运行全部通过；测试进程并发从默认全量降为 2，消除原生 DuckDB 模块在多测试进程并行加载时的偶发 SIGSEGV（旧提交 bcc0c00 同样复现，与业务代码无关），总耗时 8.2s 基本不变 |
+| 2026-09-05 | `flutter analyze` / `flutter test` | 通过 | 静态分析无问题；26 项 Flutter 测试在服务端运行与停止两种环境下均全部通过：新增配对响应六字段与刷新响应四字段（真实服务端形状）解析回归 2 项；`AgentLiveEvents` ready 失败收口修复后，干净 HEAD 上即失败的既有 4 项编排测试恢复通过 |
+| 2026-09-05 | Medium_Phone 模拟器 401 刷新链路复验 | 通过 | 访问令牌过期后 `GET /v1/ledger/summary` 401 → `POST /v1/devices/tokens` 200 → 原请求重放 200,App 总览保持已同步;修复前该路径因刷新响应解析崩溃中断重放 |
+| 2026-09-05 | Medium_Phone 模拟器 Agent 会话创建 | 通过 | 空账本下 `POST /v1/agent/sessions` 创建 Claude 会话成功,会话页渲染空闲状态与账本版本 0 权威语境;未发送真实回合（按既有纪律不启动模型会话） |
+| 2026-09-05 | `npm run check` | 通过 | 配对码消费顺序修复：`consumePairingChallenge` 哈希比较前置并新增回归测试；127 个测试套件、累计 278 项测试全部通过 |
+| 2026-09-05 | `GRADLE_USER_HOME=/private/tmp/lyra-gradle-home-20260831 flutter build apk --debug` | 通过 | `file_selector_android` 钉回 0.5.1+9 后 Android 构建恢复（52.6s）；修复配对协议头与刷新解析后再次构建成功 |
+| 2026-09-05 | Medium_Phone 模拟器端到端 smoke | 通过 | `com.lyrafinance.lyra_mobile` 安装启动无崩溃；配对真实服务端（127.0.0.1:3141 经 adb reverse）成功并显示空账本权威语境（账本版本 0、已同步）；导入面板经系统文件选择器上传 Schwab CSV，服务端正确返回 `ACCOUNT_MAPPING_REQUIRED` 且 App 显示稳定错误码；Agent 页三供应商入口渲染正常；401 刷新路径暴露的响应解析缺陷已修复并复验配对成功 |
 | 2026-09-01 | `LYRA_PORT=3143 LYRA_DATABASE_PATH=<临时文件> npm start` + loopback smoke | 通过 | 单服务入口完成 v1–v11 迁移并监听本机端口；健康端点返回 200 与 schema 11；`GET /mcp` 明确 405；无凭据与未知凭据的 `tools/list` 均返回 401 稳定 JSON-RPC 错误；SIGTERM 后写队列关闭、进程干净退出 |
 
 ## 当前环境事项
@@ -376,6 +387,8 @@
 | Android 工具链 | 可用 | Android CLI 1.0.15498356、Android SDK 36.1.0、JDK 21；Medium_Phone 设备 smoke 已通过 |
 | 外部网络代理 | 可用 | `127.0.0.1:7890` 监听正常；默认及显式代理 GitHub 探测均为 HTTP 200；受限沙箱内的 loopback 失败不代表代理离线 |
 | 测试进程并发 | 已收敛 | 原生 DuckDB Node 模块在 `node --test` 默认全量并发下偶发 SIGSEGV（agent-events-ws 集成测试套件，旧提交同样复现）；`npm test` 已固定 `--test-concurrency=2`，5 连跑稳定 |
+| file_selector_android 构建兼容性 | 已钉版、待上游 | 0.5.2+10 的 Kotlin DSL 构建脚本在 Flutter 3.47.2（AGP 9.1.0 / Gradle 9.3.1）下 `kotlin{}`/`android{}` 访问器无法解析,全新模板项目同样复现,与项目配置无关;`pubspec.yaml` dependency_overrides 钉回 0.5.1+9(groovy 构建,平台接口不变),上游发布修复后移除钉版 |
+| Flutter 3.47.2 模板 Gradle 标志 | 保持默认 | `android.newDsl=false` 与 `android.builtInKotlin=false` 必须同时保留:单独开启 builtInKotlin 会让 `:app` 的 Kotlin DSL 访问器失效,开启 newDsl 会让 flutter-gradle-plugin 转型 `AbstractAppExtension` 失败 |
 | Gradle 全局镜像 | 需隔离 | `/Users/Gin/.gradle/init.d/aliyun-mirror.gradle.kts` 会清空 Flutter 官方 Maven 仓库；Flutter 构建使用独立 `GRADLE_USER_HOME`，不修改用户全局配置 |
 | 服务端外部依赖 | TypeScript、Node 类型、Decimal、Fastify、Zod、DuckDB Node API、csv-parse、ExcelJS、mailparser 与官方 MCP SDK 已安装 | Pi 扩展 SDK 尚未安装；代理已恢复，可按后续功能点逐项引入并验证 |
 | ExcelJS 上游审计项 | 已评估、待上游修复 | uuid advisory 不命中 Lyra 的 XLSX 只读路径；保留 ExcelJS 4.4.0 精确锁定并跟踪升级，不用 `npm audit fix --force` 降级主依赖 |
