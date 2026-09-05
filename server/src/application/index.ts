@@ -170,6 +170,8 @@ export type {
   ImportCommitHttpResponse,
   ImportPreviewHttpResponse,
 } from "./import-service.js";
+export { GmailService } from "./gmail-service.js";
+export type { GmailGoogleOAuthConfig } from "./gmail-service.js";
 export { invokeAuthenticatedAgentTool } from "./agent-tool-invocation.js";
 export { createFinancialToolRegistry } from "./financial-tool-runtime.js";
 export {

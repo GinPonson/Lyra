@@ -22,5 +22,7 @@ export { registerLedgerRoutes } from "./ledger-routes.js";
 export type { LedgerRouteOptions } from "./ledger-routes.js";
 export { registerImportRoutes } from "./import-routes.js";
 export type { ImportRouteOptions } from "./import-routes.js";
+export { registerGmailRoutes } from "./gmail-routes.js";
+export type { GmailRouteOptions } from "./gmail-routes.js";
 export type { HttpServerOptions } from "./http-server.js";
 export type { ServerProtocolMetadata } from "./protocol-version.js";

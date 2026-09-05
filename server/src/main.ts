@@ -22,7 +22,9 @@ import { registerAgentRoutes } from "./transport/agent-routes.js";
 import { registerAgentEventsRoute } from "./transport/agent-events.js";
 import { registerLedgerRoutes } from "./transport/ledger-routes.js";
 import { registerImportRoutes } from "./transport/import-routes.js";
-import { ImportService } from "./application/index.js";
+import { registerGmailRoutes } from "./transport/gmail-routes.js";
+import { ImportService, GmailService } from "./application/index.js";
+import { SecretCipher } from "./infrastructure/security/index.js";
 
 const environmentSchema = z.object({
   LYRA_HOST: z.string().trim().min(1).default("127.0.0.1"),
@@ -36,6 +38,11 @@ const environmentSchema = z.object({
   LYRA_AGENT_TURN_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(900_000),
   LYRA_AGENT_PROBE_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(10_000),
   LYRA_IMPORT_STAGING_DIR: z.string().trim().min(1),
+  /** 32 字节 hex 主密钥；Gmail refresh token 等敏感数据经 AES-256-GCM 加密。 */
+  LYRA_SECRET_MASTER_KEY: z.string().regex(/^[0-9a-fA-F]{64}$/),
+  LYRA_GOOGLE_CLIENT_ID: z.string().trim().min(1).default(""),
+  LYRA_GOOGLE_CLIENT_SECRET: z.string().trim().min(1).default(""),
+  LYRA_GOOGLE_REDIRECT_URI: z.string().trim().min(1).default(""),
   /** JSON 对象：{"claude":["2.1.233"],"pi":["0.84.2"],"opencode":["1.18.21"]}。 */
   LYRA_AGENT_ALLOWED_VERSIONS: z.string().trim().min(1),
 });
@@ -67,6 +74,24 @@ async function start(): Promise<void> {
     database,
     writeCoordinator,
     stagingDirectory: environment.LYRA_IMPORT_STAGING_DIR,
+  });
+  const cipher = new SecretCipher(
+    Buffer.from(environment.LYRA_SECRET_MASTER_KEY, "hex"),
+  );
+  const googleOAuth = environment.LYRA_GOOGLE_CLIENT_ID.length > 0
+      && environment.LYRA_GOOGLE_REDIRECT_URI.length > 0
+    ? {
+        clientId: environment.LYRA_GOOGLE_CLIENT_ID,
+        ...(environment.LYRA_GOOGLE_CLIENT_SECRET.length > 0
+          ? { clientSecret: environment.LYRA_GOOGLE_CLIENT_SECRET }
+          : {}),
+        redirectUri: environment.LYRA_GOOGLE_REDIRECT_URI,
+      }
+    : null;
+  const gmailService = new GmailService({
+    database,
+    cipher,
+    googleOAuth,
   });
   const executables = {
     claude: environment.LYRA_AGENT_CLAUDE_PATH,
@@ -130,6 +155,10 @@ async function start(): Promise<void> {
   });
   registerImportRoutes(app, {
     importService,
+    authenticateDevice,
+  });
+  registerGmailRoutes(app, {
+    gmailService,
     authenticateDevice,
   });
   app.addHook("onClose", async () => {
