@@ -181,6 +181,8 @@
 
 | Phase 2 | App 极简专业白色主题重构 | 已完成 | `flutter analyze` 无问题;`flutter test` 26 项全部通过;`flutter build apk --debug` 成功;Medium_Phone 模拟器目视验收总览/持仓/Agent 会话三页,截图存档 `plans/assets/theme-20260905-*.png` | 2026-09-05 | 按用户要求弃用深色主题,改为纯白画布 + 近黑正文 + 发丝分割线 + 单一靛蓝强调(Stripe/Linear 式极简专业风);`LyraColors` 重写为语义化调色板(accent/ink/hairline 等),`LyraTheme` 提供浅色 Material 3 主题并全局启用等宽数字;总览页移除装饰性光晕绘制改为排版主导的 Hero 卡片;五个页面与导航、输入框、按钮、气泡、芯片全部适配;系统栏图标切换为深色 |
 
+| Phase 2 | App 轻量机构风主题(参照 Coinbase 设计系统) | 已完成 | `flutter analyze` 无问题;`flutter test` 26 项全部通过;`flutter build apk --debug` 成功;Medium_Phone 模拟器目视验收总览与 Agent 会话页,截图存档 `plans/assets/theme-20260905-04/05-*.png` | 2026-09-05 | 应用户要求在 `voltagent/awesome-design-md` 73 个品牌设计系统中重选风格;对比 Wise(青柠绿/鼠尾草)、Revolut(即原深色主题的 token 来源,被否)、Coinbase 三份 DESIGN.md 后采用 Coinbase token:白底 + ink `#0a0b0d`、蓝色 `#0052ff` 单一电压只做主 CTA/选中态/链接、发丝线 `#dee1e6`、软灰表面 `#f7f7f7`/`#eef0f3`、涨跌语义仅文字色、展示级标题 weight 400 不加粗、金额与时间戳改等宽字形、CTA 改药丸形、输入框聚焦 2px 蓝边;候选对比与 token 出处记录于 progress 备注 |
+
 ## 验证记录
 
 | 日期 | 命令 | 结果 | 说明 |
@@ -376,6 +378,7 @@
 | 2026-09-05 | Medium_Phone 模拟器 401 刷新链路复验 | 通过 | 访问令牌过期后 `GET /v1/ledger/summary` 401 → `POST /v1/devices/tokens` 200 → 原请求重放 200,App 总览保持已同步;修复前该路径因刷新响应解析崩溃中断重放 |
 | 2026-09-05 | Medium_Phone 模拟器 Agent 会话创建 | 通过 | 空账本下 `POST /v1/agent/sessions` 创建 Claude 会话成功,会话页渲染空闲状态与账本版本 0 权威语境;未发送真实回合（按既有纪律不启动模型会话） |
 | 2026-09-05 | `flutter analyze` / `flutter test` / `flutter build apk --debug` | 通过 | 白色主题重构:静态分析无问题,26 项测试全部通过,debug 构建成功;模拟器目视验收总览、持仓、Agent 会话三页(截图 `theme-20260905-*.png`) |
+| 2026-09-05 | `flutter analyze` / `flutter test` / `flutter build apk --debug` | 通过 | Coinbase 风格 token 落地:静态分析无问题,26 项测试全部通过,debug 构建成功;模拟器目视验收总览与 Agent 会话页(截图 `theme-20260905-04/05-*.png`) |
 | 2026-09-05 | `npm run check` | 通过 | 配对码消费顺序修复：`consumePairingChallenge` 哈希比较前置并新增回归测试；127 个测试套件、累计 278 项测试全部通过 |
 | 2026-09-05 | `GRADLE_USER_HOME=/private/tmp/lyra-gradle-home-20260831 flutter build apk --debug` | 通过 | `file_selector_android` 钉回 0.5.1+9 后 Android 构建恢复（52.6s）；修复配对协议头与刷新解析后再次构建成功 |
 | 2026-09-05 | Medium_Phone 模拟器端到端 smoke | 通过 | `com.lyrafinance.lyra_mobile` 安装启动无崩溃；配对真实服务端（127.0.0.1:3141 经 adb reverse）成功并显示空账本权威语境（账本版本 0、已同步）；导入面板经系统文件选择器上传 Schwab CSV，服务端正确返回 `ACCOUNT_MAPPING_REQUIRED` 且 App 显示稳定错误码；Agent 页三供应商入口渲染正常；401 刷新路径暴露的响应解析缺陷已修复并复验配对成功 |

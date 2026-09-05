@@ -716,8 +716,8 @@ class _InfoCard extends StatelessWidget {
           padding: const EdgeInsets.all(24),
           decoration: BoxDecoration(
             color: LyraColors.surface,
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: LyraColors.hairline),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: LyraColors.hairlineStrong),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -727,7 +727,7 @@ class _InfoCard extends StatelessWidget {
                 height: 44,
                 alignment: Alignment.center,
                 decoration: const BoxDecoration(
-                  color: LyraColors.accentSoft,
+                  color: LyraColors.surfaceStrong,
                   shape: BoxShape.circle,
                 ),
                 child: Icon(icon, color: accent, size: 22),
@@ -846,14 +846,13 @@ class _StatusChip extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: LyraColors.surfaceSubtle,
+        color: LyraColors.surfaceStrong,
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: LyraColors.hairline),
       ),
       child: Text(
         label,
         style: Theme.of(context).textTheme.labelSmall
-            ?.copyWith(color: LyraColors.inkSecondary, letterSpacing: 0),
+            ?.copyWith(color: LyraColors.ink, letterSpacing: 0),
       ),
     );
   }
@@ -886,8 +885,8 @@ class _ToolCallTile extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: LyraColors.hairline),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: LyraColors.hairlineStrong),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

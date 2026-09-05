@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/session.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_theme.dart';
 import '../../core/design/lyra_icons.dart';
 import '../import/import_sheet.dart';
 import 'pairing_panel.dart';
@@ -130,9 +131,8 @@ class _AccountScopePill extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.fromLTRB(14, 10, 12, 10),
         decoration: BoxDecoration(
-          color: LyraColors.surfaceSubtle,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: LyraColors.hairline),
+          color: LyraColors.surfaceStrong,
+          borderRadius: BorderRadius.circular(999),
         ),
         child: const Row(
           mainAxisSize: MainAxisSize.min,
@@ -185,8 +185,8 @@ class _LedgerHero extends StatelessWidget {
           padding: EdgeInsets.all(constraints.maxWidth < 380 ? 20 : 24),
           decoration: BoxDecoration(
             color: LyraColors.surface,
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: LyraColors.hairline),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: LyraColors.hairlineStrong),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -205,12 +205,14 @@ class _LedgerHero extends StatelessWidget {
               Text(
                 realizedPnl ?? '—',
                 key: const ValueKey<String>('overview-hero-value'),
-                style: Theme.of(context).textTheme.displayLarge?.copyWith(
-                  fontSize: heroSize,
-                  color: realizedPnl == null
-                      ? LyraColors.muted
-                      : LyraColors.ink,
-                ),
+                style: Theme.of(context).textTheme.displayLarge
+                    ?.merge(LyraTheme.numeric)
+                    .copyWith(
+                      fontSize: heroSize,
+                      color: realizedPnl == null
+                          ? LyraColors.mutedSoft
+                          : LyraColors.ink,
+                    ),
               ),
               const SizedBox(height: 10),
               Text(
@@ -246,7 +248,7 @@ class _ConnectionBadge extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: connected ? LyraColors.accentSoft : LyraColors.warningSoft,
+        color: LyraColors.surfaceStrong,
         borderRadius: BorderRadius.circular(999),
       ),
       child: Row(
@@ -263,7 +265,7 @@ class _ConnectionBadge extends StatelessWidget {
             style: TextStyle(
               fontSize: 12,
               fontWeight: FontWeight.w600,
-              color: connected ? LyraColors.accentDeep : LyraColors.warning,
+              color: connected ? LyraColors.accent : LyraColors.warning,
             ),
           ),
         ],
@@ -329,8 +331,8 @@ class _MetricCard extends StatelessWidget {
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
         color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: LyraColors.hairline),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: LyraColors.hairlineStrong),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -343,9 +345,15 @@ class _MetricCard extends StatelessWidget {
           const SizedBox(height: 14),
           Text(
             data.value,
-            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-              color: data.value == '—' ? LyraColors.muted : LyraColors.ink,
-            ),
+            style: Theme.of(context).textTheme.headlineSmall
+                ?.merge(LyraTheme.numeric)
+                .copyWith(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w500,
+                  color: data.value == '—'
+                      ? LyraColors.mutedSoft
+                      : LyraColors.ink,
+                ),
           ),
           const SizedBox(height: 6),
           Text(
@@ -374,8 +382,8 @@ class _LedgerStatusCard extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(22, 18, 22, 18),
       decoration: BoxDecoration(
         color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: LyraColors.hairline),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: LyraColors.hairlineStrong),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -464,8 +472,8 @@ class _ConnectionActions extends StatelessWidget {
       padding: const EdgeInsets.all(22),
       decoration: BoxDecoration(
         color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: LyraColors.hairline),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: LyraColors.hairlineStrong),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,

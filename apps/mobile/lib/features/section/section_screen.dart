@@ -63,8 +63,8 @@ class SectionScreen extends StatelessWidget {
                         padding: const EdgeInsets.all(24),
                         decoration: BoxDecoration(
                           color: LyraColors.surface,
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(color: LyraColors.hairline),
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(color: LyraColors.hairlineStrong),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -73,8 +73,8 @@ class SectionScreen extends StatelessWidget {
                               width: 44,
                               height: 44,
                               alignment: Alignment.center,
-                              decoration: BoxDecoration(
-                                color: LyraColors.accentSoft,
+                              decoration: const BoxDecoration(
+                                color: LyraColors.surfaceStrong,
                                 shape: BoxShape.circle,
                               ),
                               child: Icon(icon, color: accent, size: 22),
@@ -103,8 +103,8 @@ class SectionScreen extends StatelessWidget {
                           ),
                           decoration: BoxDecoration(
                             color: LyraColors.surface,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: LyraColors.hairline),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: LyraColors.hairlineStrong),
                           ),
                           child: Row(
                             children: <Widget>[

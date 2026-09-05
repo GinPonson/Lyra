@@ -71,8 +71,8 @@ class _PairingPanelState extends ConsumerState<PairingPanel> {
       padding: const EdgeInsets.all(22),
       decoration: BoxDecoration(
         color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: LyraColors.hairline),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: LyraColors.hairlineStrong),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,

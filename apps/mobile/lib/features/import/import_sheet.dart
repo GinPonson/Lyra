@@ -248,8 +248,8 @@ class _PreviewStats extends StatelessWidget {
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: LyraColors.surfaceSubtle,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: LyraColors.hairline),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: LyraColors.hairlineStrong),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
