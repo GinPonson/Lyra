@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import '../core/design/lyra_theme.dart';
 import 'lyra_shell.dart';
 
-/// 应用根节点，只负责全局主题与一级导航外壳。
+/// 应用根节点：全局主题、Riverpod 作用域与一级导航外壳。
 class LyraApp extends StatelessWidget {
   const LyraApp({super.key});
 

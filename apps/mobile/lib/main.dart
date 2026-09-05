@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'app/lyra_app.dart';
 
@@ -19,5 +20,5 @@ void main() {
       systemNavigationBarContrastEnforced: false,
     ),
   );
-  runApp(const LyraApp());
+  runApp(const ProviderScope(child: LyraApp()));
 }

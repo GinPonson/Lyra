@@ -1,20 +1,29 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../app/session.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
+import 'pairing_panel.dart';
 
-/// 无服务端连接时的可信总览骨架。
+/// 总览页：未配对时展示配对表单，已配对后展示真实账本汇总。
 ///
-/// 所有金额显示为缺省符号，不使用演示数字冒充真实金融数据。
-class OverviewScreen extends StatelessWidget {
+/// 金额保持服务端十进制字符串原样展示；没有数据时显示缺省符号而不伪造。
+class OverviewScreen extends ConsumerWidget {
   const OverviewScreen({super.key});
 
   static const double _contentMaxWidth = 920;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final session = ref.watch(sessionProvider).value ?? const SessionLoading();
+    final summary = switch (session) {
+      SessionPaired(:final summary) => summary,
+      _ => null,
+    };
+    final bool paired = session is SessionPaired;
     return ColoredBox(
       color: LyraColors.black,
       child: SafeArea(
@@ -29,18 +38,41 @@ class OverviewScreen extends StatelessWidget {
                 SliverPadding(
                   padding: const EdgeInsets.fromLTRB(20, 18, 20, 36),
                   sliver: SliverList.list(
-                    children: const <Widget>[
-                      _OverviewHeader(),
-                      SizedBox(height: 24),
-                      _AccountScopePill(),
-                      SizedBox(height: 18),
-                      _LedgerHero(),
-                      SizedBox(height: 20),
-                      _MetricGrid(),
-                      SizedBox(height: 16),
-                      _LedgerStatusCard(),
-                      SizedBox(height: 16),
-                      _ConnectionActions(),
+                    children: <Widget>[
+                      const _OverviewHeader(),
+                      const SizedBox(height: 24),
+                      const _AccountScopePill(),
+                      const SizedBox(height: 18),
+                      _LedgerHero(
+                        connected: paired,
+                        realizedPnl: summary == null || summary.entries.isEmpty
+                            ? null
+                            : summary.entries.first.realizedPnlTotal,
+                        currency: summary == null || summary.entries.isEmpty
+                            ? null
+                            : summary.entries.first.currency,
+                        ledgerVersion: summary?.metadata.ledgerVersion,
+                      ),
+                      const SizedBox(height: 20),
+                      _MetricGrid(
+                        netDeposits: summary == null || summary.entries.isEmpty
+                            ? null
+                            : summary.entries.first.netDeposits,
+                        cashBalance: summary == null || summary.entries.isEmpty
+                            ? null
+                            : summary.entries.first.cashBalance,
+                      ),
+                      const SizedBox(height: 16),
+                      _LedgerStatusCard(
+                        ledgerVersion: summary?.metadata.ledgerVersion,
+                        asOf: summary?.metadata.asOf,
+                      ),
+                      const SizedBox(height: 16),
+                      if (!paired) ...<Widget>[
+                        const PairingPanel(),
+                        const SizedBox(height: 16),
+                      ],
+                      const _ConnectionActions(),
                     ],
                   ),
                 ),
@@ -122,7 +154,17 @@ class _AccountScopePill extends StatelessWidget {
 }
 
 class _LedgerHero extends StatelessWidget {
-  const _LedgerHero();
+  const _LedgerHero({
+    required this.connected,
+    this.realizedPnl,
+    this.currency,
+    this.ledgerVersion,
+  });
+
+  final bool connected;
+  final String? realizedPnl;
+  final String? currency;
+  final int? ledgerVersion;
 
   @override
   Widget build(BuildContext context) {
@@ -166,12 +208,12 @@ class _LedgerHero extends StatelessWidget {
                           style: Theme.of(context).textTheme.titleMedium,
                         ),
                         const Spacer(),
-                        const _ConnectionBadge(),
+                        _ConnectionBadge(connected: connected),
                       ],
                     ),
                     const Spacer(),
                     Text(
-                      '—',
+                      realizedPnl ?? '—',
                       key: const ValueKey<String>('overview-hero-value'),
                       style: Theme.of(context).textTheme.displayLarge?.copyWith(
                         fontSize: heroSize,
@@ -180,7 +222,7 @@ class _LedgerHero extends StatelessWidget {
                     ),
                     const SizedBox(height: 10),
                     Text(
-                      '历史成本与 FIFO 口径 · 尚未连接服务端',
+                      _caption(),
                       style: Theme.of(context).textTheme.bodyMedium
                           ?.copyWith(color: LyraColors.muted),
                     ),
@@ -193,10 +235,22 @@ class _LedgerHero extends StatelessWidget {
       },
     );
   }
+
+  String _caption() {
+    if (!connected) {
+      return '历史成本与 FIFO 口径 · 尚未连接服务端';
+    }
+    if (realizedPnl == null || currency == null) {
+      return '历史成本与 FIFO 口径 · 账本尚无账户数据';
+    }
+    return '$currency 已实现合计 · 历史成本与 FIFO 口径 · 账本版本 $ledgerVersion';
+  }
 }
 
 class _ConnectionBadge extends StatelessWidget {
-  const _ConnectionBadge();
+  const _ConnectionBadge({required this.connected});
+
+  final bool connected;
 
   @override
   Widget build(BuildContext context) {
@@ -207,14 +261,18 @@ class _ConnectionBadge extends StatelessWidget {
         borderRadius: BorderRadius.circular(99),
         border: Border.all(color: LyraColors.divider),
       ),
-      child: const Row(
+      child: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          Icon(LyraIcons.security, size: 15, color: LyraColors.warning),
-          SizedBox(width: 6),
+          Icon(
+            LyraIcons.security,
+            size: 15,
+            color: connected ? LyraColors.brandBright : LyraColors.warning,
+          ),
+          const SizedBox(width: 6),
           Text(
-            '未连接',
-            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+            connected ? '已配对' : '未连接',
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
           ),
         ],
       ),
@@ -223,7 +281,10 @@ class _ConnectionBadge extends StatelessWidget {
 }
 
 class _MetricGrid extends StatelessWidget {
-  const _MetricGrid();
+  const _MetricGrid({this.netDeposits, this.cashBalance});
+
+  final String? netDeposits;
+  final String? cashBalance;
 
   @override
   Widget build(BuildContext context) {
@@ -233,10 +294,10 @@ class _MetricGrid extends StatelessWidget {
         const double gap = 12;
         final double width =
             (constraints.maxWidth - gap * (columns - 1)) / columns;
-        const List<_MetricData> metrics = <_MetricData>[
-          _MetricData('净入金', '—', '现金流口径', LyraIcons.deposit),
+        final List<_MetricData> metrics = <_MetricData>[
+          _MetricData('净入金', netDeposits ?? '—', '现金流口径', LyraIcons.deposit),
           _MetricData('持仓成本', '—', '非实时市值', LyraIcons.cost),
-          _MetricData('现金余额', '—', '账本计算值', LyraIcons.cash),
+          _MetricData('现金余额', cashBalance ?? '—', '账本计算值', LyraIcons.cash),
         ];
         return Wrap(
           spacing: gap,
@@ -310,7 +371,10 @@ class _MetricCard extends StatelessWidget {
 }
 
 class _LedgerStatusCard extends StatelessWidget {
-  const _LedgerStatusCard();
+  const _LedgerStatusCard({this.ledgerVersion, this.asOf});
+
+  final int? ledgerVersion;
+  final String? asOf;
 
   @override
   Widget build(BuildContext context) {
@@ -329,20 +393,20 @@ class _LedgerStatusCard extends StatelessWidget {
                 ?.copyWith(color: LyraColors.ink),
           ),
           const SizedBox(height: 18),
-          const _StatusRow(
+          _StatusRow(
             icon: LyraIcons.ledgerVersion,
             label: '账本版本',
-            value: '—',
+            value: ledgerVersion == null ? '—' : '$ledgerVersion',
           ),
-          const _StatusRow(
+          _StatusRow(
             icon: LyraIcons.dataCutoff,
             label: '数据截止',
-            value: '尚未获取',
+            value: asOf ?? '尚未获取',
           ),
-          const _StatusRow(
+          _StatusRow(
             icon: LyraIcons.sync,
             label: '同步状态',
-            value: '等待服务端连接',
+            value: asOf == null ? '等待服务端连接' : '已同步',
             isLast: true,
           ),
         ],
@@ -380,11 +444,15 @@ class _StatusRow extends StatelessWidget {
           Expanded(
             child: Text(label, style: const TextStyle(color: LyraColors.ink)),
           ),
-          Text(
-            value,
-            style: const TextStyle(
-              color: LyraColors.ink,
-              fontWeight: FontWeight.w700,
+          // 时间戳等长值允许换行，避免窄屏溢出破坏可读性。
+          Flexible(
+            child: Text(
+              value,
+              textAlign: TextAlign.right,
+              style: const TextStyle(
+                color: LyraColors.ink,
+                fontWeight: FontWeight.w700,
+              ),
             ),
           ),
         ],
