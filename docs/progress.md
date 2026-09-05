@@ -364,6 +364,7 @@
 | 2026-09-05 | `flutter analyze` / `flutter test` | 通过 | 静态分析无问题；20 项 Flutter 测试全部通过：新增 9 项（帧解析五类归类、delta 累积/重复忽略/缺口与 snapshot_required 刷新/terminal 刷新、switch 解析与 409、双容器重启恢复与 404 清除）加 1 项切换 widget 全流程；既有 10 项无回归 |
 | 2026-09-05 | `npm run check` / `flutter analyze` / `flutter test` | 通过 | 服务端 127 套件 277 项全部通过（新增工具调用公开列表路由集成测试）；App 静态分析无问题、21 项全部通过（新增 tool-calls 三态解析与工具调用卡片渲染 widget 测试） |
 | 2026-09-05 | `flutter analyze` / `flutter test` | 通过 | 静态分析无问题；24 项 Flutter 测试全部通过：新增 3 项重连退避测试（意外断开自动重连带最新游标、close/dispose 静默、退避封顶与 subscribed 重置），既有 21 项无回归 |
+| 2026-09-05 | `npm run check`（5 连跑） | 通过 | 服务端 277 项测试在 `--test-concurrency=2` 下 5 次连续运行全部通过；测试进程并发从默认全量降为 2，消除原生 DuckDB 模块在多测试进程并行加载时的偶发 SIGSEGV（旧提交 bcc0c00 同样复现，与业务代码无关），总耗时 8.2s 基本不变 |
 | 2026-09-01 | `LYRA_PORT=3143 LYRA_DATABASE_PATH=<临时文件> npm start` + loopback smoke | 通过 | 单服务入口完成 v1–v11 迁移并监听本机端口；健康端点返回 200 与 schema 11；`GET /mcp` 明确 405；无凭据与未知凭据的 `tools/list` 均返回 401 稳定 JSON-RPC 错误；SIGTERM 后写队列关闭、进程干净退出 |
 
 ## 当前环境事项
@@ -374,6 +375,7 @@
 | Flutter SDK | 可用 | Flutter 3.47.2 stable、Dart 3.13.2；Android 授权已接受 |
 | Android 工具链 | 可用 | Android CLI 1.0.15498356、Android SDK 36.1.0、JDK 21；Medium_Phone 设备 smoke 已通过 |
 | 外部网络代理 | 可用 | `127.0.0.1:7890` 监听正常；默认及显式代理 GitHub 探测均为 HTTP 200；受限沙箱内的 loopback 失败不代表代理离线 |
+| 测试进程并发 | 已收敛 | 原生 DuckDB Node 模块在 `node --test` 默认全量并发下偶发 SIGSEGV（agent-events-ws 集成测试套件，旧提交同样复现）；`npm test` 已固定 `--test-concurrency=2`，5 连跑稳定 |
 | Gradle 全局镜像 | 需隔离 | `/Users/Gin/.gradle/init.d/aliyun-mirror.gradle.kts` 会清空 Flutter 官方 Maven 仓库；Flutter 构建使用独立 `GRADLE_USER_HOME`，不修改用户全局配置 |
 | 服务端外部依赖 | TypeScript、Node 类型、Decimal、Fastify、Zod、DuckDB Node API、csv-parse、ExcelJS、mailparser 与官方 MCP SDK 已安装 | Pi 扩展 SDK 尚未安装；代理已恢复，可按后续功能点逐项引入并验证 |
 | ExcelJS 上游审计项 | 已评估、待上游修复 | uuid advisory 不命中 Lyra 的 XLSX 只读路径；保留 ExcelJS 4.4.0 精确锁定并跟踪升级，不用 `npm audit fix --force` 降级主依赖 |
