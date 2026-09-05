@@ -114,6 +114,16 @@ describe("Ledger read REST routes", () => {
       assert.equal(expiringData.count, 0);
       assert.equal(expiringData.basis, "historical_premium_not_market_value");
 
+      // accounts 是空输入 schema 工具；路由只强制显式账户范围。
+      const accounts = await app.inject({
+        method: "GET",
+        url: "/v1/ledger/accounts",
+        headers,
+        query: { scope: "all" },
+      });
+      assert.equal(accounts.statusCode, 200);
+      assert.deepEqual(accounts.json().data, { rows: [], count: 0, currencyGroups: [] });
+
       const missingDays = await app.inject({
         method: "GET",
         url: "/v1/ledger/expiring",

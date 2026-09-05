@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/session.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
+import '../import/import_sheet.dart';
 import 'pairing_panel.dart';
 
 /// 总览页：未配对时展示配对表单，已配对后展示真实账本汇总。
@@ -72,7 +73,7 @@ class OverviewScreen extends ConsumerWidget {
                         const PairingPanel(),
                         const SizedBox(height: 16),
                       ],
-                      const _ConnectionActions(),
+                      _ConnectionActions(paired: paired),
                     ],
                   ),
                 ),
@@ -462,7 +463,9 @@ class _StatusRow extends StatelessWidget {
 }
 
 class _ConnectionActions extends StatelessWidget {
-  const _ConnectionActions();
+  const _ConnectionActions({required this.paired});
+
+  final bool paired;
 
   @override
   Widget build(BuildContext context) {
@@ -485,7 +488,24 @@ class _ConnectionActions extends StatelessWidget {
           ),
           const SizedBox(height: 18),
           FilledButton.icon(
-            onPressed: null,
+            onPressed: paired
+                ? () => showModalBottomSheet<void>(
+                    context: context,
+                    isScrollControlled: true,
+                    backgroundColor: LyraColors.elevated,
+                    shape: const RoundedRectangleBorder(
+                      borderRadius: BorderRadius.vertical(
+                        top: Radius.circular(28),
+                      ),
+                    ),
+                    builder: (BuildContext sheetContext) => Padding(
+                      padding: EdgeInsets.only(
+                        bottom: MediaQuery.of(sheetContext).viewInsets.bottom,
+                      ),
+                      child: const ImportSheet(),
+                    ),
+                  )
+                : null,
             icon: const Icon(LyraIcons.importFile),
             label: const Text('导入 Schwab 文件'),
           ),

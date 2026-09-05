@@ -36,6 +36,9 @@ class LyraApiClient {
   final Future<String?> Function() tokenRefresher;
   final Dio _dio;
 
+  /// 供文件上传等数据层复用同一套拦截器（协议头与令牌注入）。
+  Dio get dio => _dio;
+
   String? _accessToken;
 
   /// 供调用方检查当前令牌状态。

@@ -25,6 +25,7 @@ export interface LedgerRouteOptions {
 
 /** 显式声明的只读路由表；保持与设计方案 §14.2 的路由面一致。 */
 const LEDGER_TOOL_ROUTES: readonly { path: string; tool: FinancialToolName }[] = [
+  { path: "/v1/ledger/accounts", tool: "accounts" },
   { path: "/v1/ledger/summary", tool: "summary" },
   { path: "/v1/ledger/positions", tool: "positions" },
   { path: "/v1/ledger/expiring", tool: "expiring" },
