@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../core/design/lyra_colors.dart';
 import '../core/design/lyra_icons.dart';
+import '../features/agent/agent_screen.dart';
 import '../features/overview/overview_screen.dart';
 import '../features/section/section_screen.dart';
 
@@ -62,14 +63,8 @@ class _LyraShellState extends State<LyraShell> {
       icon: LyraIcons.ledger,
       sections: <String>['全部交易', '现金流', '来源与审计'],
     ),
-    SectionScreen(
+    AgentScreen(
       key: ValueKey<String>('agent-screen'),
-      eyebrow: 'AGENT / READ ONLY',
-      title: 'Agent',
-      description: 'Claude、Pi 与 OpenCode 共用只读金融工具，并在回合边界显式切换。',
-      icon: LyraIcons.agent,
-      sections: <String>['Claude', 'Pi', 'OpenCode'],
-      accent: LyraColors.brandBright,
     ),
   ];
 
