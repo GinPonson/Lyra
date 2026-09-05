@@ -189,12 +189,6 @@ export function consumePairingChallenge(
   candidate: string,
   now: Date,
 ): PairingChallengeRecord {
-  if (record.consumedAt !== null) {
-    throw new DeviceAuthError("PAIRING_CODE_USED", "配对码已经使用");
-  }
-  if (now.getTime() >= Date.parse(record.expiresAt)) {
-    throw new DeviceAuthError("PAIRING_CODE_EXPIRED", "配对码已经过期");
-  }
   const candidateHash = Buffer.from(hashPairingCode(candidate), "hex");
   const expectedHash = Buffer.from(record.codeHash, "hex");
   if (
@@ -202,6 +196,12 @@ export function consumePairingChallenge(
     || !timingSafeEqual(candidateHash, expectedHash)
   ) {
     throw new DeviceAuthError("PAIRING_CODE_INVALID", "配对码无效");
+  }
+  if (record.consumedAt !== null) {
+    throw new DeviceAuthError("PAIRING_CODE_USED", "配对码已经使用");
+  }
+  if (now.getTime() >= Date.parse(record.expiresAt)) {
+    throw new DeviceAuthError("PAIRING_CODE_EXPIRED", "配对码已经过期");
   }
   return { ...record, consumedAt: now.toISOString() };
 }

@@ -53,6 +53,22 @@ describe("device pairing security", () => {
     );
   });
 
+  it("过期记录不阻塞其他配对码的匹配", () => {
+    const now = new Date("2026-08-30T00:00:00Z");
+    const expired = createPairingChallenge(now, 1_000);
+    const fresh = createPairingChallenge(now, 5 * 60 * 1000);
+    assert.throws(
+      () => consumePairingChallenge(expired.record, fresh.code, new Date("2026-08-30T00:00:01Z")),
+      (error: unknown) => error instanceof DeviceAuthError && error.code === "PAIRING_CODE_INVALID",
+    );
+    const consumed = consumePairingChallenge(
+      fresh.record,
+      fresh.code,
+      new Date("2026-08-30T00:00:01Z"),
+    );
+    assert.equal(consumed.consumedAt, new Date("2026-08-30T00:00:01Z").toISOString());
+  });
+
   it("签发随机不透明凭据并只用哈希验证", () => {
     const first = createOpaqueCredential();
     const second = createOpaqueCredential();
