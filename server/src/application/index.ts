@@ -174,6 +174,11 @@ export { GmailService } from "./gmail-service.js";
 export type { GmailGoogleOAuthConfig } from "./gmail-service.js";
 export { GmailSyncService } from "./gmail-sync-service.js";
 export type { GmailSyncHttpResponse } from "./gmail-sync-service.js";
+export { DevicePairingService } from "./device-pairing-service.js";
+export type {
+  DevicePairingHttpResponse,
+  DeviceTokenRefreshHttpResponse,
+} from "./device-pairing-service.js";
 export { invokeAuthenticatedAgentTool } from "./agent-tool-invocation.js";
 export { createFinancialToolRegistry } from "./financial-tool-runtime.js";
 export {

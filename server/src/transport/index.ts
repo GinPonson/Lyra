@@ -24,5 +24,7 @@ export { registerImportRoutes } from "./import-routes.js";
 export type { ImportRouteOptions } from "./import-routes.js";
 export { registerGmailRoutes } from "./gmail-routes.js";
 export type { GmailRouteOptions } from "./gmail-routes.js";
+export { registerDeviceRoutes } from "./device-routes.js";
+export type { DeviceRouteOptions } from "./device-routes.js";
 export type { HttpServerOptions } from "./http-server.js";
 export type { ServerProtocolMetadata } from "./protocol-version.js";
