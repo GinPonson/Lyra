@@ -12,9 +12,7 @@ class LyraApp extends StatelessWidget {
     return MaterialApp(
       title: 'Lyra',
       debugShowCheckedModeBanner: false,
-      theme: LyraTheme.dark,
-      darkTheme: LyraTheme.dark,
-      themeMode: ThemeMode.dark,
+      theme: LyraTheme.light,
       home: const LyraShell(),
     );
   }

@@ -70,9 +70,9 @@ class _PairingPanelState extends ConsumerState<PairingPanel> {
     return Container(
       padding: const EdgeInsets.all(22),
       decoration: BoxDecoration(
-        color: LyraColors.elevated,
-        borderRadius: BorderRadius.circular(28),
-        border: Border.all(color: LyraColors.divider),
+        color: LyraColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -82,7 +82,7 @@ class _PairingPanelState extends ConsumerState<PairingPanel> {
               const Icon(
                 LyraIcons.security,
                 size: 20,
-                color: LyraColors.brandBright,
+                color: LyraColors.accent,
               ),
               const SizedBox(width: 10),
               Text('配对 Lyra 服务端', style: Theme.of(context).textTheme.titleLarge),

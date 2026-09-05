@@ -179,6 +179,8 @@
 | Phase 4 | Agent 事件流连接失败安全收口 | 已完成 | `flutter analyze` 无问题;`flutter test` 26 项在服务端运行与停止两种环境下均全部通过(含干净 HEAD 上即失败的既有 4 项编排测试);`flutter build apk --debug` 成功 | 2026-09-05 | `WebSocketChannel.connect` 的 `ready` Future 失败此前无人处理,连接被拒或升级失败时成为未处理异步异常(干净 HEAD 复测确认既有缺陷,与本次改动无关);显式吞掉 `ready` 错误,断开重连统一由 stream 的 onError/onDone 驱动 |
 | Phase 2 | Medium_Phone 模拟器端到端 smoke | 已完成 | 全新 Flutter 模板项目复现 file_selector_android 0.5.2+10 构建失败,dependency_overrides 钉回 0.5.1+9(groovy 构建)后 `flutter build apk --debug` 成功;模拟器安装启动无崩溃、五导航完整;配对→空账本权威语境(已同步)→导入面板→系统文件选择器选 CSV→octet-stream 上传→`ACCOUNT_MAPPING_REQUIRED` 稳定错误展示→Agent 页三供应商会话入口按固定顺序渲染→Claude 会话创建成功(空闲、账本版本语境);截图存档 `plans/assets/smoke-20260905-*.png` | 2026-09-05 | 0.5.2+10 的 Kotlin DSL 构建脚本在 Flutter 3.47.2(AGP 9.1.0/Gradle 9.3)下 `kotlin{}`/`android{}` 访问器无法解析且与项目配置无关,上游修复前保留钉版;导入提交与 Agent 真实回合不在 smoke 范围(空账本无账户可映射,账户创建路由待排期;真实模型会话按既有纪律不启动) |
 
+| Phase 2 | App 极简专业白色主题重构 | 已完成 | `flutter analyze` 无问题;`flutter test` 26 项全部通过;`flutter build apk --debug` 成功;Medium_Phone 模拟器目视验收总览/持仓/Agent 会话三页,截图存档 `plans/assets/theme-20260905-*.png` | 2026-09-05 | 按用户要求弃用深色主题,改为纯白画布 + 近黑正文 + 发丝分割线 + 单一靛蓝强调(Stripe/Linear 式极简专业风);`LyraColors` 重写为语义化调色板(accent/ink/hairline 等),`LyraTheme` 提供浅色 Material 3 主题并全局启用等宽数字;总览页移除装饰性光晕绘制改为排版主导的 Hero 卡片;五个页面与导航、输入框、按钮、气泡、芯片全部适配;系统栏图标切换为深色 |
+
 ## 验证记录
 
 | 日期 | 命令 | 结果 | 说明 |
@@ -373,6 +375,7 @@
 | 2026-09-05 | `flutter analyze` / `flutter test` | 通过 | 静态分析无问题；26 项 Flutter 测试在服务端运行与停止两种环境下均全部通过：新增配对响应六字段与刷新响应四字段（真实服务端形状）解析回归 2 项；`AgentLiveEvents` ready 失败收口修复后，干净 HEAD 上即失败的既有 4 项编排测试恢复通过 |
 | 2026-09-05 | Medium_Phone 模拟器 401 刷新链路复验 | 通过 | 访问令牌过期后 `GET /v1/ledger/summary` 401 → `POST /v1/devices/tokens` 200 → 原请求重放 200,App 总览保持已同步;修复前该路径因刷新响应解析崩溃中断重放 |
 | 2026-09-05 | Medium_Phone 模拟器 Agent 会话创建 | 通过 | 空账本下 `POST /v1/agent/sessions` 创建 Claude 会话成功,会话页渲染空闲状态与账本版本 0 权威语境;未发送真实回合（按既有纪律不启动模型会话） |
+| 2026-09-05 | `flutter analyze` / `flutter test` / `flutter build apk --debug` | 通过 | 白色主题重构:静态分析无问题,26 项测试全部通过,debug 构建成功;模拟器目视验收总览、持仓、Agent 会话三页(截图 `theme-20260905-*.png`) |
 | 2026-09-05 | `npm run check` | 通过 | 配对码消费顺序修复：`consumePairingChallenge` 哈希比较前置并新增回归测试；127 个测试套件、累计 278 项测试全部通过 |
 | 2026-09-05 | `GRADLE_USER_HOME=/private/tmp/lyra-gradle-home-20260831 flutter build apk --debug` | 通过 | `file_selector_android` 钉回 0.5.1+9 后 Android 构建恢复（52.6s）；修复配对协议头与刷新解析后再次构建成功 |
 | 2026-09-05 | Medium_Phone 模拟器端到端 smoke | 通过 | `com.lyrafinance.lyra_mobile` 安装启动无崩溃；配对真实服务端（127.0.0.1:3141 经 adb reverse）成功并显示空账本权威语境（账本版本 0、已同步）；导入面板经系统文件选择器上传 Schwab CSV，服务端正确返回 `ACCOUNT_MAPPING_REQUIRED` 且 App 显示稳定错误码；Agent 页三供应商入口渲染正常；401 刷新路径暴露的响应解析缺陷已修复并复验配对成功 |

@@ -26,7 +26,7 @@ class OverviewScreen extends ConsumerWidget {
     };
     final bool paired = session is SessionPaired;
     return ColoredBox(
-      color: LyraColors.black,
+      color: LyraColors.canvas,
       child: SafeArea(
         bottom: false,
         child: Align(
@@ -54,7 +54,7 @@ class OverviewScreen extends ConsumerWidget {
                             : summary.entries.first.currency,
                         ledgerVersion: summary?.metadata.ledgerVersion,
                       ),
-                      const SizedBox(height: 20),
+                      const SizedBox(height: 12),
                       _MetricGrid(
                         netDeposits: summary == null || summary.entries.isEmpty
                             ? null
@@ -63,15 +63,15 @@ class OverviewScreen extends ConsumerWidget {
                             ? null
                             : summary.entries.first.cashBalance,
                       ),
-                      const SizedBox(height: 16),
+                      const SizedBox(height: 12),
                       _LedgerStatusCard(
                         ledgerVersion: summary?.metadata.ledgerVersion,
                         asOf: summary?.metadata.asOf,
                       ),
-                      const SizedBox(height: 16),
+                      const SizedBox(height: 12),
                       if (!paired) ...<Widget>[
                         const PairingPanel(),
-                        const SizedBox(height: 16),
+                        const SizedBox(height: 12),
                       ],
                       _ConnectionActions(paired: paired),
                     ],
@@ -99,8 +99,7 @@ class _OverviewHeader extends StatelessWidget {
             children: <Widget>[
               Text(
                 'LYRA / LEDGER 01',
-                style: Theme.of(context).textTheme.labelSmall
-                    ?.copyWith(color: LyraColors.muted),
+                style: Theme.of(context).textTheme.labelSmall,
               ),
               const SizedBox(height: 4),
               Text('总览', style: Theme.of(context).textTheme.titleLarge),
@@ -131,9 +130,9 @@ class _AccountScopePill extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.fromLTRB(14, 10, 12, 10),
         decoration: BoxDecoration(
-          color: LyraColors.elevated,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: LyraColors.divider),
+          color: LyraColors.surfaceSubtle,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: LyraColors.hairline),
         ),
         child: const Row(
           mainAxisSize: MainAxisSize.min,
@@ -141,10 +140,16 @@ class _AccountScopePill extends StatelessWidget {
             Icon(
               LyraIcons.accountScope,
               size: 18,
-              color: LyraColors.brandBright,
+              color: LyraColors.accent,
             ),
             SizedBox(width: 8),
-            Text('全部活跃账户', style: TextStyle(fontWeight: FontWeight.w600)),
+            Text(
+              '全部活跃账户',
+              style: TextStyle(
+                fontWeight: FontWeight.w600,
+                color: LyraColors.ink,
+              ),
+            ),
             SizedBox(width: 6),
             Icon(LyraIcons.disclosure, size: 18, color: LyraColors.muted),
           ],
@@ -169,66 +174,49 @@ class _LedgerHero extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bool reduceMotion = MediaQuery.disableAnimationsOf(context);
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
         final double heroSize = math.min(
-          72,
-          math.max(48, constraints.maxWidth * 0.145),
+          64,
+          math.max(44, constraints.maxWidth * 0.13),
         );
         return Container(
-          height: constraints.maxWidth < 380 ? 286 : 310,
-          clipBehavior: Clip.antiAlias,
+          width: double.infinity,
+          padding: EdgeInsets.all(constraints.maxWidth < 380 ? 20 : 24),
           decoration: BoxDecoration(
-            color: LyraColors.elevated,
-            borderRadius: BorderRadius.circular(32),
+            color: LyraColors.surface,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: LyraColors.hairline),
           ),
-          child: Stack(
-            fit: StackFit.expand,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
-              TweenAnimationBuilder<double>(
-                duration: reduceMotion
-                    ? Duration.zero
-                    : const Duration(milliseconds: 1100),
-                curve: Curves.easeOutCubic,
-                tween: Tween<double>(begin: 0, end: 1),
-                builder:
-                    (BuildContext context, double progress, Widget? child) {
-                      return CustomPaint(painter: _LedgerArcPainter(progress));
-                    },
+              Row(
+                children: <Widget>[
+                  Text(
+                    '账本已实现损益',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const Spacer(),
+                  _ConnectionBadge(connected: connected),
+                ],
               ),
-              Padding(
-                padding: const EdgeInsets.all(24),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Row(
-                      children: <Widget>[
-                        Text(
-                          '账本已实现损益',
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                        const Spacer(),
-                        _ConnectionBadge(connected: connected),
-                      ],
-                    ),
-                    const Spacer(),
-                    Text(
-                      realizedPnl ?? '—',
-                      key: const ValueKey<String>('overview-hero-value'),
-                      style: Theme.of(context).textTheme.displayLarge?.copyWith(
-                        fontSize: heroSize,
-                        color: LyraColors.white,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      _caption(),
-                      style: Theme.of(context).textTheme.bodyMedium
-                          ?.copyWith(color: LyraColors.muted),
-                    ),
-                  ],
+              const SizedBox(height: 26),
+              Text(
+                realizedPnl ?? '—',
+                key: const ValueKey<String>('overview-hero-value'),
+                style: Theme.of(context).textTheme.displayLarge?.copyWith(
+                  fontSize: heroSize,
+                  color: realizedPnl == null
+                      ? LyraColors.muted
+                      : LyraColors.ink,
                 ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                _caption(),
+                style: Theme.of(context).textTheme.bodyMedium
+                    ?.copyWith(color: LyraColors.muted),
               ),
             ],
           ),
@@ -256,24 +244,27 @@ class _ConnectionBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: LyraColors.black.withValues(alpha: 0.48),
-        borderRadius: BorderRadius.circular(99),
-        border: Border.all(color: LyraColors.divider),
+        color: connected ? LyraColors.accentSoft : LyraColors.warningSoft,
+        borderRadius: BorderRadius.circular(999),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
           Icon(
             LyraIcons.security,
-            size: 15,
-            color: connected ? LyraColors.brandBright : LyraColors.warning,
+            size: 14,
+            color: connected ? LyraColors.accent : LyraColors.warning,
           ),
           const SizedBox(width: 6),
           Text(
             connected ? '已配对' : '未连接',
-            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: connected ? LyraColors.accentDeep : LyraColors.warning,
+            ),
           ),
         ],
       ),
@@ -334,29 +325,29 @@ class _MetricCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      constraints: const BoxConstraints(minHeight: 148),
+      constraints: const BoxConstraints(minHeight: 138),
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        color: LyraColors.elevated,
-        borderRadius: BorderRadius.circular(24),
+        color: LyraColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Icon(data.icon, size: 20, color: LyraColors.brandBright),
-          const SizedBox(height: 18),
           Text(
             data.label,
             style: Theme.of(context).textTheme.bodySmall
                 ?.copyWith(color: LyraColors.muted),
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: 14),
           Text(
             data.value,
-            style: Theme.of(context).textTheme.headlineSmall
-                ?.copyWith(fontWeight: FontWeight.w700),
+            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+              color: data.value == '—' ? LyraColors.muted : LyraColors.ink,
+            ),
           ),
-          const SizedBox(height: 5),
+          const SizedBox(height: 6),
           Text(
             data.note,
             style: Theme.of(context).textTheme.labelSmall?.copyWith(
@@ -380,20 +371,17 @@ class _LedgerStatusCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(22),
+      padding: const EdgeInsets.fromLTRB(22, 18, 22, 18),
       decoration: BoxDecoration(
-        color: LyraColors.warm,
-        borderRadius: BorderRadius.circular(28),
+        color: LyraColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Text(
-            '数据语境',
-            style: Theme.of(context).textTheme.titleLarge
-                ?.copyWith(color: LyraColors.ink),
-          ),
-          const SizedBox(height: 18),
+          Text('数据语境', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 6),
           _StatusRow(
             icon: LyraIcons.ledgerVersion,
             label: '账本版本',
@@ -432,18 +420,21 @@ class _StatusRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: EdgeInsets.only(bottom: isLast ? 0 : 14, top: isLast ? 14 : 0),
+      padding: EdgeInsets.only(bottom: isLast ? 0 : 12, top: isLast ? 12 : 0),
       decoration: BoxDecoration(
         border: isLast
             ? null
-            : const Border(bottom: BorderSide(color: Color(0xFFDADBD7))),
+            : const Border(bottom: BorderSide(color: LyraColors.hairline)),
       ),
       child: Row(
         children: <Widget>[
-          Icon(icon, size: 20, color: LyraColors.brandDeep),
+          Icon(icon, size: 18, color: LyraColors.muted),
           const SizedBox(width: 12),
           Expanded(
-            child: Text(label, style: const TextStyle(color: LyraColors.ink)),
+            child: Text(
+              label,
+              style: const TextStyle(color: LyraColors.inkSecondary),
+            ),
           ),
           // 时间戳等长值允许换行，避免窄屏溢出破坏可读性。
           Flexible(
@@ -452,7 +443,7 @@ class _StatusRow extends StatelessWidget {
               textAlign: TextAlign.right,
               style: const TextStyle(
                 color: LyraColors.ink,
-                fontWeight: FontWeight.w700,
+                fontWeight: FontWeight.w600,
               ),
             ),
           ),
@@ -472,14 +463,14 @@ class _ConnectionActions extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(22),
       decoration: BoxDecoration(
-        color: LyraColors.elevated,
-        borderRadius: BorderRadius.circular(28),
-        border: Border.all(color: LyraColors.divider),
+        color: LyraColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          Text('开始建立账本', style: Theme.of(context).textTheme.titleLarge),
+          Text('开始建立账本', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
           Text(
             '服务端 API 接通后启用导入与 Google 授权。',
@@ -492,10 +483,10 @@ class _ConnectionActions extends StatelessWidget {
                 ? () => showModalBottomSheet<void>(
                     context: context,
                     isScrollControlled: true,
-                    backgroundColor: LyraColors.elevated,
+                    backgroundColor: LyraColors.surface,
                     shape: const RoundedRectangleBorder(
                       borderRadius: BorderRadius.vertical(
-                        top: Radius.circular(28),
+                        top: Radius.circular(20),
                       ),
                     ),
                     builder: (BuildContext sheetContext) => Padding(
@@ -518,63 +509,5 @@ class _ConnectionActions extends StatelessWidget {
         ],
       ),
     );
-  }
-}
-
-/// 低成本的一次性背景绘制；不在滚动或空闲时持续刷新。
-class _LedgerArcPainter extends CustomPainter {
-  const _LedgerArcPainter(this.progress);
-
-  final double progress;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final Offset center = Offset(size.width * 0.78, size.height * 0.38);
-    final double radius = math.min(size.width, size.height) * 0.52;
-
-    final Paint glow = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 34
-      ..strokeCap = StrokeCap.round
-      ..color = LyraColors.brandPrimary.withValues(alpha: 0.24 * progress)
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 28);
-    canvas.drawArc(
-      Rect.fromCircle(center: center, radius: radius),
-      -math.pi * 0.82,
-      math.pi * 1.24 * progress,
-      false,
-      glow,
-    );
-
-    final Paint line = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.2
-      ..strokeCap = StrokeCap.round
-      ..shader = const LinearGradient(
-        colors: <Color>[
-          LyraColors.brandBright,
-          LyraColors.brandPrimary,
-          Color(0x00676CFF),
-        ],
-      ).createShader(Rect.fromLTWH(0, 0, size.width, size.height));
-    canvas.drawArc(
-      Rect.fromCircle(center: center, radius: radius),
-      -math.pi * 0.82,
-      math.pi * 1.24 * progress,
-      false,
-      line,
-    );
-
-    final Paint grid = Paint()
-      ..strokeWidth = 0.7
-      ..color = LyraColors.white.withValues(alpha: 0.055);
-    for (double y = 36; y < size.height; y += 36) {
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _LedgerArcPainter oldDelegate) {
-    return oldDelegate.progress != progress;
   }
 }

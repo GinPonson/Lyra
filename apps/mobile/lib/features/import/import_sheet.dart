@@ -160,7 +160,7 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
               const Icon(
                 LyraIcons.importFile,
                 size: 20,
-                color: LyraColors.brandBright,
+                color: LyraColors.accent,
               ),
               const SizedBox(width: 10),
               Text('导入 Schwab 文件', style: Theme.of(context).textTheme.titleLarge),
@@ -247,8 +247,9 @@ class _PreviewStats extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: LyraColors.warm,
-        borderRadius: BorderRadius.circular(20),
+        color: LyraColors.surfaceSubtle,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

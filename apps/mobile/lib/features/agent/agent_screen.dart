@@ -438,7 +438,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
     final paired = sessionState.value is SessionPaired;
 
     return ColoredBox(
-      color: LyraColors.black,
+      color: LyraColors.canvas,
       child: SafeArea(
         bottom: false,
         child: Align(
@@ -458,7 +458,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
         icon: LyraIcons.agent,
         title: '未连接服务端',
         description: '完成设备配对后即可与只读金融 Agent 对话。',
-        accent: LyraColors.brandBright,
+        accent: LyraColors.accent,
       );
     }
     if (state is AgentError) {
@@ -466,7 +466,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
         icon: LyraIcons.agent,
         title: 'Agent 暂不可用',
         description: state.message,
-        accent: LyraColors.brandBright,
+        accent: LyraColors.accent,
         actionLabel: '重试',
         onAction: () => ref.read(agentControllerProvider.notifier).loadAvailability(),
       );
@@ -521,7 +521,7 @@ class _SessionViewState extends ConsumerState<_SessionView> {
               Text(
                 'AGENT / READ ONLY',
                 style: Theme.of(context).textTheme.labelSmall
-                    ?.copyWith(color: LyraColors.brandBright),
+                    ?.copyWith(color: LyraColors.accent),
               ),
               const SizedBox(height: 6),
               Row(
@@ -661,7 +661,7 @@ class _CreateView extends ConsumerWidget {
         Text(
           'AGENT / READ ONLY',
           style: Theme.of(context).textTheme.labelSmall
-              ?.copyWith(color: LyraColors.brandBright),
+              ?.copyWith(color: LyraColors.accent),
         ),
         const SizedBox(height: 14),
         Text('Agent', style: Theme.of(context).textTheme.headlineLarge),
@@ -715,22 +715,22 @@ class _InfoCard extends StatelessWidget {
         Container(
           padding: const EdgeInsets.all(24),
           decoration: BoxDecoration(
-            color: LyraColors.elevated,
-            borderRadius: BorderRadius.circular(32),
-            border: Border.all(color: LyraColors.divider),
+            color: LyraColors.surface,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: LyraColors.hairline),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
               Container(
-                width: 52,
-                height: 52,
+                width: 44,
+                height: 44,
                 alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: accent.withValues(alpha: 0.18),
+                decoration: const BoxDecoration(
+                  color: LyraColors.accentSoft,
                   shape: BoxShape.circle,
                 ),
-                child: Icon(icon, color: accent),
+                child: Icon(icon, color: accent, size: 22),
               ),
               const SizedBox(height: 24),
               Text(title, style: Theme.of(context).textTheme.titleLarge),
@@ -776,16 +776,16 @@ class _MessageBubble extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         constraints: const BoxConstraints(maxWidth: 560),
         decoration: BoxDecoration(
-          color: isUser ? LyraColors.brandPrimary : LyraColors.elevated,
-          borderRadius: BorderRadius.circular(18),
+          color: isUser ? LyraColors.accent : LyraColors.surfaceSubtle,
+          borderRadius: BorderRadius.circular(14),
           border: Border.all(
-            color: isStreaming ? LyraColors.brandBright : LyraColors.divider,
+            color: isStreaming ? LyraColors.accent : LyraColors.hairline,
           ),
         ),
         child: Text(
           isStreaming ? '$content▍' : content,
           style: TextStyle(
-            color: isUser ? Colors.white : LyraColors.ink,
+            color: isUser ? LyraColors.surface : LyraColors.ink,
             height: 1.5,
           ),
         ),
@@ -846,13 +846,14 @@ class _StatusChip extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: LyraColors.elevated,
+        color: LyraColors.surfaceSubtle,
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: LyraColors.divider),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Text(
         label,
-        style: Theme.of(context).textTheme.labelSmall,
+        style: Theme.of(context).textTheme.labelSmall
+            ?.copyWith(color: LyraColors.inkSecondary, letterSpacing: 0),
       ),
     );
   }
@@ -884,9 +885,9 @@ class _ToolCallTile extends StatelessWidget {
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
-        color: LyraColors.elevated,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: LyraColors.divider),
+        color: LyraColors.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

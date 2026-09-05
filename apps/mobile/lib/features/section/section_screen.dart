@@ -13,7 +13,7 @@ class SectionScreen extends StatelessWidget {
     required this.description,
     required this.icon,
     required this.sections,
-    this.accent = LyraColors.brandPrimary,
+    this.accent = LyraColors.accent,
     super.key,
   });
 
@@ -27,7 +27,7 @@ class SectionScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ColoredBox(
-      color: LyraColors.black,
+      color: LyraColors.canvas,
       child: SafeArea(
         bottom: false,
         child: Align(
@@ -56,33 +56,33 @@ class SectionScreen extends StatelessWidget {
                       Text(
                         description,
                         style: Theme.of(context).textTheme.bodyLarge
-                            ?.copyWith(color: LyraColors.muted, height: 1.55),
+                            ?.copyWith(color: LyraColors.inkSecondary, height: 1.55),
                       ),
                       const SizedBox(height: 34),
                       Container(
                         padding: const EdgeInsets.all(24),
                         decoration: BoxDecoration(
-                          color: LyraColors.elevated,
-                          borderRadius: BorderRadius.circular(32),
-                          border: Border.all(color: LyraColors.divider),
+                          color: LyraColors.surface,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: LyraColors.hairline),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: <Widget>[
                             Container(
-                              width: 52,
-                              height: 52,
+                              width: 44,
+                              height: 44,
                               alignment: Alignment.center,
                               decoration: BoxDecoration(
-                                color: accent.withValues(alpha: 0.18),
+                                color: LyraColors.accentSoft,
                                 shape: BoxShape.circle,
                               ),
-                              child: Icon(icon, color: accent),
+                              child: Icon(icon, color: accent, size: 22),
                             ),
-                            const SizedBox(height: 24),
+                            const SizedBox(height: 20),
                             Text(
                               '等待服务端数据',
-                              style: Theme.of(context).textTheme.titleLarge,
+                              style: Theme.of(context).textTheme.titleMedium,
                             ),
                             const SizedBox(height: 8),
                             Text(
@@ -96,14 +96,15 @@ class SectionScreen extends StatelessWidget {
                       const SizedBox(height: 16),
                       ...sections.map(
                         (String section) => Container(
-                          margin: const EdgeInsets.only(bottom: 10),
+                          margin: const EdgeInsets.only(bottom: 8),
                           padding: const EdgeInsets.symmetric(
                             horizontal: 18,
-                            vertical: 17,
+                            vertical: 16,
                           ),
                           decoration: BoxDecoration(
-                            color: LyraColors.elevated,
-                            borderRadius: BorderRadius.circular(18),
+                            color: LyraColors.surface,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: LyraColors.hairline),
                           ),
                           child: Row(
                             children: <Widget>[
@@ -112,6 +113,7 @@ class SectionScreen extends StatelessWidget {
                                   section,
                                   style: const TextStyle(
                                     fontWeight: FontWeight.w600,
+                                    color: LyraColors.ink,
                                   ),
                                 ),
                               ),

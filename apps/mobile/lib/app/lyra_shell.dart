@@ -153,7 +153,7 @@ class _LyraMark extends StatelessWidget {
       height: 44,
       alignment: Alignment.center,
       decoration: const BoxDecoration(
-        color: LyraColors.brandPrimary,
+        color: LyraColors.accent,
         shape: BoxShape.circle,
       ),
       child: Text(
