@@ -145,6 +145,9 @@ class AgentLiveEvents {
       <String>['bearer', accessToken],
     );
     _channel = channel;
+    // 连接失败会同时从 ready 与 stream 两个入口报错；ready 在此显式吞掉，
+    // 断开重连统一由 stream 的 onError/onDone 驱动，避免未处理异步异常。
+    unawaited(channel.ready.catchError((Object error) {}));
     channel.stream.listen(
       _handleMessage,
       onDone: _handleDisconnect,
