@@ -4,15 +4,44 @@ import { ApplicationError } from "../../application/app-error.js";
 import { isGmailSyncErrorCode } from "../../domain/gmail/index.js";
 import type { LyraDatabase } from "./database.js";
 
+/**
+ * 把 DuckDB TIMESTAMPTZ 文本（如 "2026-09-05 10:08:23.879941+08"）规范为保留
+ * 微秒的 UTC ISO 文本。
+ *
+ * 微秒精度必须保留：连接状态的乐观锁以 updated_at 精确相等做比较，经 Date
+ * 归一化会丢失微秒并使所有基于 current_timestamp 的行永远无法通过 CAS。
+ */
 function parseTimestamp(value: unknown, label: string): string {
   if (typeof value !== "string") {
     throw new Error(`${label}必须是时间字符串`);
   }
-  const timestamp = new Date(value);
-  if (Number.isNaN(timestamp.getTime())) {
+  const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(?:([+-])(\d{2})(?::?(\d{2}))?|Z|UTC)?$/.exec(
+    value.trim(),
+  );
+  if (match === null) {
     throw new Error(`${label}无效`);
   }
-  return timestamp.toISOString();
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const fraction = match[7];
+  const sign = match[8];
+  const offsetHour = match[9] === undefined ? 0 : Number(match[9]);
+  const offsetMinute = match[10] === undefined ? 0 : Number(match[10]);
+  const offsetMinutes = sign === undefined || sign === "+"
+    ? offsetHour * 60 + offsetMinute
+    : -(offsetHour * 60 + offsetMinute);
+  const utcMillis = Date.UTC(year, month - 1, day, hour, minute, second)
+    - offsetMinutes * 60_000;
+  const base = new Date(utcMillis);
+  if (Number.isNaN(base.getTime())) {
+    throw new Error(`${label}无效`);
+  }
+  const micros = (fraction ?? "0").padEnd(6, "0").slice(0, 6);
+  return base.toISOString().replace(/\.\d{3}Z$/, `.${micros}Z`);
 }
 
 function requireText(value: unknown, label: string): string {
@@ -241,7 +270,7 @@ export async function createGmailAccountMappingRow(
       CAST($account_id AS UUID),
       CAST($at AS TIMESTAMPTZ), CAST($at AS TIMESTAMPTZ)
     )
-    RETURNING created_at, updated_at
+    RETURNING id, created_at, updated_at
   `, {
     id: randomMappingId(),
     connection_id: record.connectionId,

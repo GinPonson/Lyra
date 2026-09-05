@@ -23,7 +23,7 @@ import { registerAgentEventsRoute } from "./transport/agent-events.js";
 import { registerLedgerRoutes } from "./transport/ledger-routes.js";
 import { registerImportRoutes } from "./transport/import-routes.js";
 import { registerGmailRoutes } from "./transport/gmail-routes.js";
-import { ImportService, GmailService } from "./application/index.js";
+import { ImportService, GmailService, GmailSyncService } from "./application/index.js";
 import { SecretCipher } from "./infrastructure/security/index.js";
 
 const environmentSchema = z.object({
@@ -93,6 +93,12 @@ async function start(): Promise<void> {
     cipher,
     googleOAuth,
   });
+  const gmailSyncService = new GmailSyncService({
+    database,
+    writeCoordinator,
+    cipher,
+    googleOAuth,
+  });
   const executables = {
     claude: environment.LYRA_AGENT_CLAUDE_PATH,
     pi: environment.LYRA_AGENT_PI_PATH,
@@ -159,6 +165,7 @@ async function start(): Promise<void> {
   });
   registerGmailRoutes(app, {
     gmailService,
+    syncService: gmailSyncService,
     authenticateDevice,
   });
   app.addHook("onClose", async () => {

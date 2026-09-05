@@ -1,13 +1,14 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 
-import type { GmailService } from "../application/index.js";
+import type { GmailService, GmailSyncService } from "../application/index.js";
 import { ApplicationError } from "../application/index.js";
 import type { PairedDeviceAuthRecord } from "../infrastructure/security/device-auth.js";
 
-/** Gmail 连接、映射与授权事务路由的装配依赖。 */
+/** Gmail 连接、映射、授权事务与同步路由的装配依赖。 */
 export interface GmailRouteOptions {
   gmailService: GmailService;
+  syncService: GmailSyncService;
   authenticateDevice: (token: string) => Promise<PairedDeviceAuthRecord>;
 }
 
@@ -24,6 +25,13 @@ const updateMappingSchema = z.object({
 
 const disconnectSchema = z.object({
   revoke: z.coerce.boolean().default(false),
+});
+
+const syncSchema = z.object({
+  /** 用户确认的首次扫描或重扫起始日（YYYY-MM-DD）；增量同步不需要。 */
+  confirmedRescanAfterDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  /** 首次映射确认时用户明确选择的账户；仅对单一未映射尾号有效。 */
+  explicitAccountId: z.string().regex(UUID_PATTERN).optional(),
 });
 
 function unauthorized(): ApplicationError {
@@ -125,6 +133,19 @@ export function registerGmailRoutes(
         targetAccountId: body.data.accountId,
       }),
     };
+  });
+
+  app.post("/v1/google/connections/:id/sync", { preHandler: authenticate }, async (request) => {
+    const connectionId = readConnectionId(request);
+    const body = syncSchema.safeParse(request.body ?? {});
+    if (!body.success) {
+      throw invalidArgument("Gmail 同步参数无效");
+    }
+    return options.syncService.sync({
+      connectionId,
+      confirmedRescanAfterDate: body.data.confirmedRescanAfterDate ?? null,
+      explicitAccountId: body.data.explicitAccountId ?? null,
+    });
   });
 
   app.delete("/v1/google/connections/:id", { preHandler: authenticate }, async (request) => {
