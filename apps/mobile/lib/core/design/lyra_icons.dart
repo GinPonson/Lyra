@@ -8,7 +8,15 @@ abstract final class LyraIcons {
   static const IconData holdings = Icons.account_balance_wallet_outlined;
   static const IconData analytics = Icons.query_stats_outlined;
   static const IconData ledger = Icons.receipt_long_outlined;
-  static const IconData agent = Icons.auto_awesome_outlined;
+  static const IconData agent = Icons.bubble_chart_outlined;
+  static const IconData stocks = Icons.candlestick_chart_outlined;
+  static const IconData search = Icons.search_outlined;
+  static const IconData arrowUpRight = Icons.north_east_outlined;
+  static const IconData back = Icons.arrow_back_outlined;
+  static const IconData filter = Icons.tune_outlined;
+  static const IconData portfolio = Icons.pie_chart_outline;
+  static const IconData error = Icons.error_outline;
+  static const IconData expand = Icons.expand_more_outlined;
 
   static const IconData accountCenter = Icons.manage_accounts_outlined;
   static const IconData accountScope = Icons.layers_outlined;
@@ -22,4 +30,9 @@ abstract final class LyraIcons {
   static const IconData gmail = Icons.alternate_email_outlined;
   static const IconData security = Icons.shield_outlined;
   static const IconData disclosure = Icons.chevron_right;
+
+  // 动作语义:发送走发送箭头,取消走关闭,不复用导航类图标。
+  static const IconData send = Icons.arrow_upward;
+  static const IconData dismiss = Icons.close;
+  static const IconData confirm = Icons.check_outlined;
 }

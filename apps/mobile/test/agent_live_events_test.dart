@@ -582,7 +582,11 @@ void main() {
     test('意外断开按指数退避自动重连并带最新游标', () async {
       final channels = <StreamChannelController<dynamic>>[];
       final subscribeFrames = <Map<String, Object?>>[];
-      WebSocketChannel createChannel(Uri uri, Iterable<String> protocols) {
+      WebSocketChannel createChannel(
+        Uri uri,
+        Iterable<String> protocols,
+        Map<String, String> headers,
+      ) {
         final controller = StreamChannelController<dynamic>(
           allowForeignErrors: false,
         );
@@ -649,7 +653,11 @@ void main() {
 
     test('主动 close 不触发重连，dispose 后完全静默', () async {
       final channels = <StreamChannelController<dynamic>>[];
-      WebSocketChannel createChannel(Uri uri, Iterable<String> protocols) {
+      WebSocketChannel createChannel(
+        Uri uri,
+        Iterable<String> protocols,
+        Map<String, String> headers,
+      ) {
         final controller = StreamChannelController<dynamic>(
           allowForeignErrors: false,
         );
@@ -688,7 +696,11 @@ void main() {
     test('连续失败退避封顶且 subscribed 确认后重置', () async {
       final channels = <StreamChannelController<dynamic>>[];
       final delays = <Duration>[];
-      WebSocketChannel createChannel(Uri uri, Iterable<String> protocols) {
+      WebSocketChannel createChannel(
+        Uri uri,
+        Iterable<String> protocols,
+        Map<String, String> headers,
+      ) {
         final controller = StreamChannelController<dynamic>(
           allowForeignErrors: false,
         );

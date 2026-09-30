@@ -260,7 +260,10 @@ class AgentController extends Notifier<AgentUiState> {
     }
     try {
       await repository.availability();
-      // 可用性只决定创建按钮；真正失败在创建时以稳定错误码暴露。
+      // 成功则从错误态回到创建视图;可用性只决定创建按钮。
+      if (state is AgentError) {
+        state = const AgentIdle();
+      }
     } on LyraApiError catch (error) {
       state = AgentError('${error.message}（${error.code}）');
     }
@@ -437,9 +440,13 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
     final sessionState = ref.watch(sessionProvider);
     final paired = sessionState.value is SessionPaired;
 
-    return ColoredBox(
-      color: LyraColors.canvas,
-      child: SafeArea(
+    // 作为推入的二级页运行,需要自备 Scaffold 提供 Material 上下文。
+    return Scaffold(
+      backgroundColor: LyraColors.canvas,
+      appBar: !paired || state is AgentError
+          ? AppBar(title: const Text('AI 分析'))
+          : null,
+      body: SafeArea(
         bottom: false,
         child: Align(
           alignment: Alignment.topCenter,
@@ -514,18 +521,13 @@ class _SessionViewState extends ConsumerState<_SessionView> {
     return Column(
       children: <Widget>[
         Padding(
-          padding: const EdgeInsets.fromLTRB(20, 30, 20, 12),
+          padding: const EdgeInsets.fromLTRB(8, 12, 20, 12),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
-              Text(
-                'AGENT / READ ONLY',
-                style: Theme.of(context).textTheme.labelSmall
-                    ?.copyWith(color: LyraColors.accent),
-              ),
-              const SizedBox(height: 6),
               Row(
                 children: <Widget>[
+                  const BackButton(),
                   Expanded(
                     child: Text(
                       'Agent · ${_providerLabel(session.provider)}',
@@ -550,6 +552,17 @@ class _SessionViewState extends ConsumerState<_SessionView> {
           child: ListView(
             padding: const EdgeInsets.symmetric(horizontal: 20),
             children: <Widget>[
+              if (session.messages.isEmpty &&
+                  state.pendingMessage == null &&
+                  state.streamingText == null)
+                _SessionEmptyState(
+                  onSuggestion: (String suggestion) {
+                    _inputController.text = suggestion;
+                    _inputController.selection = TextSelection.fromPosition(
+                      TextPosition(offset: suggestion.length),
+                    );
+                  },
+                ),
               for (final message in session.messages)
                 _MessageBubble(
                   role: message.role,
@@ -567,17 +580,7 @@ class _SessionViewState extends ConsumerState<_SessionView> {
               if (state.turnInProgress && state.streamingText == null)
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 10),
-                  child: Row(
-                    children: <Widget>[
-                      SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                      SizedBox(width: 10),
-                      Text('正在思考…'),
-                    ],
-                  ),
+                  child: _ThinkingDots(),
                 ),
               if (state.errorMessage != null)
                 Padding(
@@ -626,13 +629,22 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                 state.turnInProgress
                     ? IconButton(
                         onPressed: () => controller.cancelTurn(),
-                        icon: const Icon(LyraIcons.disclosure),
+                        icon: const Icon(LyraIcons.dismiss),
                         tooltip: '取消回合',
                       )
-                    : IconButton(
-                        onPressed: _send,
-                        icon: const Icon(LyraIcons.agent),
-                        tooltip: '发送',
+                    : ValueListenableBuilder<TextEditingValue>(
+                        valueListenable: _inputController,
+                        builder: (
+                          BuildContext context,
+                          TextEditingValue value,
+                          _,
+                        ) {
+                          final bool hasInput = value.text.trim().isNotEmpty;
+                          return _SendButton(
+                            enabled: hasInput,
+                            onTap: hasInput ? _send : null,
+                          );
+                        },
                       ),
               ],
             ),
@@ -656,34 +668,94 @@ class _CreateView extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     return ListView(
-      padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
+      padding: const EdgeInsets.fromLTRB(8, 4, 20, 40),
       children: <Widget>[
-        Text(
-          'AGENT / READ ONLY',
-          style: Theme.of(context).textTheme.labelSmall
-              ?.copyWith(color: LyraColors.accent),
+        // 二级页头部:返回键 + 紧凑标题。
+        Row(
+          children: <Widget>[
+            const BackButton(),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Text(
+                'AI 分析',
+                style: Theme.of(context).textTheme.headlineLarge?.copyWith(
+                  fontSize: 22,
+                  letterSpacing: -0.3,
+                ),
+              ),
+            ),
+          ],
         ),
-        const SizedBox(height: 14),
-        Text('Agent', style: Theme.of(context).textTheme.headlineLarge),
-        const SizedBox(height: 14),
-        Text(
-          'Claude、Pi 与 OpenCode 共用只读金融工具，并在回合边界显式切换。'
-          'Agent 只能查询经过账户范围和账本版本校验的数据。',
-          style: Theme.of(context).textTheme.bodyLarge
-              ?.copyWith(color: LyraColors.muted, height: 1.55),
-        ),
-        const SizedBox(height: 28),
-        for (final (provider, label) in _providers)
-          Container(
-            margin: const EdgeInsets.only(bottom: 12),
-            child: OutlinedButton.icon(
-              onPressed: () => ref
-                  .read(agentControllerProvider.notifier)
-                  .createSession(provider),
-              icon: const Icon(LyraIcons.agent),
-              label: Text('开始 $label 会话'),
+        const Padding(
+          padding: EdgeInsets.only(left: 60),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              '从记录中，发现值得追问的细节。',
+              style: TextStyle(color: LyraColors.muted, fontSize: 14),
             ),
           ),
+        ),
+        const SizedBox(height: 20),
+        // Coinbase 式分组:白底行 + 发丝线,无外框。
+        Column(
+          children: <Widget>[
+            for (final (int index, (String provider, String label))
+                in _providers.indexed)
+              InkWell(
+                onTap: () => ref
+                    .read(agentControllerProvider.notifier)
+                    .createSession(provider),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 0,
+                    vertical: 14,
+                  ),
+                  decoration: BoxDecoration(
+                    border: index == _providers.length - 1
+                        ? null
+                        : const Border(
+                            bottom: BorderSide(color: LyraColors.hairline),
+                          ),
+                  ),
+                  child: Row(
+                    children: <Widget>[
+                      Container(
+                        width: 38,
+                        height: 38,
+                        alignment: Alignment.center,
+                        decoration: const BoxDecoration(
+                          color: LyraColors.accentTint,
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(
+                          LyraIcons.agent,
+                          size: 19,
+                          color: LyraColors.accent,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          '开始 $label 会话',
+                          style: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                            color: LyraColors.ink,
+                          ),
+                        ),
+                      ),
+                      const Icon(
+                        LyraIcons.disclosure,
+                        size: 18,
+                        color: LyraColors.mutedSoft,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
       ],
     );
   }
@@ -712,42 +784,124 @@ class _InfoCard extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
       children: <Widget>[
-        Container(
-          padding: const EdgeInsets.all(24),
-          decoration: BoxDecoration(
-            color: LyraColors.surface,
-            borderRadius: BorderRadius.circular(24),
-            border: Border.all(color: LyraColors.hairlineStrong),
-          ),
+        // Coinbase 式空状态:居中内容直接铺在画布上,无卡片边框。
+        Padding(
+          padding: const EdgeInsets.only(top: 96),
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: <Widget>[
               Container(
-                width: 44,
-                height: 44,
+                width: 52,
+                height: 52,
                 alignment: Alignment.center,
                 decoration: const BoxDecoration(
-                  color: LyraColors.surfaceStrong,
+                  color: LyraColors.accentTint,
                   shape: BoxShape.circle,
                 ),
-                child: Icon(icon, color: accent, size: 22),
+                child: Icon(icon, color: accent, size: 24),
               ),
-              const SizedBox(height: 24),
-              Text(title, style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 18),
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
               const SizedBox(height: 8),
               Text(
                 description,
+                textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.bodyMedium
-                    ?.copyWith(color: LyraColors.muted),
+                    ?.copyWith(color: LyraColors.muted, height: 1.5),
               ),
               if (actionLabel != null) ...<Widget>[
-                const SizedBox(height: 16),
-                OutlinedButton(onPressed: onAction, child: Text(actionLabel!)),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: onAction,
+                  child: Text(actionLabel!),
+                ),
               ],
             ],
           ),
         ),
       ],
+    );
+  }
+}
+
+/// 空会话引导:不伪造对话内容,只提供可点的示例问题。
+class _SessionEmptyState extends StatelessWidget {
+  const _SessionEmptyState({required this.onSuggestion});
+
+  final ValueChanged<String> onSuggestion;
+
+  static const List<String> _suggestions = <String>[
+    '我的持仓概览',
+    '本月已实现损益',
+    '即将到期的期权',
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 64),
+      child: Column(
+        children: <Widget>[
+          Container(
+            width: 52,
+            height: 52,
+            alignment: Alignment.center,
+            decoration: const BoxDecoration(
+              color: LyraColors.surfaceStrong,
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(
+              LyraIcons.agent,
+              size: 24,
+              color: LyraColors.accent,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text('开始提问', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 6),
+          Text(
+            'Agent 只能查询当前账户范围与账本版本内的数据。',
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodySmall
+                ?.copyWith(color: LyraColors.muted),
+          ),
+          const SizedBox(height: 20),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            alignment: WrapAlignment.center,
+            children: <Widget>[
+              for (final String suggestion in _suggestions)
+                GestureDetector(
+                  onTap: () => onSuggestion(suggestion),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 9,
+                    ),
+                    decoration: BoxDecoration(
+                      color: LyraColors.surface,
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: LyraColors.hairlineStrong),
+                    ),
+                    child: Text(
+                      suggestion,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                        color: LyraColors.ink,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }
@@ -777,10 +931,7 @@ class _MessageBubble extends StatelessWidget {
         constraints: const BoxConstraints(maxWidth: 560),
         decoration: BoxDecoration(
           color: isUser ? LyraColors.accent : LyraColors.surfaceSubtle,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: isStreaming ? LyraColors.accent : LyraColors.hairline,
-          ),
+          borderRadius: BorderRadius.circular(18),
         ),
         child: Text(
           isStreaming ? '$content▍' : content,
@@ -790,6 +941,100 @@ class _MessageBubble extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// 发送按钮:主色圆形实体按钮;输入为空时禁用并降低对比。
+class _SendButton extends StatelessWidget {
+  const _SendButton({required this.enabled, this.onTap});
+
+  final bool enabled;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: '发送',
+      child: InkWell(
+        onTap: onTap,
+        customBorder: const CircleBorder(),
+        child: Container(
+          width: 44,
+          height: 44,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: enabled ? LyraColors.accent : LyraColors.surfaceStrong,
+            shape: BoxShape.circle,
+          ),
+          child: Icon(
+            LyraIcons.send,
+            size: 20,
+            color: enabled ? LyraColors.surface : LyraColors.mutedSoft,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// "正在思考"指示器:三点错相呼吸,替代通用 spinner。
+class _ThinkingDots extends StatefulWidget {
+  const _ThinkingDots();
+
+  @override
+  State<_ThinkingDots> createState() => _ThinkingDotsState();
+}
+
+class _ThinkingDotsState extends State<_ThinkingDots>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1100),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: <Widget>[
+        Text(
+          '正在思考',
+          style: Theme.of(context)
+              .textTheme
+              .bodyMedium
+              ?.copyWith(color: LyraColors.muted),
+        ),
+        const SizedBox(width: 6),
+        for (final int index in <int>[0, 1, 2])
+          FadeTransition(
+            opacity: Tween<double>(begin: 0.25, end: 1).animate(
+              CurvedAnimation(
+                parent: _controller,
+                curve: Interval(
+                  index * 0.22,
+                  (index * 0.22 + 0.55).clamp(0.0, 1.0),
+                  curve: Curves.easeInOut,
+                ),
+              ),
+            ),
+            child: Container(
+              width: 4,
+              height: 4,
+              margin: const EdgeInsets.symmetric(horizontal: 2),
+              decoration: const BoxDecoration(
+                color: LyraColors.muted,
+                shape: BoxShape.circle,
+              ),
+            ),
+          ),
+      ],
     );
   }
 }
@@ -884,9 +1129,8 @@ class _ToolCallTile extends StatelessWidget {
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
-        color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: LyraColors.hairlineStrong),
+        color: LyraColors.surfaceSubtle,
+        borderRadius: BorderRadius.circular(12),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

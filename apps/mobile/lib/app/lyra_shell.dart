@@ -2,165 +2,205 @@ import 'package:flutter/material.dart';
 
 import '../core/design/lyra_colors.dart';
 import '../core/design/lyra_icons.dart';
+import '../core/design/lyra_primary_icon.dart';
 import '../features/agent/agent_screen.dart';
+import '../features/ledger/ledger_screen.dart';
 import '../features/overview/overview_screen.dart';
-import '../features/section/section_screen.dart';
 
-/// 手机使用底部导航；展开宽度使用侧边 NavigationRail。
-const double _navigationRailBreakpoint = 720;
-
-/// 五个稳定一级入口，与产品方案保持同序。
+/// 账号与股票为核心，交易提供记录追溯；AI 从页内进入独立二级页。
 enum LyraDestination {
-  overview('总览', LyraIcons.overview),
-  holdings('持仓', LyraIcons.holdings),
-  analytics('分析', LyraIcons.analytics),
-  ledger('流水', LyraIcons.ledger),
-  agent('Agent', LyraIcons.agent);
+  accounts('账号', LyraPrimaryGlyph.accounts),
+  stocks('股票', LyraPrimaryGlyph.stocks),
+  ledger('交易', LyraPrimaryGlyph.ledger);
 
   const LyraDestination(this.label, this.icon);
-
   final String label;
-  final IconData icon;
+  final LyraPrimaryGlyph icon;
 }
 
-/// 一级导航外壳。
-///
-/// IndexedStack 保留各页面滚动位置；目前不引入路由生成器和状态管理框架，
-/// 等账户中心与详情页出现真实导航需求时再接入。
+/// 宽屏采用紧凑顶栏，手机采用带标签的底栏；保留各页滚动与筛选状态。
 class LyraShell extends StatefulWidget {
   const LyraShell({super.key});
-
   @override
   State<LyraShell> createState() => _LyraShellState();
 }
 
 class _LyraShellState extends State<LyraShell> {
   int _selectedIndex = 0;
+  final Set<int> _visited = {0};
 
-  static const List<Widget> _screens = <Widget>[
-    OverviewScreen(),
-    SectionScreen(
-      key: ValueKey<String>('holdings-screen'),
-      eyebrow: 'POSITIONS / HISTORICAL COST',
-      title: '持仓',
-      description: '按账户与合约查看数量、历史成本和到期风险。没有行情源时，不展示伪市值或伪实时涨跌。',
-      icon: LyraIcons.holdings,
-      sections: <String>['股票与期权', '到期窗口', '账户分组'],
-    ),
-    SectionScreen(
-      key: ValueKey<String>('analytics-screen'),
-      eyebrow: 'ANALYTICS / EXPLAINABLE',
-      title: '分析',
-      description: '月度、归因、回撤和风险都绑定账户范围、账本版本与计算口径。',
-      icon: LyraIcons.analytics,
-      sections: <String>['月度绩效', '损益归因', '回撤与风险'],
-    ),
-    SectionScreen(
-      key: ValueKey<String>('ledger-screen'),
-      eyebrow: 'LEDGER / IMMUTABLE',
-      title: '流水',
-      description: '交易与现金流按日期形成可追溯时间线，并明确区分 CSV、Excel 与 Gmail 来源。',
-      icon: LyraIcons.ledger,
-      sections: <String>['全部交易', '现金流', '来源与审计'],
-    ),
-    AgentScreen(
-      key: ValueKey<String>('agent-screen'),
-    ),
-  ];
-
-  /// 切换一级入口并保留其他页面状态。
   void _selectDestination(int index) {
-    if (index == _selectedIndex) {
-      return;
-    }
-    setState(() => _selectedIndex = index);
+    if (index == _selectedIndex) return;
+    setState(() {
+      _selectedIndex = index;
+      _visited.add(index);
+    });
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (BuildContext context, BoxConstraints constraints) {
-        final bool useRail = constraints.maxWidth >= _navigationRailBreakpoint;
-        final Widget content = IndexedStack(
-          index: _selectedIndex,
-          children: _screens,
-        );
+  void _openAgent() => Navigator.push(
+    context,
+    MaterialPageRoute<void>(
+      builder: (_) => const AgentScreen(key: ValueKey<String>('agent-screen')),
+    ),
+  );
 
-        if (useRail) {
-          return Scaffold(
-            body: Row(
-              children: <Widget>[
-                SafeArea(
-                  right: false,
-                  child: NavigationRail(
-                    selectedIndex: _selectedIndex,
-                    onDestinationSelected: _selectDestination,
-                    labelType: NavigationRailLabelType.all,
-                    groupAlignment: -0.72,
-                    leading: const Padding(
-                      padding: EdgeInsets.only(top: 16, bottom: 28),
-                      child: _LyraMark(),
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final wide = constraints.maxWidth >= 900;
+      final content = IndexedStack(
+        index: _selectedIndex,
+        children: [
+          OverviewScreen(
+            onOpenLedger: () => _selectDestination(2),
+            onOpenStocks: () => _selectDestination(1),
+            onOpenAgent: _openAgent,
+          ),
+          _visited.contains(1)
+              ? LedgerScreen(
+                  key: const ValueKey('stocks-screen'),
+                  stocks: true,
+                  onConnect: () => _selectDestination(0),
+                )
+              : const SizedBox.shrink(),
+          _visited.contains(2)
+              ? LedgerScreen(
+                  key: const ValueKey('ledger-screen'),
+                  stocks: false,
+                  onConnect: () => _selectDestination(0),
+                )
+              : const SizedBox.shrink(),
+        ],
+      );
+      return Scaffold(
+        body: Column(
+          children: [
+            if (wide)
+              SafeArea(
+                bottom: false,
+                child: Container(
+                  height: 72,
+                  padding: const EdgeInsets.symmetric(horizontal: 48),
+                  decoration: const BoxDecoration(
+                    border: Border(
+                      bottom: BorderSide(color: LyraColors.hairlineStrong),
                     ),
-                    destinations: LyraDestination.values
-                        .map(
-                          (LyraDestination destination) =>
-                              NavigationRailDestination(
-                                icon: Icon(destination.icon),
-                                selectedIcon: Icon(destination.icon),
-                                label: Text(destination.label),
+                  ),
+                  child: Row(
+                    children: [
+                      const _LyraWordmark(),
+                      const Spacer(),
+                      for (final (index, destination)
+                          in LyraDestination.values.indexed)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: TextButton.icon(
+                            onPressed: () => _selectDestination(index),
+                            icon: LyraPrimaryIcon(
+                              destination.icon,
+                              size: 20,
+                              color: index == _selectedIndex
+                                  ? LyraColors.accent
+                                  : LyraColors.muted,
+                            ),
+                            label: Text(destination.label),
+                            style: TextButton.styleFrom(
+                              foregroundColor: index == _selectedIndex
+                                  ? LyraColors.ink
+                                  : LyraColors.muted,
+                              backgroundColor: index == _selectedIndex
+                                  ? LyraColors.surfaceStrong
+                                  : Colors.transparent,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 22,
+                                vertical: 12,
                               ),
-                        )
-                        .toList(growable: false),
+                            ),
+                          ),
+                        ),
+                      const Spacer(),
+                      TextButton.icon(
+                        onPressed: _openAgent,
+                        icon: const Icon(LyraIcons.agent, size: 18),
+                        label: const Text('AI 分析'),
+                      ),
+                    ],
                   ),
                 ),
-                const VerticalDivider(width: 1, thickness: 1),
-                Expanded(child: content),
-              ],
-            ),
-          );
-        }
-
-        return Scaffold(
-          body: content,
-          bottomNavigationBar: NavigationBar(
-            selectedIndex: _selectedIndex,
-            onDestinationSelected: _selectDestination,
-            labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
-            destinations: LyraDestination.values
-                .map(
-                  (LyraDestination destination) => NavigationDestination(
-                    icon: Icon(destination.icon),
-                    selectedIcon: Icon(destination.icon),
-                    label: destination.label,
+              ),
+            Expanded(child: content),
+          ],
+        ),
+        bottomNavigationBar: wide
+            ? null
+            : DecoratedBox(
+                decoration: const BoxDecoration(
+                  border: Border(
+                    top: BorderSide(color: LyraColors.hairlineStrong),
                   ),
-                )
-                .toList(growable: false),
-          ),
-        );
-      },
-    );
-  }
+                ),
+                child: NavigationBar(
+                  // 选中底色由图形容器控制尺寸，导航按钮仍保留完整点击区域。
+                  indicatorColor: Colors.transparent,
+                  selectedIndex: _selectedIndex,
+                  onDestinationSelected: _selectDestination,
+                  labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+                  destinations: [
+                    for (final destination in LyraDestination.values)
+                      NavigationDestination(
+                        icon: _NavigationGlyph(destination.icon),
+                        selectedIcon: _NavigationGlyph(
+                          destination.icon,
+                          selected: true,
+                        ),
+                        label: destination.label,
+                      ),
+                  ],
+                ),
+              ),
+      );
+    },
+  );
 }
 
-/// 展开布局侧栏使用的纯文字品牌标记。
-class _LyraMark extends StatelessWidget {
-  const _LyraMark();
+/// 选中背景从默认宽胶囊收为小圆角块，不影响导航的触控和语义区域。
+class _NavigationGlyph extends StatelessWidget {
+  const _NavigationGlyph(this.glyph, {this.selected = false});
+  final LyraPrimaryGlyph glyph;
+  final bool selected;
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 44,
-      height: 44,
-      alignment: Alignment.center,
-      decoration: const BoxDecoration(
-        color: LyraColors.accent,
-        shape: BoxShape.circle,
+  Widget build(BuildContext context) => Container(
+    width: 46,
+    height: 34,
+    alignment: Alignment.center,
+    decoration: BoxDecoration(
+      color: selected ? LyraColors.accentTint : Colors.transparent,
+      borderRadius: BorderRadius.circular(11),
+    ),
+    child: LyraPrimaryIcon(
+      glyph,
+      color: selected ? LyraColors.accent : LyraColors.muted,
+    ),
+  );
+}
+
+/// 几何图标与品牌文字组合，不使用表情符号。
+class _LyraWordmark extends StatelessWidget {
+  const _LyraWordmark();
+  @override
+  Widget build(BuildContext context) => const Row(
+    children: [
+      Icon(LyraIcons.cost, size: 29, color: LyraColors.accent),
+      SizedBox(width: 10),
+      Text(
+        'lyra',
+        style: TextStyle(
+          fontSize: 32,
+          fontWeight: FontWeight.w600,
+          letterSpacing: -2,
+        ),
       ),
-      child: Text(
-        'L',
-        style: Theme.of(context).textTheme.titleLarge
-            ?.copyWith(color: Colors.white, fontWeight: FontWeight.w800),
-      ),
-    );
-  }
+    ],
+  );
 }

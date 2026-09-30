@@ -138,8 +138,8 @@ void main() {
     await tester.pumpAndSettle();
 
     // 未配对状态展示配对表单；面板在折叠列表下方，需要滚动到可见区。
-    await scrollUntilVisible(tester, find.text('配对 Lyra 服务端'));
-    expect(find.text('配对 Lyra 服务端'), findsOneWidget);
+    await scrollUntilVisible(tester, find.text('设备配对'));
+    expect(find.text('设备配对'), findsOneWidget);
 
     await tester.enterText(
       find.widgetWithText(TextField, '服务端地址'),
@@ -156,15 +156,15 @@ void main() {
     // 已配对状态展示真实汇总：十进制字符串原样展示，不伪造。先滚回顶部。
     await tester.drag(find.byType(CustomScrollView), const Offset(0, 800));
     await tester.pumpAndSettle();
-    expect(find.text('已配对'), findsOneWidget);
+    expect(find.text('全部账号'), findsOneWidget);
     expect(
       find.byKey(const ValueKey<String>('overview-hero-value')),
       findsOneWidget,
     );
     expect(find.text('12.34'), findsOneWidget);
-    expect(find.text('1000.00'), findsOneWidget);
+    expect(find.text('1,000.00'), findsOneWidget);
     expect(find.text('500.00'), findsOneWidget);
-    expect(find.textContaining('账本版本 3'), findsOneWidget);
+    expect(find.textContaining('账本 v3'), findsOneWidget);
 
     // 凭据已进入安全存储抽象。
     final stored = await store.read();

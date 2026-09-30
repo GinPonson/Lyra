@@ -1,521 +1,524 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/session.dart';
 import '../../core/design/lyra_colors.dart';
-import '../../core/design/lyra_theme.dart';
 import '../../core/design/lyra_icons.dart';
+import '../../core/design/lyra_primary_icon.dart';
+import '../../core/design/lyra_widgets.dart';
 import '../import/import_sheet.dart';
+import '../ledger/ledger_models.dart';
+import '../ledger/ledger_screen.dart';
+import '../ledger/ledger_view.dart';
+import '../ledger/ledger_workspace.dart';
 import 'pairing_panel.dart';
 
-/// 总览页：未配对时展示配对表单，已配对后展示真实账本汇总。
-///
-/// 金额保持服务端十进制字符串原样展示；没有数据时显示缺省符号而不伪造。
-class OverviewScreen extends ConsumerWidget {
-  const OverviewScreen({super.key});
-
-  static const double _contentMaxWidth = 920;
-
+/// 账号优先的投资工作台。保留配对、导入及原始精确汇总；AI 为次级入口。
+class OverviewScreen extends ConsumerStatefulWidget {
+  const OverviewScreen({
+    super.key,
+    this.onOpenLedger,
+    this.onOpenStocks,
+    this.onOpenAgent,
+  });
+  final VoidCallback? onOpenLedger;
+  final VoidCallback? onOpenStocks;
+  final VoidCallback? onOpenAgent;
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final session = ref.watch(sessionProvider).value ?? const SessionLoading();
-    final summary = switch (session) {
-      SessionPaired(:final summary) => summary,
-      _ => null,
-    };
-    final bool paired = session is SessionPaired;
-    return ColoredBox(
-      color: LyraColors.canvas,
-      child: SafeArea(
-        bottom: false,
-        child: Align(
-          alignment: Alignment.topCenter,
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: _contentMaxWidth),
-            child: CustomScrollView(
-              key: const PageStorageKey<String>('overview-scroll'),
-              slivers: <Widget>[
-                SliverPadding(
-                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 36),
-                  sliver: SliverList.list(
-                    children: <Widget>[
-                      const _OverviewHeader(),
-                      const SizedBox(height: 24),
-                      const _AccountScopePill(),
-                      const SizedBox(height: 18),
-                      _LedgerHero(
-                        connected: paired,
-                        realizedPnl: summary == null || summary.entries.isEmpty
-                            ? null
-                            : summary.entries.first.realizedPnlTotal,
-                        currency: summary == null || summary.entries.isEmpty
-                            ? null
-                            : summary.entries.first.currency,
-                        ledgerVersion: summary?.metadata.ledgerVersion,
-                      ),
-                      const SizedBox(height: 12),
-                      _MetricGrid(
-                        netDeposits: summary == null || summary.entries.isEmpty
-                            ? null
-                            : summary.entries.first.netDeposits,
-                        cashBalance: summary == null || summary.entries.isEmpty
-                            ? null
-                            : summary.entries.first.cashBalance,
-                      ),
-                      const SizedBox(height: 12),
-                      _LedgerStatusCard(
-                        ledgerVersion: summary?.metadata.ledgerVersion,
-                        asOf: summary?.metadata.asOf,
-                      ),
-                      const SizedBox(height: 12),
-                      if (!paired) ...<Widget>[
-                        const PairingPanel(),
-                        const SizedBox(height: 12),
-                      ],
-                      _ConnectionActions(paired: paired),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
+  ConsumerState<OverviewScreen> createState() => _OverviewScreenState();
 }
 
-class _OverviewHeader extends StatelessWidget {
-  const _OverviewHeader();
+class _OverviewScreenState extends ConsumerState<OverviewScreen> {
+  final _pairingKey = GlobalKey();
+
+  /// 保留原有内联配对流程，主按钮把表单滚入视口并保留已填写字段。
+  void _revealPairing() {
+    final target = _pairingKey.currentContext;
+    if (target != null) {
+      Scrollable.ensureVisible(
+        target,
+        duration: const Duration(milliseconds: 450),
+        curve: Curves.easeOutCubic,
+      );
+    }
+  }
+
+  void _openImport() => showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+    ),
+    builder: (context) => Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
+      child: const ImportSheet(),
+    ),
+  );
+
+  /// 连接管理复用已验证表单，不创建另一套凭据或配对实现。
+  void _openConnection() => showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    showDragHandle: true,
+    useSafeArea: true,
+    builder: (context) => SingleChildScrollView(
+      padding: EdgeInsets.fromLTRB(
+        16,
+        0,
+        16,
+        MediaQuery.viewInsetsOf(context).bottom + 24,
+      ),
+      child: const PairingPanel(),
+    ),
+  );
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: <Widget>[
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Text(
-                'LYRA / LEDGER 01',
-                style: Theme.of(context).textTheme.labelSmall,
+    final session = ref.watch(sessionProvider);
+    final paired = session.value is SessionPaired;
+    final summary = ref.watch(scopedSummaryProvider);
+    return LyraPage(
+      storageKey: 'overview-scroll',
+      children: [
+        if (paired) ...[
+          Row(
+            children: [
+              const Expanded(
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: AccountScopeButton(prominent: true),
+                ),
               ),
-              const SizedBox(height: 4),
-              Text('总览', style: Theme.of(context).textTheme.titleLarge),
+              IconButton(
+                tooltip: '导入文件',
+                onPressed: _openImport,
+                icon: const LyraPrimaryIcon(
+                  LyraPrimaryGlyph.importFile,
+                  size: 22,
+                ),
+              ),
+              IconButton(
+                tooltip: '连接管理',
+                onPressed: _openConnection,
+                icon: const LyraPrimaryIcon(
+                  LyraPrimaryGlyph.connection,
+                  size: 22,
+                ),
+              ),
             ],
           ),
-        ),
-        Semantics(
-          button: true,
-          label: '账户中心',
-          child: IconButton.outlined(
-            onPressed: null,
-            icon: const Icon(LyraIcons.accountCenter),
-            tooltip: '账户中心将在后续接入',
+          const SizedBox(height: 18),
+        ] else ...[
+          LyraPageTitle(
+            title: '我的账号',
+            trailing: LyraIconButton(
+              icon: LyraIcons.accountCenter,
+              label: '连接管理',
+              onPressed: paired ? _openConnection : _revealPairing,
+            ),
           ),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const AccountScopeButton(),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    paired ? LyraIcons.confirm : LyraIcons.security,
+                    size: 13,
+                    color: LyraColors.accent,
+                  ),
+                  const SizedBox(width: 5),
+                  Text(
+                    paired ? '已配对' : '等待连接',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: LyraColors.inkSecondary,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+        ],
+        if (session.hasError)
+          LyraLoadError(
+            error: session.error!,
+            onRetry: () => ref.invalidate(sessionProvider),
+          )
+        else if (session.isLoading)
+          const LyraSkeleton()
+        else if (!paired)
+          LyraReveal(child: _WelcomeHero(onConnect: _revealPairing))
+        else
+          summary.when(
+            loading: () => const LyraSkeleton(),
+            error: (error, _) => LyraLoadError(
+              error: error,
+              onRetry: () => ref.invalidate(scopedSummaryProvider),
+            ),
+            data: (read) => read == null || read.entries.isEmpty
+                ? LyraEmpty(
+                    title: '账号已连接，等待第一笔记录',
+                    message: '导入官方交易文件后，已实现损益、现金流与持仓会自动呈现。',
+                    action: FilledButton.icon(
+                      onPressed: _openImport,
+                      icon: const Icon(LyraIcons.importFile, size: 18),
+                      label: const Text('导入文件'),
+                    ),
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      for (final (index, entry) in read.entries.indexed)
+                        Padding(
+                          padding: EdgeInsets.only(top: index == 0 ? 0 : 20),
+                          child: _AccountSummary(
+                            entry: entry,
+                            primary: index == 0,
+                          ),
+                        ),
+                      const SizedBox(height: 16),
+                      // 账号先呈现持仓；宽屏仍以持仓为左侧主区，走势为辅助。
+                      LayoutBuilder(
+                        builder: (context, constraints) {
+                          final holdings = LedgerHoldingsPreview(
+                            onOpen: widget.onOpenStocks,
+                          );
+                          if (constraints.maxWidth >= 760) {
+                            return Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(flex: 6, child: holdings),
+                                const SizedBox(width: 40),
+                                const Expanded(
+                                  flex: 4,
+                                  child: LedgerTrendPreview(),
+                                ),
+                              ],
+                            );
+                          }
+                          return Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              holdings,
+                              const SizedBox(height: 24),
+                              const LedgerTrendPreview(),
+                            ],
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+          ),
+        if (!paired && !session.isLoading) ...[
+          const SizedBox(height: 26),
+          const _MetricStrip(),
+        ],
+        const SizedBox(height: 28),
+        _AssistantNote(onOpen: widget.onOpenAgent),
+        const SizedBox(height: 32),
+        if (!paired && !session.isLoading) PairingPanel(key: _pairingKey),
+        if (paired) ...[
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  '收益与报告',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: -.5,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: '刷新账号',
+                onPressed: () => ref.invalidate(sessionProvider),
+                icon: const Icon(LyraIcons.sync, size: 19),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          const ReportLink(view: LedgerView.monthly),
+          const ReportLink(view: LedgerView.attribution),
+          const ReportLink(view: LedgerView.drawdown),
+          ExpansionTile(
+            key: const PageStorageKey<String>('account-research-expanded'),
+            tilePadding: EdgeInsets.zero,
+            title: const Text('更多分析', style: TextStyle(fontSize: 14)),
+            children: const [
+              ReportLink(view: LedgerView.holdingPeriod),
+              ReportLink(view: LedgerView.extremes),
+              ReportLink(view: LedgerView.streaks),
+            ],
+          ),
+          const ReportLink(view: LedgerView.audit),
+        ],
+        const SizedBox(height: 24),
+        if (summary.value != null)
+          Text(
+            '账本 v${summary.value!.metadata.ledgerVersion} · 截止 ${summary.value!.metadata.asOf}',
+            style: const TextStyle(
+              fontSize: 10,
+              height: 1.8,
+              color: LyraColors.muted,
+            ),
+          ),
+        const SizedBox(height: 16),
+        const Row(
+          children: [
+            Icon(LyraIcons.security, size: 12, color: LyraColors.muted),
+            SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                '基于已导入交易记录 · 不含实时行情',
+                style: TextStyle(fontSize: 10, color: LyraColors.muted),
+              ),
+            ),
+          ],
         ),
       ],
     );
   }
 }
 
-class _AccountScopePill extends StatelessWidget {
-  const _AccountScopePill();
+/// 未连接时直接说明可用功能，主按钮继续使用原有配对表单。
+class _WelcomeHero extends StatelessWidget {
+  const _WelcomeHero({required this.onConnect});
+  final VoidCallback onConnect;
 
   @override
-  Widget build(BuildContext context) {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(14, 10, 12, 10),
-        decoration: BoxDecoration(
-          color: LyraColors.surfaceStrong,
-          borderRadius: BorderRadius.circular(999),
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(24),
+    decoration: BoxDecoration(
+      color: LyraColors.surfaceSubtle,
+      borderRadius: BorderRadius.circular(20),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(LyraIcons.accountCenter, size: 30, color: LyraColors.accent),
+        const SizedBox(height: 20),
+        const Text(
+          '连接你的投资账号',
+          style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
         ),
-        child: const Row(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            Icon(
-              LyraIcons.accountScope,
-              size: 18,
-              color: LyraColors.accent,
-            ),
-            SizedBox(width: 8),
-            Text(
-              '全部活跃账户',
-              style: TextStyle(
-                fontWeight: FontWeight.w600,
-                color: LyraColors.ink,
-              ),
-            ),
-            SizedBox(width: 6),
-            Icon(LyraIcons.disclosure, size: 18, color: LyraColors.muted),
-          ],
+        const SizedBox(height: 10),
+        const Text(
+          '导入 Schwab 账单，查看持仓、现金余额和已实现收益。',
+          style: TextStyle(
+            fontSize: 14,
+            height: 1.6,
+            color: LyraColors.inkSecondary,
+          ),
         ),
-      ),
-    );
-  }
-}
-
-class _LedgerHero extends StatelessWidget {
-  const _LedgerHero({
-    required this.connected,
-    this.realizedPnl,
-    this.currency,
-    this.ledgerVersion,
-  });
-
-  final bool connected;
-  final String? realizedPnl;
-  final String? currency;
-  final int? ledgerVersion;
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (BuildContext context, BoxConstraints constraints) {
-        final double heroSize = math.min(
-          64,
-          math.max(44, constraints.maxWidth * 0.13),
-        );
-        return Container(
+        const SizedBox(height: 22),
+        SizedBox(
           width: double.infinity,
-          padding: EdgeInsets.all(constraints.maxWidth < 380 ? 20 : 24),
-          decoration: BoxDecoration(
-            color: LyraColors.surface,
-            borderRadius: BorderRadius.circular(24),
-            border: Border.all(color: LyraColors.hairlineStrong),
+          child: FilledButton.icon(
+            onPressed: onConnect,
+            icon: const Icon(LyraIcons.accountCenter, size: 18),
+            label: const Text('连接我的账户'),
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Row(
-                children: <Widget>[
-                  Text(
-                    '账本已实现损益',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                  const Spacer(),
-                  _ConnectionBadge(connected: connected),
-                ],
-              ),
-              const SizedBox(height: 26),
-              Text(
-                realizedPnl ?? '—',
-                key: const ValueKey<String>('overview-hero-value'),
-                style: Theme.of(context).textTheme.displayLarge
-                    ?.merge(LyraTheme.numeric)
-                    .copyWith(
-                      fontSize: heroSize,
-                      color: realizedPnl == null
-                          ? LyraColors.mutedSoft
-                          : LyraColors.ink,
-                    ),
-              ),
-              const SizedBox(height: 10),
-              Text(
-                _caption(),
-                style: Theme.of(context).textTheme.bodyMedium
-                    ?.copyWith(color: LyraColors.muted),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  String _caption() {
-    if (!connected) {
-      return '历史成本与 FIFO 口径 · 尚未连接服务端';
-    }
-    if (realizedPnl == null || currency == null) {
-      return '历史成本与 FIFO 口径 · 账本尚无账户数据';
-    }
-    return '$currency 已实现合计 · 历史成本与 FIFO 口径 · 账本版本 $ledgerVersion';
-  }
+        ),
+      ],
+    ),
+  );
 }
 
-class _ConnectionBadge extends StatelessWidget {
-  const _ConnectionBadge({required this.connected});
-
-  final bool connected;
+/// 每个币种独立的账户汇总卡：主金额与六个辅助指标集中呈现。
+/// 只显示已导入账本数据，不将历史损益包装成实时资产或购买力。
+class _AccountSummary extends StatelessWidget {
+  const _AccountSummary({required this.entry, required this.primary});
+  final LedgerSummaryEntry entry;
+  final bool primary;
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: LyraColors.surfaceStrong,
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          Icon(
-            LyraIcons.security,
-            size: 14,
-            color: connected ? LyraColors.accent : LyraColors.warning,
-          ),
-          const SizedBox(width: 6),
-          Text(
-            connected ? '已配对' : '未连接',
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              color: connected ? LyraColors.accent : LyraColors.warning,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _MetricGrid extends StatelessWidget {
-  const _MetricGrid({this.netDeposits, this.cashBalance});
-
-  final String? netDeposits;
-  final String? cashBalance;
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (BuildContext context, BoxConstraints constraints) {
-        final int columns = constraints.maxWidth >= 660 ? 3 : 2;
-        const double gap = 12;
-        final double width =
-            (constraints.maxWidth - gap * (columns - 1)) / columns;
-        final List<_MetricData> metrics = <_MetricData>[
-          _MetricData('净入金', netDeposits ?? '—', '现金流口径', LyraIcons.deposit),
-          _MetricData('持仓成本', '—', '非实时市值', LyraIcons.cost),
-          _MetricData('现金余额', cashBalance ?? '—', '账本计算值', LyraIcons.cash),
-        ];
-        return Wrap(
-          spacing: gap,
-          runSpacing: gap,
-          children: metrics
-              .map(
-                (_MetricData metric) => SizedBox(
-                  width: width,
-                  child: _MetricCard(data: metric),
-                ),
-              )
-              .toList(growable: false),
-        );
-      },
-    );
-  }
-}
-
-class _MetricData {
-  const _MetricData(this.label, this.value, this.note, this.icon);
-
-  final String label;
-  final String value;
-  final String note;
-  final IconData icon;
-}
-
-class _MetricCard extends StatelessWidget {
-  const _MetricCard({required this.data});
-
-  final _MetricData data;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      constraints: const BoxConstraints(minHeight: 138),
+  Widget build(BuildContext context) => LyraReveal(
+    child: Container(
+      key: primary ? const ValueKey('overview-summary-card') : null,
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: LyraColors.hairlineStrong),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Text(
-            data.label,
-            style: Theme.of(context).textTheme.bodySmall
-                ?.copyWith(color: LyraColors.muted),
-          ),
-          const SizedBox(height: 14),
-          Text(
-            data.value,
-            style: Theme.of(context).textTheme.headlineSmall
-                ?.merge(LyraTheme.numeric)
-                .copyWith(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w500,
-                  color: data.value == '—'
-                      ? LyraColors.mutedSoft
-                      : LyraColors.ink,
-                ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            data.note,
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: LyraColors.muted,
-              letterSpacing: 0,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _LedgerStatusCard extends StatelessWidget {
-  const _LedgerStatusCard({this.ledgerVersion, this.asOf});
-
-  final int? ledgerVersion;
-  final String? asOf;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(22, 18, 22, 18),
-      decoration: BoxDecoration(
-        color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: LyraColors.hairlineStrong),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Text('数据语境', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 6),
-          _StatusRow(
-            icon: LyraIcons.ledgerVersion,
-            label: '账本版本',
-            value: ledgerVersion == null ? '—' : '$ledgerVersion',
-          ),
-          _StatusRow(
-            icon: LyraIcons.dataCutoff,
-            label: '数据截止',
-            value: asOf ?? '尚未获取',
-          ),
-          _StatusRow(
-            icon: LyraIcons.sync,
-            label: '同步状态',
-            value: asOf == null ? '等待服务端连接' : '已同步',
-            isLast: true,
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _StatusRow extends StatelessWidget {
-  const _StatusRow({
-    required this.icon,
-    required this.label,
-    required this.value,
-    this.isLast = false,
-  });
-
-  final IconData icon;
-  final String label;
-  final String value;
-  final bool isLast;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: EdgeInsets.only(bottom: isLast ? 0 : 12, top: isLast ? 12 : 0),
-      decoration: BoxDecoration(
-        border: isLast
-            ? null
-            : const Border(bottom: BorderSide(color: LyraColors.hairline)),
-      ),
-      child: Row(
-        children: <Widget>[
-          Icon(icon, size: 18, color: LyraColors.muted),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              label,
-              style: const TextStyle(color: LyraColors.inkSecondary),
-            ),
-          ),
-          // 时间戳等长值允许换行，避免窄屏溢出破坏可读性。
-          Flexible(
-            child: Text(
-              value,
-              textAlign: TextAlign.right,
-              style: const TextStyle(
-                color: LyraColors.ink,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ConnectionActions extends StatelessWidget {
-  const _ConnectionActions({required this.paired});
-
-  final bool paired;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(22),
-      decoration: BoxDecoration(
-        color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: LyraColors.hairlineStrong),
+        borderRadius: BorderRadius.circular(18),
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFFE9F7F0), Color(0xFFF4F8F6), Color(0xFFFAF9F5)],
+          stops: [0, .58, 1],
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          Text('开始建立账本', style: Theme.of(context).textTheme.titleMedium),
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  '已实现损益',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: LyraColors.inkSecondary,
+                  ),
+                ),
+              ),
+              Text(
+                entry.currency,
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: LyraColors.inkSecondary,
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 8),
-          Text(
-            '服务端 API 接通后启用导入与 Google 授权。',
-            style: Theme.of(context).textTheme.bodyMedium
-                ?.copyWith(color: LyraColors.muted),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: LyraAmount(
+              entry.realizedPnlTotal,
+              key: primary
+                  ? const ValueKey<String>('overview-hero-value')
+                  : null,
+              size: 34,
+              color: entry.realizedPnlTotal.startsWith('-')
+                  ? LyraColors.negative
+                  : LyraColors.ink,
+            ),
           ),
-          const SizedBox(height: 18),
-          FilledButton.icon(
-            onPressed: paired
-                ? () => showModalBottomSheet<void>(
-                    context: context,
-                    isScrollControlled: true,
-                    backgroundColor: LyraColors.surface,
-                    shape: const RoundedRectangleBorder(
-                      borderRadius: BorderRadius.vertical(
-                        top: Radius.circular(20),
-                      ),
-                    ),
-                    builder: (BuildContext sheetContext) => Padding(
-                      padding: EdgeInsets.only(
-                        bottom: MediaQuery.of(sheetContext).viewInsets.bottom,
-                      ),
-                      child: const ImportSheet(),
-                    ),
-                  )
-                : null,
-            icon: const Icon(LyraIcons.importFile),
-            label: const Text('导入 Schwab 文件'),
+          const SizedBox(height: 5),
+          const Text(
+            '全部记录 · 已扣除分摊费用',
+            style: TextStyle(fontSize: 10, color: LyraColors.muted),
           ),
-          const SizedBox(height: 10),
-          OutlinedButton.icon(
-            onPressed: null,
-            icon: const Icon(LyraIcons.gmail),
-            label: const Text('连接 Gmail'),
-          ),
+          const SizedBox(height: 20),
+          _MetricStrip(entry: entry),
         ],
       ),
-    );
-  }
+    ),
+  );
+}
+
+/// 汇总指标通常为三列两行；小屏或放大字体改为两列，避免压缩阅读空间。
+/// 未连接时保留原有三个缺失金额占位，不生成模拟数据。
+class _MetricStrip extends StatelessWidget {
+  const _MetricStrip({this.entry});
+  final LedgerSummaryEntry? entry;
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final metrics = <(String, String, int)>[
+        ('净入金', entry?.netDeposits ?? '—', 2),
+        ('现金余额', entry?.cashBalance ?? '—', 2),
+        ('股息收入', entry?.dividends ?? '—', 2),
+        if (entry != null) ...[
+          ('累计费用', entry!.totalFees, 2),
+          ('持仓条目', '${entry!.openPositions}', 0),
+          ('交易笔数', '${entry!.transactionCount}', 0),
+        ],
+      ];
+      final columns =
+          constraints.maxWidth < 290 ||
+              MediaQuery.textScalerOf(context).scale(12) > 16
+          ? 2
+          : 3;
+      return Column(
+        children: [
+          for (int start = 0; start < metrics.length; start += columns)
+            Padding(
+              padding: EdgeInsets.only(top: start == 0 ? 0 : 18),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (int offset = 0; offset < columns; offset++)
+                    Expanded(
+                      child: start + offset >= metrics.length
+                          ? const SizedBox.shrink()
+                          : Padding(
+                              padding: EdgeInsets.only(
+                                right: offset == columns - 1 ? 0 : 10,
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    metrics[start + offset].$1,
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      color: LyraColors.inkSecondary,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 5),
+                                  FittedBox(
+                                    fit: BoxFit.scaleDown,
+                                    child: LyraAmount(
+                                      metrics[start + offset].$2,
+                                      size: 18,
+                                      decimals: metrics[start + offset].$3,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                    ),
+                ],
+              ),
+            ),
+        ],
+      );
+    },
+  );
+}
+
+/// AI 以次级工具入口出现，不与账号和股票争夺一级导航。
+class _AssistantNote extends StatelessWidget {
+  const _AssistantNote({this.onOpen});
+  final VoidCallback? onOpen;
+  @override
+  Widget build(BuildContext context) => Material(
+    color: Colors.transparent,
+    child: InkWell(
+      onTap: onOpen,
+      borderRadius: BorderRadius.circular(14),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
+        decoration: BoxDecoration(
+          border: Border.all(color: LyraColors.hairlineStrong),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          children: [
+            const Icon(LyraIcons.agent, size: 24, color: LyraColors.accent),
+            const SizedBox(width: 14),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'AI 账本分析',
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                  ),
+                  SizedBox(height: 5),
+                  Text(
+                    '解读持仓与交易记录',
+                    style: TextStyle(fontSize: 10, color: LyraColors.muted),
+                  ),
+                ],
+              ),
+            ),
+            const Icon(
+              LyraIcons.arrowUpRight,
+              size: 17,
+              color: LyraColors.muted,
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
 }

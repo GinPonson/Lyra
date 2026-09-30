@@ -123,6 +123,8 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
     if (repository == null || preview == null || _busy) {
       return;
     }
+    // 保存应用级容器：即使上传面板先关闭，成功提交仍需刷新账本读取缓存。
+    final container = ProviderScope.containerOf(context, listen: false);
     setState(() => _stage = _ImportStage.committing);
     try {
       final result = await repository.commit(
@@ -132,11 +134,18 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
         // 换新预览则生成新键。键值只含安全字符，明文不进入任何存储。
         idempotencyKey: 'commit-${preview.importId}',
       );
+      if (result.changed) {
+        // 会话持有权威汇总；依赖它的账户、持仓和报告 Provider 会一起重读。
+        // 无新增的重复导入不改变版本，也不触发不必要的网络请求。
+        container.invalidate(sessionProvider);
+      }
+      if (!mounted) return;
       setState(() {
         _result = result;
         _stage = _ImportStage.committed;
       });
     } on LyraApiError catch (error) {
+      if (!mounted) return;
       setState(() {
         _stage = _ImportStage.previewReady;
         _errorMessage = '${error.message}（${error.code}）';
@@ -163,7 +172,10 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
                 color: LyraColors.accent,
               ),
               const SizedBox(width: 10),
-              Text('导入 Schwab 文件', style: Theme.of(context).textTheme.titleLarge),
+              Text(
+                '导入 Schwab 文件',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
             ],
           ),
           const SizedBox(height: 8),
@@ -176,7 +188,9 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
           FilledButton.icon(
             onPressed: _busy ? null : () => _pickAndPreview(),
             icon: const Icon(LyraIcons.importFile),
-            label: Text(_stage == _ImportStage.uploading ? '上传解析中…' : '选择文件并预览'),
+            label: Text(
+              _stage == _ImportStage.uploading ? '上传解析中…' : '选择文件并预览',
+            ),
           ),
           if (candidates != null && candidates.isNotEmpty) ...<Widget>[
             const SizedBox(height: 14),
@@ -205,7 +219,7 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
             const SizedBox(height: 14),
             FilledButton.icon(
               onPressed: _stage == _ImportStage.committing ? null : _commit,
-              icon: const Icon(LyraIcons.ledger),
+              icon: const Icon(LyraIcons.confirm),
               label: Text(
                 preview.insertableRows == 0
                     ? '无新增交易，仍确认提交'
@@ -219,9 +233,8 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
               result.changed
                   ? '已写入账本：新增 ${result.insertedRows} 行，账本版本 ${result.ledgerVersion}'
                   : '无新增交易；账本版本保持 ${result.ledgerVersion}',
-              style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                fontWeight: FontWeight.w700,
-              ),
+              style: Theme.of(context).textTheme.bodyLarge
+                  ?.copyWith(fontWeight: FontWeight.w700),
             ),
           ],
           if (_errorMessage != null) ...<Widget>[
@@ -256,10 +269,8 @@ class _PreviewStats extends StatelessWidget {
         children: <Widget>[
           Text(
             preview.fileName,
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-              color: LyraColors.ink,
-              fontWeight: FontWeight.w700,
-            ),
+            style: Theme.of(context).textTheme.titleMedium
+                ?.copyWith(color: LyraColors.ink, fontWeight: FontWeight.w700),
           ),
           const SizedBox(height: 10),
           Text(
@@ -272,9 +283,8 @@ class _PreviewStats extends StatelessWidget {
             preview.byAction.entries
                 .map((entry) => '${entry.key} × ${entry.value}')
                 .join(' · '),
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: LyraColors.ink.withValues(alpha: 0.72),
-            ),
+            style: Theme.of(context).textTheme.labelSmall
+                ?.copyWith(color: LyraColors.ink.withValues(alpha: 0.72)),
           ),
         ],
       ),

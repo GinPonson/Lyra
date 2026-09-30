@@ -21,7 +21,7 @@ class _PairingPanelState extends ConsumerState<PairingPanel> {
   final TextEditingController _serverUrl = TextEditingController();
   final TextEditingController _pairingCode = TextEditingController();
   final TextEditingController _deviceName = TextEditingController(
-    text: 'Android phone',
+    text: '我的设备',
   );
   bool _submitting = false;
   String? _errorMessage;
@@ -38,6 +38,11 @@ class _PairingPanelState extends ConsumerState<PairingPanel> {
     if (_submitting) {
       return;
     }
+    final server = Uri.tryParse(_serverUrl.text.trim());
+    if (server == null || !['http', 'https'].contains(server.scheme) || server.host.isEmpty || _pairingCode.text.trim().isEmpty || _deviceName.text.trim().isEmpty) {
+      setState(() => _errorMessage = '请输入有效的服务端地址、配对码与设备名称');
+      return;
+    }
     setState(() {
       _submitting = true;
       _errorMessage = null;
@@ -49,12 +54,14 @@ class _PairingPanelState extends ConsumerState<PairingPanel> {
             displayName: _deviceName.text.trim(),
           );
     } on LyraApiError catch (error) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = '${error.message}（${error.code}）';
       });
     } catch (error) {
+      if (!mounted) return;
       setState(() {
-        _errorMessage = '配对失败，请检查服务端地址后重试';
+        _errorMessage = '配对未完成：$error';
       });
     } finally {
       if (mounted) {
@@ -70,9 +77,9 @@ class _PairingPanelState extends ConsumerState<PairingPanel> {
     return Container(
       padding: const EdgeInsets.all(22),
       decoration: BoxDecoration(
-        color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: LyraColors.hairlineStrong),
+        // 纸白表单与主画布同一色系，字段用边界区分。
+        color: LyraColors.surfaceSubtle,
+        borderRadius: BorderRadius.circular(20),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -85,12 +92,12 @@ class _PairingPanelState extends ConsumerState<PairingPanel> {
                 color: LyraColors.accent,
               ),
               const SizedBox(width: 10),
-              Text('配对 Lyra 服务端', style: Theme.of(context).textTheme.titleLarge),
+              Text('设备配对', style: Theme.of(context).textTheme.titleLarge),
             ],
           ),
           const SizedBox(height: 8),
           Text(
-            '在服务端生成一次性配对码后，填入地址与配对码完成设备配对。',
+            '填入服务端地址与一次性配对码。',
             style: Theme.of(context).textTheme.bodyMedium
                 ?.copyWith(color: LyraColors.muted),
           ),

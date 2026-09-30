@@ -2,8 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../../core/api/lyra_api_client.dart';
 import 'agent_repository.dart';
 
 /// WebSocket 事件面的单帧视图；只保留 App 逻辑需要的判别信息。
@@ -60,10 +62,15 @@ class AgentUnknownFrame extends AgentLiveFrame {
 typedef AgentChannelFactory = WebSocketChannel Function(
   Uri uri,
   Iterable<String> protocols,
+  Map<String, String> headers,
 );
 
-WebSocketChannel _defaultChannelFactory(Uri uri, Iterable<String> protocols) {
-  return WebSocketChannel.connect(uri, protocols: protocols);
+WebSocketChannel _defaultChannelFactory(
+  Uri uri,
+  Iterable<String> protocols,
+  Map<String, String> headers,
+) {
+  return IOWebSocketChannel.connect(uri, protocols: protocols, headers: headers);
 }
 
 /// `/v1/events` WebSocket 事件流客户端。
@@ -140,10 +147,11 @@ class AgentLiveEvents {
       scheme: serverUrl.startsWith('https') ? 'wss' : 'ws',
       path: '/v1/events',
     );
-    final channel = channelFactory(
-      wsUri,
-      <String>['bearer', accessToken],
-    );
+    // 握手必须携带协议版本头与 Bearer 令牌;服务端在升级前校验两者。
+    final channel = channelFactory(wsUri, const <String>[], <String, String>{
+      'authorization': 'Bearer $accessToken',
+      'x-lyra-protocol-version': kLyraProtocolVersion,
+    });
     _channel = channel;
     // 连接失败会同时从 ready 与 stream 两个入口报错；ready 在此显式吞掉，
     // 断开重连统一由 stream 的 onError/onDone 驱动，避免未处理异步异常。

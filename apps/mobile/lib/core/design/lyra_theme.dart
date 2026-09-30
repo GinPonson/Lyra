@@ -2,11 +2,19 @@ import 'package:flutter/material.dart';
 
 import 'lyra_colors.dart';
 
-/// 全局 Material 3 主题：轻量机构风(参照 Coinbase 设计系统)。
+/// 全局 Material 3 主题：白色画布、金融数字排版与绿色交互。
+///
+/// 文本与金额统一使用 Geist Sans；金额启用表格数字，中文使用系统字体。
 abstract final class LyraTheme {
-  /// 数字专用等宽字形;用于金额、时间戳等表格化数值。
+  /// 品牌无衬线字体族。
+  static const String fontFamily = 'Geist';
+
+  /// 等宽数字字体族。
+  static const String monoFamily = 'Geist Mono';
+
+  /// 数字表格化字形;用于金额、时间戳等数值的对齐稳定性。
   static const TextStyle numeric = TextStyle(
-    fontFamily: 'monospace',
+    fontFamily: fontFamily,
     fontFeatures: <FontFeature>[FontFeature.tabularFigures()],
   );
 
@@ -14,6 +22,12 @@ abstract final class LyraTheme {
     final ThemeData base = ThemeData(
       useMaterial3: true,
       brightness: Brightness.light,
+      fontFamily: fontFamily,
+      fontFamilyFallback: const [
+        'PingFang SC',
+        'Noto Sans CJK SC',
+        'sans-serif',
+      ],
       colorScheme: const ColorScheme.light(
         primary: LyraColors.accent,
         onPrimary: LyraColors.surface,
@@ -35,25 +49,25 @@ abstract final class LyraTheme {
 
     return base.copyWith(
       textTheme: base.textTheme.copyWith(
-        // 展示级标题 weight 400 不加粗,靠字号与紧字距建立层级。
+        // 展示级数字:靠字号、紧字距与中等字重建立层级,不加粗到发闷。
         displayLarge: base.textTheme.displayLarge?.copyWith(
-          fontSize: 56,
+          fontSize: 50,
           height: 1.02,
-          letterSpacing: -1.6,
-          fontWeight: FontWeight.w400,
+          letterSpacing: -1.8,
+          fontWeight: FontWeight.w600,
           color: LyraColors.ink,
         ),
         headlineLarge: base.textTheme.headlineLarge?.copyWith(
-          fontSize: 34,
-          height: 1.08,
-          letterSpacing: -1.0,
-          fontWeight: FontWeight.w400,
+          fontSize: 30,
+          height: 1.1,
+          letterSpacing: -0.6,
+          fontWeight: FontWeight.w600,
           color: LyraColors.ink,
         ),
         headlineSmall: base.textTheme.headlineSmall?.copyWith(
-          fontSize: 22,
+          fontSize: 21,
           letterSpacing: -0.3,
-          fontWeight: FontWeight.w400,
+          fontWeight: FontWeight.w600,
           color: LyraColors.ink,
           fontFeatures: const <FontFeature>[FontFeature.tabularFigures()],
         ),
@@ -89,6 +103,33 @@ abstract final class LyraTheme {
           color: LyraColors.muted,
         ),
       ),
+      appBarTheme: const AppBarTheme(
+        backgroundColor: LyraColors.canvas,
+        foregroundColor: LyraColors.ink,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        centerTitle: false,
+        titleTextStyle: TextStyle(
+          fontFamily: fontFamily,
+          fontFamilyFallback: ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
+          fontSize: 17,
+          fontWeight: FontWeight.w600,
+          color: LyraColors.ink,
+        ),
+      ),
+      chipTheme: ChipThemeData(
+        backgroundColor: LyraColors.canvas,
+        selectedColor: LyraColors.ink,
+        side: const BorderSide(color: LyraColors.hairlineStrong),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        labelStyle: const TextStyle(
+          fontFamily: fontFamily,
+          fontFamilyFallback: ['PingFang SC', 'Noto Sans CJK SC', 'sans-serif'],
+          fontSize: 12,
+          color: LyraColors.inkSecondary,
+        ),
+      ),
       inputDecorationTheme: InputDecorationThemeData(
         filled: true,
         fillColor: LyraColors.surface,
@@ -108,9 +149,21 @@ abstract final class LyraTheme {
           foregroundColor: LyraColors.surface,
           disabledBackgroundColor: LyraColors.accentDisabled,
           disabledForegroundColor: LyraColors.surface,
-          minimumSize: const Size.fromHeight(44),
-          textStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
-          shape: const StadiumBorder(),
+          minimumSize: const Size(0, 48),
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+          textStyle: const TextStyle(
+            fontFamily: fontFamily,
+            fontFamilyFallback: [
+              'PingFang SC',
+              'Noto Sans CJK SC',
+              'sans-serif',
+            ],
+            fontWeight: FontWeight.w600,
+            fontSize: 15,
+          ),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
         ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
@@ -118,23 +171,36 @@ abstract final class LyraTheme {
           foregroundColor: LyraColors.ink,
           disabledForegroundColor: LyraColors.mutedSoft,
           backgroundColor: LyraColors.surface,
-          minimumSize: const Size.fromHeight(44),
+          minimumSize: const Size(0, 48),
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
           side: const BorderSide(color: LyraColors.hairlineStrong),
-          textStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
-          shape: const StadiumBorder(),
+          textStyle: const TextStyle(
+            fontFamily: fontFamily,
+            fontFamilyFallback: [
+              'PingFang SC',
+              'Noto Sans CJK SC',
+              'sans-serif',
+            ],
+            fontWeight: FontWeight.w600,
+            fontSize: 15,
+          ),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
         ),
       ),
+      // 底部保留图标与文字，使用轻色选中背景帮助识别当前入口。
       navigationBarTheme: NavigationBarThemeData(
-        height: 72,
+        height: 76,
         backgroundColor: LyraColors.surface,
         surfaceTintColor: LyraColors.surface,
-        indicatorColor: LyraColors.surfaceStrong,
+        indicatorColor: LyraColors.accentTint,
         iconTheme: WidgetStateProperty.resolveWith<IconThemeData>(
           (Set<WidgetState> states) => IconThemeData(
             color: states.contains(WidgetState.selected)
-                ? LyraColors.accent
+                ? LyraColors.ink
                 : LyraColors.muted,
-            size: 23,
+            size: 24,
           ),
         ),
         labelTextStyle: WidgetStateProperty.resolveWith<TextStyle>(

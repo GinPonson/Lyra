@@ -84,9 +84,7 @@ String _mappingRequiredResponse() {
     'message': '导入文件必须明确选择匹配的活跃账户',
     'retryable': false,
     'details': <String, Object?>{
-      'candidate_account_ids': <String>[
-        'a2000000-0000-4000-8000-000000000001',
-      ],
+      'candidate_account_ids': <String>['a2000000-0000-4000-8000-000000000001'],
     },
   });
 }
@@ -163,9 +161,8 @@ class _SessionProbe extends ConsumerWidget {
       state.when(
         loading: () => 'session:loading',
         error: (Object error, StackTrace stackTrace) => 'session:error',
-        data: (SessionState value) => value is SessionPaired
-            ? 'session:paired'
-            : 'session:unpaired',
+        data: (SessionState value) =>
+            value is SessionPaired ? 'session:paired' : 'session:unpaired',
       ),
     );
   }
@@ -176,12 +173,10 @@ void main() {
     final requestedPaths = <String>[];
     final store = MemoryCredentialStore();
     final dio = Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3141'))
-      ..httpClientAdapter = FakeImportAdapter(
-        (RequestOptions options) async {
-          requestedPaths.add(options.uri.path);
-          return _routeImportRequest(options);
-        },
-      );
+      ..httpClientAdapter = FakeImportAdapter((RequestOptions options) async {
+        requestedPaths.add(options.uri.path);
+        return _routeImportRequest(options);
+      });
     final repository = ImportRepository(
       client: LyraApiClient(
         serverUrl: 'http://127.0.0.1:3141',
@@ -253,6 +248,23 @@ void main() {
 
     final store = MemoryCredentialStore();
     await store.write(_snapshot);
+    var committed = false;
+    var summaryReads = 0;
+
+    // 用可变服务端版本验证真实缓存失效行为，避免仅检查成功提示而漏掉旧汇总。
+    Future<ResponseBody> routeAfterCommit(RequestOptions options) async {
+      if (options.uri.path == '/v1/ledger/summary') {
+        summaryReads++;
+        final body = jsonDecode(_accountsResponse) as Map<String, dynamic>;
+        (body['metadata'] as Map<String, dynamic>)['ledgerVersion'] = committed
+            ? 2
+            : 1;
+        body['data'] = {'aggregateCurrency': null, 'groups': <Object?>[]};
+        return _jsonResponse(jsonEncode(body), 200);
+      }
+      if (options.uri.path.endsWith('/commit')) committed = true;
+      return _routeImportRequest(options);
+    }
 
     await tester.pumpWidget(
       ProviderScope(
@@ -262,7 +274,7 @@ void main() {
               credentialStore: store,
               clientFactory: (String serverUrl) {
                 return Dio(BaseOptions(baseUrl: serverUrl))
-                  ..httpClientAdapter = FakeImportAdapter(_routeImportRequest);
+                  ..httpClientAdapter = FakeImportAdapter(routeAfterCommit);
               },
             ),
           ),
@@ -274,9 +286,9 @@ void main() {
                 // 会话探针：与生产一致地 watch 状态，驱动 AsyncNotifier
                 // 在 FakeAsync 时钟内完成凭据恢复与汇总加载。
                 const _SessionProbe(),
-                const Expanded(child: ImportSheet(
-                  openFileOverride: _openPresetCsvFile,
-                )),
+                const Expanded(
+                  child: ImportSheet(openFileOverride: _openPresetCsvFile),
+                ),
               ],
             ),
           ),
@@ -309,6 +321,13 @@ void main() {
 
     expect(find.textContaining('已写入账本'), findsOneWidget);
     expect(find.textContaining('账本版本 2'), findsOneWidget);
+    expect(summaryReads, 2);
+    final state =
+        ProviderScope.containerOf(tester.element(find.byType(ImportSheet)))
+                .read(sessionProvider)
+                .requireValue
+            as SessionPaired;
+    expect(state.summary!.metadata.ledgerVersion, 2);
   });
 
   testWidgets('未配对时导入面板提示先配对', (WidgetTester tester) async {

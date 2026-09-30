@@ -1,28 +1,33 @@
 import 'package:flutter/material.dart';
 
 import '../../core/design/lyra_colors.dart';
-import '../../core/design/lyra_icons.dart';
 
-/// 尚未接入数据源的一级页面骨架。
-///
-/// 骨架只展示页面职责与空状态，不伪造金融数字；真实用例接入时直接替换内容区。
-class SectionScreen extends StatelessWidget {
-  const SectionScreen({
-    required this.eyebrow,
-    required this.title,
-    required this.description,
+/// 一级页面的分组入口条目。
+class SectionEntry {
+  const SectionEntry({
     required this.icon,
-    required this.sections,
-    this.accent = LyraColors.accent,
-    super.key,
+    required this.title,
+    required this.subtitle,
+    this.status,
   });
 
-  final String eyebrow;
-  final String title;
-  final String description;
   final IconData icon;
-  final List<String> sections;
-  final Color accent;
+  final String title;
+  final String subtitle;
+
+  /// 入口当前状态(如"即将接入");为空表示可进入。
+  final String? status;
+}
+
+/// 尚未接入数据源的一级页面占位。
+///
+/// 只保留紧凑标题与分组入口,不伪造金融数字;真实用例接入时直接替换内容区。
+/// 入口行用状态标签如实标注"即将接入",不使用暗示可点的箭头。
+class SectionScreen extends StatelessWidget {
+  const SectionScreen({required this.title, required this.sections, super.key});
+
+  final String title;
+  final List<SectionEntry> sections;
 
   @override
   Widget build(BuildContext context) {
@@ -38,93 +43,33 @@ class SectionScreen extends StatelessWidget {
               key: PageStorageKey<String>('section-$title'),
               slivers: <Widget>[
                 SliverPadding(
-                  padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
+                  padding: const EdgeInsets.fromLTRB(20, 12, 20, 40),
                   sliver: SliverList.list(
                     children: <Widget>[
-                      Text(
-                        eyebrow,
-                        style: Theme.of(context).textTheme.labelSmall
-                            ?.copyWith(color: accent),
-                      ),
-                      const SizedBox(height: 14),
+                      // 与总览头部同一级标题尺度,不用页面级大标题。
                       Text(
                         title,
                         key: ValueKey<String>('section-title-$title'),
-                        style: Theme.of(context).textTheme.headlineLarge,
+                        style: Theme.of(context).textTheme.headlineLarge
+                            ?.copyWith(fontSize: 22, letterSpacing: -0.3),
                       ),
-                      const SizedBox(height: 14),
+                      const SizedBox(height: 6),
                       Text(
-                        description,
-                        style: Theme.of(context).textTheme.bodyLarge
-                            ?.copyWith(color: LyraColors.inkSecondary, height: 1.55),
+                        '账本数据接入后,这里提供可筛选的明细与分组视图。',
+                        style: Theme.of(context).textTheme.bodyMedium
+                            ?.copyWith(color: LyraColors.muted),
                       ),
-                      const SizedBox(height: 34),
-                      Container(
-                        padding: const EdgeInsets.all(24),
-                        decoration: BoxDecoration(
-                          color: LyraColors.surface,
-                          borderRadius: BorderRadius.circular(24),
-                          border: Border.all(color: LyraColors.hairlineStrong),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            Container(
-                              width: 44,
-                              height: 44,
-                              alignment: Alignment.center,
-                              decoration: const BoxDecoration(
-                                color: LyraColors.surfaceStrong,
-                                shape: BoxShape.circle,
-                              ),
-                              child: Icon(icon, color: accent, size: 22),
+                      const SizedBox(height: 20),
+                      // 分组直接铺在画布上,行间发丝线,无外框。
+                      Column(
+                        children: <Widget>[
+                          for (final (int index, SectionEntry entry)
+                              in sections.indexed)
+                            _EntryRow(
+                              entry: entry,
+                              isLast: index == sections.length - 1,
                             ),
-                            const SizedBox(height: 20),
-                            Text(
-                              '等待服务端数据',
-                              style: Theme.of(context).textTheme.titleMedium,
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              '连接后将在此显示经过账户范围和账本版本校验的真实结果。',
-                              style: Theme.of(context).textTheme.bodyMedium
-                                  ?.copyWith(color: LyraColors.muted),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      ...sections.map(
-                        (String section) => Container(
-                          margin: const EdgeInsets.only(bottom: 8),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 18,
-                            vertical: 16,
-                          ),
-                          decoration: BoxDecoration(
-                            color: LyraColors.surface,
-                            borderRadius: BorderRadius.circular(16),
-                            border: Border.all(color: LyraColors.hairlineStrong),
-                          ),
-                          child: Row(
-                            children: <Widget>[
-                              Expanded(
-                                child: Text(
-                                  section,
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w600,
-                                    color: LyraColors.ink,
-                                  ),
-                                ),
-                              ),
-                              const Icon(
-                                LyraIcons.disclosure,
-                                color: LyraColors.muted,
-                                size: 20,
-                              ),
-                            ],
-                          ),
-                        ),
+                        ],
                       ),
                     ],
                   ),
@@ -133,6 +78,80 @@ class SectionScreen extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _EntryRow extends StatelessWidget {
+  const _EntryRow({required this.entry, required this.isLast});
+
+  final SectionEntry entry;
+  final bool isLast;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 14),
+      decoration: BoxDecoration(
+        border: isLast
+            ? null
+            : const Border(bottom: BorderSide(color: LyraColors.hairline)),
+      ),
+      child: Row(
+        children: <Widget>[
+          Container(
+            width: 38,
+            height: 38,
+            alignment: Alignment.center,
+            decoration: const BoxDecoration(
+              color: LyraColors.accentTint,
+              shape: BoxShape.circle,
+            ),
+            child: Icon(entry.icon, size: 19, color: LyraColors.accent),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  entry.title,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: LyraColors.ink,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  entry.subtitle,
+                  style: const TextStyle(
+                    fontSize: 12.5,
+                    color: LyraColors.muted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          if (entry.status != null)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: LyraColors.surfaceStrong,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Text(
+                entry.status!,
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                  color: LyraColors.muted,
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
