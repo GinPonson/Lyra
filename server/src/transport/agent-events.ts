@@ -111,10 +111,22 @@ export async function registerAgentEventsRoute(
         }));
         return;
       }
-      const resume = options.orchestrator.resumeEvents(
-        message.sessionId,
-        message.afterSequence,
-      );
+      let resume: ReturnType<typeof options.orchestrator.resumeEvents>;
+      try {
+        resume = options.orchestrator.resumeEvents(
+          message.sessionId,
+          message.afterSequence,
+        );
+      } catch {
+        // 运行时未在内存(如进程重启后重连)不可补造事件;按既有契约要求
+        // 客户端重取权威快照。socket 回调内抛出异常会击穿整个服务进程。
+        socket.send(JSON.stringify({
+          type: "subscribed",
+          mode: "snapshot_required",
+          reason: "SESSION_NOT_RESUMED",
+        }));
+        return;
+      }
       if (boundSessionId !== message.sessionId && unsubscribe !== null) {
         unsubscribe();
       }
