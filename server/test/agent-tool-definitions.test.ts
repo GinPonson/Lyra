@@ -55,7 +55,7 @@ describe("financial tool definitions", () => {
     ]);
   });
 
-  it("仅为实际配置 handler 的工具生成 MCP 公开定义", () => {
+  it("仅为实际配置 handler 的工具生成 Genkit 公开定义", () => {
     const registry = new FinancialToolRegistry({
       summary: async () => ({}),
       risk: async () => ({}),

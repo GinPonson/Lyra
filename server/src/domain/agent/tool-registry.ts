@@ -1,7 +1,7 @@
 import type { AccountScope } from "../analytics/index.js";
 import { CASH_ACTIONS, POSITION_ACTIONS } from "../ledger/index.js";
 
-/** MCP 可直接公开的对象输入 JSON Schema。 */
+/** REST 与 Genkit 共用的对象输入 JSON Schema。 */
 export interface FinancialToolInputSchema {
   type: "object";
   properties: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
@@ -9,7 +9,7 @@ export interface FinancialToolInputSchema {
   additionalProperties: false;
 }
 
-/** MCP 与审计共用的只读能力标记。 */
+/** 业务工具与审计共用的只读能力标记。 */
 export interface FinancialToolAnnotations {
   readOnlyHint: true;
   destructiveHint: false;
@@ -54,7 +54,7 @@ const PAGINATION_PROPERTIES = {
  * 第一阶段 17 个确定性只读金融工具的唯一公开定义。
  *
  * 账户范围、账本版本和 asOf 由服务端会话凭据注入，因此不会出现在模型可控
- * schema 中。后续 MCP SDK 注册、直接适配调用和审计展示都必须读取本清单。
+ * schema 中。Genkit 注册、REST 调用和审计展示都必须读取本清单。
  */
 export const FINANCIAL_TOOL_DEFINITIONS = [
   {
@@ -276,7 +276,7 @@ export class AgentToolPolicyError extends Error {
 /**
  * 只暴露设计方案中确认过的只读金融工具。
  *
- * 三个 Agent 适配器都必须使用同一个实例。注册表在调用 handler 前删除模型
+ * REST 与 Genkit 使用同一个实例。注册表在调用 handler 前删除模型
  * 传入的账户范围、账本版本和截止时间字段，并以服务端上下文单独注入，防止
  * 模型通过参数跨账户或查询未授权账本版本。
  */
@@ -300,7 +300,7 @@ export class FinancialToolRegistry {
     return FINANCIAL_TOOL_NAMES.filter((name) => this.handlers.has(name));
   }
 
-  /** 返回 MCP 可以公开的已配置工具定义，禁止为供应商复制另一份 schema。 */
+  /** 返回 Genkit 可以公开的已配置工具定义，禁止为供应商复制另一份 schema。 */
   availableToolDefinitions(): readonly FinancialToolDefinition[] {
     return FINANCIAL_TOOL_DEFINITIONS.filter((definition) => (
       this.handlers.has(definition.name)

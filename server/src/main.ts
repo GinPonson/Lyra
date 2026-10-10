@@ -5,14 +5,17 @@ import { z } from "zod";
 
 import {
   WriteCoordinator,
-  assembleAgentMcpRuntime,
-  createAgentAvailabilityProvider,
+  createFinancialToolRegistry,
   createDeviceAuthGate,
   createServiceHealthSnapshot,
 } from "./application/index.js";
 import { AgentTurnOrchestrator } from "./application/index.js";
-import { AgentMcpCredentialStore, createAgentTurnExecutors } from "./infrastructure/agents/index.js";
+import { createGenkitRuntimeFromEnvironment } from "./infrastructure/agents/genkit-runtime.js";
+import { loadGoogleLoginConfig } from "./infrastructure/auth/google-login-client.js";
+import { GoogleLoginService } from "./application/google-login-service.js";
+import { registerGoogleLoginRoutes } from "./transport/google-login-routes.js";
 import { openLyraDatabase } from "./infrastructure/db/database.js";
+import { recoverInterruptedAgentSessions } from "./infrastructure/db/agent-session-repository.js";
 import { CURRENT_SCHEMA_VERSION } from "./infrastructure/db/schema-version.js";
 import {
   buildHttpServer,
@@ -31,27 +34,13 @@ const environmentSchema = z.object({
   LYRA_HOST: z.string().trim().min(1).default("127.0.0.1"),
   LYRA_PORT: z.coerce.number().int().min(1).max(65_535).default(3_141),
   LYRA_DATABASE_PATH: z.string().trim().min(1),
-  LYRA_AGENT_WORKSPACE_ROOT: z.string().trim().min(1),
-  LYRA_AGENT_CLAUDE_PATH: z.string().trim().min(1),
-  LYRA_AGENT_PI_PATH: z.string().trim().min(1),
-  LYRA_AGENT_OPENCODE_PATH: z.string().trim().min(1),
-  LYRA_AGENT_PI_EXTENSION_PATH: z.string().trim().min(1),
-  LYRA_AGENT_TURN_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(900_000),
-  LYRA_AGENT_PROBE_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(10_000),
   LYRA_IMPORT_STAGING_DIR: z.string().trim().min(1),
   /** 32 字节 hex 主密钥；Gmail refresh token 等敏感数据经 AES-256-GCM 加密。 */
   LYRA_SECRET_MASTER_KEY: z.string().regex(/^[0-9a-fA-F]{64}$/),
   LYRA_GOOGLE_CLIENT_ID: z.string().trim().min(1).default(""),
   LYRA_GOOGLE_CLIENT_SECRET: z.string().trim().min(1).default(""),
   LYRA_GOOGLE_REDIRECT_URI: z.string().trim().min(1).default(""),
-  /** JSON 对象：{"claude":["2.1.233"],"pi":["0.84.2"],"opencode":["1.18.21"]}。 */
-  LYRA_AGENT_ALLOWED_VERSIONS: z.string().trim().min(1),
 });
-
-const allowedVersionsSchema = z.record(
-  z.enum(["claude", "pi", "opencode"]),
-  z.array(z.string().trim().min(1)).min(1),
-);
 
 const packageSchema = z.object({
   version: z.string().trim().min(1),
@@ -63,13 +52,13 @@ async function start(): Promise<void> {
   const packageJson = packageSchema.parse(JSON.parse(
     readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
   ));
+  // Validate new integration configuration before any irreversible schema upgrade.
+  const loginConfig = loadGoogleLoginConfig(process.env);
+  const aiRuntime = createGenkitRuntimeFromEnvironment(process.env);
   const database = await openLyraDatabase(environment.LYRA_DATABASE_PATH);
   const writeCoordinator = new WriteCoordinator();
-  // MCP 短期凭据只在 Agent 回合运行期间存在于进程内；服务重启即失效。
-  const mcpCredentials = new AgentMcpCredentialStore();
-  const mcpRuntime = assembleAgentMcpRuntime({ database, mcpCredentials });
-  // 会话工作目录在受信根路径下随机创建；根目录本身按配置在启动时准备。
-  mkdirSync(environment.LYRA_AGENT_WORKSPACE_ROOT, { recursive: true });
+  await writeCoordinator.enqueue(() => recoverInterruptedAgentSessions(database, new Date()));
+  const registry = createFinancialToolRegistry(database);
   mkdirSync(environment.LYRA_IMPORT_STAGING_DIR, { recursive: true });
   const importService = new ImportService({
     database,
@@ -104,32 +93,15 @@ async function start(): Promise<void> {
     database,
     writeCoordinator,
   });
-  const executables = {
-    claude: environment.LYRA_AGENT_CLAUDE_PATH,
-    pi: environment.LYRA_AGENT_PI_PATH,
-    opencode: environment.LYRA_AGENT_OPENCODE_PATH,
-  } as const;
+  const loginService = loginConfig === null ? null : new GoogleLoginService({
+    config: loginConfig,
+    devicePairingService,
+  });
   const orchestrator = new AgentTurnOrchestrator({
     database,
     writeCoordinator,
-    mcpCredentials,
-    registry: mcpRuntime.registry,
-    executors: createAgentTurnExecutors({
-      workspaceRoot: environment.LYRA_AGENT_WORKSPACE_ROOT,
-      clientVersion: packageJson.version,
-      executables,
-      piExtensionPath: environment.LYRA_AGENT_PI_EXTENSION_PATH,
-      turnTimeoutMilliseconds: environment.LYRA_AGENT_TURN_TIMEOUT_MS,
-    }),
-    mcpEndpoint: `http://127.0.0.1:${environment.LYRA_PORT}/mcp`,
-    mcpCredentialTtlMilliseconds: 120_000,
-  });
-  const availability = createAgentAvailabilityProvider({
-    executables,
-    allowedVersions: allowedVersionsSchema.parse(
-      JSON.parse(environment.LYRA_AGENT_ALLOWED_VERSIONS),
-    ),
-    probeTimeoutMilliseconds: environment.LYRA_AGENT_PROBE_TIMEOUT_MS,
+    registry,
+    executor: aiRuntime.executor,
   });
   const authenticateDevice = createDeviceAuthGate(database);
   const app = buildHttpServer({
@@ -142,25 +114,29 @@ async function start(): Promise<void> {
       database: await database.readHealth(),
       writeQueue: writeCoordinator.status(),
       gmailConnections: [],
-      agentAvailability: null,
+      agentAvailability: await aiRuntime.availability(),
       checkedAt: new Date(),
     }),
-    mcp: {
-      registry: mcpRuntime.registry,
-      loadAuthorization: mcpRuntime.loadAuthorization,
-      persistCredentialRecord: mcpRuntime.persistCredentialRecord,
-    },
   });
   registerAgentRoutes(app, {
     orchestrator,
     writeCoordinator,
     database,
-    availability,
+    availability: aiRuntime.availability,
     authenticateDevice,
   });
-  await registerAgentEventsRoute(app, { orchestrator, authenticateDevice });
+  const eventConnections = await registerAgentEventsRoute(app, { orchestrator, authenticateDevice });
+  registerGoogleLoginRoutes(app, {
+    loginService,
+    pairingService: devicePairingService,
+    authenticateDevice,
+    onLogout: async (deviceId) => {
+      eventConnections.disconnectDevice(deviceId);
+      await orchestrator.cancelDeviceTurns(deviceId);
+    },
+  });
   registerLedgerRoutes(app, {
-    registry: mcpRuntime.registry,
+    registry,
     database,
     authenticateDevice,
   });

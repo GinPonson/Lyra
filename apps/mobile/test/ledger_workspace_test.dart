@@ -435,7 +435,7 @@ void main() {
     });
   }
 
-  testWidgets('未配对首屏提供直接连接入口', (tester) async {
+  testWidgets('未登录首屏提供直接连接入口', (tester) async {
     viewport(tester, const Size(390, 844));
     final fixture = LedgerFixture();
     final dependencies = await fixture.dependencies(paired: false);

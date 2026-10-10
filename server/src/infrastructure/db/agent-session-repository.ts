@@ -10,7 +10,7 @@ import type {
 import { ApplicationError } from "../../application/app-error.js";
 import type { LyraDatabase } from "./database.js";
 
-const AGENT_PROVIDERS = new Set<AgentProvider>(["claude", "pi", "opencode"]);
+const AGENT_PROVIDERS = new Set<AgentProvider>(["genkit"]);
 const SESSION_STATUSES = new Set<AgentSessionStatus>([
   "idle", "running", "cancelling", "closed",
 ]);
@@ -21,8 +21,80 @@ const MESSAGE_FINAL_STATUSES = new Set<NonNullable<NormalizedAgentMessage["statu
   "completed", "failed", "cancelled",
 ]);
 
+/**
+ * 服务启动且尚未接收请求时恢复被上次进程中断的 Genkit 回合。
+ * 已持久化可见文本不丢弃；进行中的工具和消息形成明确失败/取消终态，
+ * 会话回到 idle 并追加系统说明。重复启动恢复没有副作用。
+ * 调用方必须通过 WriteCoordinator 在开始服务前执行一次。
+ */
+export async function recoverInterruptedAgentSessions(
+  database: LyraDatabase,
+  now: Date,
+): Promise<number> {
+  if (Number.isNaN(now.getTime())) throw new RangeError("Agent 恢复时间无效");
+  const connection = database.connection;
+  await connection.run("BEGIN TRANSACTION");
+  try {
+    const rows = await connection.runAndReadAll(`
+      SELECT count(*)::INTEGER AS count FROM agent_sessions
+      WHERE provider = 'genkit' AND status IN ('running', 'cancelling')
+    `);
+    const count = Number(rows.getRowObjectsJson()[0]?.count ?? 0);
+    if (count > 0) {
+      const params = { now: now.toISOString() };
+      await connection.run(`
+        UPDATE agent_tool_calls
+        SET status = 'cancelled', result_summary = NULL,
+            duration_ms = coalesce(duration_ms, 0), error_code = 'AGENT_TOOL_CANCELLED',
+            completed_at = greatest(started_at, CAST($now AS TIMESTAMPTZ))
+        WHERE status = 'started' AND session_id IN (
+          SELECT id FROM agent_sessions
+          WHERE provider = 'genkit' AND status IN ('running', 'cancelling')
+        )
+      `, params);
+      await connection.run(`
+        UPDATE agent_messages
+        SET status = 'failed', error_code = 'AGENT_TURN_FAILED',
+            completed_at = greatest(created_at, CAST($now AS TIMESTAMPTZ))
+        WHERE status = 'streaming' AND session_id IN (
+          SELECT id FROM agent_sessions
+          WHERE provider = 'genkit' AND status IN ('running', 'cancelling')
+        )
+      `, params);
+      await connection.run(`
+        INSERT INTO agent_messages (
+          id, session_id, ordinal, role, provider, status, content, error_code,
+          created_at, completed_at
+        )
+        SELECT uuid(), s.id, coalesce(m.last_ordinal, 0) + 1, 'system', NULL, 'completed',
+               '上一回合因服务重启中断。已保存的消息和工具记录保留，你可以重新提问继续。',
+               NULL, greatest(s.updated_at, CAST($now AS TIMESTAMPTZ)),
+               greatest(s.updated_at, CAST($now AS TIMESTAMPTZ))
+        FROM agent_sessions s
+        LEFT JOIN (
+          SELECT session_id, max(ordinal) AS last_ordinal
+          FROM agent_messages GROUP BY session_id
+        ) m ON m.session_id = s.id
+        WHERE s.provider = 'genkit' AND s.status IN ('running', 'cancelling')
+      `, params);
+      await connection.run(`
+        UPDATE agent_sessions SET status = 'idle', revision = revision + 1,
+          last_event_sequence = last_event_sequence + 1,
+          updated_at = greatest(updated_at, CAST($now AS TIMESTAMPTZ))
+        WHERE provider = 'genkit' AND status IN ('running', 'cancelling')
+      `, params);
+    }
+    await connection.run("COMMIT");
+    return count;
+  } catch (error) {
+    await connection.run("ROLLBACK");
+    throw error;
+  }
+}
+
 /** 编排器恢复回合时需要的规范会话与持久化事件游标。 */
 export interface AgentSessionRuntimeRecord {
+  deviceId: string;
   snapshot: AgentSessionSnapshot;
   lastEventSequence: number;
 }
@@ -62,6 +134,7 @@ export async function loadAgentSessionRuntime(
   const reader = await database.connection.runAndReadAll(`
     SELECT
       CAST(s.id AS VARCHAR) AS session_id,
+      CAST(s.device_id AS VARCHAR) AS device_id,
       s.provider,
       s.status AS session_status,
       s.account_scope_kind,
@@ -107,6 +180,7 @@ export async function loadAgentSessionRuntime(
       .map(parseMessage),
   };
   return {
+    deviceId: requireString(first.device_id, "Agent 设备 ID"),
     snapshot,
     lastEventSequence: parseNonNegativeInteger(
       first.last_event_sequence,
@@ -119,7 +193,7 @@ export async function loadAgentSessionRuntime(
  * 持久化领域层已经创建的空 Agent 会话。
  *
  * 当前账本版本与设备状态在同一事务中核对；只保存规范会话，不创建子进程、
- * 工作目录或 MCP 凭据。调用方应通过 `WriteCoordinator` 串行执行本函数。
+ * 外部运行环境。调用方应通过 `WriteCoordinator` 串行执行本函数。
  *
  * @param database - 已完成 v1–v11 migration 的数据库。
  * @param input.session - `createAgentSession` 返回的 idle 空会话。
@@ -204,7 +278,7 @@ export async function persistNewAgentSession(
 /**
  * 原子固化用户消息、running 状态、revision 和下一事件序号。
  *
- * 供应商子进程只能在本函数提交成功后收到 `plan.adapterInput`。事件正文不落库，
+ * Genkit 执行器只能在本函数提交成功后收到 `plan.adapterInput`。事件正文不落库，
  * 仅持久化序号；提交后由 orchestrator 把领域事件写入有界内存缓冲并推送 App。
  * 同一计划重放或会话已变化时 CAS 失败，事务不会留下重复消息。
  *
@@ -392,100 +466,6 @@ export async function persistAgentSessionCancelling(
       await connection.run("ROLLBACK");
     } catch (rollbackError: unknown) {
       throw new AggregateError([error, rollbackError], "Agent 取消持久化失败且回滚失败");
-    }
-    throw error;
-  }
-}
-
-/**
- * 原子持久化回合边界的跨供应商切换：更新 provider 与 revision，并写入显式
- * 切换边界 system 消息。
- *
- * revision 递增使既有 MCP 单会话凭据失效；切换消息是规范快照的一部分，必须
- * 与会话状态在同一事务落库。
- */
-export async function persistAgentSessionSwitch(
-  database: LyraDatabase,
-  input: {
-    session: AgentSessionSnapshot;
-    previousProvider: string;
-  },
-): Promise<void> {
-  const switched = input.session;
-  const boundary = switched.messages.at(-1);
-  if (
-    switched.status !== "idle"
-    || switched.provider === input.previousProvider
-    || boundary === undefined
-    || boundary.role !== "system"
-    || boundary.id !== switched.messages.at(-1)?.id
-  ) {
-    throw new RangeError("Agent 切换计划必须是含边界消息的已切换快照");
-  }
-  const connection = database.connection;
-  await connection.run("BEGIN TRANSACTION");
-  try {
-    const accountId = switched.accountScope.kind === "account"
-      ? switched.accountScope.account
-      : null;
-    const updated = await connection.run(`
-      UPDATE agent_sessions
-      SET provider = $next_provider,
-          revision = $next_revision,
-          updated_at = CAST($switched_at AS TIMESTAMPTZ)
-      WHERE id = CAST($session_id AS UUID)
-        AND status = 'idle'
-        AND provider = $previous_provider
-        AND revision = $expected_revision
-        AND ledger_version = $ledger_version
-        AND as_of = CAST($as_of AS TIMESTAMPTZ)
-        AND account_scope_kind = $account_scope_kind
-        AND (
-          ($account_scope_kind = 'all' AND account_id IS NULL)
-          OR ($account_scope_kind = 'account' AND account_id = CAST($account_id AS UUID))
-        )
-    `, {
-      next_provider: switched.provider,
-      next_revision: switched.revision,
-      switched_at: boundary.createdAt,
-      session_id: switched.id,
-      previous_provider: input.previousProvider,
-      expected_revision: switched.revision - 1,
-      ledger_version: switched.ledgerVersion,
-      as_of: switched.asOf,
-      account_scope_kind: switched.accountScope.kind,
-      account_id: accountId,
-    });
-    if (updated.rowsChanged !== 1) {
-      throw new ApplicationError({
-        code: "AGENT_SESSION_STATE_CONFLICT",
-        message: "Agent 会话已变化，切换未生效",
-        statusCode: 409,
-        retryable: false,
-      });
-    }
-    await connection.run(`
-      INSERT INTO agent_messages (
-        id, session_id, ordinal, role, provider, status, content, error_code,
-        created_at, completed_at
-      ) VALUES (
-        CAST($message_id AS UUID), CAST($session_id AS UUID), $ordinal,
-        'system', NULL, 'completed', $content, NULL,
-        CAST($created_at AS TIMESTAMPTZ), CAST($created_at AS TIMESTAMPTZ)
-      )
-    `, {
-      message_id: boundary.id,
-      session_id: switched.id,
-      ordinal: switched.messages.length,
-      content: boundary.content,
-      created_at: boundary.createdAt,
-    });
-    await connection.run("COMMIT");
-  } catch (error: unknown) {
-    try {
-      await connection.run("ROLLBACK");
-    } catch (rollbackError: unknown) {
-      throw new AggregateError([error, rollbackError], "Agent 切换持久化失败且回滚失败");
     }
     throw error;
   }

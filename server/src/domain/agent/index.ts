@@ -13,15 +13,12 @@ export {
 } from "./events.js";
 export {
   AgentSwitchError,
-  buildBoundedAgentHandoff,
   createAgentSession,
   prepareAgentAccountScopeChange,
   prepareAgentLedgerBaselineRefresh,
-  prepareAgentSwitch,
 } from "./switching.js";
 export { AgentSessionStateError, transitionAgentSession } from "./lifecycle.js";
 export { buildAgentSystemContext } from "./system-context.js";
-export { AgentMcpCredentialError, AgentProtocolError } from "./errors.js";
 export { completeAgentTurn, failAgentTurn, startAgentTurn } from "./turn.js";
 export {
   completeAgentToolCall,
@@ -50,20 +47,15 @@ export type {
 } from "./events.js";
 export type { AgentTurnExecutor } from "./executor.js";
 export type {
-  AgentHandoffContext,
   AgentAccountScopeChangePlan,
   AgentLedgerBaselineRefreshPlan,
   AgentProvider,
   AgentProviderAvailability,
   AgentSessionSnapshot,
   AgentSessionStatus,
-  AgentSwitchPlan,
   AgentSwitchErrorCode,
   NormalizedAgentMessage,
 } from "./switching.js";
-export type {
-  AgentMcpCredentialFailure,
-} from "./errors.js";
 export type {
   AgentTurnCompletionPlan,
   AgentTurnFailureOutcome,

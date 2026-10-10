@@ -7,7 +7,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lyra_mobile/app/session.dart';
 import 'package:lyra_mobile/core/api/lyra_api_client.dart';
-import 'package:lyra_mobile/core/api/lyra_api_error.dart';
 import 'package:lyra_mobile/core/security/credential_store.dart';
 import 'package:lyra_mobile/features/agent/agent_live_events.dart';
 import 'package:lyra_mobile/features/agent/agent_repository.dart';
@@ -100,7 +99,7 @@ ResponseBody _jsonResponse(String body, int status) {
 
 Map<String, Object?> _sessionBody({
   required int revision,
-  String provider = 'claude',
+  String provider = 'genkit',
   required List<Object?> messages,
 }) {
   return <String, Object?>{
@@ -120,9 +119,7 @@ Map<String, Object?> _sessionBody({
 const String _availabilityJson = '''
 {
   "providers": [
-    {"provider": "claude", "status": "available", "version": "2.1.233"},
-    {"provider": "pi", "status": "unavailable", "reason": "VERSION_NOT_ALLOWED"},
-    {"provider": "opencode", "status": "available", "version": "1.18.21"}
+    {"provider": "genkit", "status": "available"}
   ]
 }
 ''';
@@ -138,6 +135,7 @@ const CredentialSnapshot _snapshot = CredentialSnapshot(
   deviceId: 'd1000000-0000-4000-8000-000000000001',
   accessToken: 'access-token-1',
   refreshToken: 'refresh-token-1',
+  authMethod: 'google',
 );
 
 AgentEventView _event(int sequence, String type, {String? text}) {
@@ -239,7 +237,7 @@ void main() {
           return _jsonResponse(
             jsonEncode(_sessionBody(
               revision: 7,
-              provider: 'claude',
+              provider: 'genkit',
               messages: <Object?>[
                 <String, Object?>{
                   'id': 'm1000000-0000-4000-8000-000000000002',
@@ -277,7 +275,7 @@ void main() {
         (AgentUiState? previous, AgentUiState next) {},
       );
       controller = container.read(agentControllerProvider.notifier);
-      await controller.createSession('claude');
+      await controller.createSession();
     });
 
     tearDown(() {
@@ -411,7 +409,7 @@ void main() {
       await firstContainer.read(sessionProvider.future);
       await firstContainer
           .read(agentControllerProvider.notifier)
-          .createSession('claude');
+          .createSession();
       expect(
         await store.read(),
         'a1000000-0000-4000-8000-000000000001',
@@ -552,10 +550,13 @@ void main() {
           200,
         );
       });
+      final credentials = MemoryCredentialStore();
+      await credentials.write(_snapshot);
       final repository = AgentRepository(
         client: LyraApiClient(
           serverUrl: 'http://127.0.0.1:3141',
-          credentialStore: MemoryCredentialStore(),
+          deviceId: _snapshot.deviceId,
+          credentialStore: credentials,
           tokenRefresher: () async => null,
           dio: Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3141'))
             ..httpClientAdapter = adapter,
@@ -581,12 +582,15 @@ void main() {
   group('AgentLiveEvents 重连退避', () {
     test('意外断开按指数退避自动重连并带最新游标', () async {
       final channels = <StreamChannelController<dynamic>>[];
+      final connectionTokens = <String?>[];
       final subscribeFrames = <Map<String, Object?>>[];
       WebSocketChannel createChannel(
         Uri uri,
         Iterable<String> protocols,
         Map<String, String> headers,
       ) {
+        expect(headers['x-lyra-protocol-version'], '2');
+        connectionTokens.add(headers['authorization']);
         final controller = StreamChannelController<dynamic>(
           allowForeignErrors: false,
         );
@@ -631,6 +635,7 @@ void main() {
       expect(live.lastSequence, 6);
 
       // 模拟服务器断开。
+      live.updateAccessToken('token-2');
       await channels[0].local.sink.close();
       await pumpEventQueue();
       expect(live.isConnected, isFalse);
@@ -640,6 +645,7 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 30));
       await pumpEventQueue();
       expect(channels, hasLength(2));
+      expect(connectionTokens.last, 'Bearer token-2');
       expect(subscribeFrames, hasLength(2));
       expect(subscribeFrames[1]['afterSequence'], 6);
 
@@ -741,89 +747,4 @@ void main() {
     });
   });
 
-  group('回合边界切换', () {
-    test('仓库层发送 switch 请求并解析新供应商快照', () async {
-      final adapter = FakeFrameAdapter((RequestOptions options) async {
-        expect(
-          options.uri.path,
-          '/v1/agent/sessions/a1000000-0000-4000-8000-000000000001/switch',
-        );
-        final body = options.data is Map
-            ? (options.data as Map).cast<String, Object?>()
-            : jsonDecode(options.data.toString()) as Map<String, Object?>;
-        expect(body['provider'], 'opencode');
-        return _jsonResponse(
-          jsonEncode(_sessionBody(
-            revision: 2,
-            provider: 'opencode',
-            messages: <Object?>[
-              <String, Object?>{
-                'id': 'm1000000-0000-4000-8000-000000000003',
-                'role': 'system',
-                'content': '已切换到 OpenCode。上下文已交接，历史结论仅供参考。',
-                'createdAt': '2026-09-05T10:00:05.000Z',
-              },
-            ],
-          )),
-          200,
-        );
-      });
-      final repository = AgentRepository(
-        client: LyraApiClient(
-          serverUrl: 'http://127.0.0.1:3141',
-          credentialStore: MemoryCredentialStore(),
-          tokenRefresher: () async => null,
-          dio: Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3141'))
-            ..httpClientAdapter = adapter,
-        ),
-      );
-      final switched = await repository.switchSession(
-        sessionId: 'a1000000-0000-4000-8000-000000000001',
-        targetProvider: 'opencode',
-      );
-      expect(switched.provider, 'opencode');
-      expect(switched.revision, 2);
-      expect(switched.messages.single.role, 'system');
-    });
-
-    test('目标不可用返回稳定 409 与错误信息', () async {
-      final adapter = FakeFrameAdapter((RequestOptions options) async {
-        return _jsonResponse(
-          jsonEncode(<String, Object?>{
-            'code': 'AGENT_UNAVAILABLE',
-            'message': '目标 Agent 当前不可用',
-          }),
-          409,
-        );
-      });
-      final repository = AgentRepository(
-        client: LyraApiClient(
-          serverUrl: 'http://127.0.0.1:3141',
-          credentialStore: MemoryCredentialStore(),
-          tokenRefresher: () async => null,
-          dio: Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3141'))
-            ..httpClientAdapter = adapter,
-        ),
-      );
-      await expectLater(
-        repository.switchSession(
-          sessionId: 'a1000000-0000-4000-8000-000000000001',
-          targetProvider: 'pi',
-        ),
-        throwsA(
-          isA<LyraApiError>()
-              .having(
-                (LyraApiError error) => error.code,
-                'code',
-                'AGENT_UNAVAILABLE',
-              )
-              .having(
-                (LyraApiError error) => error.statusCode,
-                'statusCode',
-                409,
-              ),
-        ),
-      );
-    });
-  });
 }

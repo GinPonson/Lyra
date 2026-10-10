@@ -118,6 +118,7 @@ export async function persistAgentToolCallCompletion(
     await advanceSessionEventSequence(connection, {
       sessionId: plan.call.sessionId,
       nextSequence: plan.event.sequence,
+      allowCancelling: true,
     });
     await connection.run("COMMIT");
   } catch (error: unknown) {
@@ -229,15 +230,16 @@ function assertToolCallPlan(
  */
 async function advanceSessionEventSequence(
   connection: LyraDatabase["connection"],
-  input: { sessionId: string; nextSequence: number },
+  input: { sessionId: string; nextSequence: number; allowCancelling?: boolean },
 ): Promise<void> {
   const updated = await connection.run(`
     UPDATE agent_sessions
     SET last_event_sequence = $next_sequence
     WHERE id = CAST($session_id AS UUID)
-      AND status = 'running'
+      AND (status = 'running' OR ($allow_cancelling AND status = 'cancelling'))
       AND last_event_sequence < $next_sequence
   `, {
+    allow_cancelling: input.allowCancelling ?? false,
     next_sequence: input.nextSequence,
     session_id: input.sessionId,
   });

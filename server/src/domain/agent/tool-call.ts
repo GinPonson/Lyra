@@ -20,6 +20,7 @@ export type AgentToolFailureOutcome = "failed" | "cancelled";
 export type AgentToolRejectionReason =
   | "unknown_tool"
   | "unconfigured_tool"
+  | "invalid_arguments"
   | "forbidden_capability";
 
 /** 与 DuckDB `agent_tool_calls` 对齐的规范工具调用记录。 */

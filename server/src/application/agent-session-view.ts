@@ -31,7 +31,7 @@ export interface PublicAgentSession {
 /**
  * 将持久化 Agent 会话投影为 App 可公开的快照。
  *
- * 逐字段重建会话、账户范围与消息，保证内部 handoff 摘要以及未来新增的
+ * 逐字段重建会话、账户范围与消息，保证内部运行状态以及未来新增的
  * 供应商私有字段不会因对象透传进入客户端响应。
  *
  * @param session - 已从仓储恢复的规范 Agent 会话快照。

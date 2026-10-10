@@ -1,7 +1,5 @@
 import { ApplicationError, type ApiErrorCode, type ApiErrorDetails } from "../application/index.js";
 import {
-  AgentProtocolError,
-  AgentMcpCredentialError,
   AgentSessionStateError,
   AgentSwitchError,
   AgentToolPolicyError,
@@ -137,26 +135,6 @@ export function serializeApiError(error: unknown, requestId: string): Serialized
       409,
       error.code,
       error.message,
-      null,
-      false,
-    );
-  }
-  if (error instanceof AgentProtocolError) {
-    return createResponse(
-      requestId,
-      502,
-      error.code,
-      "Agent 供应商协议异常，请稍后重试",
-      null,
-      true,
-    );
-  }
-  if (error instanceof AgentMcpCredentialError) {
-    return createResponse(
-      requestId,
-      401,
-      error.code,
-      "Agent 工具会话授权无效",
       null,
       false,
     );

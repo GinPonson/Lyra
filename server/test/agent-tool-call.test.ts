@@ -12,7 +12,7 @@ import type { AgentSessionSnapshot } from "../src/domain/agent/index.js";
 function runningSession(): AgentSessionSnapshot {
   return {
     id: "session-1",
-    provider: "opencode",
+    provider: "genkit",
     status: "running",
     accountScope: { kind: "account", account: "TST901" },
     ledgerVersion: 41,

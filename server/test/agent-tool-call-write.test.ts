@@ -63,8 +63,8 @@ describe("Agent tool call write repository", () => {
 
       const session = createAgentSession({
         sessionId: SESSION_ID,
-        provider: "claude",
-        availability: { provider: "claude", status: "available" },
+        provider: "genkit",
+        availability: { provider: "genkit", status: "available" },
         accountScope: { kind: "account", account: ACCOUNT_ID },
         ledgerVersion: 1,
         asOf: "2026-09-01T09:00:00.000Z",

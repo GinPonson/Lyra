@@ -52,7 +52,7 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
   Future<void> _pickAndPreview({String? accountId}) async {
     final repository = _resolveRepository();
     if (repository == null) {
-      setState(() => _errorMessage = '请先完成设备配对');
+      setState(() => _errorMessage = '请先完成登录');
       return;
     }
     // 账户选择重试不重新弹文件选择器，直接复用已暂存的字节。

@@ -89,14 +89,14 @@ describe("Import REST routes", () => {
 
       const headers = {
         authorization: `Bearer ${issued.token}`,
-        "x-lyra-protocol-version": "1",
+        "x-lyra-protocol-version": "2",
       };
       const noAuth = await app.inject({
         method: "POST",
         url: "/v1/imports/preview",
         headers: {
           authorization: "Bearer missing",
-          "x-lyra-protocol-version": "1",
+          "x-lyra-protocol-version": "2",
           "content-type": "application/octet-stream",
           "x-lyra-file-name": FILE_NAME,
         },
@@ -260,7 +260,7 @@ describe("Import REST routes", () => {
 
       const headers = {
         authorization: `Bearer ${issued.token}`,
-        "x-lyra-protocol-version": "1",
+        "x-lyra-protocol-version": "2",
       };
       const commitKey = "import-commit-key-000001";
       const commitHeaders = { ...headers, "idempotency-key": commitKey };

@@ -25,7 +25,7 @@ export interface LedgerAnalysisSnapshot {
  *
  * 所有集合和当前账本版本由同一条 SQL 语句返回，因此不会在共享连接上通过
  * 多次查询拼出跨版本数据。若 Agent 会话绑定的版本已经落后，调用会明确失败，
- * 由上层刷新会话基线后重新签发 MCP 凭据。
+ * 由上层在回合边界刷新会话基线后重新查询。
  *
  * @param database - 已完成 v1–v10 migration 的数据库。
  * @param expectedLedgerVersion - Agent 会话中固化的权威账本版本。

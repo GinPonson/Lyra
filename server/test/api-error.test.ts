@@ -3,14 +3,12 @@ import { describe, it } from "node:test";
 
 import { ApplicationError } from "../src/application/index.js";
 import {
-  AgentMcpCredentialError,
   AgentSessionStateError,
   AgentToolPolicyError,
 } from "../src/domain/agent/index.js";
 import { FifoError } from "../src/domain/fifo/index.js";
 import { IngestError } from "../src/domain/ledger/index.js";
 import { DeviceAuthError } from "../src/infrastructure/security/index.js";
-import { PiRpcProtocolError } from "../src/infrastructure/agents/index.js";
 import { serializeApiError } from "../src/transport/index.js";
 
 describe("API error protocol", () => {
@@ -42,7 +40,6 @@ describe("API error protocol", () => {
       [new DeviceAuthError("PAIRING_CODE_EXPIRED", "配对码已经过期"), 410, "PAIRING_CODE_EXPIRED"],
       [new AgentToolPolicyError("模型请求了 shell"), 403, "AGENT_TOOL_FORBIDDEN"],
       [new AgentSessionStateError("running", "closed"), 409, "AGENT_SESSION_STATE_CONFLICT"],
-      [new AgentMcpCredentialError("scope_mismatch"), 401, "AGENT_MCP_UNAUTHORIZED"],
       [new RangeError("limit 必须为正整数"), 400, "INVALID_ARGUMENT"],
     ];
 
@@ -66,14 +63,14 @@ describe("API error protocol", () => {
     assert.equal(serialized.includes("ledger.duckdb"), false);
 
     const protocol = serializeApiError(
-      new PiRpcProtocolError("token=provider-secret path=/private/pi-session"),
+      new ApplicationError({ code: "AGENT_TURN_FAILED", message: "AI 请求失败", statusCode: 502, retryable: true, cause: new Error("token=provider-secret path=/private/runtime") }),
       "request-protocol",
     );
     const serializedProtocol = JSON.stringify(protocol);
     assert.equal(protocol.statusCode, 502);
-    assert.equal(protocol.body.code, "AGENT_PROTOCOL_ERROR");
+    assert.equal(protocol.body.code, "AGENT_TURN_FAILED");
     assert.equal(protocol.body.retryable, true);
     assert.equal(serializedProtocol.includes("provider-secret"), false);
-    assert.equal(serializedProtocol.includes("pi-session"), false);
+    assert.equal(serializedProtocol.includes("runtime"), false);
   });
 });

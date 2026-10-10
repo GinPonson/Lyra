@@ -22,6 +22,7 @@ class LedgerFixture {
           deviceId: 'test-device',
           accessToken: 'test-only-token',
           refreshToken: 'test-only-refresh',
+          authMethod: 'google',
         ),
       );
     }

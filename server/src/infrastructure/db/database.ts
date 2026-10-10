@@ -25,6 +25,16 @@ const MIGRATIONS = [
     description: "immutable agent session identity for mutable lifecycle",
     fileName: "agent-session-identity-schema.sql",
   },
+  {
+    version: 12,
+    description: "single Genkit runtime and archived legacy sessions",
+    fileName: "agent-genkit-schema.sql",
+  },
+  {
+    version: 13,
+    description: "single owner Google login and credential reauthorization",
+    fileName: "owner-login-schema.sql",
+  },
 ] as const;
 
 /** 单进程共用的 DuckDB 实例与连接。 */
@@ -70,7 +80,7 @@ export class LyraDatabase {
 }
 
 /**
- * 打开 Lyra DuckDB，并在同一事务中执行和核验 v1–v11 迁移。
+ * 打开 Lyra DuckDB，并在同一事务中执行和核验 v1–v13 迁移。
  *
  * @param databasePath - 显式数据库文件路径；测试可传 `:memory:`。
  * @returns 已迁移、可供单进程服务使用的数据库连接。

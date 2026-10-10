@@ -1,8 +1,5 @@
-import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
-import type {
-  JsonSchemaType,
-  JsonSchemaValidator,
-} from "@modelcontextprotocol/sdk/validation";
+import { Ajv, type ValidateFunction } from "ajv";
+import addFormats from "ajv-formats";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 
 import type { FinancialToolName, FinancialToolRegistry } from "../domain/agent/index.js";
@@ -56,14 +53,15 @@ export function registerLedgerRoutes(
   options: LedgerRouteOptions,
 ): void {
   const now = options.now ?? (() => new Date());
-  const validatorProvider = new AjvJsonSchemaValidator();
+  const validatorProvider = new Ajv({ allErrors: true, strict: false });
+  addFormats.default(validatorProvider);
   const definitions = new Map(
     options.registry.availableToolDefinitions().map((definition) => [
       definition.name,
       definition,
     ]),
   );
-  const validators = new Map<FinancialToolName, JsonSchemaValidator<Readonly<Record<string, unknown>>>>();
+  const validators = new Map<FinancialToolName, ValidateFunction>();
 
   const authenticate = async (request: FastifyRequest): Promise<void> => {
     const header = request.headers.authorization;
@@ -99,12 +97,9 @@ export function registerLedgerRoutes(
         query,
       );
       const validator = validators.get(route.tool)
-        ?? validatorProvider.getValidator<Readonly<Record<string, unknown>>>(
-          definition.inputSchema as JsonSchemaType,
-        );
+        ?? validatorProvider.compile(definition.inputSchema);
       validators.set(route.tool, validator);
-      const validation = validator(args);
-      if (!validation.valid) {
+      if (!validator(args)) {
         throw new ApplicationError({
           code: "INVALID_ARGUMENT",
           message: "账本查询参数不符合公开定义",

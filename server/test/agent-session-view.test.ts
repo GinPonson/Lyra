@@ -8,7 +8,7 @@ describe("public Agent session", () => {
   it("公开规范消息和权威数据基线且隔离内部 handoff 状态", () => {
     const session: AgentSessionSnapshot = {
       id: "session-1",
-      provider: "claude",
+      provider: "genkit",
       status: "idle",
       accountScope: { kind: "account", account: "account-uuid-1" },
       ledgerVersion: 17,
@@ -37,7 +37,7 @@ describe("public Agent session", () => {
 
     assert.deepEqual(result, {
       id: "session-1",
-      provider: "claude",
+      provider: "genkit",
       status: "idle",
       accountScope: { kind: "account", account: "account-uuid-1" },
       ledgerVersion: 17,

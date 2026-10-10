@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-sql.mjs",
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.json && node scripts/copy-sql.mjs",
     "test": "node --test --test-concurrency=2 dist/test/*.test.js",
     "check": "npm run build && npm run test",
     "start": "node dist/src/main.js"
@@ -15,11 +15,15 @@
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.4",
     "@fastify/websocket": "11.1.0",
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@genkit-ai/compat-oai": "1.42.0",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
     "csv-parse": "7.0.2",
     "decimal.js": "10.6.0",
     "exceljs": "4.4.0",
     "fastify": "5.12.1",
+    "genkit": "1.42.0",
+    "google-auth-library": "11.2.0",
     "mailparser": "3.9.17",
     "zod": "4.5.4"
   },

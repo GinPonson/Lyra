@@ -1,7 +1,26 @@
 # Lyra 实现进度
 
 > 本表只记录已经落盘的实现和实际验证结果。未通过验证的功能不得标记为完成。  
-> 总体方案见 [Lyra 移动资产账本与 AI Agent 应用完整方案](plans/lyra-product-technical-design.md)。
+> 当前架构与部署方式见 [Genkit 与 Google 登录](genkit-oauth.md)。早期总体方案见 [Lyra 移动资产账本与 AI Agent 应用完整方案](plans/lyra-product-technical-design.md)。
+
+## 当前迁移：Genkit 与 Google 登录（2026-10-10）
+
+本节记录当前分支状态。下方历史进度保留当时的实现与验证；其中 MCP、多 CLI、供应商切换和匿名配对设计已被本次迁移替代。
+
+| 功能 | 状态 | 实际验证与边界 |
+| --- | --- | --- |
+| 单一 Genkit 助手 | 已完成 | 一个 `genkit` provider，界面名称 Lyra；官方兼容插件、真实 Genkit 工具循环、DuckDB 和本机 HTTP/SSE 模型测试通过；保留 17 个既有金融工具及权威数据语境 |
+| 删除 MCP 与多 CLI 接入 | 已完成 | 移除项目 MCP HTTP 服务、凭据/配置/进程适配、Claude/Pi/OpenCode 运行时及切换入口；实际进程测试确认 `/mcp` 返回 404；构建先清理 `dist`，旧产物不会残留 |
+| Google 登录与设备凭据 | 已完成 | Google OIDC 官方验签边界、两个独立 PKCE、owner 限制及固定 subject、一次性兑换、刷新轮换、注销与旧凭据失效均有通过的测试；只申请 `openid email profile`，不混用 Gmail 授权 |
+| 协议 2 / schema 13 迁移 | 已完成 | 实际旧 v11 数据库升级，金融事实、消息及工具记录保持；旧 CLI 会话归档，旧配对凭据撤销；部分 OAuth 配置在数据库迁移前拒绝启动 |
+| 回合取消与重启恢复 | 已完成 | 测试覆盖退出发生于回合启动等待期间、取消持久化与模型完成交错、工具调用取消、迟到输出抑制、重启恢复及重复恢复幂等 |
+| 服务端完整回归 | 已完成 | Node 24.19.0，`npm run check` 干净 TypeScript 构建通过；116 套件、271 项测试通过，0 失败、0 跳过；包含实际 `main.js` 进程启动测试。已删除的旧适配器测试不计入当前统计 |
+| Flutter 登录与单助手界面 | 进行中 | 代码、对应测试与独立静态审查已落盘；独立 Dart 3.13.2 可执行格式/语法解析，完整 Flutter 检查尚未执行 |
+| Flutter 依赖与 APK 验证 | 阻塞 | 完整 Flutter 工具链下载的网络批准流程被取消，离线缓存不足；新增 `url_launcher` 尚需 `flutter pub get` 实际解析并保存 lockfile；未运行 `flutter analyze`、`flutter test` 或 APK 构建，不伪造通过结果 |
+| 真实 Google / 模型 / 手机联调 | 待开始 | 尚未配置真实 OAuth Web client、公开回调域名和模型凭据；现有测试使用受控外部边界，不代表真实第三方服务已验收 |
+| GitHub 草稿 PR 交付 | 阻塞 | 当前 GitHub 连接创建 Git tree 时返回 `403 / Resource not accessible by integration`，尚未创建远端分支或 PR；完整改动保留在本地 `feat/genkit-oauth` 分支，需要连接具备仓库写权限后发布 |
+
+配置模板在 [`server/.env.example`](../server/.env.example)，启动、升级和待验步骤见 [迁移说明](genkit-oauth.md)。App 与服务端需一起更新；迁移前备份数据库并保留原加密主密钥，迁移后重新登录并新建 Lyra 会话。Flutter 验证和真实联调完成前，迁移 PR 保持草稿。
 
 ## 进度状态
 

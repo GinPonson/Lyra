@@ -1,10 +1,10 @@
 import { ApplicationError } from "../application/index.js";
 
 /** 当前移动端与服务端共享的协议版本。 */
-export const LYRA_PROTOCOL_VERSION = 1;
+export const LYRA_PROTOCOL_VERSION = 2;
 
 /** 当前服务端接受的最旧协议版本。 */
-export const MIN_SUPPORTED_PROTOCOL_VERSION = 1;
+export const MIN_SUPPORTED_PROTOCOL_VERSION = 2;
 
 /** 当前服务端接受的最新协议版本。 */
 export const MAX_SUPPORTED_PROTOCOL_VERSION = LYRA_PROTOCOL_VERSION;

@@ -11,7 +11,7 @@ import type { AgentSessionSnapshot } from "../src/domain/agent/index.js";
 function session(): AgentSessionSnapshot {
   return {
     id: "session-1",
-    provider: "claude",
+    provider: "genkit",
     status: "idle",
     accountScope: { kind: "account", account: "TST276" },
     ledgerVersion: 7,

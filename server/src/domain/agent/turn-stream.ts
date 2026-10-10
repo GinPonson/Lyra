@@ -11,12 +11,12 @@ import type {
   AgentTurnFailurePlan,
 } from "./turn.js";
 
-/** 三个供应商适配器共用的消息流信号子集。 */
+/** Genkit 执行器与会话编排器之间的规范消息流信号。 */
 export type AgentTurnStreamSignal =
   | { kind: "message_delta"; delta: string }
   | { kind: "reasoning_delta"; delta: string }
   | { kind: "message_snapshot"; content: string; stopReason: string }
-  | { kind: "usage_updated"; totalTokens: number; totalCost: number }
+  | { kind: "usage_updated"; totalTokens: number; totalCost: number | null }
   | { kind: "message_failed"; outcome: AgentTurnFailureOutcome }
   | { kind: "turn_settled" };
 
@@ -127,7 +127,7 @@ export function applyAgentTurnStreamSignal(input: {
       break;
     case "usage_updated":
       requireNonNegativeNumber(input.signal.totalTokens, "Agent total tokens");
-      requireNonNegativeNumber(input.signal.totalCost, "Agent total cost");
+      if (input.signal.totalCost !== null) requireNonNegativeNumber(input.signal.totalCost, "Agent total cost");
       state = {
         ...state,
         totalTokens: input.signal.totalTokens,

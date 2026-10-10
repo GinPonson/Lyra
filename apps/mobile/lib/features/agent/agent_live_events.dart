@@ -82,16 +82,20 @@ WebSocketChannel _defaultChannelFactory(
 class AgentLiveEvents {
   AgentLiveEvents({
     required this.serverUrl,
-    required this.accessToken,
+    required String accessToken,
     required this.onFrame,
     this.onDone,
     this.reconnectDelay = _defaultReconnectDelay,
     this.maxReconnectDelay = _defaultMaxReconnectDelay,
     this.channelFactory = _defaultChannelFactory,
-  });
+  }) : _accessToken = accessToken;
 
   final String serverUrl;
-  final String accessToken;
+  String _accessToken;
+  String get accessToken => _accessToken;
+
+  /// HTTP 刷新后的令牌用于下次握手，已建立的流不必重建。
+  void updateAccessToken(String token) => _accessToken = token;
   final void Function(AgentLiveFrame frame) onFrame;
 
   /// 意外断开时的通知回调；重连由客户端内部完成，回调只用于上层提示。

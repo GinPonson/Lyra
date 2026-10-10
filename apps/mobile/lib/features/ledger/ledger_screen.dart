@@ -378,7 +378,7 @@ class _LedgerPanelState extends ConsumerState<LedgerPanel> {
         onRetry: () => ref.invalidate(sessionProvider),
       );
     }
-    if (session.value is! SessionPaired) {
+    if (session.value is! SessionAuthenticated) {
       return LyraEmpty(
         title: widget.view == LedgerView.positions ? '你的持仓，从这里展开' : '连接账号，开始查看',
         message: widget.view == LedgerView.positions

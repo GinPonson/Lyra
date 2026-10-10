@@ -11,9 +11,9 @@ import '../ledger/ledger_models.dart';
 import '../ledger/ledger_screen.dart';
 import '../ledger/ledger_view.dart';
 import '../ledger/ledger_workspace.dart';
-import 'pairing_panel.dart';
+import 'login_panel.dart';
 
-/// 账号优先的投资工作台。保留配对、导入及原始精确汇总；AI 为次级入口。
+/// 账号优先的投资工作台。保留登录、导入及原始精确汇总；AI 为次级入口。
 class OverviewScreen extends ConsumerStatefulWidget {
   const OverviewScreen({
     super.key,
@@ -29,11 +29,11 @@ class OverviewScreen extends ConsumerStatefulWidget {
 }
 
 class _OverviewScreenState extends ConsumerState<OverviewScreen> {
-  final _pairingKey = GlobalKey();
+  final _loginKey = GlobalKey();
 
-  /// 保留原有内联配对流程，主按钮把表单滚入视口并保留已填写字段。
-  void _revealPairing() {
-    final target = _pairingKey.currentContext;
+  /// 保留原有内联登录流程，主按钮把表单滚入视口并保留已填写字段。
+  void _revealLogin() {
+    final target = _loginKey.currentContext;
     if (target != null) {
       Scrollable.ensureVisible(
         target,
@@ -56,7 +56,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
     ),
   );
 
-  /// 连接管理复用已验证表单，不创建另一套凭据或配对实现。
+  /// 连接管理复用已验证表单，不创建另一套凭据或登录实现。
   void _openConnection() => showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
@@ -69,14 +69,14 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
         16,
         MediaQuery.viewInsetsOf(context).bottom + 24,
       ),
-      child: const PairingPanel(),
+      child: const LoginPanel(),
     ),
   );
 
   @override
   Widget build(BuildContext context) {
     final session = ref.watch(sessionProvider);
-    final paired = session.value is SessionPaired;
+    final paired = session.value is SessionAuthenticated;
     final summary = ref.watch(scopedSummaryProvider);
     return LyraPage(
       storageKey: 'overview-scroll',
@@ -115,7 +115,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
             trailing: LyraIconButton(
               icon: LyraIcons.accountCenter,
               label: '连接管理',
-              onPressed: paired ? _openConnection : _revealPairing,
+              onPressed: paired ? _openConnection : _revealLogin,
             ),
           ),
           Row(
@@ -132,7 +132,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
                   ),
                   const SizedBox(width: 5),
                   Text(
-                    paired ? '已配对' : '等待连接',
+                    paired ? '已登录' : '等待连接',
                     style: const TextStyle(
                       fontSize: 11,
                       color: LyraColors.inkSecondary,
@@ -152,7 +152,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
         else if (session.isLoading)
           const LyraSkeleton()
         else if (!paired)
-          LyraReveal(child: _WelcomeHero(onConnect: _revealPairing))
+          LyraReveal(child: _WelcomeHero(onConnect: _revealLogin))
         else
           summary.when(
             loading: () => const LyraSkeleton(),
@@ -221,7 +221,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
         const SizedBox(height: 28),
         _AssistantNote(onOpen: widget.onOpenAgent),
         const SizedBox(height: 32),
-        if (!paired && !session.isLoading) PairingPanel(key: _pairingKey),
+        if (!paired && !session.isLoading) LoginPanel(key: _loginKey),
         if (paired) ...[
           Row(
             children: [
@@ -286,7 +286,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
   }
 }
 
-/// 未连接时直接说明可用功能，主按钮继续使用原有配对表单。
+/// 未连接时直接说明可用功能，主按钮继续使用原有登录表单。
 class _WelcomeHero extends StatelessWidget {
   const _WelcomeHero({required this.onConnect});
   final VoidCallback onConnect;

@@ -11,7 +11,7 @@ import type { AgentSessionSnapshot } from "../src/domain/agent/index.js";
 function idleSession(): AgentSessionSnapshot {
   return {
     id: "session-baseline-1",
-    provider: "claude",
+    provider: "genkit",
     status: "idle",
     accountScope: { kind: "account", account: "TST001" },
     ledgerVersion: 20,

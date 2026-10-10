@@ -1,9 +1,9 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:lyra_mobile/features/pairing/pairing_repository.dart';
+import 'package:lyra_mobile/features/auth/auth_repository.dart';
 
 void main() {
-  test('配对响应解析完整凭据集', () {
-    final credentials = PairedDeviceCredentials.fromJson(const {
+  test('登录响应解析完整凭据集', () {
+    final credentials = LoginCredentials.fromJson(const {
       'deviceId': 'd1000000-0000-4000-8000-000000000001',
       'displayName': 'Test phone',
       'accessToken': 'access-token-1',

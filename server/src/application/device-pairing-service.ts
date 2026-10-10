@@ -5,14 +5,13 @@ import type {
   PairedDeviceAuthRecord,
 } from "../infrastructure/security/device-auth.js";
 import {
-  consumePairingChallenge,
   createPairedDeviceRecord,
-  createPairingChallenge,
   issueDeviceAccessToken,
   issueDeviceRefreshCredential,
   normalizeDevicePublicKey,
   planRefreshCredentialReuseRevocation,
   rotateDeviceRefreshCredential,
+  hashOpaqueCredential,
   DeviceAuthError,
 } from "../infrastructure/security/device-auth.js";
 import {
@@ -24,20 +23,21 @@ import {
   loadDeviceRefreshCredentialFamily,
   rotateDeviceRefreshCredentialRows,
 } from "../infrastructure/db/device-pairing-repository.js";
-import { hashOpaqueCredential } from "../infrastructure/security/index.js";
+import {
+  claimServerOwnerIdentity,
+  findDeviceIdByPublicKey,
+  revokeDeviceCredentials,
+} from "../infrastructure/db/owner-login-repository.js";
+import type { GoogleLoginIdentity } from "../infrastructure/auth/google-login-client.js";
 import { loadPairedDeviceAuthRecord } from "../infrastructure/db/device-access-token-repository.js";
 import type { LyraDatabase } from "../infrastructure/db/database.js";
 import { ApplicationError } from "./app-error.js";
 import type { WriteCoordinator } from "./write-coordinator.js";
 
-/** 配对码有效期；一次性且短时，不写入任何静态配置。 */
-const PAIRING_CODE_TTL_MILLISECONDS = 10 * 60 * 1000;
-
-/** 访问令牌与刷新凭据的有效期。 */
 const ACCESS_TOKEN_TTL_MILLISECONDS = 15 * 60 * 1000;
 const REFRESH_TOKEN_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1000;
 
-/** 一次配对完成后 App 获得的凭据集。 */
+/** OAuth 登录成功后 App 获得的 Lyra 凭据，不含任何 Google token。 */
 export interface DevicePairingHttpResponse {
   deviceId: string;
   displayName: string;
@@ -47,7 +47,6 @@ export interface DevicePairingHttpResponse {
   refreshTokenExpiresAt: string;
 }
 
-/** 一次刷新轮换后 App 获得的新凭据集。 */
 export interface DeviceTokenRefreshHttpResponse {
   accessToken: string;
   accessTokenExpiresAt: string;
@@ -56,17 +55,13 @@ export interface DeviceTokenRefreshHttpResponse {
 }
 
 /**
- * 设备配对、访问令牌签发与刷新凭据轮换的应用层编排。
- *
- * 配对码记录只保存在进程内内存（短时、一次性；重启即失效，需要时重新生
- * 成）。刷新凭据与访问令牌只持久化 SHA-256 哈希；明文仅在签发响应中出现
- * 一次。旧刷新凭据重放会触发同族全代次撤销。
+ * OAuth owner 登录后的设备会话管理。保留已有 access/refresh 凭据格式；
+ * 删除匿名配对码入口。所有签发、刷新与撤销在同一单写队列中执行。
  */
 export class DevicePairingService {
   readonly #database: LyraDatabase;
   readonly #writeCoordinator: WriteCoordinator;
   readonly #now: () => Date;
-  readonly #challenges = new Map<string, PairingChallengeRecordLike>();
 
   constructor(input: {
     database: LyraDatabase;
@@ -78,156 +73,119 @@ export class DevicePairingService {
     this.#now = input.now ?? (() => new Date());
   }
 
-  /** 生成一次性配对码；仅返回明文展示码与过期时间。 */
-  createPairingCode(): { code: string; expiresAt: string } {
-    const challenge = createPairingChallenge(this.#now(), PAIRING_CODE_TTL_MILLISECONDS);
-    this.#challenges.set(challenge.record.codeHash, challenge.record);
-    return { code: challenge.code, expiresAt: challenge.record.expiresAt };
-  }
-
-  /**
-   * 用配对码兑换设备凭据：消费一次性挑战、登记设备并签发首代刷新凭据与
-   * 短期访问令牌。
-   */
-  async pairDevice(input: {
-    code: string;
+  /** 仅由已验证 OAuth + App PKCE 的应用用例调用；所有写入原子提交。 */
+  async authorizeOwnerDevice(input: {
+    identity: GoogleLoginIdentity;
     displayName: string;
     publicKeyPem: string;
   }): Promise<DevicePairingHttpResponse> {
-    const now = this.#now();
-    const consumed = this.#consumeChallenge(input.code);
     const publicKey = normalizeDevicePublicKey(input.publicKeyPem);
-    const record = createPairedDeviceRecord(
-      randomUUID(),
-      input.displayName,
-      publicKey,
-      now,
-    );
-    const authRecord: PairedDeviceAuthRecord = {
-      id: record.id,
-      status: record.status,
-      revokedAt: record.revokedAt,
-    };
-    const refresh = issueDeviceRefreshCredential(
-      record.id,
-      now,
-      REFRESH_TOKEN_TTL_MILLISECONDS,
-    );
-    const access = issueDeviceAccessToken(authRecord, now, ACCESS_TOKEN_TTL_MILLISECONDS);
-    await this.#writeCoordinator.enqueue(async () => {
-      await createPairedDeviceRow(this.#database, record);
-      await createDeviceRefreshCredentialRow(this.#database, refresh.record);
-      await createDeviceAccessTokenRow(this.#database, {
-        id: access.record.id,
-        deviceId: record.id,
-        tokenHash: access.record.tokenHash,
-        expiresAt: access.record.expiresAt,
-        issuedAt: access.record.issuedAt,
-      });
-    });
-    this.#challenges.delete(consumed.codeHash);
-    return {
-      deviceId: record.id,
-      displayName: record.displayName,
-      accessToken: access.token,
-      accessTokenExpiresAt: access.record.expiresAt,
-      refreshToken: refresh.token,
-      refreshTokenExpiresAt: refresh.record.expiresAt,
-    };
-  }
-
-  /**
-   * 校验刷新凭据并轮换：旧代标记 rotated、新代入库，同时签发新访问令牌。
-   *
-   * 已轮换/已撤销凭据再次出现会撤销整个凭据族并返回稳定重用错误。
-   */
-  async refreshTokens(input: { refreshToken: string }): Promise<DeviceTokenRefreshHttpResponse> {
-    const now = this.#now();
-    const record = await loadDeviceRefreshCredentialRow(
-      this.#database,
-      hashOpaqueCredential(input.refreshToken),
-    );
-    if (record === null) {
-      throw this.#credentialInvalid();
-    }
-    const device = await loadPairedDeviceAuthRecord(this.#database, record.deviceId);
-    if (device === null) {
-      throw this.#credentialInvalid();
-    }
-    if (record.status !== "active") {
-      await this.#revokeCredentialFamily(record);
-      throw new ApplicationError({
-        code: "DEVICE_CREDENTIAL_REUSED",
-        message: "设备刷新凭据已使用或撤销",
-        statusCode: 401,
-        retryable: false,
-      });
-    }
-    let rotation;
-    try {
-      rotation = rotateDeviceRefreshCredential(
-        device,
-        record,
-        input.refreshToken,
-        now,
-        REFRESH_TOKEN_TTL_MILLISECONDS,
-      );
-    } catch (error: unknown) {
-      if (error instanceof DeviceAuthError
-        && error.code === "DEVICE_CREDENTIAL_REUSED") {
-        await this.#revokeCredentialFamily(record);
-      }
-      throw this.#deviceError(error);
-    }
-    await this.#writeCoordinator.enqueue(() => rotateDeviceRefreshCredentialRows(
-      this.#database,
-      rotation,
-    ));
-    const access = issueDeviceAccessToken(device, now, ACCESS_TOKEN_TTL_MILLISECONDS);
-    await this.#writeCoordinator.enqueue(() => createDeviceAccessTokenRow(this.#database, {
-      id: access.record.id,
-      deviceId: device.id,
-      tokenHash: access.record.tokenHash,
-      expiresAt: access.record.expiresAt,
-      issuedAt: access.record.issuedAt,
-    }));
-    return {
-      accessToken: access.token,
-      accessTokenExpiresAt: access.record.expiresAt,
-      refreshToken: rotation.token,
-      refreshTokenExpiresAt: rotation.next.expiresAt,
-    };
-  }
-
-  /** 逐条尝试消费内存中的挑战记录；USED/EXPIRED 直接上报，INVALID 尝试下一条。 */
-  #consumeChallenge(candidate: string) {
-    let invalidSeen = false;
-    for (const record of this.#challenges.values()) {
+    return this.#writeCoordinator.enqueue(async () => {
+      const now = this.#now();
+      const connection = this.#database.connection;
+      await connection.run("BEGIN TRANSACTION");
       try {
-        return consumePairingChallenge(record, candidate, this.#now());
-      } catch (error: unknown) {
-        if (error instanceof DeviceAuthError
-          && (error.code === "PAIRING_CODE_USED" || error.code === "PAIRING_CODE_EXPIRED")) {
-          throw this.#deviceError(error);
+        await claimServerOwnerIdentity(this.#database, input.identity, now);
+        const existingId = await findDeviceIdByPublicKey(this.#database, publicKey.fingerprint);
+        const deviceId = existingId ?? randomUUID();
+        const record = createPairedDeviceRecord(deviceId, input.displayName, publicKey, now);
+        if (existingId === null) {
+          await createPairedDeviceRow(this.#database, record);
+        } else {
+          await revokeDeviceCredentials(this.#database, deviceId, now);
+          await connection.run(`
+            UPDATE paired_devices SET display_name = $display_name,
+              status = 'active', revoked_at = NULL,
+              updated_at = greatest(updated_at, CAST($now AS TIMESTAMPTZ))
+            WHERE id = CAST($id AS UUID)
+          `, { id: deviceId, display_name: record.displayName, now: now.toISOString() });
         }
-        invalidSeen = true;
+        const authRecord: PairedDeviceAuthRecord = { id: deviceId, status: "active", revokedAt: null };
+        const refresh = issueDeviceRefreshCredential(deviceId, now, REFRESH_TOKEN_TTL_MILLISECONDS);
+        const access = issueDeviceAccessToken(authRecord, now, ACCESS_TOKEN_TTL_MILLISECONDS);
+        await createDeviceRefreshCredentialRow(this.#database, refresh.record);
+        await createDeviceAccessTokenRow(this.#database, access.record);
+        await connection.run("COMMIT");
+        return {
+          deviceId,
+          displayName: record.displayName,
+          accessToken: access.token,
+          accessTokenExpiresAt: access.record.expiresAt,
+          refreshToken: refresh.token,
+          refreshTokenExpiresAt: refresh.record.expiresAt,
+        };
+      } catch (error: unknown) {
+        await rollback(connection, error);
+        throw error;
       }
-    }
-    void invalidSeen;
-    throw this.#deviceError(new DeviceAuthError("PAIRING_CODE_INVALID", "配对码无效"));
+    });
+  }
+
+  /** 读取、校验、轮换与 access 签发共用队列，避免刷新/退出登录交错。 */
+  async refreshTokens(input: { refreshToken: string }): Promise<DeviceTokenRefreshHttpResponse> {
+    return this.#writeCoordinator.enqueue(async () => {
+      const now = this.#now();
+      const record = await loadDeviceRefreshCredentialRow(
+        this.#database, hashOpaqueCredential(input.refreshToken),
+      );
+      if (record === null) {
+        throw this.#credentialInvalid();
+      }
+      const device = await loadPairedDeviceAuthRecord(this.#database, record.deviceId);
+      if (device === null) {
+        throw this.#credentialInvalid();
+      }
+      if (record.status !== "active") {
+        await this.#revokeCredentialFamily(record);
+        throw new ApplicationError({
+          code: "DEVICE_CREDENTIAL_REUSED", message: "设备刷新凭据已使用或撤销", statusCode: 401, retryable: false,
+        });
+      }
+      let rotation;
+      try {
+        rotation = rotateDeviceRefreshCredential(
+          device, record, input.refreshToken, now, REFRESH_TOKEN_TTL_MILLISECONDS,
+        );
+      } catch (error: unknown) {
+        throw this.#deviceError(error);
+      }
+      const access = issueDeviceAccessToken(device, now, ACCESS_TOKEN_TTL_MILLISECONDS);
+      await rotateDeviceRefreshCredentialRows(this.#database, rotation, access.record);
+      return {
+        accessToken: access.token,
+        accessTokenExpiresAt: access.record.expiresAt,
+        refreshToken: rotation.token,
+        refreshTokenExpiresAt: rotation.next.expiresAt,
+      };
+    });
+  }
+
+  /** 当前安装退出登录，撤销设备与每个 access/refresh；重新登录可复用设备 ID。 */
+  async revokeDevice(deviceId: string): Promise<void> {
+    await this.#writeCoordinator.enqueue(async () => {
+      const connection = this.#database.connection;
+      const now = this.#now();
+      await connection.run("BEGIN TRANSACTION");
+      try {
+        await revokeDeviceCredentials(this.#database, deviceId, now);
+        await connection.run(`
+          UPDATE paired_devices SET status = 'revoked',
+            revoked_at = coalesce(revoked_at, CAST($now AS TIMESTAMPTZ)),
+            updated_at = greatest(updated_at, CAST($now AS TIMESTAMPTZ))
+          WHERE id = CAST($id AS UUID)
+        `, { id: deviceId, now: now.toISOString() });
+        await connection.run("COMMIT");
+      } catch (error: unknown) {
+        await rollback(connection, error);
+        throw error;
+      }
+    });
   }
 
   async #revokeCredentialFamily(record: DeviceRefreshCredentialRecord): Promise<void> {
-    const family = await loadDeviceRefreshCredentialFamily(
-      this.#database,
-      record.deviceId,
-      record.familyId,
-    );
+    const family = await loadDeviceRefreshCredentialFamily(this.#database, record.deviceId, record.familyId);
     const plan = planRefreshCredentialReuseRevocation(record, family, this.#now());
-    await this.#writeCoordinator.enqueue(() => applyRefreshCredentialFamilyRevocation(
-      this.#database,
-      plan,
-    ));
+    await applyRefreshCredentialFamilyRevocation(this.#database, plan);
   }
 
   #deviceError(error: unknown): ApplicationError {
@@ -235,15 +193,8 @@ export class DevicePairingService {
       return error;
     }
     if (error instanceof DeviceAuthError) {
-      const statusCode = error.code === "PAIRING_CODE_EXPIRED" ? 410
-        : error.code === "PAIRING_CODE_USED" ? 409
-          : error.code === "PAIRING_CODE_INVALID" ? 400
-            : 401;
       return new ApplicationError({
-        code: error.code,
-        message: error.message,
-        statusCode,
-        retryable: false,
+        code: error.code, message: error.message, statusCode: 401, retryable: false,
       });
     }
     return this.#credentialInvalid();
@@ -251,16 +202,15 @@ export class DevicePairingService {
 
   #credentialInvalid(): ApplicationError {
     return new ApplicationError({
-      code: "DEVICE_CREDENTIAL_INVALID",
-      message: "设备凭据无效",
-      statusCode: 401,
-      retryable: false,
+      code: "DEVICE_CREDENTIAL_INVALID", message: "设备凭据无效", statusCode: 401, retryable: false,
     });
   }
 }
 
-interface PairingChallengeRecordLike {
-  codeHash: string;
-  expiresAt: string;
-  consumedAt: string | null;
+async function rollback(connection: LyraDatabase["connection"], error: unknown): Promise<void> {
+  try {
+    await connection.run("ROLLBACK");
+  } catch (rollbackError: unknown) {
+    throw new AggregateError([error, rollbackError], "设备凭据事务失败且回滚失败");
+  }
 }

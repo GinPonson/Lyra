@@ -5,7 +5,7 @@ import 'package:lyra_mobile/app/lyra_app.dart';
 import 'package:lyra_mobile/app/session.dart';
 import 'package:lyra_mobile/core/security/credential_store.dart';
 
-/// 注入空凭据验证真正未配对界面，不访问设备安全存储或真实服务端。
+/// 注入空凭据验证真正未登录界面，不访问设备安全存储或真实服务端。
 Widget _app() => ProviderScope(
   overrides: [
     sessionDependenciesProvider.overrideWithValue(
@@ -60,7 +60,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('连接我的账户'));
     await tester.pumpAndSettle();
-    expect(find.text('完成配对').hitTestable(), findsOneWidget);
+    expect(find.text('使用 Google 登录').hitTestable(), findsOneWidget);
     await tester.ensureVisible(find.text('AI 账本分析'));
     await tester.tap(find.text('AI 账本分析'));
     await tester.pumpAndSettle();

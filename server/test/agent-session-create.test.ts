@@ -10,8 +10,8 @@ describe("Agent session creation", () => {
   it("创建固定供应商、账户范围和账本基线的 idle 空会话", () => {
     const session = createAgentSession({
       sessionId: "session-create-1",
-      provider: "pi",
-      availability: { provider: "pi", status: "available" },
+      provider: "genkit",
+      availability: { provider: "genkit", status: "available" },
       accountScope: { kind: "account", account: " TST276 " },
       ledgerVersion: 31,
       asOf: " 2026-08-31T04:00:00.000Z ",
@@ -19,7 +19,7 @@ describe("Agent session creation", () => {
 
     assert.deepEqual(session, {
       id: "session-create-1",
-      provider: "pi",
+      provider: "genkit",
       status: "idle",
       accountScope: { kind: "account", account: "TST276" },
       ledgerVersion: 31,
@@ -34,9 +34,9 @@ describe("Agent session creation", () => {
     assert.throws(
       () => createAgentSession({
         sessionId: "session-create-2",
-        provider: "claude",
+        provider: "genkit",
         availability: {
-          provider: "claude",
+          provider: "genkit",
           status: "unavailable",
           reason: "本机未登录",
         },

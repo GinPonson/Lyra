@@ -13,7 +13,7 @@ import type { AgentSessionSnapshot } from "../src/domain/agent/index.js";
 function runningSession(): AgentSessionSnapshot {
   return {
     id: "session-stream-1",
-    provider: "pi",
+    provider: "genkit",
     status: "running",
     accountScope: { kind: "all" },
     ledgerVersion: 61,
@@ -72,7 +72,7 @@ describe("Agent turn stream aggregation", () => {
     assert.equal(reasoning.event?.type, "reasoning.delta");
     assert.deepEqual(reasoning.event?.payload, {
       state: "active",
-      provider: "pi",
+      provider: "genkit",
       ledger_version: 61,
     });
     assert.equal(JSON.stringify(reasoning.event).includes("隐藏分析"), false);

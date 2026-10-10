@@ -104,6 +104,7 @@ const CredentialSnapshot _snapshot = CredentialSnapshot(
   deviceId: 'd1000000-0000-4000-8000-000000000001',
   accessToken: 'access-token-1',
   refreshToken: 'refresh-token-1',
+  authMethod: 'google',
 );
 
 Future<ResponseBody> _routeImportRequest(RequestOptions options) async {
@@ -161,8 +162,9 @@ class _SessionProbe extends ConsumerWidget {
       state.when(
         loading: () => 'session:loading',
         error: (Object error, StackTrace stackTrace) => 'session:error',
-        data: (SessionState value) =>
-            value is SessionPaired ? 'session:paired' : 'session:unpaired',
+        data: (SessionState value) => value is SessionAuthenticated
+            ? 'session:paired'
+            : 'session:unpaired',
       ),
     );
   }
@@ -172,6 +174,7 @@ void main() {
   test('ImportRepository 读取账户列表并解析上传预览与确认提交', () async {
     final requestedPaths = <String>[];
     final store = MemoryCredentialStore();
+    await store.write(_snapshot);
     final dio = Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3141'))
       ..httpClientAdapter = FakeImportAdapter((RequestOptions options) async {
         requestedPaths.add(options.uri.path);
@@ -180,6 +183,7 @@ void main() {
     final repository = ImportRepository(
       client: LyraApiClient(
         serverUrl: 'http://127.0.0.1:3141',
+        deviceId: _snapshot.deviceId,
         credentialStore: store,
         tokenRefresher: () async => null,
         dio: dio,
@@ -326,11 +330,11 @@ void main() {
         ProviderScope.containerOf(tester.element(find.byType(ImportSheet)))
                 .read(sessionProvider)
                 .requireValue
-            as SessionPaired;
+            as SessionAuthenticated;
     expect(state.summary!.metadata.ledgerVersion, 2);
   });
 
-  testWidgets('未配对时导入面板提示先配对', (WidgetTester tester) async {
+  testWidgets('未登录时导入面板提示先登录', (WidgetTester tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -352,6 +356,6 @@ void main() {
     await tester.tap(find.text('选择文件并预览'));
     await tester.pumpAndSettle();
 
-    expect(find.text('请先完成设备配对'), findsOneWidget);
+    expect(find.text('请先完成登录'), findsOneWidget);
   });
 }

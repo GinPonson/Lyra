@@ -11,7 +11,7 @@ import type { AgentSessionSnapshot } from "../src/domain/agent/index.js";
 function activeSession(status: "running" | "cancelling"): AgentSessionSnapshot {
   return {
     id: "session-1",
-    provider: "claude",
+    provider: "genkit",
     status,
     accountScope: { kind: "all" },
     ledgerVersion: 31,

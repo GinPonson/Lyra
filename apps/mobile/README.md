@@ -1,17 +1,41 @@
-# lyra_mobile
+# Lyra Mobile
 
-A new Flutter project.
+Flutter 客户端用于查看交易账本、持仓、绩效和压力分析，并与一个 Lyra 金融助手对话。AI 由服务端 Genkit 运行，客户端不再选择 Claude、Pi 或 OpenCode，也不使用 MCP。
 
-## Getting Started
+## 环境与启动
 
-This project is a starting point for a Flutter application.
+项目基线为 Flutter **3.47.2** / Dart **3.13.2**。完整服务端配置和迁移说明见 [Genkit 与 Google 登录](../../docs/genkit-oauth.md)。
 
-A few resources to get you started if this is your first Flutter project:
+在本目录执行：
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+```bash
+flutter pub get
+flutter run --dart-define=LYRA_SERVER_URL=https://lyra.example.com
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+`LYRA_SERVER_URL` 用于预填登录表单，也可在界面填写或修改服务端地址。建议 App 和系统浏览器都使用同一个可访问的 HTTPS 域名。客户端协议版本为 **2**，需要同步升级服务端；协议 1 的旧客户端不能继续访问升级后的服务。
+
+客户端仅允许本机回环地址 `localhost`、`127.0.0.1`、`::1` 使用 HTTP；其他地址使用 HTTPS。模拟器的 `10.0.2.2` 不属于回环地址，不接受 `http://10.0.2.2`。真机的 `localhost` 指真机自身，不能用来代指电脑上的服务端。
+
+## 登录与会话
+
+1. 在服务端配置 Google OAuth Web 应用和获准登录的账号，回调地址按服务端迁移文档设置。Google client secret 保留在服务端。
+2. 输入服务端地址并点「使用 Google 登录」，App 打开系统浏览器进行授权。
+3. 浏览器提示成功后返回 Lyra，App 会自动完成登录。也可在 App 点「取消登录」停止等待；授权事务最多等待 10 分钟。
+4. 在「连接管理」中可查看当前登录账号和退出登录。退出会先清除本机凭据及保存的 AI 会话 ID，随后用捕获的原设备凭据请求服务端撤销；网络失败会明确提示远端撤销未完成。
+
+访问令牌、刷新令牌与设备私钥保存在系统安全存储中。登录交换凭证仅存在于内存，不通过跳转 URL 传递 Lyra 令牌。旧版配对凭据不能迁移为 Google 身份，升级后需要重新登录。
+
+「开始分析」会使用当前页面选择的账户范围。已有对话保留自己的账户范围；切换页面账户后，需要点「新对话」才能按新范围分析。流式回答、取消回合、工具结果和服务端会话恢复继续沿用现有交互。迁移前已关闭的旧引擎会话只供查看，需要新建对话继续。
+
+## 验证与构建
+
+```bash
+flutter analyze
+flutter test
+flutter build apk --release --dart-define=LYRA_SERVER_URL=https://lyra.example.com
+```
+
+本次迁移新增 `url_launcher: ^6.3.3`。迁移工作环境在下载完整 Flutter 工具链时，网络批准流程被取消；因此只完成了已安装 Dart 3.13.2 的格式/语法解析检查，**没有执行 Flutter 分析、测试或 APK 构建**。`pubspec.lock` 保留原始内容，未手工编造依赖解析结果；需要在具备完整 Flutter 环境和网络访问的机器运行 `flutter pub get`，保存生成的锁文件，再执行上面的验证命令。
+
+测试覆盖 OAuth 开始/等待/完成、取消与失败、旧凭据失效、刷新轮换和退出，以及单助手会话、账户范围、实时事件与恢复。测试使用合成数据和假 HTTP/WebSocket，不能替代真实 Google 账号与模型 API 的端到端验收。

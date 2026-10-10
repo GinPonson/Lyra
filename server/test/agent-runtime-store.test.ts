@@ -4,12 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import type { AgentSessionSnapshot } from "../src/domain/agent/index.js";
-import {
-  AgentMcpCredentialStore,
-  authenticateAgentMcpCredential,
-  issueAgentMcpCredential,
-} from "../src/infrastructure/agents/index.js";
 import { loadAgentSession } from "../src/infrastructure/db/agent-session-repository.js";
 import { openLyraDatabase } from "../src/infrastructure/db/database.js";
 
@@ -53,7 +47,7 @@ async function seedAgentSession(databasePath: string): Promise<void> {
         ledger_version, as_of, revision, last_event_sequence, summary,
         created_at, updated_at
       ) VALUES (
-        CAST($session_id AS UUID), CAST($device_id AS UUID), 'claude', 'running',
+        CAST($session_id AS UUID), CAST($device_id AS UUID), 'genkit', 'running',
         'account', CAST($account_id AS UUID), 31,
         CAST('2026-08-31T10:00:00Z' AS TIMESTAMPTZ), 4, 2, '已完成摘要',
         CAST('2026-08-31T10:00:00Z' AS TIMESTAMPTZ),
@@ -73,7 +67,7 @@ async function seedAgentSession(databasePath: string): Promise<void> {
         ),
         (
           CAST($assistant_id AS UUID), CAST($session_id AS UUID), 2, 'assistant',
-          'claude', 'completed', '本月结果如下', NULL,
+          'genkit', 'completed', '本月结果如下', NULL,
           CAST('2026-08-31T10:00:20Z' AS TIMESTAMPTZ),
           CAST('2026-08-31T10:00:20Z' AS TIMESTAMPTZ)
         )
@@ -98,7 +92,7 @@ describe("Agent production runtime stores", () => {
         const session = await loadAgentSession(database, SESSION_ID);
         assert.deepEqual(session, {
           id: SESSION_ID,
-          provider: "claude",
+          provider: "genkit",
           status: "running",
           accountScope: { kind: "account", account: ACCOUNT_ID },
           ledgerVersion: 31,
@@ -137,46 +131,4 @@ describe("Agent production runtime stores", () => {
     }
   });
 
-  it("只保存 MCP 哈希记录，并回存使用时间后按会话撤销", () => {
-    const session: AgentSessionSnapshot = {
-      id: SESSION_ID,
-      provider: "claude",
-      status: "running",
-      accountScope: { kind: "account", account: ACCOUNT_ID },
-      ledgerVersion: 31,
-      asOf: "2026-08-31T10:00:00.000Z",
-      revision: 4,
-      messages: [],
-    };
-    const issued = issueAgentMcpCredential({
-      session,
-      now: new Date("2026-08-31T10:00:00.000Z"),
-      ttlMilliseconds: 60_000,
-    });
-    const store = new AgentMcpCredentialStore();
-    store.add(issued.record);
-
-    const loaded = store.findByTokenHash(issued.record.tokenHash);
-    assert.notEqual(loaded, null);
-    if (loaded === null) {
-      throw new Error("测试 MCP 凭据未写入存储");
-    }
-    const authenticated = authenticateAgentMcpCredential({
-      session,
-      record: loaded,
-      token: issued.token,
-      now: new Date("2026-08-31T10:00:15.000Z"),
-    });
-    store.update(authenticated.record);
-    assert.equal(
-      store.findByTokenHash(issued.record.tokenHash)?.lastUsedAt,
-      "2026-08-31T10:00:15.000Z",
-    );
-
-    assert.equal(
-      store.revokeSession(SESSION_ID, new Date("2026-08-31T10:00:20.000Z")),
-      1,
-    );
-    assert.equal(store.findByTokenHash(issued.record.tokenHash)?.status, "revoked");
-  });
 });

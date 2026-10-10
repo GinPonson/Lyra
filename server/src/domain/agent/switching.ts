@@ -1,15 +1,14 @@
 import type { AccountScope } from "../analytics/index.js";
 
-/** Lyra 第一阶段支持的服务端 Agent。 */
-export type AgentProvider = "claude" | "pi" | "opencode";
+/** Lyra 唯一的服务端 Agent 运行时。 */
+export type AgentProvider = "genkit";
 
-/** Agent 会话只允许在 idle 回合边界切换。 */
+/** Agent 会话生命周期；账户范围与数据基线只能在 idle 边界变更。 */
 export type AgentSessionStatus = "idle" | "running" | "cancelling" | "closed";
 
-/** Agent 切换可由客户端稳定处理的预期错误码。 */
+/** 会话上下文变更可由客户端稳定处理的预期错误码。 */
 export type AgentSwitchErrorCode =
   | "AGENT_SWITCH_REQUIRES_TURN_BOUNDARY"
-  | "AGENT_HANDOFF_CONTEXT_TOO_LARGE"
   | "AGENT_UNAVAILABLE";
 
 /** 回合边界或目标供应商状态阻止了 Agent 切换。 */
@@ -60,24 +59,6 @@ export interface AgentSessionSnapshot {
   messages: readonly NormalizedAgentMessage[];
 }
 
-/** 新适配器启动 handoff 时接收的规范化上下文。 */
-export interface AgentHandoffContext {
-  fromProvider: AgentProvider;
-  toProvider: AgentProvider;
-  accountScope: AccountScope;
-  ledgerVersion: number;
-  asOf: string;
-  summary: string | null;
-  omittedMessageCount: number;
-  messages: readonly NormalizedAgentMessage[];
-}
-
-/** 一次合法 Agent 切换产生的新快照和 handoff 输入。 */
-export interface AgentSwitchPlan {
-  nextSession: AgentSessionSnapshot;
-  handoff: AgentHandoffContext;
-}
-
 /** 账户范围变化后需要原子固化的新会话快照和显式上下文消息。 */
 export interface AgentAccountScopeChangePlan {
   nextSession: AgentSessionSnapshot;
@@ -93,8 +74,7 @@ export interface AgentLedgerBaselineRefreshPlan {
 /**
  * 创建绑定首个数据基线的空 Agent 会话。
  *
- * 创建不会启动模型回合或子进程；调用方应先持久化返回快照，再建立私有工作
- * 目录。用户选择的供应商不可用时明确失败，禁止静默切换到其他 Agent。
+ * 创建不会启动模型回合；调用方先持久化快照。模型尚未配置时明确失败。
  */
 export function createAgentSession(input: {
   sessionId: string;
@@ -132,88 +112,10 @@ export function createAgentSession(input: {
 }
 
 /**
- * 在完整回合边界生成 Agent 切换计划。
- *
- * @param session - 当前已固化的规范化会话快照。
- * @param target - 用户明确选择的目标 Agent。
- * @param availability - 目标 Agent 的最新探测结果。
- * @param switchMessageId - 将持久化的切换标记消息 ID。
- * @param switchedAt - UTC ISO 时间戳，由应用层时钟提供。
- * @returns 新会话快照和目标适配器 handoff 上下文。
- * @throws AgentSwitchError 当回合未结束或目标不可用时抛出。
- * @throws RangeError 当目标相同或切换输入无效时抛出。
- */
-export function prepareAgentSwitch(
-  session: AgentSessionSnapshot,
-  target: AgentProvider,
-  availability: AgentProviderAvailability,
-  switchMessageId: string,
-  switchedAt: string,
-  maximumContextCharacters = 32_000,
-): AgentSwitchPlan {
-  if (session.status !== "idle") {
-    throw new AgentSwitchError(
-      "AGENT_SWITCH_REQUIRES_TURN_BOUNDARY",
-      `Agent 只能在完整回合边界切换，当前状态为 ${session.status}`,
-    );
-  }
-  if (session.provider === target) {
-    throw new RangeError(`当前会话已经使用 ${target}`);
-  }
-  if (availability.provider !== target) {
-    throw new Error(
-      `Agent 可用性结果与目标不一致: target=${target} probe=${availability.provider}`,
-    );
-  }
-  if (availability.status === "unavailable") {
-    throw new AgentSwitchError(
-      "AGENT_UNAVAILABLE",
-      `Agent ${target} 当前不可用`,
-      availability.reason,
-    );
-  }
-  if (switchMessageId.trim().length === 0 || switchedAt.trim().length === 0) {
-    throw new RangeError("Agent 切换消息 ID 和时间戳不能为空");
-  }
-
-  const switchMessage: NormalizedAgentMessage = {
-    id: switchMessageId,
-    role: "system",
-    content: (
-      `Agent 已从 ${session.provider} 切换到 ${target}；`
-      + `账户范围与账本版本 ${session.ledgerVersion} 保持不变。`
-    ),
-    createdAt: switchedAt,
-  };
-  const nextMessages = [...session.messages, switchMessage];
-  const handoff = buildBoundedAgentHandoff({
-    fromProvider: session.provider,
-    toProvider: target,
-    accountScope: session.accountScope,
-    ledgerVersion: session.ledgerVersion,
-    asOf: session.asOf,
-    summary: session.summary ?? null,
-    omittedMessageCount: 0,
-    // 目标 Agent 必须收到与持久化快照相同的显式切换边界，不能只靠结构字段推断。
-    messages: nextMessages,
-  }, maximumContextCharacters);
-  return {
-    nextSession: {
-      ...session,
-      provider: target,
-      revision: session.revision + 1,
-      messages: nextMessages,
-    },
-    handoff,
-  };
-}
-
-/**
  * 在完整回合边界显式切换 Agent 会话的账户范围和账本基线。
  *
  * 旧消息仍保留用于对话连续性，但新增 system 消息划清前后数据口径；旧摘要
- * 可能包含原账户数字，因此必须失效。revision 递增会同步使此前签发的 MCP
- * 单会话凭据失效，下一回合只能使用新范围重新签发。
+ * 可能包含原账户数字，因此必须失效。下一回合由服务器注入新的授权范围。
  */
 export function prepareAgentAccountScopeChange(input: {
   session: AgentSessionSnapshot;
@@ -272,7 +174,7 @@ export function prepareAgentAccountScopeChange(input: {
  * 在账户范围不变时，将已完成的数据更新显式带入 Agent 会话。
  *
  * 该操作只接受严格递增的账本版本。旧消息保留用于复核，但旧摘要可能包含
- * 已过期数字，因此必须清除；revision 递增会使此前签发的 MCP 会话凭据失效。
+ * 已过期数字，因此必须清除；下一回合重新注入权威数据基线。
  */
 export function prepareAgentLedgerBaselineRefresh(input: {
   session: AgentSessionSnapshot;
@@ -322,60 +224,6 @@ export function prepareAgentLedgerBaselineRefresh(input: {
     },
     contextMessage,
   };
-}
-
-/**
- * 按字符预算保留连续的最近完整消息，并用已固化摘要覆盖被省略的旧消息。
- *
- * 本函数不截断单条消息，也不现场让模型编造摘要。预算不足且没有既有摘要，
- * 或最新一条完整消息本身无法容纳时，切换必须显式失败并先更新会话摘要。
- */
-export function buildBoundedAgentHandoff(
-  context: AgentHandoffContext,
-  maximumContextCharacters: number,
-): AgentHandoffContext {
-  if (!Number.isSafeInteger(maximumContextCharacters) || maximumContextCharacters <= 0) {
-    throw new RangeError("Agent handoff 字符预算必须是正安全整数");
-  }
-  const normalizedSummary = context.summary?.trim() || null;
-  let remaining = maximumContextCharacters - (normalizedSummary?.length ?? 0);
-  if (remaining < 0) {
-    throw handoffTooLarge("会话摘要超过 handoff 字符预算");
-  }
-
-  const selected: NormalizedAgentMessage[] = [];
-  let omittedMessageCount = 0;
-  for (let index = context.messages.length - 1; index >= 0; index -= 1) {
-    const message = context.messages[index];
-    if (message === undefined) {
-      continue;
-    }
-    if (message.content.length > remaining) {
-      omittedMessageCount = index + 1;
-      break;
-    }
-    selected.unshift(message);
-    remaining -= message.content.length;
-  }
-
-  if (omittedMessageCount > 0 && (normalizedSummary === null || selected.length === 0)) {
-    throw handoffTooLarge("切换上下文需要先生成覆盖旧消息的会话摘要");
-  }
-  return {
-    ...context,
-    summary: normalizedSummary,
-    omittedMessageCount,
-    messages: omittedMessageCount === 0 ? context.messages : selected,
-  };
-}
-
-/** 生成不包含消息正文或供应商详情的稳定切换错误。 */
-function handoffTooLarge(internalReason: string): AgentSwitchError {
-  return new AgentSwitchError(
-    "AGENT_HANDOFF_CONTEXT_TOO_LARGE",
-    "Agent 切换上下文过大，需要先更新会话摘要",
-    internalReason,
-  );
 }
 
 /** 复制并校验模型不可控制的目标账户范围。 */

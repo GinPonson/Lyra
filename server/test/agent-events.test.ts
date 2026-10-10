@@ -14,7 +14,7 @@ describe("AgentEventSequencer", () => {
       type: "message.started",
       messageId: "message-1",
       occurredAt: "2026-08-30T00:00:00Z",
-      payload: { provider: "claude" },
+      payload: { provider: "genkit" },
     });
     const delta = sequencer.next({
       type: "message.delta",

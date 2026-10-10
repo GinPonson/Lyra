@@ -8,22 +8,18 @@ import {
   assertClientProtocolVersion,
   type ServerProtocolMetadata,
 } from "./protocol-version.js";
-import {
-  registerAgentMcpHttpRoutes,
-  type AgentMcpHttpOptions,
-} from "./agent-mcp-http.js";
 
 /** 构建 HTTP 服务所需的最小运行时依赖。 */
 export interface HttpServerOptions {
   protocolMetadata: ServerProtocolMetadata;
   getHealthSnapshot: () => ServiceHealthSnapshot | Promise<ServiceHealthSnapshot>;
-  mcp?: AgentMcpHttpOptions;
   logger?: boolean;
 }
 
 const PUBLIC_V1_ROUTES = new Set<string>([
   "/v1/system/info",
   "/v1/health",
+  "/v1/auth/google/callback",
 ]);
 
 /**
@@ -38,12 +34,29 @@ const PUBLIC_V1_ROUTES = new Set<string>([
  */
 export function buildHttpServer(options: HttpServerOptions): FastifyInstance {
   const app = Fastify({
-    logger: options.logger ?? false,
+    logger: options.logger ? {
+      serializers: {
+        // OAuth 回调的 code/state 与其他查询参数不进入访问日志。
+        req(request) {
+          return {
+            method: request.method,
+            url: request.url?.split("?")[0] ?? "/",
+            hostname: request.hostname,
+            remoteAddress: request.ip,
+          };
+        },
+      },
+    } : false,
     genReqId: () => randomUUID(),
   });
 
   app.addHook("onRequest", async (request, reply) => {
     reply.header("x-request-id", request.id);
+    if (request.url.startsWith("/v1/auth/")) {
+      reply.header("cache-control", "no-store");
+      reply.header("referrer-policy", "no-referrer");
+      reply.header("x-content-type-options", "nosniff");
+    }
 
     if (
       request.url.startsWith("/v1/")
@@ -73,14 +86,6 @@ export function buildHttpServer(options: HttpServerOptions): FastifyInstance {
     const statusCode = snapshot.status === "unavailable" ? 503 : 200;
     return reply.code(statusCode).send(snapshot);
   });
-
-  if (options.mcp !== undefined) {
-    registerAgentMcpHttpRoutes(
-      app,
-      options.protocolMetadata.server_version,
-      options.mcp,
-    );
-  }
 
   return app;
 }

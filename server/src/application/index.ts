@@ -150,19 +150,12 @@ export type { WriteCoordinatorStatus } from "./write-coordinator.js";
 export { AgentTurnOrchestrator } from "./agent-turn-orchestrator.js";
 export type { AgentTurnRunResult } from "./agent-turn-orchestrator.js";
 export type { AgentTurnExecutor } from "../domain/agent/index.js";
-export { assembleAgentMcpRuntime } from "./agent-mcp-assembly.js";
-export type {
-  AgentMcpAuthorization,
-  AgentMcpRuntimeAssembly,
-} from "./agent-mcp-assembly.js";
 export {
   closeAgentSessionForRequest,
   createAgentSessionForRequest,
-  switchAgentSessionForRequest,
 } from "./agent-session-commands.js";
 export type { CreateAgentSessionRequest } from "./agent-session-commands.js";
 export { createDeviceAuthGate } from "./device-auth-gate.js";
-export { createAgentAvailabilityProvider } from "./agent-availability-cache.js";
 export {
   IMPORT_PARSER_VERSION,
   ImportService,
@@ -180,7 +173,7 @@ export type {
   DevicePairingHttpResponse,
   DeviceTokenRefreshHttpResponse,
 } from "./device-pairing-service.js";
-export { invokeAuthenticatedAgentTool } from "./agent-tool-invocation.js";
+export { createAgentFinancialToolData } from "./agent-tool-invocation.js";
 export { createFinancialToolRegistry } from "./financial-tool-runtime.js";
 export {
   DEFAULT_OFFICIAL_IMPORT_INTERVAL_MONTHS,
@@ -188,7 +181,6 @@ export {
 } from "./official-import-reminder.js";
 export type {
   AgentFinancialToolData,
-  AuthenticatedAgentToolResult,
 } from "./agent-tool-invocation.js";
 export type {
   AgentAccountSummaryResult,

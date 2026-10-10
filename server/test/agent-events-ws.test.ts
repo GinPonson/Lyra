@@ -5,15 +5,14 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { WebSocket } from "ws";
 
-import type { AgentTurnExecutor } from "../src/domain/agent/index.js";
+import type { AgentEvent, AgentTurnExecutor } from "../src/domain/agent/index.js";
 import {
   AgentTurnOrchestrator,
   WriteCoordinator,
   createDeviceAuthGate,
   createFinancialToolRegistry,
 } from "../src/application/index.js";
-import { AgentMcpCredentialStore } from "../src/infrastructure/agents/index.js";
-import { issueDeviceAccessToken } from "../src/infrastructure/security/device-auth.js";
+import { issueDeviceAccessToken, type PairedDeviceAuthRecord } from "../src/infrastructure/security/device-auth.js";
 import { loadPairedDeviceAuthRecord } from "../src/infrastructure/db/device-access-token-repository.js";
 import { openLyraDatabase } from "../src/infrastructure/db/database.js";
 import { registerAgentRoutes } from "../src/transport/agent-routes.js";
@@ -62,6 +61,81 @@ function createMessageSink(socket: WebSocket) {
         waiters.push({ predicate, resolve, timer });
       });
     },
+  };
+}
+
+/** 有界等待真实 close 帧；失败时不让 WebSocket 用例无限挂起。 */
+function waitForClose(socket: WebSocket): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("等待 WS 关闭超时")), 5_000);
+    socket.once("close", (code) => { clearTimeout(timer); resolve(code); });
+    socket.once("error", (error) => { clearTimeout(timer); reject(error); });
+  });
+}
+
+/** ping/pong 保证之前发送的订阅帧已抵达服务端，避免使用时间猜测断言。 */
+function waitForRoundTrip(socket: WebSocket): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("等待 WS pong 超时")), 5_000);
+    socket.once("pong", () => { clearTimeout(timer); resolve(); });
+    socket.ping("auth-test-barrier");
+  });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+/** 用真实 WS 传输、可控认证和受保护事件源隔离认证竞态。 */
+async function createAuthRaceFixture() {
+  const firstAuthentication = deferred<PairedDeviceAuthRecord>();
+  const event: AgentEvent = {
+    type: "message.completed", sessionId: ACCOUNT_ID, messageId: null,
+    sequence: 1, occurredAt: "2026-10-10T13:00:00.000Z",
+    payload: { content: "private financial result" },
+  };
+  let authenticationCalls = 0;
+  let resumeCalls = 0;
+  let subscribeCalls = 0;
+  const eventSource: Pick<AgentTurnOrchestrator, "resumeEvents" | "subscribe"> = {
+    resumeEvents: () => { resumeCalls += 1; return { mode: "events", events: [event] }; },
+    subscribe: () => { subscribeCalls += 1; return () => undefined; },
+  };
+  const app = buildHttpServer({
+    protocolMetadata: createServerProtocolMetadata("0.1.0", 13),
+    getHealthSnapshot: async () => { throw new Error("unused health endpoint"); },
+  });
+  await registerAgentEventsRoute(app, {
+    // The route only consumes these two event-source methods. No model/database
+    // behavior is mocked into the authentication boundary under test.
+    orchestrator: eventSource as AgentTurnOrchestrator,
+    authenticateDevice: async () => {
+      authenticationCalls += 1;
+      if (authenticationCalls === 1) return firstAuthentication.promise;
+      return { id: DEVICE_ID, status: "active", revokedAt: null };
+    },
+  });
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  if (address === null || typeof address === "string") throw new Error("测试服务地址无效");
+  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/events`, {
+    headers: { authorization: "Bearer held-in-app", "x-lyra-protocol-version": "2" },
+  });
+  const sink = createMessageSink(socket);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("open", () => resolve());
+    socket.once("error", reject);
+  });
+  return {
+    socket, sink, event, firstAuthentication,
+    counts: () => ({ authenticationCalls, resumeCalls, subscribeCalls }),
+    close: async () => { socket.terminate(); await app.close(); },
   };
 }
 
@@ -119,11 +193,8 @@ describe("Agent events WebSocket surface", () => {
       const orchestrator = new AgentTurnOrchestrator({
         database,
         writeCoordinator,
-        mcpCredentials: new AgentMcpCredentialStore(),
         registry: createFinancialToolRegistry(database),
-        executors: { claude: executor, pi: executor, opencode: executor },
-        mcpEndpoint: "http://127.0.0.1:3141/mcp",
-        mcpCredentialTtlMilliseconds: 60_000,
+        executor,
       });
       const app = buildHttpServer({
         protocolMetadata: createServerProtocolMetadata("0.1.0", 11),
@@ -139,14 +210,12 @@ describe("Agent events WebSocket surface", () => {
         availability: async () => ({
           checkedAt: "2026-09-02T09:00:00.000Z",
           providers: [
-            { provider: "claude", status: "available", version: "1.0.0" },
-            { provider: "pi", status: "available", version: "1.0.0" },
-            { provider: "opencode", status: "available", version: "1.0.0" },
+            { provider: "genkit", name: "Lyra", status: "available", version: "Genkit" },
           ],
         }),
         authenticateDevice,
       });
-      await registerAgentEventsRoute(app, { orchestrator, authenticateDevice });
+      const connections = await registerAgentEventsRoute(app, { orchestrator, authenticateDevice });
       await app.listen({ host: "127.0.0.1", port: 0 });
       const address = app.server.address();
       if (address === null || typeof address === "string") {
@@ -155,14 +224,14 @@ describe("Agent events WebSocket surface", () => {
       const wsUrl = `ws://127.0.0.1:${address.port}/v1/events`;
       const headers = {
         authorization: `Bearer ${issued.token}`,
-        "x-lyra-protocol-version": "1",
+        "x-lyra-protocol-version": "2",
       };
 
       const created = await app.inject({
         method: "POST",
         url: "/v1/agent/sessions",
         headers,
-        payload: { provider: "claude", accountScope: { kind: "all" } },
+        payload: { provider: "genkit", accountScope: { kind: "all" } },
       });
       assert.equal(created.statusCode, 201);
       const sessionId = created.json().session.id as string;
@@ -170,7 +239,7 @@ describe("Agent events WebSocket surface", () => {
       const unauthorized = new WebSocket(wsUrl, {
         headers: {
           authorization: "Bearer invalid-token-value",
-          "x-lyra-protocol-version": "1",
+          "x-lyra-protocol-version": "2",
         },
       });
       const unauthorizedCode = await new Promise<number>((resolve) => {
@@ -225,10 +294,11 @@ describe("Agent events WebSocket surface", () => {
       const errorFrame = await invalidSink.waitFor((message) => message.type === "error");
       assert.equal(errorFrame.code, "INVALID_ARGUMENT");
 
-      live.close();
-      resuming.close();
-      stale.close();
-      invalidFrame.close();
+      // 退出登录的连接控制器必须主动关闭该设备的所有已认证连接，而不是等
+      // 下一条事件、订阅帧或 token 自然过期。
+      const closeCodes = Promise.all([live, resuming, stale, invalidFrame].map(waitForClose));
+      connections.disconnectDevice(DEVICE_ID);
+      assert.deepEqual(await closeCodes, [4001, 4001, 4001, 4001]);
       await app.close();
     } finally {
       await database.close();
@@ -280,11 +350,8 @@ describe("Agent events WebSocket surface", () => {
       const orchestrator = new AgentTurnOrchestrator({
         database,
         writeCoordinator,
-        mcpCredentials: new AgentMcpCredentialStore(),
         registry: createFinancialToolRegistry(database),
-        executors: { claude: executor, pi: executor, opencode: executor },
-        mcpEndpoint: "http://127.0.0.1:3141/mcp",
-        mcpCredentialTtlMilliseconds: 60_000,
+        executor,
       });
       const app = buildHttpServer({
         protocolMetadata: createServerProtocolMetadata("0.1.0", 11),
@@ -300,9 +367,7 @@ describe("Agent events WebSocket surface", () => {
         availability: async () => ({
           checkedAt: "2026-09-02T09:00:00.000Z",
           providers: [
-            { provider: "claude", status: "available", version: "1.0.0" },
-            { provider: "pi", status: "available", version: "1.0.0" },
-            { provider: "opencode", status: "available", version: "1.0.0" },
+            { provider: "genkit", name: "Lyra", status: "available", version: "Genkit" },
           ],
         }),
         authenticateDevice,
@@ -318,9 +383,9 @@ describe("Agent events WebSocket surface", () => {
         url: "/v1/agent/sessions",
         headers: {
           authorization: `Bearer ${issued.token}`,
-          "x-lyra-protocol-version": "1",
+          "x-lyra-protocol-version": "2",
         },
-        payload: { provider: "claude", accountScope: { kind: "all" } },
+        payload: { provider: "genkit", accountScope: { kind: "all" } },
       });
       assert.equal(created.statusCode, 201);
       const sessionId = created.json().session.id as string;
@@ -330,11 +395,8 @@ describe("Agent events WebSocket surface", () => {
       const freshOrchestrator = new AgentTurnOrchestrator({
         database,
         writeCoordinator,
-        mcpCredentials: new AgentMcpCredentialStore(),
         registry: createFinancialToolRegistry(database),
-        executors: { claude: executor, pi: executor, opencode: executor },
-        mcpEndpoint: "http://127.0.0.1:3141/mcp",
-        mcpCredentialTtlMilliseconds: 60_000,
+        executor,
       });
       const eventsApp = buildHttpServer({
         protocolMetadata: createServerProtocolMetadata("0.1.0", 11),
@@ -355,7 +417,7 @@ describe("Agent events WebSocket surface", () => {
       const socket = new WebSocket(`ws://127.0.0.1:${eventsAddress.port}/v1/events`, {
         headers: {
           authorization: `Bearer ${issued.token}`,
-          "x-lyra-protocol-version": "1",
+          "x-lyra-protocol-version": "2",
         },
       });
       const sink = createMessageSink(socket);
@@ -371,7 +433,7 @@ describe("Agent events WebSocket surface", () => {
       const second = new WebSocket(`ws://127.0.0.1:${eventsAddress.port}/v1/events`, {
         headers: {
           authorization: `Bearer ${issued.token}`,
-          "x-lyra-protocol-version": "1",
+          "x-lyra-protocol-version": "2",
         },
       });
       const secondSink = createMessageSink(second);
@@ -385,5 +447,33 @@ describe("Agent events WebSocket surface", () => {
       await database.close();
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("首帧等待延迟认证完成后才读取和返回受保护事件", async () => {
+    const f = await createAuthRaceFixture();
+    try {
+      f.socket.send(JSON.stringify({ type: "subscribe", sessionId: ACCOUNT_ID, afterSequence: 0 }));
+      await waitForRoundTrip(f.socket);
+      assert.deepEqual(f.counts(), { authenticationCalls: 1, resumeCalls: 0, subscribeCalls: 0 });
+      assert.deepEqual(f.sink.received, []);
+      f.firstAuthentication.resolve({ id: DEVICE_ID, status: "active", revokedAt: null });
+      const subscribed = await f.sink.waitFor((message) => message.type === "subscribed");
+      assert.deepEqual(subscribed, { type: "subscribed", mode: "events", events: [f.event] });
+      assert.deepEqual(f.counts(), { authenticationCalls: 2, resumeCalls: 1, subscribeCalls: 1 });
+    } finally { await f.close(); }
+  });
+
+  it("延迟首轮认证失败时关闭连接且不暴露已排队订阅的事件", async () => {
+    const f = await createAuthRaceFixture();
+    try {
+      f.socket.send(JSON.stringify({ type: "subscribe", sessionId: ACCOUNT_ID, afterSequence: 0 }));
+      await waitForRoundTrip(f.socket);
+      assert.deepEqual(f.counts(), { authenticationCalls: 1, resumeCalls: 0, subscribeCalls: 0 });
+      const closed = waitForClose(f.socket);
+      f.firstAuthentication.reject(new Error("invalid or revoked credential"));
+      assert.equal(await closed, 4001);
+      assert.deepEqual(f.sink.received, []);
+      assert.deepEqual(f.counts(), { authenticationCalls: 1, resumeCalls: 0, subscribeCalls: 0 });
+    } finally { await f.close(); }
   });
 });

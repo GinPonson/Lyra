@@ -258,7 +258,7 @@ class AccountScopeButton extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final scope = ref.watch(accountScopeProvider);
-    final paired = ref.watch(sessionProvider).value is SessionPaired;
+    final paired = ref.watch(sessionProvider).value is SessionAuthenticated;
     return TextButton.icon(
       onPressed: paired
           ? () => showModalBottomSheet<void>(

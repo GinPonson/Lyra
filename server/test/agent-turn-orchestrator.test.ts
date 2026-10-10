@@ -11,7 +11,6 @@ import {
   createFinancialToolRegistry,
 } from "../src/application/index.js";
 import { createAgentSession } from "../src/domain/agent/index.js";
-import { AgentMcpCredentialStore } from "../src/infrastructure/agents/index.js";
 import { persistNewAgentSession } from "../src/infrastructure/db/agent-session-repository.js";
 import { openLyraDatabase } from "../src/infrastructure/db/database.js";
 
@@ -61,8 +60,8 @@ describe("Agent turn orchestrator", () => {
       const database = await openLyraDatabase(databasePath);
       const session = createAgentSession({
         sessionId: SESSION_ID,
-        provider: "opencode",
-        availability: { provider: "opencode", status: "available" },
+        provider: "genkit",
+        availability: { provider: "genkit", status: "available" },
         accountScope: { kind: "account", account: ACCOUNT_ID },
         ledgerVersion: 1,
         asOf: "2026-09-01T09:00:00.000Z",
@@ -73,26 +72,22 @@ describe("Agent turn orchestrator", () => {
         createdAt: new Date("2026-09-01T09:00:00.000Z"),
       });
 
-      let observedBearer: string | null = null;
       let observedContent: string | null = null;
       const successExecutor: AgentTurnExecutor = async (input) => {
-        observedBearer = input.mcp.bearer;
         observedContent = input.adapterInput.content;
         input.emitSignal({ kind: "reasoning_delta", delta: "hidden" });
-        // 模拟 CLI 通过 MCP 先发起一次越权工具请求，再发起一次合法查询。
+        // 模型只通过当前回合绑定的函数申请工具执行。
         await assert.rejects(
-          () => orchestrator.executeAuthorizedToolCall({
-            sessionId: SESSION_ID,
+          () => input.executeTool({
             toolName: "run-shell",
             args: { command: "rm -rf /" },
           }),
         );
-        const executed = await orchestrator.executeAuthorizedToolCall({
-          sessionId: SESSION_ID,
+        const executed = await input.executeTool({
           toolName: "positions",
           args: {},
         });
-        assert.equal((executed.data as { count: number }).count, 0);
+        assert.equal((executed.data as { data: { count: number } }).data.count, 0);
         input.emitSignal({ kind: "message_delta", delta: "当前有持仓记录。" });
         input.emitSignal({ kind: "usage_updated", totalTokens: 18, totalCost: 0.5 });
         input.emitSignal({
@@ -112,27 +107,14 @@ describe("Agent turn orchestrator", () => {
       const orchestrator = new AgentTurnOrchestrator({
         database,
         writeCoordinator: new WriteCoordinator(),
-        mcpCredentials: new AgentMcpCredentialStore(),
         registry: createFinancialToolRegistry(database),
-        executors: {
-          claude: () => {
-            throw new Error("未使用的供应商不应被启动");
-          },
-          pi: () => {
-            throw new Error("未使用的供应商不应被启动");
-          },
-          opencode: (input) => activeExecutor(input),
-        },
-        mcpEndpoint: "http://127.0.0.1:3141/mcp",
-        mcpCredentialTtlMilliseconds: 60_000,
+        executor: (input) => activeExecutor(input),
       });
 
       const opened = await orchestrator.openSession(SESSION_ID);
       assert.equal(opened.status, "idle");
 
       const run = await orchestrator.startTurn(SESSION_ID, " 分析当前持仓 ");
-      assert.notEqual(observedBearer, null);
-      assert.notEqual(observedBearer, "");
       assert.equal(observedContent, "分析当前持仓");
       assert.equal(run.snapshot.status, "idle");
       assert.equal(run.snapshot.revision, 3);
@@ -220,8 +202,8 @@ describe("Agent turn orchestrator", () => {
       const database = await openLyraDatabase(databasePath);
       const session = createAgentSession({
         sessionId: CANCEL_SESSION_ID,
-        provider: "claude",
-        availability: { provider: "claude", status: "available" },
+        provider: "genkit",
+        availability: { provider: "genkit", status: "available" },
         accountScope: { kind: "all" },
         ledgerVersion: 1,
         asOf: "2026-09-01T09:00:00.000Z",
@@ -235,10 +217,8 @@ describe("Agent turn orchestrator", () => {
       const orchestrator = new AgentTurnOrchestrator({
         database,
         writeCoordinator: new WriteCoordinator(),
-        mcpCredentials: new AgentMcpCredentialStore(),
         registry: createFinancialToolRegistry(database),
-        executors: {
-          claude: async (input) => {
+        executor: async (input) => {
             turnStarted();
             await new Promise<void>((resolve) => {
               if (input.abortSignal.aborted) {
@@ -250,15 +230,6 @@ describe("Agent turn orchestrator", () => {
             input.emitSignal({ kind: "message_failed", outcome: "cancelled" });
             input.emitSignal({ kind: "turn_settled" });
           },
-          pi: () => {
-            throw new Error("未使用的供应商不应被启动");
-          },
-          opencode: () => {
-            throw new Error("未使用的供应商不应被启动");
-          },
-        },
-        mcpEndpoint: "http://127.0.0.1:3141/mcp",
-        mcpCredentialTtlMilliseconds: 60_000,
       });
       await orchestrator.openSession(CANCEL_SESSION_ID);
       // 执行器入口作为回合已注册的确定性信号，避免在回合启动落库前取消。

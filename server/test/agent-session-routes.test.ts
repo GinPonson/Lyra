@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -13,11 +13,10 @@ import type {
 import {
   AgentTurnOrchestrator,
   WriteCoordinator,
-  createAgentAvailabilityProvider,
+  createAgentAvailabilitySnapshot,
   createDeviceAuthGate,
   createFinancialToolRegistry,
 } from "../src/application/index.js";
-import { AgentMcpCredentialStore } from "../src/infrastructure/agents/index.js";
 import { issueDeviceAccessToken } from "../src/infrastructure/security/device-auth.js";
 import { loadPairedDeviceAuthRecord } from "../src/infrastructure/db/device-access-token-repository.js";
 import { openLyraDatabase, type LyraDatabase } from "../src/infrastructure/db/database.js";
@@ -32,15 +31,13 @@ interface AgentRoutesFixture {
   app: FastifyInstance;
   token: string;
   accountId: string;
-  /** 每个已完成回合的 (provider, handoff 是否投递) 记录。 */
-  readonly executedTurns: { provider: string; handoffDelivered: boolean }[];
+  readonly executedTurns: string[];
   close: () => Promise<void>;
 }
 
 /** 构建带完整种子数据与假执行器的 Agent 路由夹具。 */
 async function createAgentRoutesFixture(): Promise<AgentRoutesFixture> {
   const directory = await mkdtemp(join(tmpdir(), "lyra-agent-routes-"));
-  const availabilityFixtures = await mkdtemp(join(tmpdir(), "lyra-fake-probe-clis-"));
   const database = await openLyraDatabase(join(directory, "ledger.duckdb"));
   await database.connection.run(`
     INSERT INTO accounts (
@@ -82,12 +79,9 @@ async function createAgentRoutesFixture(): Promise<AgentRoutesFixture> {
     issued_at: new Date().toISOString(),
   });
 
-  const executedTurns: { provider: string; handoffDelivered: boolean }[] = [];
+  const executedTurns: string[] = [];
   const executor: AgentTurnExecutor = async (input) => {
-    executedTurns.push({
-      provider: input.session.provider,
-      handoffDelivered: input.handoffContext !== null,
-    });
+    executedTurns.push(input.session.provider);
     const signals: AgentTurnStreamSignal[] = [
       { kind: "message_snapshot", content: "回合完成", stopReason: "end_turn" },
     ];
@@ -96,27 +90,14 @@ async function createAgentRoutesFixture(): Promise<AgentRoutesFixture> {
     }
     input.emitSignal({ kind: "turn_settled" });
   };
-  const fakeCliPath = join(availabilityFixtures, "fake-cli.mjs");
-  await writeFile(fakeCliPath, `#!${process.execPath}\nconsole.log("fake-cli 1.0.0");\n`);
-  await chmod(fakeCliPath, 0o755);
-
   const writeCoordinator = new WriteCoordinator();
   const orchestrator = new AgentTurnOrchestrator({
     database,
     writeCoordinator,
-    mcpCredentials: new AgentMcpCredentialStore(),
     registry: createFinancialToolRegistry(database),
-    executors: { claude: executor, pi: executor, opencode: executor },
-    mcpEndpoint: "http://127.0.0.1:3141/mcp",
-    mcpCredentialTtlMilliseconds: 60_000,
+    executor,
   });
-  const availability = createAgentAvailabilityProvider({
-    executables: { claude: fakeCliPath, pi: fakeCliPath, opencode: fakeCliPath },
-    allowedVersions: { claude: ["1.0.0"], pi: ["1.0.0"], opencode: ["1.0.0"] },
-    probeTimeoutMilliseconds: 5_000,
-    cacheMilliseconds: 60_000,
-    now: () => new Date("2026-09-01T09:00:00.000Z"),
-  });
+  const availability = async () => createAgentAvailabilitySnapshot(true, new Date());
   const app = buildHttpServer({
     protocolMetadata: createServerProtocolMetadata("0.1.0", 11),
     getHealthSnapshot: async () => {
@@ -141,7 +122,6 @@ async function createAgentRoutesFixture(): Promise<AgentRoutesFixture> {
       await app.close();
       await database.close();
       await rm(directory, { recursive: true, force: true });
-      await rm(availabilityFixtures, { recursive: true, force: true });
     },
   };
 }
@@ -152,12 +132,12 @@ describe("Agent session REST routes", () => {
     try {
       const headers = {
         authorization: `Bearer ${fixture.token}`,
-        "x-lyra-protocol-version": "1",
+        "x-lyra-protocol-version": "2",
       };
       const noAuth = await fixture.app.inject({
         method: "GET",
         url: "/v1/agents",
-        headers: { "x-lyra-protocol-version": "1" },
+        headers: { "x-lyra-protocol-version": "2" },
       });
       assert.equal(noAuth.statusCode, 401);
       assert.equal(noAuth.json().code, "DEVICE_CREDENTIAL_INVALID");
@@ -167,7 +147,7 @@ describe("Agent session REST routes", () => {
         url: "/v1/agents",
         headers: {
           authorization: "Bearer not-a-real-token",
-          "x-lyra-protocol-version": "1",
+          "x-lyra-protocol-version": "2",
         },
       });
       assert.equal(invalidToken.statusCode, 401);
@@ -179,9 +159,7 @@ describe("Agent session REST routes", () => {
       });
       assert.equal(agents.statusCode, 200);
       assert.deepEqual(agents.json().providers, [
-        { provider: "claude", status: "available", version: "1.0.0" },
-        { provider: "pi", status: "available", version: "1.0.0" },
-        { provider: "opencode", status: "available", version: "1.0.0" },
+        { provider: "genkit", name: "Lyra", status: "available", version: "Genkit" },
       ]);
 
       const invalidBody = await fixture.app.inject({
@@ -197,13 +175,13 @@ describe("Agent session REST routes", () => {
         url: "/v1/agent/sessions",
         headers,
         payload: {
-          provider: "opencode",
+          provider: "genkit",
           accountScope: { kind: "account", account: fixture.accountId },
         },
       });
       assert.equal(created.statusCode, 201);
       const createdSession = created.json().session;
-      assert.equal(createdSession.provider, "opencode");
+      assert.equal(createdSession.provider, "genkit");
       assert.equal(createdSession.status, "idle");
       assert.equal(createdSession.ledgerVersion, 1);
 
@@ -212,7 +190,7 @@ describe("Agent session REST routes", () => {
         url: "/v1/agent/sessions",
         headers,
         payload: {
-          provider: "opencode",
+          provider: "genkit",
           accountScope: {
             kind: "account",
             account: "99000000-0000-4000-8000-000000000001",
@@ -245,7 +223,7 @@ describe("Agent session REST routes", () => {
       ]);
       assert.equal(
         turn.json().events.at(-1)?.payload?.provider,
-        "opencode",
+        "genkit",
       );
 
       await fixture.app.inject({
@@ -285,13 +263,13 @@ describe("Agent session REST routes", () => {
     try {
       const headers = {
         authorization: `Bearer ${fixture.token}`,
-        "x-lyra-protocol-version": "1",
+        "x-lyra-protocol-version": "2",
       };
       const created = await fixture.app.inject({
         method: "POST",
         url: "/v1/agent/sessions",
         headers,
-        payload: { provider: "claude", accountScope: { kind: "all" } },
+        payload: { provider: "genkit", accountScope: { kind: "all" } },
       });
       assert.equal(created.statusCode, 201);
       const sessionId = created.json().session.id as string;
@@ -384,86 +362,29 @@ describe("Agent session REST routes", () => {
     }
   });
 
-  it("在回合边界切换供应商并持久化边界消息与 handoff", async () => {
+  it("defaults to Genkit and removes provider-switch/MCP endpoints", async () => {
     const fixture = await createAgentRoutesFixture();
     try {
       const headers = {
         authorization: `Bearer ${fixture.token}`,
-        "x-lyra-protocol-version": "1",
+        "x-lyra-protocol-version": "2",
       };
       const created = await fixture.app.inject({
-        method: "POST",
-        url: "/v1/agent/sessions",
-        headers,
-        payload: { provider: "opencode", accountScope: { kind: "all" } },
+        method: "POST", url: "/v1/agent/sessions", headers,
+        payload: { accountScope: { kind: "all" } },
       });
       assert.equal(created.statusCode, 201);
-      const sessionId = created.json().session.id as string;
-
-      await fixture.app.inject({
-        method: "POST",
-        url: `/v1/agent/sessions/${sessionId}/messages`,
-        headers,
-        payload: { content: "用 opencode 分析" },
-      });
-
-      const sameProvider = await fixture.app.inject({
-        method: "POST",
-        url: `/v1/agent/sessions/${sessionId}/switch`,
-        headers,
-        payload: { provider: "opencode" },
-      });
-      assert.equal(sameProvider.statusCode, 400);
-
-      const switched = await fixture.app.inject({
-        method: "POST",
-        url: `/v1/agent/sessions/${sessionId}/switch`,
-        headers,
-        payload: { provider: "claude" },
-      });
-      assert.equal(switched.statusCode, 200);
-      const switchedSession = switched.json().session as Record<string, unknown>;
-      assert.equal(switchedSession.provider, "claude");
-      assert.equal(switchedSession.revision, 4);
-      assert.equal(
-        (switchedSession.messages as Record<string, unknown>[]).at(-1)?.role,
-        "system",
-      );
-
-      const turnAfterSwitch = await fixture.app.inject({
-        method: "POST",
-        url: `/v1/agent/sessions/${sessionId}/messages`,
-        headers,
-        payload: { content: "继续用 claude 分析" },
-      });
-      assert.equal(turnAfterSwitch.statusCode, 200);
-      assert.equal(
-        (turnAfterSwitch.json().events.at(-1)?.payload as Record<string, unknown>)
-          ?.provider,
-        "claude",
-      );
-
-      const persisted = await fixture.database.connection.runAndReadAll(`
-        SELECT
-          (SELECT provider FROM agent_sessions WHERE id = CAST($session_id AS UUID))
-            AS provider,
-          (SELECT revision FROM agent_sessions WHERE id = CAST($session_id AS UUID))
-            AS revision,
-          (SELECT count(*)::INTEGER FROM agent_messages
-           WHERE session_id = CAST($session_id AS UUID) AND role = 'system')
-            AS boundary_rows
-      `, { session_id: sessionId });
-      assert.deepEqual(persisted.getRowObjectsJson()[0], {
-        provider: "claude",
-        // 查询发生在切换后的回合完成之后：switch(+1) → start(+1) → settle(+1)。
-        revision: 6,
-        boundary_rows: 1,
-      });
-
-      assert.deepEqual(fixture.executedTurns, [
-        { provider: "opencode", handoffDelivered: false },
-        { provider: "claude", handoffDelivered: true },
-      ]);
+      assert.equal(created.json().session.provider, "genkit");
+      for (const provider of ["claude", "pi", "opencode"]) {
+        const rejected = await fixture.app.inject({
+          method: "POST", url: "/v1/agent/sessions", headers,
+          payload: { provider, accountScope: { kind: "all" } },
+        });
+        assert.equal(rejected.statusCode, 400);
+      }
+      for (const url of ["/mcp", `/v1/agent/sessions/${created.json().session.id}/switch`]) {
+        assert.equal((await fixture.app.inject({ method: "POST", url, headers, payload: {} })).statusCode, 404);
+      }
     } finally {
       await fixture.close();
     }

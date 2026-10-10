@@ -124,6 +124,7 @@ export async function loadDeviceRefreshCredentialRow(
 export async function rotateDeviceRefreshCredentialRows(
   database: LyraDatabase,
   rotation: RotatedDeviceRefreshCredential,
+  accessToken: Parameters<typeof createDeviceAccessTokenRow>[1],
 ): Promise<void> {
   const connection = database.connection;
   await connection.run("BEGIN TRANSACTION");
@@ -151,6 +152,7 @@ export async function rotateDeviceRefreshCredentialRows(
       });
     }
     await createDeviceRefreshCredentialRow(database, rotation.next);
+    await createDeviceAccessTokenRow(database, accessToken);
     await connection.run("COMMIT");
   } catch (error: unknown) {
     try {

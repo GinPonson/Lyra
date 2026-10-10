@@ -61,8 +61,8 @@ describe("Agent session write repository", () => {
 
       const session = createAgentSession({
         sessionId: SESSION_ID,
-        provider: "opencode",
-        availability: { provider: "opencode", status: "available" },
+        provider: "genkit",
+        availability: { provider: "genkit", status: "available" },
         accountScope: { kind: "account", account: ACCOUNT_ID },
         ledgerVersion: 1,
         asOf: "2026-08-31T09:00:00.000Z",
@@ -74,7 +74,7 @@ describe("Agent session write repository", () => {
       });
 
       const created = await loadAgentSessionRuntime(database, SESSION_ID);
-      assert.deepEqual(created, { snapshot: session, lastEventSequence: 0 });
+      assert.deepEqual(created, { deviceId: DEVICE_ID, snapshot: session, lastEventSequence: 0 });
       if (created === null) {
         throw new Error("测试 Agent 会话未持久化");
       }
@@ -183,11 +183,11 @@ describe("Agent session write repository", () => {
       `, { session_id: SESSION_ID });
       assert.deepEqual(terminalRows.getRowObjectsJson(), [
         { role: "user", provider: null, status: "completed", error_code: null },
-        { role: "assistant", provider: "opencode", status: "completed", error_code: null },
+        { role: "assistant", provider: "genkit", status: "completed", error_code: null },
         { role: "user", provider: null, status: "completed", error_code: null },
         {
           role: "assistant",
-          provider: "opencode",
+          provider: "genkit",
           status: "failed",
           error_code: "AGENT_TURN_FAILED",
         },

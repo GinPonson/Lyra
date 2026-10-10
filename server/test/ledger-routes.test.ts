@@ -65,13 +65,13 @@ describe("Ledger read REST routes", () => {
 
       const headers = {
         authorization: `Bearer ${issued.token}`,
-        "x-lyra-protocol-version": "1",
+        "x-lyra-protocol-version": "2",
       };
 
       const noAuth = await app.inject({
         method: "GET",
         url: "/v1/ledger/summary",
-        headers: { "x-lyra-protocol-version": "1" },
+        headers: { "x-lyra-protocol-version": "2" },
       });
       assert.equal(noAuth.statusCode, 401);
 

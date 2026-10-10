@@ -11,7 +11,6 @@ import {
   createAgentSessionForRequest,
   createPublicAgentSession,
   createPublicAgentToolCallList,
-  switchAgentSessionForRequest,
 } from "../application/index.js";
 import { ApplicationError } from "../application/index.js";
 import type { PairedDeviceAuthRecord } from "../infrastructure/security/device-auth.js";
@@ -38,7 +37,7 @@ export interface AgentRouteOptions {
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 const createSessionSchema = z.object({
-  provider: z.enum(["claude", "pi", "opencode"]),
+  provider: z.literal("genkit").default("genkit"),
   accountScope: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("all") }),
     z.object({ kind: z.literal("account"), account: z.string().regex(UUID_PATTERN) }),
@@ -47,10 +46,6 @@ const createSessionSchema = z.object({
 
 const sendMessageSchema = z.object({
   content: z.string().trim().min(1).max(8_192),
-});
-
-const switchSchema = z.object({
-  provider: z.enum(["claude", "pi", "opencode"]),
 });
 
 const sessionIdSchema = z.object({
@@ -165,7 +160,9 @@ export function registerAgentRoutes(
     if (!params.success || !body.success) {
       throw invalidArgument("Agent 回合参数无效");
     }
-    const run = await options.orchestrator.startTurn(params.data.sessionId, body.data.content);
+    const run = await options.orchestrator.startTurn(
+      params.data.sessionId, body.data.content, () => authenticate(request),
+    );
     return {
       session: createPublicAgentSession(run.snapshot),
       events: run.events,
@@ -178,24 +175,6 @@ export function registerAgentRoutes(
       throw invalidArgument("Agent 会话 ID 无效");
     }
     const snapshot = await options.orchestrator.cancelTurn(params.data.sessionId);
-    return { session: createPublicAgentSession(snapshot) };
-  });
-
-  app.post("/v1/agent/sessions/:sessionId/switch", { preHandler: authenticate }, async (request) => {
-    const params = sessionIdSchema.safeParse(request.params);
-    const body = switchSchema.safeParse(request.body);
-    if (!params.success || !body.success) {
-      throw invalidArgument("Agent 切换参数无效");
-    }
-    const snapshot = await switchAgentSessionForRequest({
-      orchestrator: options.orchestrator,
-      writeCoordinator: options.writeCoordinator,
-      database: options.database,
-      availability: await options.availability(),
-      sessionId: params.data.sessionId,
-      targetProvider: body.data.provider,
-      now: now(),
-    });
     return { session: createPublicAgentSession(snapshot) };
   });
 

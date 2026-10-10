@@ -11,7 +11,7 @@ import type { AgentSessionSnapshot } from "../src/domain/agent/index.js";
 function idleSession(): AgentSessionSnapshot {
   return {
     id: "session-scope-1",
-    provider: "opencode",
+    provider: "genkit",
     status: "idle",
     accountScope: { kind: "account", account: "TST001" },
     ledgerVersion: 12,
@@ -39,7 +39,7 @@ describe("Agent account scope change", () => {
       changedAt: "2026-08-31T03:01:00.000Z",
     });
 
-    assert.equal(plan.nextSession.provider, "opencode");
+    assert.equal(plan.nextSession.provider, "genkit");
     assert.deepEqual(plan.nextSession.accountScope, { kind: "all" });
     assert.equal(plan.nextSession.ledgerVersion, 18);
     assert.equal(plan.nextSession.revision, 6);

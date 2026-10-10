@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
+import type { WebSocket } from "ws";
 
 import type { AgentEvent } from "../domain/agent/index.js";
 import type { AgentTurnOrchestrator } from "../application/index.js";
@@ -9,6 +10,11 @@ import type { PairedDeviceAuthRecord } from "../infrastructure/security/device-a
 export interface AgentEventsRouteOptions {
   orchestrator: AgentTurnOrchestrator;
   authenticateDevice: (token: string) => Promise<PairedDeviceAuthRecord>;
+}
+
+/** 已撤销设备的事件连接可随退出登录立即关闭。 */
+export interface AgentEventConnections {
+  disconnectDevice(deviceId: string): void;
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -64,86 +70,107 @@ const websocketRegisteredApps = new WeakSet<FastifyInstance>();
 export async function registerAgentEventsRoute(
   app: FastifyInstance,
   options: AgentEventsRouteOptions,
-): Promise<void> {
+): Promise<AgentEventConnections> {
   if (!websocketRegisteredApps.has(app)) {
     await app.register(websocket);
     websocketRegisteredApps.add(app);
   }
+  const deviceSockets = new Map<string, Set<WebSocket>>();
 
   app.get("/v1/events", { websocket: true }, (socket, request) => {
     let unsubscribe: (() => void) | null = null;
-    let boundSessionId: string | null = null;
-
-    const push = (event: AgentEvent): void => {
-      if (socket.readyState === socket.OPEN) {
-        socket.send(JSON.stringify({ type: "event", event }));
-      }
-    };
+    let deviceId: string | null = null;
+    let queue = Promise.resolve();
+    const header = request.headers.authorization;
+    const token = typeof header === "string" && header.startsWith("Bearer ")
+      ? header.slice("Bearer ".length)
+      : null;
 
     const authenticate = async (): Promise<boolean> => {
-      const header = request.headers.authorization;
-      const token = typeof header === "string" && header.startsWith("Bearer ")
-        ? header.slice("Bearer ".length)
-        : null;
-      if (token === null) {
-        return false;
-      }
+      if (token === null || socket.readyState !== socket.OPEN) return false;
       try {
-        await options.authenticateDevice(token);
+        const device = await options.authenticateDevice(token);
+        if (socket.readyState !== socket.OPEN) return false;
+        deviceId = device.id;
+        const sockets = deviceSockets.get(device.id) ?? new Set<WebSocket>();
+        sockets.add(socket);
+        deviceSockets.set(device.id, sockets);
         return true;
       } catch {
+        socket.close(4001, "unauthorized");
         return false;
       }
     };
-    void authenticate().then((authorized) => {
-      if (!authorized) {
-        socket.close(4001, "unauthorized");
-      }
+
+    // 首帧必须等待认证完成；不能在异步认证尚未结算时订阅账本事件。
+    queue = authenticate().then((authorized) => {
+      if (!authorized) socket.close(4001, "unauthorized");
     });
+    const push = (event: AgentEvent): void => {
+      queue = queue.then(async () => {
+        // 长连接同样遵守凭据过期与设备撤销，不沿用连接时的认证结果。
+        if (await authenticate()) {
+          socket.send(JSON.stringify({ type: "event", event }));
+        }
+      }).catch(() => { socket.close(1011, "event unavailable"); });
+    };
 
     socket.on("message", (data: unknown) => {
-      const message = parseSubscribeMessage(toText(data));
-      if (message === null) {
-        socket.send(JSON.stringify({
-          type: "error",
-          code: "INVALID_ARGUMENT",
-          message: "WebSocket 订阅帧无效",
-        }));
-        return;
-      }
-      let resume: ReturnType<typeof options.orchestrator.resumeEvents>;
-      try {
-        resume = options.orchestrator.resumeEvents(
-          message.sessionId,
-          message.afterSequence,
-        );
-      } catch {
-        // 运行时未在内存(如进程重启后重连)不可补造事件;按既有契约要求
-        // 客户端重取权威快照。socket 回调内抛出异常会击穿整个服务进程。
-        socket.send(JSON.stringify({
-          type: "subscribed",
-          mode: "snapshot_required",
-          reason: "SESSION_NOT_RESUMED",
-        }));
-        return;
-      }
-      if (boundSessionId !== message.sessionId && unsubscribe !== null) {
-        unsubscribe();
-      }
-      unsubscribe = options.orchestrator.subscribe(message.sessionId, push);
-      boundSessionId = message.sessionId;
-      socket.send(JSON.stringify(
-        resume.mode === "events"
-          ? { type: "subscribed", mode: "events", events: resume.events }
-          : { type: "subscribed", mode: "snapshot_required", reason: resume.reason },
-      ));
+      queue = queue.then(async () => {
+        if (!await authenticate()) return;
+        const message = parseSubscribeMessage(toText(data));
+        if (message === null) {
+          socket.send(JSON.stringify({
+            type: "error",
+            code: "INVALID_ARGUMENT",
+            message: "WebSocket 订阅帧无效",
+          }));
+          return;
+        }
+        let resume: ReturnType<typeof options.orchestrator.resumeEvents>;
+        try {
+          resume = options.orchestrator.resumeEvents(
+            message.sessionId,
+            message.afterSequence,
+          );
+        } catch {
+          socket.send(JSON.stringify({
+            type: "subscribed",
+            mode: "snapshot_required",
+            reason: "SESSION_NOT_RESUMED",
+          }));
+          return;
+        }
+        // 重复 subscribe 也替换旧订阅，避免同一事件被发送多次。
+        unsubscribe?.();
+        unsubscribe = options.orchestrator.subscribe(message.sessionId, push);
+        socket.send(JSON.stringify(
+          resume.mode === "events"
+            ? { type: "subscribed", mode: "events", events: resume.events }
+            : { type: "subscribed", mode: "snapshot_required", reason: resume.reason },
+        ));
+      }).catch(() => { socket.close(1011, "subscription unavailable"); });
     });
 
     socket.on("close", () => {
       unsubscribe?.();
       unsubscribe = null;
+      if (deviceId !== null) {
+        const sockets = deviceSockets.get(deviceId);
+        sockets?.delete(socket);
+        if (sockets?.size === 0) deviceSockets.delete(deviceId);
+      }
     });
   });
+
+  return {
+    disconnectDevice(deviceId: string): void {
+      for (const socket of deviceSockets.get(deviceId) ?? []) {
+        socket.close(4001, "signed out");
+      }
+      deviceSockets.delete(deviceId);
+    },
+  };
 }
 
 /** 把 ws 的 RawData 归一为文本；二进制帧按 null 拒绝。 */

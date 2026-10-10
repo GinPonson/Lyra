@@ -11,7 +11,7 @@ import type { AgentSessionSnapshot } from "../src/domain/agent/index.js";
 function runningSession(status: AgentSessionSnapshot["status"] = "running"): AgentSessionSnapshot {
   return {
     id: "session-1",
-    provider: "pi",
+    provider: "genkit",
     status,
     accountScope: { kind: "account", account: "TST276" },
     ledgerVersion: 22,

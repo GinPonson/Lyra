@@ -445,7 +445,7 @@ function requiredString(
   return value;
 }
 
-/** 把 MCP 参数映射为既有交易分页过滤器。 */
+/** 把金融工具参数映射为既有交易分页过滤器。 */
 function createTradeFilters(
   arguments_: Readonly<Record<string, unknown>>,
 ): TradeQueryFilters {
@@ -467,7 +467,7 @@ function createTradeFilters(
   };
 }
 
-/** 把 MCP 参数映射为既有已实现分页过滤器。 */
+/** 把金融工具参数映射为既有已实现分页过滤器。 */
 function createRealizedFilters(
   arguments_: Readonly<Record<string, unknown>>,
 ): RealizedQueryFilters {
@@ -485,7 +485,7 @@ function createRealizedFilters(
   };
 }
 
-/** 把 MCP 参数映射为既有现金流水分页过滤器。 */
+/** 把金融工具参数映射为既有现金流水分页过滤器。 */
 function createCashflowFilters(
   arguments_: Readonly<Record<string, unknown>>,
 ): CashflowQueryFilters {

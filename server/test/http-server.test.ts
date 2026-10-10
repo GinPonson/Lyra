@@ -16,9 +16,7 @@ function createHealthySnapshot() {
     agentAvailability: {
       checkedAt: "2026-08-31T08:30:00.000Z",
       providers: [
-        { provider: "claude", status: "available", version: "2.1.233" },
-        { provider: "pi", status: "available", version: "0.84.2" },
-        { provider: "opencode", status: "available", version: "1.18.21" },
+        { provider: "genkit", name: "Lyra", status: "available", version: "Genkit" },
       ],
     },
     checkedAt: new Date("2026-08-31T08:31:00.000Z"),
@@ -36,9 +34,9 @@ describe("Fastify vertical API", () => {
     assert.equal(info.statusCode, 200);
     assert.deepEqual(info.json(), {
       server_version: "0.1.0",
-      protocol_version: 1,
-      min_supported_protocol_version: 1,
-      max_supported_protocol_version: 1,
+      protocol_version: 2,
+      min_supported_protocol_version: 2,
+      max_supported_protocol_version: 2,
       schema_version: 10,
     });
     assert.match(String(info.headers["x-request-id"] ?? ""), /^[0-9a-f-]{36}$/u);
@@ -69,12 +67,27 @@ describe("Fastify vertical API", () => {
     const accepted = await app.inject({
       method: "GET",
       url: "/v1/test-protected",
-      headers: { "x-lyra-protocol-version": "1" },
+      headers: { "x-lyra-protocol-version": "2" },
     });
     assert.equal(accepted.statusCode, 200);
     assert.deepEqual(accepted.json(), { ok: true });
 
     await app.close();
+  });
+
+  it("不再公开旧 MCP 传输端点", async () => {
+    const app = buildHttpServer({
+      protocolMetadata: createServerProtocolMetadata("0.1.0", 13),
+      getHealthSnapshot: createHealthySnapshot,
+    });
+    try {
+      for (const method of ["GET", "POST", "DELETE"] as const) {
+        const response = await app.inject({ method, url: "/mcp" });
+        assert.equal(response.statusCode, 404);
+      }
+    } finally {
+      await app.close();
+    }
   });
 
   it("健康状态不可用时返回 503，且未知异常不泄露敏感信息", async () => {
@@ -99,7 +112,7 @@ describe("Fastify vertical API", () => {
     const failed = await app.inject({
       method: "GET",
       url: "/v1/test-error",
-      headers: { "x-lyra-protocol-version": "1" },
+      headers: { "x-lyra-protocol-version": "2" },
     });
     const serialized = failed.body;
     assert.equal(failed.statusCode, 500);

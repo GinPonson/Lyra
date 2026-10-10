@@ -12,9 +12,7 @@ describe("service health snapshot", () => {
       agentAvailability: {
         checkedAt: "2026-08-31T18:00:00.000Z",
         providers: [
-          { provider: "claude", status: "available", version: "2.1.233" },
-          { provider: "pi", status: "available", version: "0.84.2" },
-          { provider: "opencode", status: "available", version: "1.18.21" },
+          { provider: "genkit", name: "Lyra", status: "available", version: "Genkit" },
         ],
       },
       checkedAt: new Date("2026-08-31T18:01:00Z"),
@@ -27,7 +25,7 @@ describe("service health snapshot", () => {
       database: { status: "available", schemaVersion: 9, ledgerVersion: 42 },
       writeQueue: { status: "available", pendingOperations: 2 },
       gmail: { status: "available", totalConnections: 2, attentionRequired: 0 },
-      agents: { status: "available", availableProviders: 3, unavailableProviders: 0 },
+      agents: { status: "available", availableProviders: 1, unavailableProviders: 0 },
     });
     const serialized = JSON.stringify(snapshot);
     assert.equal(serialized.includes("@"), false);

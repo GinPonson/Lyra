@@ -12,6 +12,8 @@ const sqlFiles = [
   "transaction-source-view-schema.sql",
   "idempotency-schema.sql",
   "agent-session-identity-schema.sql",
+  "agent-genkit-schema.sql",
+  "owner-login-schema.sql",
 ];
 
 const sourceDirectory = new URL("../src/infrastructure/db/", import.meta.url);

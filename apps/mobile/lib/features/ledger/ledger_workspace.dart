@@ -8,7 +8,17 @@ import 'ledger_repository.dart';
 /// 跨账号、股票与交易页共享的显式账户范围；不改变既有 AI 会话范围。
 class AccountScopeController extends Notifier<({String id, String label})> {
   @override
-  ({String id, String label}) build() => (id: 'all', label: '全部账号');
+  ({String id, String label}) build() {
+    ref.watch(
+      sessionProvider.select((value) {
+        final session = value.value;
+        return session is SessionAuthenticated
+            ? '${session.snapshot.serverUrl}/${session.snapshot.deviceId}'
+            : null;
+      }),
+    );
+    return (id: 'all', label: '全部账号');
+  }
 
   /// [id] 为服务端公开 UUID 或 all；[label] 为可见账户名称。
   void select(String id, String label) => state = (id: id, label: label);
@@ -107,7 +117,7 @@ class LedgerRead {
 final ledgerReadProvider = FutureProvider.autoDispose
     .family<LedgerRead, LedgerQuery>((ref, query) async {
       final session = await ref.watch(sessionProvider.future);
-      if (session is! SessionPaired) {
+      if (session is! SessionAuthenticated) {
         throw const LyraApiError(
           code: 'DEVICE_NOT_PAIRED',
           message: '请先连接账户',
@@ -116,7 +126,7 @@ final ledgerReadProvider = FutureProvider.autoDispose
         );
       }
       final client = ref.read(sessionProvider.notifier).client;
-      if (client == null) throw StateError('配对会话缺少 API 客户端');
+      if (client == null) throw StateError('登录会话缺少 API 客户端');
       final response = await client.get<Map<String, Object?>>(
         query.path,
         <String, String>{
@@ -135,9 +145,9 @@ final scopedSummaryProvider = FutureProvider.autoDispose<LedgerSummaryRead?>((
 ) async {
   final scope = ref.watch(accountScopeProvider);
   final session = await ref.watch(sessionProvider.future);
-  if (session is! SessionPaired) return null;
+  if (session is! SessionAuthenticated) return null;
   if (scope.id == 'all' && session.summary != null) return session.summary;
   final client = ref.read(sessionProvider.notifier).client;
-  if (client == null) throw StateError('配对会话缺少 API 客户端');
+  if (client == null) throw StateError('登录会话缺少 API 客户端');
   return LedgerRepository(client).summary(scope: scope.id);
 }, retry: (retryCount, error) => null);
