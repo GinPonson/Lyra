@@ -4,50 +4,11 @@ import 'package:dio/dio.dart';
 
 import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
+import '../accounts/account_repository.dart';
 
 /// 导入账户选择器使用的最小账户公开视图；与 `/v1/ledger/accounts` 投影一致，
 /// 不包含完整账户号码或服务端旧账户键。
-class ImportAccountView {
-  const ImportAccountView({
-    required this.id,
-    required this.displayName,
-    required this.maskedSuffix,
-    required this.status,
-  });
-
-  final String id;
-  final String displayName;
-  final String maskedSuffix;
-
-  /// 服务端闭域状态：`active` 或 `archived`。
-  final String status;
-
-  bool get isActive => status == 'active';
-
-  factory ImportAccountView.fromJson(Map<String, Object?> json) {
-    final id = json['id'];
-    final displayName = json['displayName'];
-    final maskedSuffix = json['maskedSuffix'];
-    final status = json['status'];
-    if (id is! String ||
-        displayName is! String ||
-        maskedSuffix is! String ||
-        status is! String) {
-      throw const LyraApiError(
-        code: 'CLIENT_REQUEST_FAILED',
-        message: '账户列表字段无效',
-        statusCode: 0,
-        retryable: false,
-      );
-    }
-    return ImportAccountView(
-      id: id,
-      displayName: displayName,
-      maskedSuffix: maskedSuffix,
-      status: status,
-    );
-  }
-}
+typedef ImportAccountView = BrokerageAccount;
 
 /// `GET /v1/ledger/accounts` 数据载荷中的账户行集合。
 ///

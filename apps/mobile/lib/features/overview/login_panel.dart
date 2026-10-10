@@ -61,7 +61,8 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
       _submitting = true;
       _errorMessage = null;
     });
-    final controller = _activeController = ref.read(sessionProvider.notifier);
+    final controller = ref.read(sessionProvider.notifier);
+    _activeController = controller;
     try {
       await controller.signInWithGoogle(
         serverUrl: serverUrl,

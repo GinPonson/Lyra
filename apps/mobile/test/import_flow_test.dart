@@ -145,6 +145,7 @@ Future<ResponseBody> _routeImportRequest(RequestOptions options) async {
 Future<XFile?> _openPresetCsvFile(List<XTypeGroup> acceptedTypes) async {
   return XFile.fromData(
     Uint8List.fromList(utf8.encode('Date,Action\n')),
+    path: 'Individual_TST276_Transactions_20260902-080000.csv',
     name: 'Individual_TST276_Transactions_20260902-080000.csv',
     mimeType: 'text/csv',
   );

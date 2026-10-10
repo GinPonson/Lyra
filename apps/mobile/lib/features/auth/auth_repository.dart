@@ -94,7 +94,7 @@ class RefreshedDeviceTokens {
 }
 
 class AuthRepository {
-  AuthRepository({required Dio dio}) : _dio = dio;
+  AuthRepository({required this._dio});
 
   final Dio _dio;
 

@@ -30,7 +30,7 @@ export function resolveImportAccount(
   accounts: readonly ImportAccountRecord[],
   explicitAccountId: string | null,
 ): ResolvedImportAccount {
-  const hint = accountHint.trim();
+  const hint = accountHint.trim().toUpperCase();
   if (hint.length === 0) {
     throw new RangeError("导入账户线索不能为空");
   }
@@ -48,7 +48,9 @@ export function resolveImportAccount(
     };
   }
 
-  const exactMatches = activeAccounts.filter((account) => account.legacyAccountKey === hint);
+  const exactMatches = activeAccounts.filter((account) => (
+    account.legacyAccountKey.trim().toUpperCase() === hint
+  ));
   if (exactMatches.length === 1) {
     const [matched] = exactMatches;
     if (matched !== undefined) {
@@ -64,8 +66,8 @@ export function resolveImportAccount(
 
 /** 显式选择允许完整旧键或脱敏后缀与文件线索对应。 */
 function accountHintMatches(account: ImportAccountRecord, hint: string): boolean {
-  const suffix = account.maskedSuffix.trim();
-  return account.legacyAccountKey === hint
+  const suffix = account.maskedSuffix.trim().toUpperCase();
+  return account.legacyAccountKey.trim().toUpperCase() === hint
     || (suffix.length > 0 && hint.endsWith(suffix));
 }
 

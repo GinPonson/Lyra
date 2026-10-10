@@ -65,7 +65,10 @@ class LyraApiClient {
 
   Future<CredentialSnapshot> _readBoundCredentials() async {
     if (_invalidated) throw _sessionChanged;
-    final snapshot = await withCredentialMutation(credentialStore.read);
+    final snapshot = await withCredentialMutation(
+      credentialStore,
+      credentialStore.read,
+    );
     if (_invalidated ||
         snapshot == null ||
         snapshot.deviceId != deviceId ||

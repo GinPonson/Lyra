@@ -6,6 +6,8 @@ import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
 import '../../core/design/lyra_widgets.dart';
+import '../accounts/account_sheet.dart';
+import '../accounts/account_workspace.dart';
 import '../import/import_sheet.dart';
 import '../ledger/ledger_models.dart';
 import '../ledger/ledger_screen.dart';
@@ -52,9 +54,19 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
     ),
     builder: (context) => Padding(
       padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
-      child: const ImportSheet(),
+      child: const SingleChildScrollView(child: ImportSheet()),
     ),
   );
+
+  Future<void> _createAccount() async {
+    final client = ref.read(sessionProvider.notifier).client;
+    final account = await showCreateAccountSheet(context);
+    if (account != null &&
+        mounted &&
+        identical(client, ref.read(sessionProvider.notifier).client)) {
+      _openImport();
+    }
+  }
 
   /// 连接管理复用已验证表单，不创建另一套凭据或登录实现。
   void _openConnection() => showModalBottomSheet<void>(
@@ -78,6 +90,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
     final session = ref.watch(sessionProvider);
     final paired = session.value is SessionAuthenticated;
     final summary = ref.watch(scopedSummaryProvider);
+    final accounts = paired ? ref.watch(brokerageAccountsProvider) : null;
     return LyraPage(
       storageKey: 'overview-scroll',
       children: [
@@ -153,6 +166,24 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
           const LyraSkeleton()
         else if (!paired)
           LyraReveal(child: _WelcomeHero(onConnect: _revealLogin))
+        else if (accounts!.isLoading)
+          const LyraSkeleton()
+        else if (accounts.hasError)
+          LyraLoadError(
+            error: accounts.error!,
+            onRetry: () => ref.invalidate(brokerageAccountsProvider),
+          )
+        else if (accounts.value!.isEmpty)
+          LyraEmpty(
+            title: '先创建一个证券账户',
+            message: '你已使用 Google 登录。添加 Schwab 账户后，即可导入交易并查看持仓。',
+            icon: LyraIcons.cash,
+            action: FilledButton.icon(
+              onPressed: _createAccount,
+              icon: const Icon(LyraIcons.addAccount, size: 18),
+              label: const Text('创建第一个证券账户'),
+            ),
+          )
         else
           summary.when(
             loading: () => const LyraSkeleton(),
@@ -160,9 +191,12 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
               error: error,
               onRetry: () => ref.invalidate(scopedSummaryProvider),
             ),
-            data: (read) => read == null || read.entries.isEmpty
+            data: (read) =>
+                read == null ||
+                    read.entries.isEmpty ||
+                    read.entries.every((entry) => entry.transactionCount == 0)
                 ? LyraEmpty(
-                    title: '账号已连接，等待第一笔记录',
+                    title: '证券账户已准备好，等待第一笔记录',
                     message: '导入官方交易文件后，已实现损益、现金流与持仓会自动呈现。',
                     action: FilledButton.icon(
                       onPressed: _openImport,

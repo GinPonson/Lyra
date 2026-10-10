@@ -61,6 +61,7 @@ class SessionController extends AsyncNotifier<SessionState> {
   _PendingTokenRefresh? _pendingRefresh;
   int _loginGeneration = 0;
   int _authGeneration = 0;
+  int _ledgerRefreshGeneration = 0;
   SessionState _publishedState = const SessionSignedOut();
   CancelToken? _loginCancel;
   Timer? _pollTimer;
@@ -80,11 +81,13 @@ class SessionController extends AsyncNotifier<SessionState> {
       _client = null;
     });
     final snapshot = await withCredentialMutation(
+      dependencies.credentialStore,
       dependencies.credentialStore.read,
     );
     if (!_authActive(generation)) return _publishedState;
-    if (snapshot == null)
+    if (snapshot == null) {
       return _restored(generation, const SessionSignedOut());
+    }
     if (snapshot.authMethod != 'google') {
       await _expireIdentity(
         dependencies,
@@ -98,11 +101,13 @@ class SessionController extends AsyncNotifier<SessionState> {
     try {
       final summary = await LedgerRepository(client).summary(scope: 'all');
       final latest = await withCredentialMutation(
+        dependencies.credentialStore,
         dependencies.credentialStore.read,
       );
       if (!_authActive(generation)) return _publishedState;
-      if (!_sameIdentity(latest, snapshot))
+      if (!_sameIdentity(latest, snapshot)) {
         return _restored(generation, const SessionSignedOut());
+      }
       return _restored(
         generation,
         SessionAuthenticated(snapshot: latest!, summary: summary),
@@ -227,24 +232,27 @@ class SessionController extends AsyncNotifier<SessionState> {
             authMethod: 'google',
             userEmail: credentials.userEmail,
           );
-          return withCredentialMutation(() async {
-            if (!active()) return false;
-            await dependencies.credentialStore.write(snapshot);
-            // 取消/新登录可能发生在安全存储 await 期间；回滚仍在同一队列内，
-            // 所以下一次登录只能在旧写入与回滚全部完成后提交。
-            if (!active()) {
-              await dependencies.credentialStore.clear();
-              return false;
-            }
-            await _sessionStore(dependencies).clear();
-            if (!active()) {
-              await dependencies.credentialStore.clear();
-              return false;
-            }
-            _client = _buildClient(dependencies, snapshot, authGeneration);
-            _publish(SessionAuthenticated(snapshot: snapshot, summary: null));
-            return true;
-          });
+          return await withCredentialMutation(
+            dependencies.credentialStore,
+            () async {
+              if (!active()) return false;
+              await dependencies.credentialStore.write(snapshot);
+              // 取消/新登录可能发生在安全存储 await 期间；回滚仍在同一队列内，
+              // 所以下一次登录只能在旧写入与回滚全部完成后提交。
+              if (!active()) {
+                await dependencies.credentialStore.clear();
+                return false;
+              }
+              await _sessionStore(dependencies).clear();
+              if (!active()) {
+                await dependencies.credentialStore.clear();
+                return false;
+              }
+              _client = _buildClient(dependencies, snapshot, authGeneration);
+              _publish(SessionAuthenticated(snapshot: snapshot, summary: null));
+              return true;
+            },
+          );
         }
         await _waitForPoll(login.pollInterval);
       }
@@ -295,12 +303,15 @@ class SessionController extends AsyncNotifier<SessionState> {
     _publish(const SessionSignedOut());
     final CredentialSnapshot? snapshot;
     try {
-      snapshot = await withCredentialMutation(() async {
-        final previous = await dependencies.credentialStore.read();
-        await dependencies.credentialStore.clear();
-        await _sessionStore(dependencies).clear();
-        return previous;
-      });
+      snapshot = await withCredentialMutation(
+        dependencies.credentialStore,
+        () async {
+          final previous = await dependencies.credentialStore.read();
+          await dependencies.credentialStore.clear();
+          await _sessionStore(dependencies).clear();
+          return previous;
+        },
+      );
     } on Object {
       throw const LyraApiError(
         code: 'LOCAL_LOGOUT_FAILED',
@@ -341,13 +352,44 @@ class SessionController extends AsyncNotifier<SessionState> {
 
   LyraApiClient? get client => _client;
 
+  /// 刷新账本汇总不重建登录会话，保留新建/选择的证券账户范围。
+  /// 写入已成功但读请求失败时清除旧汇总，让页面进入可重试读取状态。
+  Future<bool> refreshLedger() async {
+    final generation = _authGeneration;
+    final refreshGeneration = ++_ledgerRefreshGeneration;
+    final client = _client;
+    final before = _publishedState;
+    if (client == null || before is! SessionAuthenticated) return false;
+    bool active() =>
+        _authActive(generation) &&
+        refreshGeneration == _ledgerRefreshGeneration &&
+        identical(_client, client);
+    try {
+      final summary = await LedgerRepository(client).summary(scope: 'all');
+      final current = _publishedState;
+      if (!active() || current is! SessionAuthenticated) return false;
+      _publish(
+        SessionAuthenticated(snapshot: current.snapshot, summary: summary),
+      );
+      return true;
+    } on Object {
+      final current = _publishedState;
+      if (active() && current is SessionAuthenticated) {
+        _publish(
+          SessionAuthenticated(snapshot: current.snapshot, summary: null),
+        );
+      }
+      return false;
+    }
+  }
+
   Future<void> _expireIdentity(
     SessionDependencies dependencies,
     CredentialSnapshot identity,
     int generation,
     String message,
   ) {
-    return withCredentialMutation(() async {
+    return withCredentialMutation(dependencies.credentialStore, () async {
       if (!_authActive(generation)) return;
       final latest = await dependencies.credentialStore.read();
       if (!_authActive(generation) || !_sameIdentity(latest, identity)) return;
@@ -384,13 +426,16 @@ class SessionController extends AsyncNotifier<SessionState> {
       credentialStore: dependencies.credentialStore,
       dio: dependencies.clientFactory?.call(identity.serverUrl),
       tokenRefresher: () async {
-        final current = await withCredentialMutation(() async {
-          if (!_authActive(generation)) return null;
-          final value = await dependencies.credentialStore.read();
-          return _authActive(generation) && _sameIdentity(value, identity)
-              ? value
-              : null;
-        });
+        final current = await withCredentialMutation(
+          dependencies.credentialStore,
+          () async {
+            if (!_authActive(generation)) return null;
+            final value = await dependencies.credentialStore.read();
+            return _authActive(generation) && _sameIdentity(value, identity)
+                ? value
+                : null;
+          },
+        );
         if (current == null || !_authActive(generation)) return null;
         final pending = _PendingTokenRefresh(
           identity: identity,
@@ -401,33 +446,42 @@ class SessionController extends AsyncNotifier<SessionState> {
         _pendingRefresh = pending;
         try {
           final tokens = await pending.tokens;
-          return await withCredentialMutation(() async {
-            if (!_authActive(generation)) return null;
-            final latest = await dependencies.credentialStore.read();
-            if (!_authActive(generation) || !_sameIdentity(latest, identity))
-              return null;
-            if (latest!.refreshToken != current.refreshToken)
-              return latest.accessToken;
-            final updated = CredentialSnapshot(
-              serverUrl: current.serverUrl,
-              deviceId: current.deviceId,
-              accessToken: tokens.accessToken,
-              refreshToken: tokens.refreshToken,
-              devicePrivateKey: current.devicePrivateKey,
-              authMethod: current.authMethod,
-              userEmail: current.userEmail,
-            );
-            await dependencies.credentialStore.write(updated);
-            if (!_authActive(generation)) return null;
-            final value = _publishedState;
-            if (value is SessionAuthenticated &&
-                _sameIdentity(value.snapshot, identity)) {
-              _publish(
-                SessionAuthenticated(snapshot: updated, summary: value.summary),
+          return await withCredentialMutation(
+            dependencies.credentialStore,
+            () async {
+              if (!_authActive(generation)) return null;
+              final latest = await dependencies.credentialStore.read();
+              if (!_authActive(generation) ||
+                  !_sameIdentity(latest, identity)) {
+                return null;
+              }
+              if (latest!.refreshToken != current.refreshToken) {
+                return latest.accessToken;
+              }
+              final updated = CredentialSnapshot(
+                serverUrl: current.serverUrl,
+                deviceId: current.deviceId,
+                accessToken: tokens.accessToken,
+                refreshToken: tokens.refreshToken,
+                devicePrivateKey: current.devicePrivateKey,
+                authMethod: current.authMethod,
+                userEmail: current.userEmail,
               );
-            }
-            return tokens.accessToken;
-          });
+              await dependencies.credentialStore.write(updated);
+              if (!_authActive(generation)) return null;
+              final value = _publishedState;
+              if (value is SessionAuthenticated &&
+                  _sameIdentity(value.snapshot, identity)) {
+                _publish(
+                  SessionAuthenticated(
+                    snapshot: updated,
+                    summary: value.summary,
+                  ),
+                );
+              }
+              return tokens.accessToken;
+            },
+          );
         } finally {
           if (identical(_pendingRefresh, pending)) _pendingRefresh = null;
         }

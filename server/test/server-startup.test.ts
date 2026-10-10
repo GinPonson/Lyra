@@ -97,6 +97,11 @@ describe("real server startup", () => {
         assert.equal((await fetch(`${server.baseUrl}${path}`, { method: "POST", headers, body: "{}" })).status, 404);
       }
       assert.equal((await fetch(`${server.baseUrl}/v1/ledger/summary?scope=all`, { headers })).status, 401);
+      const createAccount = await fetch(`${server.baseUrl}/v1/ledger/accounts`, {
+        method: "POST", headers, body: JSON.stringify({ displayName: "Smoke", accountIdentifier: "XXX276" }),
+      });
+      assert.equal(createAccount.status, 401);
+      assert.equal((await createAccount.json() as Record<string, unknown>).code, "DEVICE_CREDENTIAL_INVALID");
     } finally {
       await server.close();
     }

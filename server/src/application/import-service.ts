@@ -48,7 +48,7 @@ import { resolveImportAccount } from "./import-account.js";
 import type { LyraDatabase } from "../infrastructure/db/database.js";
 
 /** 解析规则版本；任何标准化规则变化都必须提升该版本使旧预览失效。 */
-export const IMPORT_PARSER_VERSION = "1";
+export const IMPORT_PARSER_VERSION = "2";
 
 /** 预览确认令牌有效期；过期后必须重新预览。 */
 const PREVIEW_AUTHORIZATION_TTL_MILLISECONDS = 10 * 60 * 1000;
@@ -425,7 +425,9 @@ export class ImportService {
         .map((transaction) => transaction.transactionHash),
     );
     return createImportPreview({
-      batch,
+      // The filename is only a matching hint. Hashes and FIFO identity must use
+      // the stored key, including its original case, after account resolution.
+      batch: { ...batch, account: legacyAccountKey },
       parserVersion: IMPORT_PARSER_VERSION,
       baseLedgerVersion: ledgerVersion,
       existingTransactionHashes: existingHashes,

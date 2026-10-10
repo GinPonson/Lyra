@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/session.dart';
+import '../../features/accounts/account_sheet.dart';
+import '../../features/accounts/account_workspace.dart';
 import '../../features/ledger/ledger_workspace.dart';
 import '../api/lyra_api_error.dart';
 import 'lyra_colors.dart';
@@ -301,8 +303,7 @@ class _AccountPicker extends ConsumerWidget {
   const _AccountPicker();
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    const query = (path: '/v1/ledger/accounts', parameters: '', scope: 'all');
-    final accounts = ref.watch(ledgerReadProvider(query));
+    final accounts = ref.watch(brokerageAccountsProvider);
     final scope = ref.watch(accountScopeProvider);
     void select(String id, String label) {
       ref.read(accountScopeProvider.notifier).select(id, label);
@@ -320,7 +321,7 @@ class _AccountPicker extends ConsumerWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const Text(
-                '选择账号',
+                '选择证券账户',
                 style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
               ),
               const SizedBox(height: 16),
@@ -337,34 +338,48 @@ class _AccountPicker extends ConsumerWidget {
                 loading: () => const LyraSkeleton(),
                 error: (e, _) => LyraLoadError(
                   error: e,
-                  onRetry: () => ref.invalidate(ledgerReadProvider(query)),
+                  onRetry: () => ref.invalidate(brokerageAccountsProvider),
                 ),
-                data: (read) {
-                  final rows = read.data['rows'] as List<Object?>;
+                data: (rows) {
                   return Column(
                     children: [
-                      for (final item in rows)
-                        Builder(
-                          builder: (context) {
-                            final account = item as Map<String, Object?>;
-                            final id = account['id'] as String;
-                            final label = account['displayName'] as String;
-                            return ListTile(
-                              title: Text(label),
-                              subtitle: Text(
-                                '${account['maskedSuffix']} · ${account['baseCurrency']}',
-                              ),
-                              leading: const Icon(LyraIcons.cash),
-                              trailing: scope.id == id
-                                  ? const Icon(LyraIcons.confirm)
-                                  : null,
-                              onTap: () => select(id, label),
-                            );
-                          },
+                      if (rows.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 20),
+                          child: Text('尚无证券账户，添加后即可导入交易。'),
+                        ),
+                      for (final account in rows)
+                        ListTile(
+                          title: Text(account.displayName),
+                          subtitle: Text(
+                            '${account.maskedSuffix} · ${account.baseCurrency}',
+                          ),
+                          leading: const Icon(LyraIcons.cash),
+                          trailing: scope.id == account.id
+                              ? const Icon(LyraIcons.confirm)
+                              : null,
+                          onTap: () => select(account.id, account.displayName),
                         ),
                     ],
                   );
                 },
+              ),
+              const SizedBox(height: 16),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  final client = ref.read(sessionProvider.notifier).client;
+                  final account = await showCreateAccountSheet(context);
+                  if (account != null &&
+                      context.mounted &&
+                      identical(
+                        client,
+                        ref.read(sessionProvider.notifier).client,
+                      )) {
+                    Navigator.pop(context);
+                  }
+                },
+                icon: const Icon(LyraIcons.addAccount, size: 18),
+                label: const Text('新增证券账户'),
               ),
             ],
           ),

@@ -28,14 +28,24 @@ flutter run --dart-define=LYRA_SERVER_URL=https://lyra.example.com
 
 「开始分析」会使用当前页面选择的账户范围。已有对话保留自己的账户范围；切换页面账户后，需要点「新对话」才能按新范围分析。流式回答、取消回合、工具结果和服务端会话恢复继续沿用现有交互。迁移前已关闭的旧引擎会话只供查看，需要新建对话继续。
 
+## 添加证券账户与首次导入
+
+账户页在空账本时提供创建入口，已有账户时也可从账户选择器添加。填写用于识别的名称、Schwab 文件名中的账户标识和基础币种（默认 USD）。例如 `Individual_XXX276_Transactions.csv` 对应 `XXX276`，无需填写完整券商账号。
+
+也可以先选 CSV / XLSX。导入面板会保留已选文件；没有对应账户时，创建表单会预填文件中的标识，用户确认创建后继续原文件预览。创建证券账户只添加账本归属，交易须在预览页明确确认后才写入。
+
+创建请求响应丢失时，在原表单重试可取回同一次创建结果。重复账户会提示选择已有账户；取消表单会回到导入面板。退出登录或切换身份后，旧请求结果不能写回另一登录会话。
+
 ## 验证与构建
 
 ```bash
 flutter analyze
 flutter test
-flutter build apk --release --dart-define=LYRA_SERVER_URL=https://lyra.example.com
+flutter build apk --debug
 ```
 
-本次迁移新增 `url_launcher: ^6.3.3`。迁移工作环境在下载完整 Flutter 工具链时，网络批准流程被取消；因此只完成了已安装 Dart 3.13.2 的格式/语法解析检查，**没有执行 Flutter 分析、测试或 APK 构建**。`pubspec.lock` 保留原始内容，未手工编造依赖解析结果；需要在具备完整 Flutter 环境和网络访问的机器运行 `flutter pub get`，保存生成的锁文件，再执行上面的验证命令。
+调试 APK 位于 `build/app/outputs/flutter-apk/app-debug.apk`，安装后可以在登录表单填写服务端地址。正式分发前需另行配置 Android 发布签名；当前 Gradle 的 release 配置仍使用开发签名，不能据此标记为发布版本。
 
-测试覆盖 OAuth 开始/等待/完成、取消与失败、旧凭据失效、刷新轮换和退出，以及单助手会话、账户范围、实时事件与恢复。测试使用合成数据和假 HTTP/WebSocket，不能替代真实 Google 账号与模型 API 的端到端验收。
+本轮已经实际执行 `flutter pub get` 并保存生成的 `pubspec.lock`：新增 `url_launcher 6.3.3` 及其平台依赖，没有升级原有业务依赖。Flutter 3.47.2 / Dart 3.13.2 下，`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded` **91 项全部通过**。Android 调试 APK 正在执行原生构建，结果同步记录在 [实现进度](../../docs/progress.md)。
+
+测试覆盖 OAuth 开始/等待/完成、取消与失败、旧凭据失效、刷新轮换和退出，以及单助手会话、账户范围、实时事件与恢复。本轮新增 18 项回归，覆盖创建证券账户与首次导入、同文件重试、凭据存储队列和汇总乱序响应。原有金额精度、多币种、页面布局与范围断言继续通过。测试使用合成数据和假 HTTP/WebSocket，不能替代真实 Google 账号与模型 API 的端到端验收。

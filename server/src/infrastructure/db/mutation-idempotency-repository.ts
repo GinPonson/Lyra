@@ -114,31 +114,7 @@ export async function startMutationIdempotencyRecord(
   const connection = database.connection;
   await connection.run("BEGIN TRANSACTION");
   try {
-    if (input.replacesExpiredRecordId !== null) {
-      await connection.run(`
-        DELETE FROM mutation_idempotency_records
-        WHERE id = CAST($record_id AS UUID)
-      `, { record_id: input.replacesExpiredRecordId });
-    }
-    await connection.run(`
-      INSERT INTO mutation_idempotency_records (
-        id, device_id, operation, key_hash, request_hash, status,
-        result_resource_id, response_status_code,
-        created_at, expires_at, completed_at
-      ) VALUES (
-        CAST($id AS UUID), CAST($device_id AS UUID), $operation, $key_hash,
-        $request_hash, 'in_progress', NULL, NULL,
-        CAST($created_at AS TIMESTAMPTZ), CAST($expires_at AS TIMESTAMPTZ), NULL
-      )
-    `, {
-      id: input.record.id,
-      device_id: input.record.deviceId,
-      operation: input.record.operation,
-      key_hash: input.record.keyHash,
-      request_hash: input.record.requestHash,
-      created_at: input.record.createdAt,
-      expires_at: input.record.expiresAt,
-    });
+    await startMutationIdempotencyRecordInTransaction(connection, input);
     await connection.run("COMMIT");
   } catch (error: unknown) {
     try {
@@ -148,6 +124,41 @@ export async function startMutationIdempotencyRecord(
     }
     throw error;
   }
+}
+
+/** 在调用方业务事务内开始幂等记录，支持短操作与业务结果一起原子提交。 */
+export async function startMutationIdempotencyRecordInTransaction(
+  connection: DuckDBConnection,
+  input: {
+    record: MutationIdempotencyRecord;
+    replacesExpiredRecordId: string | null;
+  },
+): Promise<void> {
+  if (input.replacesExpiredRecordId !== null) {
+    await connection.run(`
+      DELETE FROM mutation_idempotency_records
+      WHERE id = CAST($record_id AS UUID)
+    `, { record_id: input.replacesExpiredRecordId });
+  }
+  await connection.run(`
+    INSERT INTO mutation_idempotency_records (
+      id, device_id, operation, key_hash, request_hash, status,
+      result_resource_id, response_status_code,
+      created_at, expires_at, completed_at
+    ) VALUES (
+      CAST($id AS UUID), CAST($device_id AS UUID), $operation, $key_hash,
+      $request_hash, 'in_progress', NULL, NULL,
+      CAST($created_at AS TIMESTAMPTZ), CAST($expires_at AS TIMESTAMPTZ), NULL
+    )
+  `, {
+    id: input.record.id,
+    device_id: input.record.deviceId,
+    operation: input.record.operation,
+    key_hash: input.record.keyHash,
+    request_hash: input.record.requestHash,
+    created_at: input.record.createdAt,
+    expires_at: input.record.expiresAt,
+  });
 }
 
 /**

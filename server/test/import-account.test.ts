@@ -48,4 +48,22 @@ describe("resolveImportAccount", () => {
       );
     }
   });
+
+  it("大小写匹配沿用持久化的旧键，保持已有交易哈希与账户归属", () => {
+    const account = { id: "legacy-lowercase", legacyAccountKey: "xxx276", maskedSuffix: "276", status: "active" as const };
+    assert.deepEqual(resolveImportAccount(" XXX276 ", [account], null), {
+      accountId: account.id,
+      legacyAccountKey: "xxx276",
+      matchedBy: "legacy_key",
+    });
+    assert.deepEqual(resolveImportAccount("nEw276", [account], account.id), {
+      accountId: account.id,
+      legacyAccountKey: "xxx276",
+      matchedBy: "explicit_selection",
+    });
+    assert.throws(
+      () => resolveImportAccount("XXX276", [account, { ...account, id: "second", legacyAccountKey: "XXX276" }], null),
+      (error: unknown) => error instanceof ApplicationError && error.code === "ACCOUNT_MAPPING_REQUIRED",
+    );
+  });
 });

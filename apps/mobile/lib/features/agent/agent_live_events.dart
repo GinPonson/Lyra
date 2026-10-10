@@ -30,8 +30,9 @@ class AgentSubscribedFrame extends AgentLiveFrame {
     return AgentSubscribedFrame(
       mode: json['mode'] as String,
       events: rawEvents
-          .map((event) =>
-              AgentEventView.fromJson(event as Map<String, Object?>))
+          .map(
+            (event) => AgentEventView.fromJson(event as Map<String, Object?>),
+          )
           .toList(growable: false),
       reason: json['reason'] as String?,
     );
@@ -70,7 +71,11 @@ WebSocketChannel _defaultChannelFactory(
   Iterable<String> protocols,
   Map<String, String> headers,
 ) {
-  return IOWebSocketChannel.connect(uri, protocols: protocols, headers: headers);
+  return IOWebSocketChannel.connect(
+    uri,
+    protocols: protocols,
+    headers: headers,
+  );
 }
 
 /// `/v1/events` WebSocket 事件流客户端。
@@ -82,13 +87,13 @@ WebSocketChannel _defaultChannelFactory(
 class AgentLiveEvents {
   AgentLiveEvents({
     required this.serverUrl,
-    required String accessToken,
+    required this._accessToken,
     required this.onFrame,
     this.onDone,
     this.reconnectDelay = _defaultReconnectDelay,
     this.maxReconnectDelay = _defaultMaxReconnectDelay,
     this.channelFactory = _defaultChannelFactory,
-  }) : _accessToken = accessToken;
+  });
 
   final String serverUrl;
   String _accessToken;
@@ -126,10 +131,7 @@ class AgentLiveEvents {
   /// 建立连接并发送订阅帧；[afterSequence] 为已消费的最大事件序号。
   ///
   /// 已在线时只更新游标不重复建连；等待重连期间调用会取消定时器立即重连。
-  void subscribe({
-    required String sessionId,
-    required int afterSequence,
-  }) {
+  void subscribe({required String sessionId, required int afterSequence}) {
     if (_disposed) {
       return;
     }
@@ -167,11 +169,13 @@ class AgentLiveEvents {
       cancelOnError: true,
     );
     // subscribe 帧在连接建立后由底层队列发送。
-    channel.sink.add(jsonEncode(<String, Object?>{
-      'type': 'subscribe',
-      'sessionId': sessionId,
-      'afterSequence': afterSequence,
-    }));
+    channel.sink.add(
+      jsonEncode(<String, Object?>{
+        'type': 'subscribe',
+        'sessionId': sessionId,
+        'afterSequence': afterSequence,
+      }),
+    );
   }
 
   /// 断开处理：主动关闭不重连；意外断开按指数退避自动重连。
@@ -248,14 +252,12 @@ AgentLiveFrame parseAgentLiveFrame(Object? message) {
   return switch (json['type']) {
     'subscribed' => AgentSubscribedFrame.fromJson(json),
     'event' => AgentEventFrame(
-        event: AgentEventView.fromJson(
-          json['event'] as Map<String, Object?>,
-        ),
-      ),
+      event: AgentEventView.fromJson(json['event'] as Map<String, Object?>),
+    ),
     'error' => AgentErrorFrame(
-        code: json['code'] as String? ?? 'UNKNOWN',
-        message: json['message'] as String? ?? '',
-      ),
+      code: json['code'] as String? ?? 'UNKNOWN',
+      message: json['message'] as String? ?? '',
+    ),
     _ => const AgentUnknownFrame(),
   };
 }

@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import {
   WriteCoordinator,
+  AccountService,
   createFinancialToolRegistry,
   createDeviceAuthGate,
   createServiceHealthSnapshot,
@@ -24,6 +25,7 @@ import {
 import { registerAgentRoutes } from "./transport/agent-routes.js";
 import { registerAgentEventsRoute } from "./transport/agent-events.js";
 import { registerLedgerRoutes } from "./transport/ledger-routes.js";
+import { registerAccountRoutes } from "./transport/account-routes.js";
 import { registerImportRoutes } from "./transport/import-routes.js";
 import { registerGmailRoutes } from "./transport/gmail-routes.js";
 import { registerDeviceRoutes } from "./transport/device-routes.js";
@@ -138,6 +140,10 @@ async function start(): Promise<void> {
   registerLedgerRoutes(app, {
     registry,
     database,
+    authenticateDevice,
+  });
+  registerAccountRoutes(app, {
+    accountService: new AccountService({ database, writeCoordinator }),
     authenticateDevice,
   });
   registerImportRoutes(app, {

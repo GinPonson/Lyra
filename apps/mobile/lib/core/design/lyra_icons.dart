@@ -19,6 +19,7 @@ abstract final class LyraIcons {
   static const IconData expand = Icons.expand_more_outlined;
 
   static const IconData accountCenter = Icons.manage_accounts_outlined;
+  static const IconData addAccount = Icons.add_card_outlined;
   static const IconData accountScope = Icons.layers_outlined;
   static const IconData ledgerVersion = Icons.storage_outlined;
   static const IconData dataCutoff = Icons.schedule_outlined;

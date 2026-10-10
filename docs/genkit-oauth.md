@@ -84,7 +84,31 @@ Lyra access token 有效期十五分钟，refresh token 有效期三十天并在
 node -e 'console.log(require("node:crypto").randomBytes(32).toString("hex"))'
 ```
 
-## 5. 启动与升级
+## 5. 创建证券账户并导入第一份账本
+
+Google 登录成功后，新数据库还没有证券账户。先在账户页添加账户，再导入官方 CSV / XLSX；也可以直接选择文件，在导入面板按提示创建账户，随后继续同一文件的预览。
+
+- **账户名称**：自己识别的名称，例如“长期账户”。
+- **账户标识**：Schwab 导出文件名中 `Individual_` 后、下一个下划线前的片段。例如 `Individual_XXX276_Transactions.csv` 填 `XXX276`；可直接使用导出文件中的脱敏标识。
+- **基础币种**：默认 USD，用于该账户的币种标记；创建账户不会进行换汇或重新计算交易金额。
+
+添加账户与导入确认是两次明确操作。创建成功只增加账户记录，不添加交易、不创建新的金融账本版本。文件仍须通过既有全批校验、导入预览与确认提交；成功导入后再刷新持仓和分析。
+
+账户写接口为 `POST /v1/ledger/accounts`，要求协议 2 和有效的设备 Bearer token。请求示例：
+
+```json
+{
+  "displayName": "长期账户",
+  "accountIdentifier": "XXX276",
+  "baseCurrency": "USD"
+}
+```
+
+成功返回 `201` 与 `{ "account": ... }`，公开账户对象仅包含 ID、显示名、券商、脱敏后缀、币种、状态与时间。完整导入标识不回传至账户列表或模型工具。标识会进行大小写规范化；同一标识不能重复创建，包括已归档的账户。
+
+App 为一次创建保留 `Idempotency-Key`，请求响应丢失时可重试并取回原账户。同设备、同键、同规范化请求在 24 小时内重放原成功结果；同键改换请求返回 `IDEMPOTENCY_KEY_REUSED`，重复标识返回 `ACCOUNT_ALREADY_EXISTS`。新增账户是 App 的明确写操作，不在 Genkit 的 17 个只读工具中。
+
+## 6. 启动与升级
 
 环境变量模板见 [`server/.env.example`](../server/.env.example)。以下命令均从仓库根目录执行：
 
@@ -114,13 +138,17 @@ v12 保留旧消息和工具审计，记录旧 provider，将旧会话归档，�
 
 旧客户端使用协议 1 时收到 `426 / CLIENT_VERSION_INCOMPATIBLE`。当前 schema 为 **13**；旧程序不能直接读取升级后的数据库。若需要回退，使用停服时保存的备份和相匹配的旧 App / 服务端版本。
 
-## 6. 验证与当前边界
+## 7. 验证与当前边界
 
 `npm run check` 执行干净 TypeScript 构建、复制 SQL 迁移，再运行全部服务端测试。构建前清理 `dist`，防止删除的 CLI/MCP 模块及旧测试继续残留在部署产物中。
 
 Genkit 集成验证使用 Genkit 的真实工具循环、可控假模型、真实 DuckDB，以及运行在本机的兼容 HTTP/SSE 模型端点；不需要外部模型账号。OAuth 测试替换外部 Google 边界，验证状态、身份规则与真实数据库凭据流程。
 
-真实 Google 浏览器登录、真实模型供应商及手机完整联调仍需要部署配置。当前执行环境的 Flutter 工具链下载因网络审批取消而中断；Dart 格式化与语法解析已执行，`flutter pub get`、`flutter analyze`、`flutter test` 和 APK 构建尚未完成。新加的 `url_launcher` 仍需通过 `flutter pub get` 生成并审查实际 lockfile，现有锁文件没有手工伪造新条目。
+最新完整服务端回归为 **117 个套件、279 项测试通过**，0 失败、0 跳过。首次账户与导入用例从真实空数据库开始，经受控 Google 身份验证后签发设备凭据，创建账户、预览并确认 CSV，最后读取真实持仓与已实现盈亏；大小写不同的文件名重复上传仍不会重复入账。
+
+Flutter 工具链已恢复。本轮已经执行 `flutter pub get` 并保存真实解析的锁文件；`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded` **91 项全部通过**。检查期间修复了空值类型问题、凭据存储之间的队列相互阻塞，以及账户创建和导入恢复路径；同一生产安全存储仍串行处理登录、刷新、退出及助手会话 ID。
+
+Android 调试 APK 正在完成原生构建。真实 Google 浏览器登录、真实模型供应商及手机完整联调仍需要部署配置，不能用受控测试代替。
 
 最新执行结果记录在 [`docs/progress.md`](progress.md)。这些待验证项完成前，保持迁移 PR 为草稿。
 

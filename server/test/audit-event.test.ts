@@ -46,4 +46,13 @@ describe("audit event policy", () => {
       AuditEventError,
     );
   });
+
+  it("账户导入匹配标识和旧账户键不能写入审计元数据", () => {
+    for (const key of ["accountIdentifier", "legacy_account_key"]) {
+      assert.throws(() => createAuditEvent({
+        eventType: "account.created", outcome: "success", actorType: "device", actorId: "device-id",
+        metadata: { [key]: "XXX276" }, now: new Date("2026-10-10T00:00:00Z"),
+      }), AuditEventError);
+    }
+  });
 });

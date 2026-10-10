@@ -1,16 +1,41 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
-// 所有生产凭据读写使用同一队列，避免多字段安全存储在登录、刷新和退出
-// 之间交错。队列跨 SessionController 生命周期保留，不会因 Provider 重建丢失。
-Future<void> _credentialOperations = Future<void>.value();
+// 同一底层凭据存储跨 SessionController 生命周期共用队列。所有生产安全存储
+// 实例操作同一组键，必须全局串行；独立内存存储互不阻塞。
+final _secureCredentialIdentity = Object();
+final _credentialQueues = Expando<_CredentialQueue>();
 
-Future<T> withCredentialMutation<T>(Future<T> Function() operation) {
-  final result = _credentialOperations.then((_) => operation());
-  _credentialOperations = result.then<void>(
-    (_) {},
-    onError: (Object error, StackTrace stack) {},
-  );
-  return result;
+Future<T> withCredentialMutation<T>(
+  CredentialStore store,
+  Future<T> Function() operation,
+) {
+  final identity = store is SecureCredentialStore
+      ? _secureCredentialIdentity
+      : store;
+  final queue = _credentialQueues[identity] ??= _CredentialQueue();
+  return queue.run(operation);
+}
+
+class _CredentialQueue {
+  Future<void>? _tail;
+
+  Future<T> run<T>(Future<T> Function() operation) {
+    final previous = _tail;
+    final result = previous == null
+        ? Future<T>.microtask(operation)
+        : previous.then((_) => operation());
+    late final Future<void> tail;
+    void release() {
+      if (identical(_tail, tail)) _tail = null;
+    }
+
+    tail = result.then<void>(
+      (_) => release(),
+      onError: (Object error, StackTrace stack) => release(),
+    );
+    _tail = tail;
+    return result;
+  }
 }
 
 /// 凭据安全存储抽象；实现负责把令牌放进系统安全存储（Android Keystore）。

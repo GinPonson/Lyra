@@ -89,6 +89,8 @@ const FORBIDDEN_METADATA_KEYS = new Set([
   "token",
   "email",
   "accountnumber",
+  "accountidentifier",
+  "legacyaccountkey",
   "mailbody",
   "body",
   "prompt",

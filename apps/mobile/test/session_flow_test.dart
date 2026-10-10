@@ -148,8 +148,9 @@ void main() {
                       );
                       expect(options.uri.query, isEmpty);
                       exchangeCount++;
-                      if (exchangeCount == 1)
+                      if (exchangeCount == 1) {
                         return _response('{"status":"pending"}', 202);
+                      }
                       return _response(_loginResponse, 200);
                     }
                     if (path == '/v1/ledger/summary') {
@@ -162,6 +163,24 @@ void main() {
                           ],
                           'x-request-id': <String>['req-summary'],
                         },
+                      );
+                    }
+                    if (path == '/v1/ledger/accounts') {
+                      return _response(
+                        jsonEncode({
+                          'data': {
+                            'rows': [
+                              {
+                                'id': 'a2000000-0000-4000-8000-000000000001',
+                                'displayName': 'Schwab 主账户',
+                                'maskedSuffix': '276',
+                                'baseCurrency': 'USD',
+                                'status': 'active',
+                              },
+                            ],
+                          },
+                        }),
+                        200,
                       );
                     }
                     return ResponseBody.fromString('unexpected', 404);
@@ -216,8 +235,9 @@ void main() {
     final exchanged = Completer<void>();
     var exchangeCount = 0;
     final container = _sessionContainer(store, (options) async {
-      if (options.uri.path.endsWith('/start'))
+      if (options.uri.path.endsWith('/start')) {
         return _response(_startResponse(), 201);
+      }
       exchangeCount++;
       if (!exchanged.isCompleted) exchanged.complete();
       return _response('{"status":"pending"}', 202);
@@ -242,8 +262,9 @@ void main() {
   test('授权被拒绝返回稳定错误且保持未登录', () async {
     final store = MemoryCredentialStore();
     final container = _sessionContainer(store, (options) async {
-      if (options.uri.path.endsWith('/start'))
+      if (options.uri.path.endsWith('/start')) {
         return _response(_startResponse(), 201);
+      }
       return _response(
         '{"code":"LOGIN_DENIED","message":"该账号未获授权","retryable":false}',
         403,
@@ -383,8 +404,9 @@ void main() {
     var refreshCalls = 0;
     var remotelyRevoked = false;
     final container = _sessionContainer(store, (options) async {
-      if (options.uri.path == '/v1/ledger/summary')
+      if (options.uri.path == '/v1/ledger/summary') {
         return _response(_summaryResponse, 200);
+      }
       if (options.uri.path == '/v1/devices/tokens') {
         refreshCalls++;
         if (refreshCalls == 1) {
@@ -543,6 +565,57 @@ void main() {
     expect(await agentStore.read(), isNull);
     expect(controller.client, isNull);
   });
+
+  for (final oldFails in [false, true]) {
+    test('汇总并发刷新仅发布最后请求，旧${oldFails ? '失败' : '结果'}不覆盖新版本', () async {
+      final store = MemoryCredentialStore();
+      await store.write(_authenticatedSnapshot);
+      final older = Completer<ResponseBody>();
+      final newer = Completer<ResponseBody>();
+      var reads = 0;
+      final container = _sessionContainer(store, (options) async {
+        reads++;
+        if (reads == 1) return _response(_summaryResponse, 200);
+        return reads == 2 ? older.future : newer.future;
+      });
+      addTearDown(container.dispose);
+      await container.read(sessionProvider.future);
+      final controller = container.read(sessionProvider.notifier);
+      final first = controller.refreshLedger();
+      await pumpEventQueue();
+      final second = controller.refreshLedger();
+      await pumpEventQueue();
+      newer.complete(
+        _response(
+          _summaryResponse.replaceFirst(
+            '"ledgerVersion": 3',
+            '"ledgerVersion": 5',
+          ),
+          200,
+        ),
+      );
+      expect(await second, isTrue);
+      older.complete(
+        oldFails
+            ? _response('unavailable', 503)
+            : _response(
+                _summaryResponse.replaceFirst(
+                  '"ledgerVersion": 3',
+                  '"ledgerVersion": 4',
+                ),
+                200,
+              ),
+      );
+      expect(await first, isFalse);
+      expect(
+        (container.read(sessionProvider).value as SessionAuthenticated)
+            .summary!
+            .metadata
+            .ledgerVersion,
+        5,
+      );
+    });
+  }
 }
 
 const _authenticatedSnapshot = CredentialSnapshot(

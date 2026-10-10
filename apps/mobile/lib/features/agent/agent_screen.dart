@@ -155,7 +155,10 @@ class AgentController extends Notifier<AgentUiState> {
       return;
     }
     final store = ref.read(agentSessionStoreProvider);
-    final sessionId = await withCredentialMutation(store.read);
+    final credentialStore = ref
+        .read(sessionDependenciesProvider)
+        .credentialStore;
+    final sessionId = await withCredentialMutation(credentialStore, store.read);
     if (sessionId == null || sessionId.isEmpty || state is! AgentIdle) {
       return;
     }
@@ -164,7 +167,7 @@ class AgentController extends Notifier<AgentUiState> {
       session = await repository.getSession(sessionId);
     } on LyraApiError {
       // 会话已关闭或不存在：清掉本地 ID，回到创建视图。
-      await withCredentialMutation(() async {
+      await withCredentialMutation(credentialStore, () async {
         if (ref.mounted && _repository == repository) await store.clear();
       });
       return;
@@ -311,8 +314,9 @@ class AgentController extends Notifier<AgentUiState> {
   Future<void> createSession() async {
     final current = state;
     if (current is AgentCreating ||
-        (current is AgentSessionActive && current.turnInProgress))
+        (current is AgentSessionActive && current.turnInProgress)) {
       return;
+    }
     final repository = _resolve();
     if (repository == null) {
       state = const AgentError('请先登录 Lyra');
@@ -333,12 +337,15 @@ class AgentController extends Notifier<AgentUiState> {
         session: session,
         turnInProgress: false,
       );
-      await withCredentialMutation(() async {
-        if (_isCurrentSession(repository, session.id) &&
-            ref.read(sessionProvider).value is SessionAuthenticated) {
-          await ref.read(agentSessionStoreProvider).write(session.id);
-        }
-      });
+      await withCredentialMutation(
+        ref.read(sessionDependenciesProvider).credentialStore,
+        () async {
+          if (_isCurrentSession(repository, session.id) &&
+              ref.read(sessionProvider).value is SessionAuthenticated) {
+            await ref.read(agentSessionStoreProvider).write(session.id);
+          }
+        },
+      );
       if (!ref.mounted || _repository != repository) return;
       _subscribeLive(session.id);
       await _refreshToolCalls();
@@ -550,8 +557,9 @@ class _SessionViewState extends ConsumerState<_SessionView> {
   }
 
   void _send() {
-    if (widget.state.turnInProgress || widget.state.session.status != 'idle')
+    if (widget.state.turnInProgress || widget.state.session.status != 'idle') {
       return;
+    }
     final content = _inputController.text.trim();
     if (content.isEmpty) {
       return;
