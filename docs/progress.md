@@ -18,7 +18,7 @@
 | Flutter 登录与单助手界面 | 进行中 | 代码、对应测试与独立静态审查已落盘；独立 Dart 3.13.2 可执行格式/语法解析，完整 Flutter 检查尚未执行 |
 | Flutter 依赖与 APK 验证 | 阻塞 | 完整 Flutter 工具链下载的网络批准流程被取消，离线缓存不足；新增 `url_launcher` 尚需 `flutter pub get` 实际解析并保存 lockfile；未运行 `flutter analyze`、`flutter test` 或 APK 构建，不伪造通过结果 |
 | 真实 Google / 模型 / 手机联调 | 待开始 | 尚未配置真实 OAuth Web client、公开回调域名和模型凭据；现有测试使用受控外部边界，不代表真实第三方服务已验收 |
-| GitHub 草稿 PR 交付 | 阻塞 | 当前 GitHub 连接创建 Git tree 时返回 `403 / Resource not accessible by integration`，尚未创建远端分支或 PR；完整改动保留在本地 `feat/genkit-oauth` 分支，需要连接具备仓库写权限后发布 |
+| GitHub 草稿 PR 交付 | 已完成 | 已发布 `feat/genkit-oauth` 分支并创建[草稿 PR #1](https://github.com/GinPonson/Lyra/pull/1)；Flutter 完整验证、实际锁文件解析与保存、真实 Google / 模型 / 手机联调尚未完成，保持草稿；未合并、未部署 |
 
 配置模板在 [`server/.env.example`](../server/.env.example)，启动、升级和待验步骤见 [迁移说明](genkit-oauth.md)。App 与服务端需一起更新；迁移前备份数据库并保留原加密主密钥，迁移后重新登录并新建 Lyra 会话。Flutter 验证和真实联调完成前，迁移 PR 保持草稿。
 
