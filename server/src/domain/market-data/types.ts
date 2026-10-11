@@ -73,10 +73,14 @@ export interface MarketQuoteLookup {
 export interface MarketDataReader {
   getQuote(instrument: MarketInstrument): Promise<MarketQuoteLookup>;
   status(): MarketDataStatus;
+  /** Mutable readers pin routing for a whole valuation, including queued symbol reads. */
+  snapshot?(): MarketDataReader;
 }
 
 export interface MarketDataStatus {
   enabled: boolean;
+  /** Revision of the route settings used by this read; omitted by legacy static readers. */
+  settingsRevision?: number;
   routes: Readonly<Record<MarketAssetType, readonly string[]>>;
   providers: readonly {
     id: string;

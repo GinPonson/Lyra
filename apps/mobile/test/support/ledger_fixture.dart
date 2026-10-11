@@ -33,7 +33,10 @@ class LedgerFixture {
             ..httpClientAdapter = FakeLyraAdapter((options) async {
               requests.add(options);
               final market = options.uri.path == '/v1/market/positions';
-              final command = market
+              final settings = options.uri.path == '/v1/market/settings';
+              final command = settings
+                  ? 'market-settings'
+                  : market
                   ? 'market-positions'
                   : options.uri.path.split('/').last;
               return ResponseBody.fromString(
@@ -44,6 +47,8 @@ class LedgerFixture {
                           'message': '测试连接中断',
                           'retryable': true,
                         }
+                      : settings
+                      ? marketSettingsResponse()
                       : market
                       ? marketResponse(options.queryParameters)
                       : response(command, options.queryParameters),
@@ -56,6 +61,14 @@ class LedgerFixture {
             }),
     );
   }
+
+  Map<String, Object?> marketSettingsResponse() => {
+    'revision': 0,
+    'routes': {'stock': <String>[], 'option': <String>[]},
+    'effectiveRoutes': {'stock': <String>[], 'option': <String>[]},
+    'providers': <Object?>[],
+    'updatedAt': null,
+  };
 
   Map<String, Object?> response(String command, Map<String, dynamic> query) {
     final data = payload(command, query);

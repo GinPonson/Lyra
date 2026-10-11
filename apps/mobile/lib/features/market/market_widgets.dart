@@ -11,6 +11,7 @@ import '../accounts/account_workspace.dart';
 import '../ledger/ledger_view.dart';
 import '../ledger/ledger_workspace.dart';
 import 'market_models.dart';
+import 'market_settings_widgets.dart';
 import 'market_workspace.dart';
 
 String marketTimeLabel(String value) {
@@ -95,14 +96,15 @@ class MarketPositionsPanel extends ConsumerWidget {
                 _Note('正在读取行情…'),
               ],
             ),
-            error: (error, _) => _Note(
-              error is LyraApiError && error.code == 'MARKET_LEDGER_CHANGED'
-                  ? '持仓已更新，请刷新账本后查看参考估值。'
-                  : '行情暂不可用，历史成本与账本记录仍可查看。可稍后刷新行情。',
-            ),
+            error: (error, _) => _Note(switch (error) {
+              LyraApiError(code: 'MARKET_LEDGER_CHANGED') =>
+                '持仓已更新，请刷新账本后查看参考估值。',
+              LyraApiError(code: 'MARKET_SETTINGS_CHANGED') => '行情来源已切换，请刷新行情。',
+              _ => '行情暂不可用，历史成本与账本记录仍可查看。可稍后刷新行情。',
+            }),
             data: (read) {
               if (!read.enabled) {
-                return const _Note('行情尚未配置。服务端接入行情后，这里会显示参考价格与估值。');
+                return const _Note('行情尚未配置或已关闭。可在“我的 → 行情与估值”中选择来源。');
               }
               final positions =
                   <({Map<String, Object?> row, String? currency})>[
@@ -407,9 +409,27 @@ class _MarketDataSheet extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Text('行情与估值', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        const _Note('查看服务端提供的参考行情。日终或延迟价格会标明报价时点，盈亏估算不含费用。'),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                '行情与估值',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
+            IconButton(
+              tooltip: '关闭',
+              onPressed: () => Navigator.of(context).pop(),
+              icon: const Icon(LyraIcons.dismiss, size: 20),
+            ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        const MarketSettingsPanel(),
+        const SizedBox(height: 24),
+        const Divider(),
+        const SizedBox(height: 20),
+        const _Note('日终或延迟价格会标明报价时点，盈亏估算不含费用。'),
         if (!signedIn)
           const Padding(
             padding: EdgeInsets.only(top: 16),

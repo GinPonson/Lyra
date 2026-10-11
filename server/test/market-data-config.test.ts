@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { createMarketDataServiceFromEnvironment, marketDataEnvironmentSchema } from "../src/infrastructure/market-data/market-data-runtime.js";
+import { createMarketDataRuntimeFromEnvironment, createMarketDataServiceFromEnvironment, marketDataEnvironmentSchema } from "../src/infrastructure/market-data/market-data-runtime.js";
 
 describe("market data composition configuration", () => {
   it("defaults to disabled without credentials or network calls", async () => {
@@ -43,14 +43,33 @@ describe("market data composition configuration", () => {
     ]) assert.equal(marketDataEnvironmentSchema.safeParse(environment).success, false);
   });
 
-  it("does not enable providers from unused credentials and changes cache policy explicitly", () => {
+  it("registers unused credentials for UI selection without enabling reads and changes cache policy explicitly", () => {
     const unused = createMarketDataServiceFromEnvironment({ LYRA_MARKETDATA_API_TOKEN: "private-token" });
     assert.equal(unused.status().enabled, false);
-    assert.deepEqual(unused.status().providers, []);
+    assert.deepEqual(unused.status().providers.map((entry) => entry.id), ["marketdata"]);
     const delayed = createMarketDataServiceFromEnvironment({
       LYRA_MARKET_OPTION_PROVIDERS: "marketdata", LYRA_MARKETDATA_API_TOKEN: "private-token",
       LYRA_MARKETDATA_MODE: "delayed",
     });
     assert.equal(delayed.status().providers[0]?.cacheTtlSeconds, 900);
+  });
+
+  it("exposes a secret-free selectable catalog and can enable a configured source without rebuilding the runtime", async () => {
+    let calls = 0;
+    const runtime = createMarketDataRuntimeFromEnvironment({ LYRA_MARKETDATA_API_TOKEN: "private-token" }, {
+      fetchFn: async () => { calls += 1; return new Response(null, { status: 503 }); },
+    });
+    assert.deepEqual(runtime.defaultRoutes, { stock: [], option: [] });
+    assert.deepEqual(runtime.providers.map((entry) => [entry.id, entry.configured]), [["alpaca", false], ["marketdata", true]]);
+    assert.doesNotMatch(JSON.stringify(runtime.providers), /private-token|apiToken|apiKey|secret/u);
+    const instrument = { assetType: "stock", market: "US", symbol: "AMD", currency: "USD" } as const;
+    await runtime.reader.getQuote(instrument);
+    assert.equal(calls, 0);
+    runtime.reader.setRoutes({ stock: ["marketdata"], option: [] }, 1);
+    await runtime.reader.getQuote(instrument);
+    assert.equal(calls, 1);
+    assert.equal(runtime.reader.status().settingsRevision, 1);
+    assert.throws(() => runtime.reader.setRoutes({ stock: ["alpaca"], option: [] }, 2));
+    assert.deepEqual(runtime.reader.status().routes.stock, ["marketdata"]);
   });
 });

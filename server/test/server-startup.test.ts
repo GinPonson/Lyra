@@ -77,12 +77,12 @@ async function startProcess(overrides: NodeJS.ProcessEnv = {}) {
 }
 
 describe("real server startup", () => {
-  it("boots schema13/protocol2 with Genkit unavailable and keeps OAuth-only enrollment closed until configured", async () => {
+  it("boots schema14/protocol2 with Genkit unavailable and keeps OAuth-only enrollment closed until configured", async () => {
     const server = await startProcess();
     try {
       const info = await (await server.ready()).json() as Record<string, unknown>;
       assert.equal(info.protocol_version, 2);
-      assert.equal(info.schema_version, 13);
+      assert.equal(info.schema_version, 14);
       const headers = { "x-lyra-protocol-version": "2", "content-type": "application/json" };
       const health = await fetch(`${server.baseUrl}/v1/health`);
       assert.equal(health.status, 200);
@@ -97,6 +97,13 @@ describe("real server startup", () => {
         assert.equal((await fetch(`${server.baseUrl}${path}`, { method: "POST", headers, body: "{}" })).status, 404);
       }
       assert.equal((await fetch(`${server.baseUrl}/v1/ledger/summary?scope=all`, { headers })).status, 401);
+      assert.equal((await fetch(`${server.baseUrl}/v1/market/settings`, { headers })).status, 401);
+      const marketSettings = await fetch(`${server.baseUrl}/v1/market/settings`, {
+        method: "PUT", headers,
+        body: JSON.stringify({ expectedRevision: 0, routes: { stock: [], option: [] } }),
+      });
+      assert.equal(marketSettings.status, 401);
+      assert.equal((await marketSettings.json() as Record<string, unknown>).code, "DEVICE_CREDENTIAL_INVALID");
       const createAccount = await fetch(`${server.baseUrl}/v1/ledger/accounts`, {
         method: "POST", headers, body: JSON.stringify({ displayName: "Smoke", accountIdentifier: "XXX276" }),
       });

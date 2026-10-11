@@ -235,7 +235,8 @@ describe("OAuth device login, refresh and logout routes", () => {
       const old = await pairing.authorizeOwnerDevice({ identity, displayName: "legacy device", publicKeyPem });
       // Reproduce v12: paired credentials exist but the OAuth owner migration does not.
       await database.connection.run("DROP TABLE server_owner_identity");
-      await database.connection.run("DELETE FROM schema_migrations WHERE version = 13");
+      await database.connection.run("DROP TABLE market_source_settings");
+      await database.connection.run("DELETE FROM schema_migrations WHERE version >= 13");
       database.close();
       database = await openLyraDatabase(path);
       await assert.rejects(createDeviceAuthGate(database)(old.accessToken), denied);

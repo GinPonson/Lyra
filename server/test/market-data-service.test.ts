@@ -44,6 +44,65 @@ function service(providers: readonly MarketDataProvider[], overrides: Partial<Ma
 }
 
 describe("provider-neutral market data service", () => {
+  it("switches routes without resetting provider cache or budgets and isolates caller-owned route arrays", async () => {
+    const calls: string[] = [];
+    const sources = ["first", "replacement"].map((id) => provider(id, async (instrument) => {
+      calls.push(`${id}:${marketInstrumentKey(instrument)}`);
+      return { status: "available", quote: quote(instrument, id) };
+    }));
+    const data = service(sources, {
+      routes: { stock: ["first"], option: [] },
+      policies: Object.fromEntries(sources.map((source) => [source.id, {
+        cacheTtlMs: 60_000, maxRequestsPerMinute: 1, maxRequestsPerDay: 1,
+      }])),
+    });
+    assert.equal((await data.getQuote(stock())).quote?.providerId, "first");
+    const next = { stock: ["replacement"], option: [] };
+    data.setRoutes(next, 1);
+    next.stock[0] = "first";
+    assert.equal((await data.getQuote(stock())).quote?.providerId, "replacement");
+    data.setRoutes({ stock: ["first"], option: [] }, 2);
+    assert.equal((await data.getQuote(stock())).cached, true);
+    assert.equal((await data.getQuote(stock("INTC"))).issue, "rate_limited");
+    assert.equal(calls.length, 2);
+    assert.throws(() => data.setRoutes({ stock: ["unknown"], option: [] }, 3));
+    assert.throws(() => data.setRoutes({ stock: ["replacement"], option: [] }, 1));
+    assert.equal(data.status().settingsRevision, 2);
+    assert.deepEqual(data.status().routes.stock, ["first"]);
+    data.setRoutes({ stock: [], option: [] }, 3);
+    assert.equal((await data.getQuote(stock())).issue, "not_configured");
+    assert.equal(calls.length, 2);
+  });
+
+  it("pins an in-flight reader snapshot and its metadata across later route changes", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const begins = new Promise<void>((resolve) => { started = resolve; });
+    const first = provider("first", async (instrument) => {
+      started();
+      await gate;
+      return { status: "available", quote: quote(instrument) };
+    });
+    const replacement = provider("replacement", async (instrument) => ({
+      status: "available", quote: quote(instrument, "replacement"),
+    }));
+    const data = service([first, replacement], { routes: { stock: ["first"], option: [] } });
+    const frozen = data.snapshot();
+    const pending = frozen.getQuote(stock());
+    await begins;
+    data.setRoutes({ stock: ["replacement"], option: [] }, 1);
+    release();
+    assert.equal((await pending).quote?.providerId, "first");
+    assert.equal((await frozen.getQuote(stock("INTC"))).quote?.providerId, "first");
+    assert.equal((await data.getQuote(stock())).quote?.providerId, "replacement");
+    assert.equal(frozen.status().settingsRevision, 0);
+    assert.equal(data.status().settingsRevision, 1);
+    const exposed = frozen.status().routes.stock as string[];
+    exposed[0] = "replacement";
+    assert.deepEqual(frozen.status().routes.stock, ["first"]);
+  });
+
   it("coalesces concurrent reads and caches a quote without changing its market timestamp", async () => {
     let calls = 0;
     const source = provider("first", async (instrument) => {

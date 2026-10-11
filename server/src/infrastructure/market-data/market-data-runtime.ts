@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { MarketDataService, type MarketProviderPolicy } from "../../application/market-data-service.js";
 import type { MarketDataProvider } from "../../domain/market-data/types.js";
+import type { MarketProviderOption, MarketRoutes } from "../../domain/market-data/settings.js";
 import { AlpacaMarketDataProvider } from "./alpaca-provider.js";
 import { MarketDataAppProvider } from "./marketdata-provider.js";
 
@@ -48,24 +49,31 @@ export const MARKET_ENVIRONMENT_VARIABLES = [
   "LYRA_MARKETDATA_MODE", "LYRA_MARKETDATA_DAILY_REQUEST_LIMIT", "LYRA_MARKET_TIMEOUT_MS",
 ] as const;
 
-/** No credentials means disabled, and unused credentials do not silently turn on remote access. */
-export function createMarketDataServiceFromEnvironment(
+export interface MarketDataRuntime {
+  reader: MarketDataService;
+  providers: readonly MarketProviderOption[];
+  defaultRoutes: MarketRoutes;
+}
+
+/** Register configured adapters for UI selection without starting any remote reads. */
+export function createMarketDataRuntimeFromEnvironment(
   environment: NodeJS.ProcessEnv,
   dependencies: { fetchFn?: typeof globalThis.fetch; now?: () => Date } = {},
-): MarketDataService {
+): MarketDataRuntime {
   const config = marketDataEnvironmentSchema.parse(environment);
-  const selected = new Set([...config.LYRA_MARKET_STOCK_PROVIDERS, ...config.LYRA_MARKET_OPTION_PROVIDERS]);
   const providers: MarketDataProvider[] = [];
   const policies: Record<string, MarketProviderPolicy> = {};
   const fetchDependency = dependencies.fetchFn === undefined ? {} : { fetchFn: dependencies.fetchFn };
-  if (selected.has("alpaca")) {
+  const alpacaConfigured = Boolean(config.LYRA_ALPACA_API_KEY && config.LYRA_ALPACA_SECRET_KEY);
+  const marketdataConfigured = Boolean(config.LYRA_MARKETDATA_API_TOKEN);
+  const historical = config.LYRA_MARKETDATA_MODE === "historical";
+  if (alpacaConfigured) {
     providers.push(new AlpacaMarketDataProvider({
       apiKey: config.LYRA_ALPACA_API_KEY!, secretKey: config.LYRA_ALPACA_SECRET_KEY!, ...fetchDependency,
     }));
     policies.alpaca = { cacheTtlMs: 15 * 60_000, maxRequestsPerMinute: 120, maxRequestsPerDay: null };
   }
-  if (selected.has("marketdata")) {
-    const historical = config.LYRA_MARKETDATA_MODE === "historical";
+  if (marketdataConfigured) {
     providers.push(new MarketDataAppProvider({
       apiToken: config.LYRA_MARKETDATA_API_TOKEN!,
       timing: { kind: historical ? "end_of_day" : "delayed", delayMinutes: historical ? null : 15 },
@@ -77,11 +85,37 @@ export function createMarketDataServiceFromEnvironment(
       maxRequestsPerDay: config.LYRA_MARKETDATA_DAILY_REQUEST_LIMIT,
     };
   }
-  return new MarketDataService({
+  const defaultRoutes: MarketRoutes = {
+    stock: [...config.LYRA_MARKET_STOCK_PROVIDERS], option: [...config.LYRA_MARKET_OPTION_PROVIDERS],
+  };
+  const reader = new MarketDataService({
     providers,
     policies,
-    routes: { stock: config.LYRA_MARKET_STOCK_PROVIDERS, option: config.LYRA_MARKET_OPTION_PROVIDERS },
+    routes: defaultRoutes,
     timeoutMs: config.LYRA_MARKET_TIMEOUT_MS,
     ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
   });
+  return {
+    reader,
+    defaultRoutes,
+    providers: [
+      {
+        id: "alpaca", displayName: "Alpaca", assetTypes: ["stock", "option"], configured: alpacaConfigured,
+        timing: { kind: "delayed", delayMinutes: 16 }, cacheTtlSeconds: 900,
+      },
+      {
+        id: "marketdata", displayName: "MarketData", assetTypes: ["stock", "option"], configured: marketdataConfigured,
+        timing: { kind: historical ? "end_of_day" : "delayed", delayMinutes: historical ? null : 15 },
+        cacheTtlSeconds: historical ? 86_400 : 900,
+      },
+    ],
+  };
+}
+
+/** Compatibility helper for callers that only need quotes, with environment defaults. */
+export function createMarketDataServiceFromEnvironment(
+  environment: NodeJS.ProcessEnv,
+  dependencies: { fetchFn?: typeof globalThis.fetch; now?: () => Date } = {},
+): MarketDataService {
+  return createMarketDataRuntimeFromEnvironment(environment, dependencies).reader;
 }

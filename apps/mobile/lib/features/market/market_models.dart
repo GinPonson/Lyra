@@ -241,6 +241,9 @@ class MarketPositionsRead {
       pricedCount = _count(_map(json['data'])['pricedCount']),
       complete = _flag(_map(json['data'])['complete']),
       enabled = _flag(_map(_map(json['data'])['marketData'])['enabled']),
+      settingsRevision = _count(
+        _map(_map(json['data'])['marketData'])['settingsRevision'] ?? 0,
+      ),
       rows = List.unmodifiable(
         _list(_map(json['data'])['rows'])
             .map((value) => MarketPosition.fromJson(_map(value))),
@@ -264,6 +267,7 @@ class MarketPositionsRead {
   final int pricedCount;
   final bool complete;
   final bool enabled;
+  final int settingsRevision;
   final List<MarketPosition> rows;
   final List<MarketCurrencyGroup> currencyGroups;
 

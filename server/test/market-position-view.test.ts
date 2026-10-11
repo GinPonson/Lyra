@@ -6,6 +6,7 @@ import { Decimal } from "decimal.js";
 
 import { resolveAccountScope } from "../src/application/account-scope.js";
 import { createMarketPositionView } from "../src/application/market-position-view.js";
+import { MarketDataService } from "../src/application/market-data-service.js";
 import { aggregatePositions } from "../src/domain/analytics/positions.js";
 import type { PositionRow } from "../src/domain/analytics/types.js";
 import { replayFifo } from "../src/domain/fifo/replay.js";
@@ -98,6 +99,49 @@ function transaction(overrides: Partial<RawTransactionFields>): RawTransactionFi
 }
 
 describe("market position public view", () => {
+  it("keeps all portfolio batches on one source revision when settings change during a read", async () => {
+    let release!: () => void;
+    let firstBatchStarted!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const batch = new Promise<void>((resolve) => { firstBatchStarted = resolve; });
+    const calls: string[] = [];
+    const sources = ["first", "replacement"].map((id) => ({
+      id,
+      assetTypes: ["stock", "option"] as const,
+      fetchQuote: async (instrument: MarketInstrument) => {
+        calls.push(id);
+        if (id === "first") {
+          if (calls.length === 4) firstBatchStarted();
+          await gate;
+        }
+        const quote = available(instrument).quote!;
+        return { status: "available" as const, quote: { ...quote, providerId: id } };
+      },
+    }));
+    const data = new MarketDataService({
+      providers: sources,
+      routes: { stock: ["first"], option: [] },
+      policies: Object.fromEntries(sources.map(({ id }) => [id, {
+        cacheTtlMs: 60_000, maxRequestsPerMinute: 100, maxRequestsPerDay: null,
+      }])),
+      now: () => new Date(NOW),
+    });
+    const positions = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH"]
+      .map((symbol) => stock({ symbolKey: symbol, underlying: symbol }));
+    const pending = createMarketPositionView(positions, scope, data);
+    await batch;
+    data.setRoutes({ stock: ["replacement"], option: [] }, 1);
+    release();
+    const previous = await pending;
+    assert.equal(previous.marketData.settingsRevision, 0);
+    assert.deepEqual(previous.marketData.routes.stock, ["first"]);
+    assert.ok(previous.rows.every((row) => row.quote.quote?.providerId === "first"));
+    assert.deepEqual(calls, Array(8).fill("first"));
+    const current = await createMarketPositionView(positions, scope, data);
+    assert.equal(current.marketData.settingsRevision, 1);
+    assert.ok(current.rows.every((row) => row.quote.quote?.providerId === "replacement"));
+  });
+
   it("values real FIFO stock and long/short options without changing historical cost or mixing fees", async () => {
     const transactions = normalizeTransactionBatch({
       fileName: "Individual_TST001_Transactions.csv", account: "PRIVATE-USD-A",

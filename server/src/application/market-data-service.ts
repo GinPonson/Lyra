@@ -1,4 +1,5 @@
 import { selectMarketReferencePrice } from "../domain/market-data/reference-price.js";
+import type { MarketRouteController, MarketRoutes } from "../domain/market-data/settings.js";
 import {
   marketInstrumentKey,
   MARKET_QUOTE_ISSUES,
@@ -52,12 +53,13 @@ const DAY_MS = 86_400_000;
  * Only public instrument quotes are cached; account holdings and valuation results are not.
  * All network failures remain data states, so a missing feed never breaks the ledger.
  */
-export class MarketDataService implements MarketDataReader {
+export class MarketDataService implements MarketDataReader, MarketRouteController {
   private readonly providers = new Map<string, MarketDataProvider>();
   private readonly budgets = new Map<string, ProviderBudget>();
   private readonly cache = new Map<string, CacheEntry>();
   private readonly inFlight = new Map<string, Promise<CacheEntry>>();
-  private readonly routes: Readonly<Record<MarketAssetType, readonly string[]>>;
+  private routes: MarketRoutes;
+  private settingsRevision = 0;
   private readonly policies: Readonly<Record<string, MarketProviderPolicy>>;
   private readonly now: () => Date;
   private readonly timeoutMs: number;
@@ -93,18 +95,46 @@ export class MarketDataService implements MarketDataReader {
         minuteCalls: [], dailyCalls: [], blockedUntil: 0, blockedReason: "provider_unavailable",
       });
     }
+    this.validateRoutes(this.routes);
+  }
+
+  status(): MarketDataStatus {
+    return this.describeRoutes(this.routes, this.settingsRevision);
+  }
+
+  /** Keep per-provider quotas and caches; a UI switch must not reset consumption limits. */
+  setRoutes(routes: MarketRoutes, revision: number): void {
+    if (!Number.isSafeInteger(revision) || revision < this.settingsRevision) {
+      throw new RangeError("Invalid market settings revision");
+    }
+    this.validateRoutes(routes);
+    this.routes = { stock: [...routes.stock], option: [...routes.option] };
+    this.settingsRevision = revision;
+  }
+
+  snapshot(): MarketDataReader {
+    const routes: MarketRoutes = { stock: [...this.routes.stock], option: [...this.routes.option] };
+    const status = this.describeRoutes(routes, this.settingsRevision);
+    return {
+      status: () => structuredClone(status),
+      getQuote: (instrument) => this.readQuote(instrument, routes[instrument.assetType]),
+    };
+  }
+
+  private validateRoutes(routes: MarketRoutes): void {
     for (const assetType of ["stock", "option"] as const) {
-      if (new Set(this.routes[assetType]).size !== this.routes[assetType].length
-        || this.routes[assetType].some((id) => !this.providers.get(id)?.assetTypes.includes(assetType))) {
+      if (!Array.isArray(routes[assetType]) || new Set(routes[assetType]).size !== routes[assetType].length
+        || routes[assetType].some((id) => !this.providers.get(id)?.assetTypes.includes(assetType))) {
         throw new RangeError("Invalid market data provider route");
       }
     }
   }
 
-  status(): MarketDataStatus {
+  private describeRoutes(routes: MarketRoutes, revision: number): MarketDataStatus {
     return {
-      enabled: this.routes.stock.length + this.routes.option.length > 0,
-      routes: { stock: [...this.routes.stock], option: [...this.routes.option] },
+      enabled: routes.stock.length + routes.option.length > 0,
+      settingsRevision: revision,
+      routes: { stock: [...routes.stock], option: [...routes.option] },
       providers: [...this.providers.values()].map((provider) => ({
         id: provider.id,
         assetTypes: [...provider.assetTypes],
@@ -114,7 +144,10 @@ export class MarketDataService implements MarketDataReader {
   }
 
   async getQuote(instrument: MarketInstrument): Promise<MarketQuoteLookup> {
-    const route = this.routes[instrument.assetType];
+    return this.readQuote(instrument, this.routes[instrument.assetType]);
+  }
+
+  private async readQuote(instrument: MarketInstrument, route: readonly string[]): Promise<MarketQuoteLookup> {
     let issue: MarketQuoteIssue = "not_configured";
     let stale: MarketQuoteLookup | null = null;
     for (const providerId of route) {

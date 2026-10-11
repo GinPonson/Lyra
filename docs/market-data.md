@@ -1,5 +1,7 @@
 # 行情接入与换源
 
+在 **「我的 → 行情与估值」**，股票和期权可以分别选择主来源、备用来源或关闭。点击「保存」后，新的行情请求立即使用所选来源；设置保存在服务端，对同一所有者的所有账户、设备和 Genkit 共用，重启后恢复。
+
 Lyra 将行情提供方放在服务端适配器边界内。App 和 Genkit 读取同一份标准报价与参考估值；换源时，现有持仓成本、FIFO、已实现盈亏和页面金额计算不会跟着供应商 API 改写。
 
 当前实现支持 **USD 账户内可精确识别的美国股票和标准美股期权**，以历史或延迟行情作为参考。默认关闭远程行情；已实现 Alpaca、MarketData 两个适配器，真实账户凭据与权限尚未联调。
@@ -18,14 +20,16 @@ flowchart TD
 | 层 | 责任 | 主要文件 |
 | --- | --- | --- |
 | 领域契约 | 标准证券身份、报价、时点、来源、缺失状态 | `server/src/domain/market-data/types.ts` |
+| 设置契约 | 来源目录、主备顺序、设置版本与当前生效来源 | `server/src/domain/market-data/settings.ts` |
 | 选价规则 | 有效买卖中间价 → 最近成交价 → 区间收盘价 | `server/src/domain/market-data/reference-price.ts` |
 | 报价服务 | 路由、缓存、并发合并、请求预算、超时和备用源 | `server/src/application/market-data-service.ts` |
 | 持仓估值 | 账户授权、证券匹配、多空、合约乘数、币种分组 | `server/src/application/market-position-view.ts` |
 | 供应商适配 | 鉴权、端点、供应商代码、字段及错误归一化 | `server/src/infrastructure/market-data/*-provider.ts` |
 | 配置组装 | 注册具体供应商，校验配置并设置缓存和预算 | `server/src/infrastructure/market-data/market-data-runtime.ts` |
+| 设置保存 | 设备鉴权、版本冲突、DuckDB 持久化与热切换 | `server/src/application/market-settings-service.ts`、`server/src/infrastructure/db/market-settings-repository.ts` |
 | 移动端 | 读取标准结果、匹配当前持仓、展示时间与隐私状态 | `apps/mobile/lib/features/market/` |
 
-App 使用已鉴权的 `GET /v1/market/positions?scope=all`，可带 `underlying` 筛选；单账户范围沿用现有 `scope` 规则。协议头仍为 `X-Lyra-Protocol-Version: 2`。响应复用账本的 `metadata` / `data` 信封，包含账户范围和 `ledgerVersion`。
+App 使用已鉴权的 `GET /v1/market/positions?scope=all`，可带 `underlying` 筛选；单账户范围沿用现有 `scope` 规则。协议头仍为 `X-Lyra-Protocol-Version: 2`。响应复用账本的 `metadata` / `data` 信封，包含账户范围和 `ledgerVersion`，`data.marketData.settingsRevision` 标明本次估值使用的来源设置版本。
 
 Genkit 的 `market-positions` 工具通过同一估值层执行，只公开可选的 `underlying` 参数。供应商、任意 URL、账户权限和密钥均不能由模型参数覆盖。工具标记为外部只读；调用继续接受既有范围及账本版本校验，并保存工具审计。
 
@@ -55,6 +59,7 @@ interface MarketDataProvider {
 interface MarketDataReader {
   getQuote(instrument: MarketInstrument): Promise<MarketQuoteLookup>;
   status(): MarketDataStatus;
+  snapshot?(): MarketDataReader;
 }
 ```
 
@@ -94,51 +99,74 @@ interface MarketDataReader {
 
 第一版没有汇率换算。账本没有独立的证券计价币种信息，因此非 USD 账户返回 `currency_unsupported`。无法精确映射的调整合约、非标准交割、分数期权合约数量等返回 `unsupported_instrument`，不会猜测乘数。
 
-## 4. 配置与换源
+## 4. 在界面选择来源
 
-开发环境编辑 `server/.env`，Compose 部署编辑 `deploy/server.env`。以下只展示行情相关配置；Google 登录等既有必需配置仍须保留。
+### 日常操作
 
-### 使用一个提供方
+1. 登录 App，打开「我的 → 行情与估值」。来源列表由服务端返回，包含支持的资产类型、凭据是否配置，以及历史或延迟模式说明。
+2. 分别设置「股票」和「期权」的「主来源」。需要回退时，再选择一个不同的「备用来源」；主来源选「关闭」并保存后，该资产不再发起新的行情读取。
+3. 点击「保存」。只有服务端确认保存成功后，App 才应用选择并刷新参考估值。修改选择但未保存，不改变当前生效来源。
 
-股票和期权都选 MarketData，使用账户允许的历史模式：
+例如，股票主来源选 Alpaca、备用选 MarketData，期权主来源选 MarketData、备用选「不使用备用」。也可以两类都使用同一个来源，或分别关闭。备用源只在主来源无法提供可用报价时尝试；实际来源与选价依据仍显示在每一项行情明细中。
+
+选择保存在服务端，作用于该所有者的全部证券账户与设备。其他设备下一次读取设置或行情时会获得新的选择与版本；服务重启后优先恢复已保存设置。切源不需要重启服务，也不会修改已保存的账本交易和历史工具结果。
+
+**未配置的来源会显示但不可选。** 若已保存来源的凭据后来移除、资产支持变化，或者适配器已被移除，原选择仍保留，并在界面提示不可用。实际请求会过滤这些项，用户可以改选其他来源或关闭；不会擅自选择没有保存过的新来源。
+
+### 服务器准备可选来源
+
+开发环境使用 `server/.env`，Compose 部署使用 `deploy/server.env`。服务器负责凭据、MarketData 数据模式、预算和超时；日常主备选择通过 App 保存。下面示例注册两个可选来源，同时保持尚未保存时的行情默认关闭；只填计划使用的来源凭据即可。
 
 ```dotenv
-LYRA_MARKET_STOCK_PROVIDERS=marketdata
-LYRA_MARKET_OPTION_PROVIDERS=marketdata
+LYRA_MARKET_STOCK_PROVIDERS=none
+LYRA_MARKET_OPTION_PROVIDERS=none
+LYRA_ALPACA_API_KEY=填写真实服务端key
+LYRA_ALPACA_SECRET_KEY=填写真实服务端secret
 LYRA_MARKETDATA_API_TOKEN=填写真实服务端token
 LYRA_MARKETDATA_MODE=historical
 LYRA_MARKETDATA_DAILY_REQUEST_LIMIT=80
 LYRA_MARKET_TIMEOUT_MS=8000
 ```
 
-适配器会显式传 `mode=historical`；即使账户以后升级，也不会因付费账户默认模式改变而悄悄请求实时数据。历史数据的可用时点由提供方及端点决定，不是固定“昨天”或固定延迟 24 小时。尤其期权在周末或节假日可能仍返回更早交易日的数据，页面保留实际时间。
+完整凭据使对应来源在服务端注册、在 App 中变为可选；**填写 Key 本身不会启用远程行情**。这些字段不接受 App 或模型覆盖，密钥不会出现在来源目录、设置响应或 APK 中。新增或修改凭据、模式、预算后，按[部署指南](deployment.md)执行离线预检并重启服务，再回到界面选择。
 
-如账户具有延迟模式权限，可设 `LYRA_MARKETDATA_MODE=delayed`，请求随之改为 `mode=delayed`，声明至少延迟 15 分钟。该模式需要相应付费权限；Lyra 不会因配置模式而取得额外授权。
+`LYRA_MARKET_STOCK_PROVIDERS` 与 `LYRA_MARKET_OPTION_PROVIDERS` 只在数据库还没有保存记录时提供启动默认值，可填 `none`、`alpaca`、`marketdata` 或逗号分隔的主备顺序。模板保留 `none`，便于通过 App 管理。已有持久记录时，环境变量中的来源顺序不会覆盖用户保存的选择。环境默认值仍须通过预检；若旧配置里显式指定了某个源，移除其 Key 时也应将对应默认值改回 `none`，避免留下不完整的启动配置。
 
-### 按资产类型选源
+MarketData 默认显式传 `mode=historical`；即使账户以后升级，也不会因付费账户默认模式改变而悄悄请求实时数据。历史数据的可用时点由提供方及端点决定，不是固定“昨天”或固定延迟 24 小时。尤其期权在周末或节假日可能仍返回更早交易日的数据，页面保留实际时间。
 
-股票使用 Alpaca，期权使用 MarketData：
+如账户具有延迟模式权限，可设 `LYRA_MARKETDATA_MODE=delayed`，请求随之改为 `mode=delayed`，声明至少延迟 15 分钟。该模式需要相应权限；Lyra 不会因配置模式而取得额外授权。预检只验证配置形状、已选择默认源的凭据完整性及模式 / 请求上限，不验证供应商账户权限或剩余额度。
 
-```dotenv
-LYRA_MARKET_STOCK_PROVIDERS=alpaca
-LYRA_MARKET_OPTION_PROVIDERS=marketdata
-LYRA_ALPACA_API_KEY=填写真实服务端key
-LYRA_ALPACA_SECRET_KEY=填写真实服务端secret
-LYRA_MARKETDATA_API_TOKEN=填写真实服务端token
-LYRA_MARKETDATA_MODE=historical
-LYRA_MARKETDATA_DAILY_REQUEST_LIMIT=80
+### 设置 API 与版本
+
+`GET /v1/market/settings` 和 `PUT /v1/market/settings` 均要求协议 2 与有效设备 Bearer token，响应使用 `Cache-Control: no-store`。这是所有者的全局设置，不接收账户范围、供应商 URL 或密钥，也没有对应的 Genkit 写工具。
+
+GET 直接返回 `MarketSettingsView`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `revision` | 当前已保存设置版本；尚无记录时为 `0` |
+| `routes.stock` / `routes.option` | 用户保存的有序来源 ID；最多主、备各一个，`[]` 表示关闭 |
+| `effectiveRoutes` | 按当前凭据和资产支持情况过滤后的实际来源顺序 |
+| `providers` | 服务端来源目录：`id`、`displayName`、`assetTypes`、`configured`、`timing`、`cacheTtlSeconds`；没有密钥，`configured` 也不保证外部服务健康 |
+| `updatedAt` | 最近保存变化的时间；尚无记录时为 `null` |
+
+PUT 的严格请求示例：
+
+```json
+{
+  "expectedRevision": 3,
+  "routes": {
+    "stock": ["alpaca", "marketdata"],
+    "option": ["marketdata"]
+  }
+}
 ```
 
-若希望某一类证券在主源失败或缺价时尝试另一个已配置的源，可显式写顺序：
+保存成功返回完整的 `MarketSettingsView`。服务端在共享写队列中重新验证设备凭据、读取当前版本，事务提交成功后才切换运行时路由。新选择只允许目录中已配置且支持该资产的来源；重复、超出两项、未知字段或非法来源返回 `400 / INVALID_ARGUMENT`，缺凭据返回 `400 / MARKET_PROVIDER_NOT_CONFIGURED`。
 
-```dotenv
-LYRA_MARKET_STOCK_PROVIDERS=alpaca,marketdata
-LYRA_MARKET_OPTION_PROVIDERS=marketdata,alpaca
-```
+若 `expectedRevision` 与当前版本不同且目标与现值不同，返回 `409 / MARKET_SETTINGS_CHANGED`，App 保留编辑内容并提示重新加载后再保存。若目标已经与现值完全相同，则作为幂等重试返回当前结果，不增加版本，也不会重复应用路由。尚无保存记录且选择未改变时，继续使用环境默认值，不创建持久记录。设置写入 schema 14 的 `market_source_settings`，随数据库备份，且不增加金融账本的 `ledgerVersion`。
 
-备用源可能有不同的报价字段和时点，因此每行保留实际来源与选价依据。只有列入配置且凭据完整的源才会参与请求。配置为 `none` 可单独关闭某类资产；仅填写凭据不会自动启用行情。
-
-改配置后按[部署指南](deployment.md)先运行离线预检，再重启服务。已实现的两个源之间切换不需要修改 Flutter、Genkit 工具或估值公式。初始化会拒绝未知 / 重复来源、`none` 与提供方混用、缺少凭据以及无效模式 / 请求上限；配置错误在数据库迁移前被发现。
+每次持仓估值固定一份来源快照，结果中的 `data.marketData.settingsRevision` 对应整次读取。读取途中切源不会导致同一份结果混用不同设置版本。App 在保存成功后使旧请求失效；低于已知设置版本的迟到响应不会覆盖新结果。已开始的旧版本服务端请求仍可能完成，其结果保留自身的来源版本。
 
 ## 5. 两个适配器的实际行为
 
@@ -167,6 +195,8 @@ LYRA_MARKET_OPTION_PROVIDERS=marketdata,alpaca
 
 缓存键包含提供方和完整证券身份。同一证券在多个账户或并发请求中只需一份行情读取；只缓存公开行情，账户持仓、授权结果和估值不进入报价缓存。返回和缓存边界会复制对象，避免适配器或调用方修改其他请求看到的价格。
 
+**界面热切换只替换来源顺序和设置版本。** 不重建供应商实例，也不清空各来源的缓存、请求预算或故障冷却。切回某个来源可以复用它仍有效的缓存，来回切换不能重置限额。
+
 **刷新按需发生**：读取时命中 TTL 就复用，否则尝试更新。没有后台定时任务，也不保证每天某一时刻更新。24 小时 TTL 可能推迟看到供应商刚更新的日终数据。
 
 限流后冷却 15 分钟，凭据拒绝后冷却 5 分钟，一般故障冷却 1 分钟；单证券无数据或不支持的结果短期缓存，不阻断该源的其他证券。刷新失败时可保留已有报价并标为 `stale`；有显式备用源时优先尝试取得可用报价。全失败或未配置时只影响行情面板，账本成本和既有分析仍可读取。
@@ -176,17 +206,17 @@ LYRA_MARKET_OPTION_PROVIDERS=marketdata,alpaca
 ## 7. 增加第三个提供方
 
 1. 在基础设施目录实现 `MarketDataProvider`，完成标准证券到供应商标识的转换、字段 / 单位 / 时间归一化，并将异常映射为固定错误枚举。
-2. 在 `market-data-runtime.ts` 注册工厂、配置名称、凭据校验、支持的资产类型与缓存 / 请求预算；配置预检和两个 env 模板同步更新。
+2. 在 `market-data-runtime.ts` 注册工厂、配置名称、凭据校验、支持的资产类型、显示名称、数据模式与缓存 / 请求预算，并加入服务器来源目录；配置预检和两个 env 模板同步更新。
 3. 使用受控 HTTP fixture 验证完整合约匹配、价格单位、时间、缺字段、限流、权限失败及取消；通过公共报价服务验证换源与缓存隔离。
-4. 用部署账户做一次真实请求验收，再将该源加入所需资产路由。
+4. 用部署账户做一次真实请求验收，再在 App 的主来源或备用来源中选择它并保存。
 
-现有报价结构和资产能力能表达新源时，其余业务层无需修改。未来若增加其他市场、外汇或非标准期权乘数，需要明确扩展领域契约；不能把新语义塞入 `feed` 文案或伪装成现有资产。
+来源选择界面读取服务器目录，不在 Flutter 中写死提供方名称和名单。现有报价结构和资产能力能表达新源时，其余业务层无需修改。未来若增加其他市场、外汇或非标准期权乘数，需要明确扩展领域契约；不能把新语义塞入 `feed` 文案或伪装成现有资产。
 
 ## 8. 验证与当前边界
 
-服务端测试覆盖适配器协议、来源配置、缓存与预算、故障回退、精度、完整证券身份、真实 DuckDB 持仓估值、路由鉴权以及账本版本门禁。Flutter 测试覆盖完整合约匹配、账户 / 会话切换、恢复启动范围、缺价 / 过期、金额隐私及窄屏大字体。测试使用合成行情，没有真实凭据、真实行情请求或付费订阅操作。
+服务端测试覆盖适配器协议、来源配置、缓存与预算、故障回退、精度、完整证券身份、真实 DuckDB 持仓估值、路由鉴权以及账本版本门禁。设置用例另覆盖真实数据库保存与重开、幂等和版本冲突、来源不可用时恢复、排队期间注销、提交失败回滚，以及切源时的路由快照。Flutter 测试覆盖完整合约匹配、账户 / 会话切换、恢复启动范围、缺价 / 过期、金额隐私及窄屏大字体。测试使用合成行情，没有真实凭据、真实行情请求或付费订阅操作。
 
-最新全量结果见[实现进度](progress.md)。本轮未重新构建 Android APK；此前交付的深色界面 APK 不包含新增行情面板。实际供应商权限、VPS 和真机联调仍需部署后验收。
+最新全量结果见[实现进度](progress.md)。本轮未部署服务或重新构建 Android APK；此前交付的深色界面 APK 不包含新增行情面板和界面切源。真实供应商凭据与权限、VPS 和真机联调仍需部署后验收。
 
 ## 官方协议参考
 

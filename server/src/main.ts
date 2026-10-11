@@ -14,7 +14,8 @@ import { AgentTurnOrchestrator } from "./application/index.js";
 import { createGenkitRuntimeFromEnvironment } from "./infrastructure/agents/genkit-runtime.js";
 import { loadGoogleLoginConfig } from "./infrastructure/auth/google-login-client.js";
 import { environmentSchema } from "./infrastructure/config/server-environment.js";
-import { createMarketDataServiceFromEnvironment } from "./infrastructure/market-data/market-data-runtime.js";
+import { createMarketDataRuntimeFromEnvironment } from "./infrastructure/market-data/market-data-runtime.js";
+import { MarketSettingsService } from "./application/market-settings-service.js";
 import { GoogleLoginService } from "./application/google-login-service.js";
 import { registerGoogleLoginRoutes } from "./transport/google-login-routes.js";
 import { openLyraDatabase } from "./infrastructure/db/database.js";
@@ -28,6 +29,7 @@ import { registerAgentRoutes } from "./transport/agent-routes.js";
 import { registerAgentEventsRoute } from "./transport/agent-events.js";
 import { registerLedgerRoutes } from "./transport/ledger-routes.js";
 import { registerAccountRoutes } from "./transport/account-routes.js";
+import { registerMarketSettingsRoutes } from "./transport/market-settings-routes.js";
 import { registerImportRoutes } from "./transport/import-routes.js";
 import { registerGmailRoutes } from "./transport/gmail-routes.js";
 import { registerDeviceRoutes } from "./transport/device-routes.js";
@@ -47,10 +49,22 @@ async function start(): Promise<void> {
   // Validate new integration configuration before any irreversible schema upgrade.
   const loginConfig = loadGoogleLoginConfig(process.env);
   const aiRuntime = createGenkitRuntimeFromEnvironment(process.env);
-  const marketData = createMarketDataServiceFromEnvironment(process.env);
+  const marketRuntime = createMarketDataRuntimeFromEnvironment(process.env);
+  const marketData = marketRuntime.reader;
   const database = await openLyraDatabase(environment.LYRA_DATABASE_PATH);
   const writeCoordinator = new WriteCoordinator();
-  await writeCoordinator.enqueue(() => recoverInterruptedAgentSessions(database, new Date()));
+  const marketSettingsService = new MarketSettingsService({
+    database, writeCoordinator, marketData,
+    providers: marketRuntime.providers, defaultRoutes: marketRuntime.defaultRoutes,
+  });
+  try {
+    await writeCoordinator.enqueue(() => recoverInterruptedAgentSessions(database, new Date()));
+    await marketSettingsService.initialize();
+  } catch (error) {
+    await writeCoordinator.close();
+    database.close();
+    throw error;
+  }
   const registry = createFinancialToolRegistry(database, marketData);
   mkdirSync(environment.LYRA_IMPORT_STAGING_DIR, { recursive: true });
   const importService = new ImportService({
@@ -137,6 +151,7 @@ async function start(): Promise<void> {
     accountService: new AccountService({ database, writeCoordinator }),
     authenticateDevice,
   });
+  registerMarketSettingsRoutes(app, { marketSettingsService, authenticateDevice });
   registerImportRoutes(app, {
     importService,
     authenticateDevice,

@@ -30,7 +30,7 @@ if (origin) {
         || !Number.isInteger(info.min_supported_protocol_version)
         || !Number.isInteger(info.max_supported_protocol_version)
         || info.min_supported_protocol_version > 2 || info.max_supported_protocol_version < 2
-        || !Number.isInteger(info.schema_version) || info.schema_version < 13) throw new Error();
+        || !Number.isInteger(info.schema_version) || info.schema_version < 14) throw new Error();
     process.stdout.write("PASS service information and App protocol 2\n");
 
     phase = "ledger health";

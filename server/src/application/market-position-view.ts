@@ -85,7 +85,9 @@ export async function createMarketPositionView(
   for (const { instrument } of prepared) {
     if (instrument !== null) instruments.set(marketInstrumentKey(instrument), instrument);
   }
-  const lookups = await readQuotes(instruments, reader);
+  // A source switch during a queued portfolio read must not mix routing revisions.
+  const snapshot = reader.snapshot?.() ?? reader;
+  const lookups = await readQuotes(instruments, snapshot);
   const rows: MarketPosition[] = prepared.map(({ position, source, currency, instrument }) => {
     const instrumentKey = instrument === null ? null : marketInstrumentKey(instrument);
     const quote = instrumentKey === null
@@ -119,7 +121,7 @@ export async function createMarketPositionView(
     pricedCount: rows.filter(hasValuation).length,
     complete: rows.every(isComplete),
     basis: "current_positions_at_quote_times_excluding_fees",
-    marketData: reader.status(),
+    marketData: snapshot.status(),
     currencyGroups: scope.currencyGroups.map((group) => {
       const accounts = new Set(group.accountIds);
       const selected = rows.filter((row) => accounts.has(row.accountId));

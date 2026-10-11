@@ -56,7 +56,7 @@ const serviceInformation = {
   protocol_version: 2,
   min_supported_protocol_version: 2,
   max_supported_protocol_version: 2,
-  schema_version: 13,
+  schema_version: 14,
   detail: responseSecret,
 };
 const degradedHealth = {

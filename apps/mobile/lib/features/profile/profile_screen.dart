@@ -220,7 +220,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                       key: const ValueKey('profile-market-data'),
                       title: '行情与估值',
                       icon: Icons.query_stats_outlined,
-                      subtitle: '参考价格、报价时点与数据状态',
+                      subtitle: '切换行情来源、查看参考估值',
                       onTap: () => showMarketDataSheet(context),
                     ),
                     ProfileSettingRow(
