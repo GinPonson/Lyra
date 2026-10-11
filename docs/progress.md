@@ -16,7 +16,7 @@
 | 回合取消与重启恢复 | 已完成 | 测试覆盖退出发生于回合启动等待期间、取消持久化与模型完成交错、工具调用取消、迟到输出抑制、重启恢复及重复恢复幂等 |
 | 证券账户创建接口 | 已完成 | 新增已鉴权 `POST /v1/ledger/accounts`；复用领域账户模型、共享写队列和公开脱敏投影；账户、审计与幂等结果同事务，空建账户不增加交易或账本版本；测试覆盖请求重放、并发重复、注销排队和失败回滚 |
 | 首次导入与账户标识一致性 | 已完成 | 真实空库经受控 Google 登录签发设备后，创建账户、上传 CSV、预览、确认并读取持仓/已实现；账户匹配规范化后，交易和哈希沿用数据库原账户键；不同大小写文件名重传仍识别为既有交易。导入解析器版本为 2，财务数据继续沿用既有表与口径 |
-| 服务端完整回归 | 已完成 | Node 24.19.0，`npm run check` 干净 TypeScript 构建通过；127 套件、364 项测试通过，0 失败、0 跳过；覆盖来源设置持久化 / 重启恢复 / 事务回滚 / 并发冲突、热切换快照、预算保留、未登录设置接口门禁及逐项修复失效来源，既有金融与登录回归继续通过 |
+| 服务端完整回归 | 已完成 | **2026-10-11 修复轮**：Node 22.22.2，`npm run check` 干净 TypeScript 构建通过，退出码 0；128 套件、368 项测试全部通过，0 失败、0 取消、0 跳过。此前记录的「127 套件 / 364 项全部通过」在干净检出上**不可复现**（实测 360 通过 / 1 失败 / 3 取消），失败原因与修复见下节。 |
 | Flutter 登录、单助手与首次账户界面 | 已完成 | 空账户首页与账户选择器提供创建入口；导入保留原文件、创建后继续预览；创建重试、重复账户、预览失败恢复、取消、身份切换和组件卸载均有通过的回归；空库账本版本保持 0，首次财务导入才变为 1 |
 | Flutter 凭据队列与汇总刷新 | 已完成 | 按凭据存储归属排队，所有生产 SecureCredentialStore 实例保持共享队列；独立内存存储互不阻塞，队列失败/空闲后正确释放；登录、刷新、退出及助手会话 ID 保持串行。汇总刷新有身份与请求代次检查，旧成功/失败不能覆盖较新的结果 |
 | Flutter 用户页面与账户管理 | 已完成 | 四个主入口为总览、股票、交易、我的；用户页显示邮箱/Google 身份、证券账户列表与新增、偏好、连接、关于和确认退出；未登录仍可访问设置。手机和宽屏导航、账户创建刷新、取消与失败恢复回归通过 |
@@ -37,13 +37,49 @@
 
 配置模板在 [`server/.env.example`](../server/.env.example)，启动、升级和待验步骤见 [迁移说明](genkit-oauth.md)。界面切源需要更新 App 与服务端；迁移前备份数据库并保留原加密主密钥。v14 保留 v13 的 OAuth 凭据；从 v12 或更早版本升级时，重新登录并新建 Lyra 会话。真实 Google / 模型 / 手机联调完成前，迁移 PR 保持草稿。
 
+### 缺陷修复轮（2026-10-11）
+
+对 `feat/genkit-oauth` 做了一轮完整代码审查后的修复，所有结论均以实测为准。
+
+**先纠正不可复现的验证结论**：在干净检出（`npm ci` 后）上运行 `npm run check`，得到的是 **127 套件 / 364 项：360 通过、1 失败、3 取消**，与先前记录的「全部通过」不符。两个根因：
+
+- `genkit-runtime.ts` 的回合超时定时器调用了 `timer.unref()`。模型调用若只是挂起的 Promise 且进程内无其它 handle，事件循环会在 100ms 截止时间之前就判空，超时**永不触发**；`genkit-runtime.test.ts` 的超时用例因此挂起，并连带取消后续 2 项。移除 `unref()` 后该套件 8/8 通过。
+- `deployment-config.test.ts` 断言子进程 `stderr` 严格为空，而 `check-config` 的导入链（genkit → compat-oai → openai → node-fetch@2 → whatwg-url@5 → 内建 punycode）会在 Node ≥ 21 打印 `DEP0040`。断言改为忽略 Node 对第三方依赖的运行时警告，仍要求 CLI 自身零诊断输出。
+
+**其余已修复缺陷**：
+
+- 流式契约错位：服务端发 `payload.delta`，App 读 `payload.text`，导致 AI 回复**永不流式显示**，只在终态快照时一次性出现；服务端改为发 `text` 并新增契约断言（该错位在 `main` 上已存在）。
+- 结算落库失败会永久占用内存中的活跃回合，使 start/cancel/close 全部 409、只能重启恢复；改为失败时也释放回合并丢弃缓存运行时，错误照常上抛。
+- 供应商未返回 token 用量时被上报为 `0`（与「未知不估算为零」矛盾）；改为无法确定时不发用量事件。
+- 启动顺序：信号处理器与暂存目录创建移到打开数据库（含不可逆迁移）之前；实测暂存目录不可创建时启动失败且**不会**创建/迁移数据库。
+- 登录 `/start` 无凭据：改为按来源滚动窗口限流，容量被占满时淘汰最早事务而非对所有人 429，终态事务短暂保留后立即释放容量。
+- 行情层：单证券 `invalid_response` 不再冷却整个来源；单行坏账本数据降级为无法估值而非整体 500；「形状合法但无可用参考价」改报 `no_data`；HTTP 403 不再误报为密钥被拒；重复查询参数不再静默忽略（返回 400）；零买价不再参与中间价。
+- 部署：`.gitignore` 覆盖 `deploy/server.env*`（原先 `server.env.bak` 等含主密钥的文件不被忽略）；预检与运行时对 loopback HTTP 回调的判定统一；DuckDB 溢出目录固定到数据目录同级 `tmp/`（支持只读根文件系统）；Caddy 关闭管理 API；健康检查 `start-period` 与文档化的 `--wait-timeout` 对齐。
+- Flutter：Agent 页非协议异常不再被吞并锁死（可重试错误态）；汇总缺失金额不再伪造成 `0`；畸形金额/标识字段在异步数据边界拦截而非渲染期崩溃；WebSocket 保留部署子路径；Android 安全存储改用 EncryptedSharedPreferences 并关闭 Auto Backup。
+
+**验证**：`npm run check` 退出码 0，**128 套件 / 368 项全部通过**；`flutter analyze --no-pub` 零问题，`flutter test --no-pub` **212 项通过 / 2 项跳过**（修复前 198 / 2）；端到端 smoke 复验协议 2、schema 14、`/mcp` 404、未认证 401、SIGTERM 干净退出，并新增「暂存目录不可创建即失败且不迁移」的实测。
+
+**本轮刻意未修**：登录事务绑定的是发起方而非浏览器授权方，未认证者可通过钓鱼链接取得所有者凭据（详见 [genkit-oauth.md 的安全边界](genkit-oauth.md#app-登录过程)）；补齐需要人类共享秘密，属协议与交互改动，待明确方案后再实施。另有一批低危清理项（删除 MCP/CLI 后的死代码与相关域函数）未做，避免为纯卫生问题牵动多个测试套件。
+
+### Android 模拟机启动测试（2026-10-11）
+
+对本轮修复后的代码做真机（模拟器）启动与连通性验收。AVD `Medium_Phone`（`emulator-5554`，Android 17）在测试前已在运行，未新建模拟器。
+
+- **构建**：环境中 `JAVA_HOME` 指向不存在的 `/opt/homebrew/opt/openjdk@21/...`，Gradle 直接拒绝启动；改用本机已装的 Amazon Corretto 21（`/Users/Gin/Library/Java/JavaVirtualMachines/corretto-21.0.12.1/Contents/Home`）后构建成功。`flutter build apk --debug` **57.4s**，使用默认 `~/.gradle`（全局镜像可直接用于 Flutter 构建）。仅有既有的 `package_info_plus` KGP 提示与 SDK XML 版本提示，不影响产物。
+- **产物**：`apps/mobile/build/app/outputs/flutter-apk/app-debug.apk`，**167,108,575 字节**，SHA-256 `b296ec5d2ef3d338344f50792757cdf689daf26d0cadc9166ee7109cbfcd071a`；`aapt2 dump badging` 确认 `com.lyrafinance.lyra_mobile`、versionCode **3**、versionName 1.0.0、minSdk 24 / targetSdk 36。注意该 APK 与先前交付的 `1.0.0+3` 版本号相同，但已包含后来的行情面板与本轮修复，发布前应递增 versionCode。
+- **安装与启动**：`android install` 成功；`am start` 后进程存活，`logcat` crash buffer 为空、无 Flutter 异常，四个主 Tab（总览 / 股票 / 交易 / 我的）均正常渲染。
+- **修复项实测**：未登录总览的「净入金 / 现金余额 / 股息收入」显示 **`—`**，不再是伪造的 `0.00`（对应本轮「缺失金额不再编造为零」）；「我的」页展示 Google 登录入口、证券账户、启动时隐藏金额、启动账户、涨跌配色等分区；金额隐私开关可正常交互。
+- **连通性（`adb reverse` + 本地服务端）**：在 App 内保存服务端地址 `http://127.0.0.1:3141` 后，`POST /v1/auth/google/start` 返回 201（协议 2 / schema 14），App 随即调起系统浏览器打开 `accounts.google.com` 授权页；服务端日志同时出现 `/v1/system/info` 与 `/v1/health` 探测。
+- **边界**：使用合成 `client_id`，未完成真实 Google 授权，因此未签发设备凭据、未进入账本页面；本次只验证启动、渲染与 App↔服务端链路，不代表真实 OAuth、模型或行情联调完成。登录事务被放弃后 App 仍按约 2 秒间隔轮询 `/v1/auth/google/exchange`，直至事务十分钟过期，属既有设计行为。
+- 截图：[未登录总览（金额显示 `—`）](plans/assets/android-smoke-20261011-overview.png)、[我的与偏好](plans/assets/android-smoke-20261011-profile.png)。
+
 ### 选源即时生效验证（2026-10-11）
 
 - 移除行情设置的「保存 / 取消」按钮及未提交草稿。股票、期权的主来源、备用来源或关闭每次选择后立即提交；服务端确认后持久化并刷新全部行情查询。重复选择当前值不发请求。
 - 请求期间显示「正在切换…」并禁用来源控件，关闭后重开仍可看到待确认状态。同一登录会话中关闭面板不打断已提交请求；换服务器或登录后旧响应不能影响新会话。
 - 失败时界面恢复最后确认的选择；重试沿用原目标和原 `expectedRevision`，服务端已提交但响应丢失时仍可幂等确认。网络失败不代表服务端回滚。配置变化或 409 冲突要求显式重新加载后再选择，避免覆盖其他设备的新值。
 - 服务端允许在原资产、原位置保留已失效的旧来源，支持逐项修复多个失效设置；有效路由继续过滤这些失效来源。新增或移动来源仍需通过目录、资产支持与凭据校验，版本冲突先于变更校验处理。协议 2、schema 14 保持不变。
-- 服务端 `npm run check`：Node 24.19.0，干净 TypeScript 构建，**127 套件 / 364 项全部通过**，0 失败、0 跳过。较手动保存版新增 3 项回归，覆盖跨资产 / 同资产多失效来源逐项修复、保留原位置的幂等重试，以及新增 / 移动失效来源与陈旧版本拒绝。
+- 服务端 `npm run check`：Node 24.19.0，干净 TypeScript 构建，**127 套件 / 364 项全部通过**，0 失败、0 跳过。较手动保存版新增 3 项回归，覆盖跨资产 / 同资产多失效来源逐项修复、保留原位置的幂等重试，以及新增 / 移动失效来源与陈旧版本拒绝。（注：该轮记录的「全部通过」在干净检出上不可复现，见[缺陷修复轮](progress.md)。）
 - Flutter `analyze --no-pub` 零问题；`test --no-pub --reporter expanded --timeout 60s --concurrency=2` **198 项全部通过**，默认图片捕获入口 2 项跳过。20 项设置测试已更新为即时提交，包含失败恢复、已提交但响应丢失后的重试、关闭重开时的等待状态、冲突和迟到报价隔离；另显式启用 2 个截图用例，与设置测试合计 **22 项通过**。
 - 生成并目视核对 3 张实际 Flutter 新截图，使用合成 HTTP 响应并显示“演示配置”：普通手机完整设置页、打开来源下拉，以及 320 px / 1.6 倍字体期权来源区。依赖版本和锁文件未改变；未使用真实行情凭据、部署服务或重新构建 APK。
 
@@ -507,5 +543,5 @@ flutter test --no-pub test/market_settings_capture_test.dart \
 | file_selector_android 构建兼容性 | 已钉版、待上游 | 0.5.2+10 的 Kotlin DSL 构建脚本在 Flutter 3.47.2（AGP 9.1.0 / Gradle 9.3.1）下 `kotlin{}`/`android{}` 访问器无法解析,全新模板项目同样复现,与项目配置无关;`pubspec.yaml` dependency_overrides 钉回 0.5.1+9(groovy 构建,平台接口不变),上游发布修复后移除钉版 |
 | Flutter 3.47.2 模板 Gradle 标志 | 保持默认 | `android.newDsl=false` 与 `android.builtInKotlin=false` 必须同时保留:单独开启 builtInKotlin 会让 `:app` 的 Kotlin DSL 访问器失效,开启 newDsl 会让 flutter-gradle-plugin 转型 `AbstractAppExtension` 失败 |
 | Gradle 全局镜像 | 需隔离 | `/Users/Gin/.gradle/init.d/aliyun-mirror.gradle.kts` 会清空 Flutter 官方 Maven 仓库；Flutter 构建使用独立 `GRADLE_USER_HOME`，不修改用户全局配置 |
-| 服务端外部依赖 | TypeScript、Node 类型、Decimal、Fastify、Zod、DuckDB Node API、csv-parse、ExcelJS、mailparser 与官方 MCP SDK 已安装 | Pi 扩展 SDK 尚未安装；代理已恢复，可按后续功能点逐项引入并验证 |
+| 服务端外部依赖 | TypeScript、Node 类型、Decimal、Fastify、Zod、DuckDB Node API、csv-parse、ExcelJS、mailparser 与 genkit / @genkit-ai/compat-oai / google-auth-library 已安装 | MCP SDK、Claude/Pi/OpenCode CLI 相关依赖已随本次迁移移除；Pi 扩展 SDK 不再计划引入，可按后续功能点逐项评估并验证 |
 | ExcelJS 上游审计项 | 已评估、待上游修复 | uuid advisory 不命中 Lyra 的 XLSX 只读路径；保留 ExcelJS 4.4.0 精确锁定并跟踪升级，不用 `npm audit fix --force` 降级主依赖 |
