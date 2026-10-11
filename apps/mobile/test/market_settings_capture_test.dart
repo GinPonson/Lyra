@@ -82,7 +82,12 @@ Future<void> _choose(
   await tester.pumpAndSettle();
 }
 
-Future<void> _capture(WidgetTester tester, GlobalKey key, String name) async {
+Future<void> _capture(
+  WidgetTester tester,
+  GlobalKey key,
+  String name, {
+  String? outputName,
+}) async {
   await tester.pumpAndSettle();
   expect(tester.takeException(), isNull, reason: name);
   final boundary =
@@ -91,7 +96,8 @@ Future<void> _capture(WidgetTester tester, GlobalKey key, String name) async {
     final image = await boundary.toImage(pixelRatio: 2);
     try {
       final data = await image.toByteData(format: ui.ImageByteFormat.png);
-      await File('$_directory/market-settings-instant-20261011-$name.png').writeAsBytes(
+      final filename = outputName ?? 'market-settings-instant-20261011-$name';
+      await File('$_directory/$filename.png').writeAsBytes(
         data!.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
         flush: true,
       );
@@ -133,8 +139,14 @@ void main() {
     ]);
   });
   for (final scenario in const [
-    (name: '390', size: Size(390, 844), scale: 1.0),
-    (name: '320-large', size: Size(320, 740), scale: 1.6),
+    (name: '390', size: Size(390, 844), scale: 1.0, unavailable: false),
+    (name: '320-large', size: Size(320, 740), scale: 1.6, unavailable: false),
+    (
+      name: 'unavailable-390',
+      size: Size(390, 844),
+      scale: 1.0,
+      unavailable: true,
+    ),
   ]) {
     testWidgets('capture actual market settings ${scenario.name}', (
       tester,
@@ -145,7 +157,10 @@ void main() {
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
       addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
-      final settings = MarketSettingsFixture.settingsPayload();
+      final settings = MarketSettingsFixture.settingsPayload(
+        option: scenario.unavailable ? [] : ['second-feed'],
+        secondConfigured: !scenario.unavailable,
+      );
       final providers = settings['providers']! as List;
       (providers[0] as Map)['displayName'] = 'Alpaca';
       (providers[1] as Map)['displayName'] = 'MarketData';
@@ -194,11 +209,32 @@ void main() {
       await tester.ensureVisible(entry);
       await tester.tap(entry);
       await tester.pumpAndSettle();
-      await _choose(tester, 'stock', 'second-feed', backup: true);
-      expect(fixture.settings['revision'], 1);
+      if (!scenario.unavailable) {
+        await _choose(tester, 'stock', 'second-feed', backup: true);
+        expect(fixture.settings['revision'], 1);
+      }
       expect(find.text('保存'), findsNothing);
       expect(find.text('取消'), findsNothing);
-      if (scenario.name == '390') {
+      if (scenario.unavailable) {
+        expect(find.text('暂不可用的来源无法选择，请稍后再试。'), findsOneWidget);
+        expect(find.textContaining('服务端'), findsNothing);
+        expect(find.textContaining('凭据'), findsNothing);
+        await tester.ensureVisible(find.byTooltip('关闭'));
+        await tester.tap(_field('stock'));
+        await tester.pumpAndSettle();
+        expect(find.text('MarketData · 暂不可用'), findsWidgets);
+        await _capture(
+          tester,
+          boundaryKey,
+          scenario.name,
+          outputName: 'user-ui-20261011-market-unavailable-390',
+        );
+        expect(fixture.settings['revision'], 0);
+        expect(
+          fixture.requests.where((request) => request.method == 'PUT'),
+          isEmpty,
+        );
+      } else if (scenario.name == '390') {
         await tester.ensureVisible(find.byTooltip('关闭'));
         await _capture(tester, boundaryKey, scenario.name);
         await tester.tap(_field('stock'));

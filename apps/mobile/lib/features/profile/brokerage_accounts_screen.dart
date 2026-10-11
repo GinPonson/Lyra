@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/session.dart';
-import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
 import '../accounts/account_repository.dart';
@@ -41,7 +41,7 @@ class BrokerageAccountsScreen extends ConsumerWidget {
                 child: LinearProgressIndicator(minHeight: 2),
               ),
               error: (error, _) => ProfileNotice(
-                message: '暂时无法读取证券账户。${LyraApiError.from(error).message}',
+                message: lyraErrorMessage(error, fallback: '暂时无法读取证券账户，请重新加载。'),
                 onRetry: () => ref.invalidate(brokerageAccountsProvider),
                 retryLabel: '重新加载账户',
               ),

@@ -385,7 +385,8 @@ void main() {
     await _tap(tester, find.text('选择文件并预览'));
     expect(find.text('总行数 1 · 可新增 1 · 已存在 0'), findsOneWidget);
     await _tap(tester, find.text('确认写入账本（1 行）'));
-    expect(find.textContaining('已写入账本：新增 1 行'), findsOneWidget);
+    expect(find.text('导入完成：新增 1 条交易。'), findsOneWidget);
+    expect(find.textContaining('账本版本'), findsNothing);
     expect(container.read(accountScopeProvider).id, LedgerFixture.account);
     expect(
       (container.read(sessionProvider).value as SessionAuthenticated)
@@ -438,7 +439,8 @@ void main() {
     await _openImportCreation(tester);
     await _tap(tester, find.byKey(const ValueKey('create-account-submit')));
     expect(find.byType(AccountSheet), findsOneWidget);
-    expect(find.textContaining('CLIENT_REQUEST_FAILED'), findsOneWidget);
+    expect(find.text('暂时无法创建证券账户，请重试。'), findsOneWidget);
+    expect(find.textContaining('CLIENT_REQUEST_FAILED'), findsNothing);
     expect(fixture.previewAccounts, [null]);
     await _tap(tester, find.byKey(const ValueKey('create-account-submit')));
     expect(fixture.createKeys, hasLength(2));
@@ -471,7 +473,8 @@ void main() {
     await _openImportCreation(tester);
     await _tap(tester, find.byKey(const ValueKey('create-account-submit')));
     expect(find.byType(AccountSheet), findsNothing);
-    expect(find.textContaining('SERVER_BUSY'), findsOneWidget);
+    expect(find.text('暂时无法预览文件，请重试。'), findsOneWidget);
+    expect(find.textContaining('SERVER_BUSY'), findsNothing);
     expect(find.textContaining('尚无可用的证券账户'), findsNothing);
     await _tap(tester, find.text('重试当前文件'));
     expect(fixture.previewAccounts, [

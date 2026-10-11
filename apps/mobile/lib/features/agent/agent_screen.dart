@@ -7,6 +7,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/session.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_date.dart';
+import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/security/credential_store.dart';
 import '../ledger/ledger_workspace.dart';
@@ -269,7 +271,14 @@ class AgentController extends Notifier<AgentUiState> {
         }
       case AgentErrorFrame():
         state = current.copyWith(
-          errorMessage: '${frame.message}（${frame.code}）',
+          errorMessage: lyraErrorMessage(
+            LyraApiError(
+              code: frame.code,
+              message: '',
+              statusCode: 500,
+              retryable: true,
+            ),
+          ),
         );
       case AgentUnknownFrame():
         break;
@@ -512,14 +521,8 @@ class AgentController extends Notifier<AgentUiState> {
   }
 }
 
-/// 失败原因的可见文案：协议错误保留稳定 code，其它异常按 LyraLoadError 的
-/// 约定暴露原始原因，避免把失败伪装成空状态。
-String _unexpectedMessage(Object error) {
-  if (error is LyraApiError) {
-    return '${error.message}（${error.code}）';
-  }
-  return '响应处理失败：$error';
-}
+/// 失败仍然可见且可重试，协议码和原始诊断仅用于内部处理。
+String _unexpectedMessage(Object error) => lyraErrorMessage(error);
 
 /// Agent 页 Provider（进入页面时创建，离开销毁）。
 final agentControllerProvider =
@@ -574,7 +577,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
     if (!paired) {
       return _InfoCard(
         icon: LyraIcons.agent,
-        title: '未连接服务端',
+        title: '请先登录 Lyra',
         description: '登录后即可查询仓位、绩效与压力分析。',
         accent: LyraColors.accent,
       );
@@ -641,9 +644,8 @@ class _SessionViewState extends ConsumerState<_SessionView> {
     final scopeLabel = session.accountScopeKind == 'all'
         ? '全部账号'
         : state.accountLabel ??
-              (selectedScope.id == scopeId
-                  ? selectedScope.label
-                  : '账号 ${session.accountId}');
+              (selectedScope.id == scopeId ? selectedScope.label : '指定账户');
+    final asOf = lyraDateTime(session.asOf);
     return Column(
       children: <Widget>[
         Padding(
@@ -699,7 +701,7 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                     ],
                     const SizedBox(height: 4),
                     Text(
-                      '账本版本 ${session.ledgerVersion} · 截止 ${session.asOf}',
+                      asOf == '时间未知' ? '数据时间未知' : '数据截至 $asOf',
                       style: Theme.of(context).textTheme.bodySmall
                           ?.copyWith(color: LyraColors.muted),
                     ),
@@ -729,6 +731,7 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                   role: message.role,
                   content: message.content,
                   isFailed: message.status == 'failed',
+                  isCancelled: message.status == 'cancelled',
                 ),
               if (state.pendingMessage != null)
                 _MessageBubble(role: 'user', content: state.pendingMessage!),
@@ -755,7 +758,7 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                 ),
               if (state.toolCalls.isNotEmpty) ...<Widget>[
                 const SizedBox(height: 8),
-                Text('工具调用', style: Theme.of(context).textTheme.titleSmall),
+                Text('分析进度', style: Theme.of(context).textTheme.titleSmall),
                 const SizedBox(height: 6),
                 for (final call in state.toolCalls) _ToolCallTile(call: call),
               ],
@@ -791,7 +794,7 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                     ? IconButton(
                         onPressed: () => controller.cancelTurn(),
                         icon: const Icon(LyraIcons.dismiss),
-                        tooltip: '取消回合',
+                        tooltip: '停止分析',
                       )
                     : ValueListenableBuilder<TextEditingValue>(
                         valueListenable: _inputController,
@@ -1034,17 +1037,21 @@ class _MessageBubble extends StatelessWidget {
     required this.role,
     required this.content,
     this.isFailed = false,
+    this.isCancelled = false,
     this.isStreaming = false,
   });
 
   final String role;
   final String content;
   final bool isFailed;
+  final bool isCancelled;
   final bool isStreaming;
 
   @override
   Widget build(BuildContext context) {
     final isUser = role == 'user';
+    final hasContent = content.trim().isNotEmpty;
+    final cancelledNotice = hasContent ? '分析已停止，以上为已完成的内容。' : '分析已停止。';
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -1056,12 +1063,27 @@ class _MessageBubble extends StatelessWidget {
           borderRadius: BorderRadius.circular(16),
           border: isUser ? null : Border.all(color: LyraColors.hairline),
         ),
-        child: Text(
-          isStreaming ? '$content▍' : content,
-          style: TextStyle(
-            color: isUser ? LyraColors.onAccent : LyraColors.ink,
-            height: 1.6,
-          ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (hasContent || isStreaming)
+              Text(
+                isStreaming ? '$content▍' : content,
+                style: TextStyle(
+                  color: isUser ? LyraColors.onAccent : LyraColors.ink,
+                  height: 1.6,
+                ),
+              ),
+            if (!isUser && (isFailed || isCancelled)) ...[
+              if (hasContent) const SizedBox(height: 8),
+              Text(
+                isCancelled ? cancelledNotice : '本次分析未完成，请重试。',
+                style: Theme.of(context).textTheme.bodySmall
+                    ?.copyWith(color: LyraColors.muted, height: 1.6),
+              ),
+            ],
+          ],
         ),
       ),
     );
@@ -1169,10 +1191,11 @@ class _StatusChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final label = switch (session.status) {
-      'running' => '回合中',
-      'cancelling' => '取消中',
-      'closed' => '已关闭',
-      _ => '空闲',
+      'running' => '分析中',
+      'cancelling' => '正在停止',
+      'closed' => '已结束',
+      'idle' => '可提问',
+      _ => '状态待更新',
     };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
@@ -1190,7 +1213,43 @@ class _StatusChip extends StatelessWidget {
   }
 }
 
-/// 单条工具调用的折叠卡片；只显示公开摘要，不伪造结果。
+/// 固定的业务任务名，不把内部命令或未知工具名作为用户文案。
+String _analysisTaskLabel(String toolName) => switch (toolName) {
+  'accounts' => '读取证券账户',
+  'summary' => '汇总账户概况',
+  'positions' => '查询当前持仓',
+  'expiring' => '查看期权到期',
+  'trades' => '查询交易记录',
+  'realized' => '分析已实现损益',
+  'cashflow' => '分析现金流',
+  'monthly' => '分析每月表现',
+  'allocation' => '分析资产配置',
+  'attribution' => '分析收益来源',
+  'drawdown' => '分析已实现损益回撤',
+  'risk' => '分析期权风险',
+  'holding-period' => '分析持有时长',
+  'extremes' => '查看交易盈亏',
+  'streaks' => '分析连续盈亏',
+  'stress' => '进行压力分析',
+  'audit' => '核对账本记录',
+  'market-positions' => '查询参考估值',
+  _ => '分析任务',
+};
+
+/// 仅展示已知业务含义的整数计数，任意参数和结果摘要不直接进入界面。
+String? _analysisResultLabel(AgentToolCallView call) {
+  if (call.status != 'completed') return null;
+  final count = call.resultSummary?['count'];
+  if (count is! int || count < 0) return null;
+  return switch (call.toolName) {
+    'accounts' => '已读取 $count 个账户',
+    'positions' || 'market-positions' => '已读取 $count 项持仓',
+    'expiring' || 'trades' || 'realized' || 'cashflow' => '已读取 $count 条记录',
+    _ => null,
+  };
+}
+
+/// 分析进度卡片；保留任务状态和有意义的结果计数。
 class _ToolCallTile extends StatelessWidget {
   const _ToolCallTile({required this.call});
 
@@ -1199,19 +1258,15 @@ class _ToolCallTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final statusLabel = switch (call.status) {
-      'started' => '运行中',
-      'completed' => '完成',
-      'failed' => '失败',
+      'started' => '进行中',
+      'completed' => '已完成',
+      'failed' => '未完成',
       'cancelled' => '已取消',
-      'rejected' => '被拒绝',
-      _ => call.status,
+      'rejected' => '暂不可用',
+      _ => '状态待更新',
     };
-    final arguments = call.argumentsSummary.entries
-        .map((entry) => '${entry.key}: ${entry.value}')
-        .join('，');
-    final result = call.resultSummary?.entries
-        .map((entry) => '${entry.key}: ${entry.value}')
-        .join('，');
+    final result = _analysisResultLabel(call);
+    final failed = call.status == 'failed' || call.status == 'rejected';
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
@@ -1227,39 +1282,37 @@ class _ToolCallTile extends StatelessWidget {
             children: <Widget>[
               Expanded(
                 child: Text(
-                  call.toolName,
+                  _analysisTaskLabel(call.toolName),
                   style: const TextStyle(fontWeight: FontWeight.w600),
                 ),
               ),
               Text(
-                call.durationMs == null
-                    ? statusLabel
-                    : '$statusLabel · ${call.durationMs}ms',
+                statusLabel,
                 style: Theme.of(context).textTheme.labelSmall
                     ?.copyWith(color: LyraColors.muted),
               ),
             ],
           ),
-          if (arguments.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 4),
+          if (result != null) ...<Widget>[
+            const SizedBox(height: 2),
             Text(
-              '参数：$arguments',
+              result,
               style: Theme.of(context).textTheme.bodySmall
                   ?.copyWith(color: LyraColors.muted),
             ),
           ],
-          if (result != null && result.isNotEmpty) ...<Widget>[
+          if (failed) ...<Widget>[
             const SizedBox(height: 2),
             Text(
-              '结果：$result',
-              style: Theme.of(context).textTheme.bodySmall
-                  ?.copyWith(color: LyraColors.muted),
-            ),
-          ],
-          if (call.errorCode != null) ...<Widget>[
-            const SizedBox(height: 2),
-            Text(
-              call.errorCode!,
+              lyraErrorMessage(
+                LyraApiError(
+                  code: call.errorCode ?? 'AGENT_TOOL_EXECUTION_FAILED',
+                  message: '',
+                  statusCode: 500,
+                  retryable: true,
+                ),
+                fallback: '这一步未能完成，可以重新提问。',
+              ),
               style: TextStyle(color: Theme.of(context).colorScheme.error),
             ),
           ],

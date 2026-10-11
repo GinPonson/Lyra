@@ -5,9 +5,9 @@ import '../../app/session.dart';
 import '../../features/accounts/account_sheet.dart';
 import '../../features/accounts/account_workspace.dart';
 import '../../features/ledger/ledger_workspace.dart';
-import '../api/lyra_api_error.dart';
 import '../preferences/app_preferences.dart';
 import 'lyra_colors.dart';
+import 'lyra_error_message.dart';
 import 'lyra_icons.dart';
 import 'lyra_number.dart';
 import 'lyra_primary_icon.dart';
@@ -101,7 +101,12 @@ class LyraPageTitle extends StatelessWidget {
             children: [heading, const SizedBox(height: 8), trailing!],
           );
         }
-        return Row(children: [Expanded(child: heading), ?trailing]);
+        return Row(
+          children: [
+            Expanded(child: heading),
+            ?trailing,
+          ],
+        );
       },
     ),
   );
@@ -186,7 +191,7 @@ class LyraEmpty extends StatelessWidget {
   );
 }
 
-/// 错误不是空数据：保留错误代码与可见重试动作。
+/// 数据读取失败时说明下一步操作，诊断信息留在错误对象中。
 class LyraLoadError extends StatelessWidget {
   const LyraLoadError({super.key, required this.error, required this.onRetry});
   final Object error;
@@ -195,9 +200,7 @@ class LyraLoadError extends StatelessWidget {
   Widget build(BuildContext context) => LyraEmpty(
     icon: LyraIcons.error,
     title: '数据未能加载',
-    message: error is LyraApiError
-        ? '${(error as LyraApiError).message} · ${(error as LyraApiError).code}'
-        : '响应处理失败：$error',
+    message: lyraErrorMessage(error, fallback: '暂时无法读取数据，请重新加载。'),
     action: OutlinedButton.icon(
       onPressed: onRetry,
       icon: const Icon(LyraIcons.sync, size: 18),

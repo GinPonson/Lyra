@@ -193,14 +193,16 @@ void main() {
   testWidgets('stale 且 issue 为空也明确标记过期并隐藏合计', (tester) async {
     await _pump(tester, MarketFixture(stale: {MarketFixture.callSymbol}));
     expect(find.text('包含过期报价，请留意各项报价时间。'), findsOneWidget);
-    expect(find.textContaining('日终报价 · 已过期 · 缓存'), findsOneWidget);
+    expect(find.textContaining('日终报价 · 已过期'), findsOneWidget);
+    expect(find.textContaining('缓存'), findsNothing);
+    expect(find.textContaining('报价 2026-09-03 20:00 UTC'), findsWidgets);
     expect(find.text('2,325.00'), findsOneWidget);
     expect(find.text('2,326.00'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
   for (final configured in [false, true]) {
-    testWidgets(configured ? '行情请求失败不阻断持仓账本成本' : '行情未配置有通用提示且保留账本成本', (
+    testWidgets(configured ? '行情请求失败不阻断持仓账本成本' : '行情未开启有通用提示且保留账本成本', (
       tester,
     ) async {
       final fixture = MarketFixture(enabled: configured);
@@ -214,7 +216,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('4,286.40'), findsOneWidget);
       expect(
-        find.textContaining(configured ? '行情暂不可用' : '行情尚未配置'),
+        find.textContaining(configured ? '行情暂不可用' : '行情暂未开启'),
         findsOneWidget,
       );
       expect(find.text('fixture-feed'), findsNothing);
@@ -235,7 +237,7 @@ void main() {
     await tester.ensureVisible(entry);
     await tester.tap(entry);
     await tester.pumpAndSettle();
-    expect(find.textContaining('行情尚未配置'), findsOneWidget);
+    expect(find.textContaining('行情暂未开启'), findsOneWidget);
     expect(find.byType(TextField), findsNothing);
     expect(
       fixture.requests.where(

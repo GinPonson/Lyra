@@ -248,7 +248,8 @@ void main() {
     expect(find.text('+12.34'), findsOneWidget);
     expect(find.text('1,000.00'), findsOneWidget);
     expect(find.text('500.00'), findsOneWidget);
-    expect(find.textContaining('账本 v3'), findsOneWidget);
+    expect(find.text('数据截至 2026年9月2日 10:00:00 UTC'), findsOneWidget);
+    expect(find.textContaining('账本 v'), findsNothing);
 
     // 凭据已进入安全存储抽象。
     final stored = await store.read();
@@ -674,7 +675,7 @@ void main() {
     // 读取失败不再留在 build 的 Future 里；用户看到可自助的登录入口与原因。
     expect(find.byKey(const ValueKey('login-screen')), findsOneWidget);
     await scrollUntilVisible(tester, find.text('登录 Lyra'));
-    expect(find.text('本机登录凭据无法读取，请重新登录以恢复。'), findsOneWidget);
+    expect(find.text('暂时无法恢复登录，请重新登录。'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 }

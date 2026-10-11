@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lyra_mobile/core/api/lyra_api_client.dart';
+import 'package:lyra_mobile/core/design/lyra_theme.dart';
 import 'package:lyra_mobile/core/security/credential_store.dart';
 import 'package:lyra_mobile/features/agent/agent_live_events.dart';
 import 'package:lyra_mobile/features/agent/agent_repository.dart';
@@ -34,6 +35,107 @@ class FakeAgentAdapter implements HttpClientAdapter {
 
   @override
   void close({bool force = false}) {}
+}
+
+/// 与实际 AgentScreen 共用的合成状态，供可见字段回归和 opt-in 截图复用。
+AgentSessionActive agentReviewState({bool running = false}) =>
+    AgentSessionActive(
+      availability: const AgentAvailabilitySnapshotView(
+        items: [AgentAvailabilityView(provider: 'genkit', available: true)],
+      ),
+      session: AgentSessionView(
+        id: 'private-session-id',
+        provider: 'genkit',
+        status: running ? 'running' : 'idle',
+        accountScopeKind: 'account',
+        accountId: 'a2000000-0000-4000-8000-000000000099',
+        ledgerVersion: 81234,
+        asOf: '2026-10-11T10:30:00.000Z',
+        revision: 76543,
+        messages: const [
+          AgentMessageView(
+            id: 'private-message-id',
+            role: 'user',
+            content: '我的现金余额是多少？',
+            createdAt: '2026-10-11T10:30:00.000Z',
+          ),
+          AgentMessageView(
+            id: 'private-reply-id',
+            role: 'assistant',
+            content: 'USD 现金余额为 12,345.67。',
+            createdAt: '2026-10-11T10:30:01.000Z',
+            status: 'completed',
+          ),
+        ],
+      ),
+      turnInProgress: running,
+      streamingText: running ? '正在结合持仓，继续检查风险。' : null,
+      toolCalls: [
+        const AgentToolCallView(
+          id: 'private-call-id',
+          messageId: 'private-message-id',
+          ordinal: 1,
+          toolName: 'accounts',
+          status: 'completed',
+          argumentsSummary: {
+            'accountScope': 'all',
+            'accountId': 'private-account-id',
+          },
+          resultSummary: {'count': 3, 'trace': '/internal/genkit/runner.ts'},
+          ledgerVersion: 81234,
+          durationMs: 42,
+          errorCode: null,
+          startedAt: '2026-10-11T10:30:00.000Z',
+          completedAt: '2026-10-11T10:30:00.042Z',
+        ),
+        AgentToolCallView(
+          id: 'private-risk-call-id',
+          messageId: 'private-message-id',
+          ordinal: 2,
+          toolName: running ? 'risk' : 'summary',
+          status: running ? 'started' : 'failed',
+          argumentsSummary: const {'ledgerVersion': 81234},
+          resultSummary: null,
+          ledgerVersion: 81234,
+          durationMs: running ? null : 15,
+          errorCode: running ? null : 'AGENT_TOOL_EXECUTION_FAILED',
+          startedAt: '2026-10-11T10:30:01.000Z',
+          completedAt: running ? null : '2026-10-11T10:30:01.015Z',
+        ),
+      ],
+    );
+
+/// 只替换状态来源，保留真实页面、主题、布局、输入和进度组件。
+Widget agentReviewApp(AgentUiState state) => ProviderScope(
+  overrides: [
+    sessionProvider.overrideWith(_ReviewSessionController.new),
+    agentControllerProvider.overrideWith(() => _ReviewAgentController(state)),
+    accountScopeProvider.overrideWith(_ReviewAccountScopeController.new),
+  ],
+  child: MaterialApp(
+    debugShowCheckedModeBanner: false,
+    theme: LyraTheme.dark,
+    home: const AgentScreen(),
+  ),
+);
+
+class _ReviewSessionController extends SessionController {
+  @override
+  Future<SessionState> build() async =>
+      const SessionAuthenticated(snapshot: _snapshot, summary: null);
+}
+
+class _ReviewAgentController extends AgentController {
+  _ReviewAgentController(this.initial);
+  final AgentUiState initial;
+
+  @override
+  AgentUiState build() => initial;
+}
+
+class _ReviewAccountScopeController extends AccountScopeController {
+  @override
+  ({String id, String label}) build() => (id: 'all', label: '全部账号');
 }
 
 const String _availabilityResponse = '''
@@ -351,7 +453,7 @@ void main() {
 
     // 会话视图出现，发送回合。
     expect(find.text('Lyra 助手'), findsOneWidget);
-    expect(find.text('空闲'), findsOneWidget);
+    expect(find.text('可提问'), findsOneWidget);
     await tester.enterText(find.byType(TextField), '我的现金余额是多少？');
     await tester.testTextInput.receiveAction(TextInputAction.send);
     await tester.pumpAndSettle();
@@ -360,14 +462,141 @@ void main() {
     expect(find.text('我的现金余额是多少？'), findsOneWidget);
     expect(find.text('USD 现金余额为 12,345.67。'), findsOneWidget);
 
-    // 回合结束后拉取并渲染工具调用公开列表。
+    // 回合结束后保留业务进度与计数，内部工具字段不进入界面。
     await tester.pumpAndSettle();
-    expect(find.text('工具调用'), findsOneWidget);
-    expect(find.text('accounts'), findsOneWidget);
-    expect(find.text('完成 · 42ms'), findsOneWidget);
-    expect(find.text('summary'), findsOneWidget);
-    expect(find.text('AGENT_TOOL_EXECUTION_FAILED'), findsOneWidget);
+    expect(find.text('分析进度'), findsOneWidget);
+    expect(find.text('读取证券账户'), findsOneWidget);
+    expect(find.text('已读取 3 个账户'), findsOneWidget);
+    expect(find.text('汇总账户概况'), findsOneWidget);
+    expect(find.text('本次分析未完成，请重试。'), findsOneWidget);
+    expect(find.text('accounts'), findsNothing);
+    expect(find.text('完成 · 42ms'), findsNothing);
+    expect(find.text('summary'), findsNothing);
+    expect(find.textContaining('AGENT_TOOL_EXECUTION_FAILED'), findsNothing);
   });
+
+  testWidgets('会话只显示账户范围、业务进度和财务内容，不展示内部字段', (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final base = agentReviewState();
+    await tester.pumpWidget(
+      agentReviewApp(
+        base.copyWith(
+          toolCalls: [
+            base.toolCalls.first,
+            const AgentToolCallView(
+              id: 'private-unknown-call',
+              messageId: 'private-message-id',
+              ordinal: 2,
+              toolName: 'internal-runner-command',
+              status: 'internal-state',
+              argumentsSummary: {'secret': 'private-command-argument'},
+              resultSummary: {'count': 999, 'trace': 'private-result-trace'},
+              ledgerVersion: 81234,
+              durationMs: 93821,
+              errorCode: 'INTERNAL_RUNNER_ERROR',
+              startedAt: '2026-10-11T10:30:00.000Z',
+              completedAt: null,
+            ),
+          ],
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('本次对话：指定账户'), findsOneWidget);
+    expect(find.text('数据截至 2026年10月11日 10:30:00 UTC'), findsOneWidget);
+    expect(find.text('USD 现金余额为 12,345.67。'), findsOneWidget);
+    expect(find.text('读取证券账户'), findsOneWidget);
+    expect(find.text('已读取 3 个账户'), findsOneWidget);
+    expect(find.text('分析任务'), findsOneWidget);
+    expect(find.text('状态待更新'), findsOneWidget);
+    for (final value in [
+      'a2000000-0000-4000-8000-000000000099',
+      '账本版本',
+      '81234',
+      '76543',
+      '2026-10-11T',
+      'genkit',
+      '/internal',
+      'accounts',
+      'accountScope',
+      'accountId',
+      'private-',
+      'internal-runner-command',
+      'internal-state',
+      'INTERNAL_RUNNER_ERROR',
+      '93821',
+      '42ms',
+      '999',
+    ]) {
+      expect(find.textContaining(value), findsNothing, reason: value);
+    }
+    expect(tester.widget<TextField>(find.byType(TextField)).enabled, isTrue);
+    expect(tester.takeException(), isNull);
+  });
+
+  const partialAnswer = '已确认 USD 现金余额为 12,345.67，持仓分析尚未完成。';
+  for (final failure in [
+    (status: 'failed', content: partialAnswer, notice: '本次分析未完成，请重试。'),
+    (status: 'cancelled', content: partialAnswer, notice: '分析已停止，以上为已完成的内容。'),
+    (status: 'cancelled', content: '', notice: '分析已停止。'),
+  ]) {
+    testWidgets(
+      '分析 ${failure.status}（正文长度 ${failure.content.length}）后保留内容并允许提问',
+      (tester) async {
+        tester.view.physicalSize = const Size(390, 844);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        final base = agentReviewState();
+        final session = base.session;
+        final state = base.copyWith(
+          session: AgentSessionView(
+            id: session.id,
+            provider: session.provider,
+            status: 'idle',
+            accountScopeKind: session.accountScopeKind,
+            accountId: session.accountId,
+            ledgerVersion: session.ledgerVersion,
+            asOf: session.asOf,
+            revision: session.revision,
+            messages: [
+              session.messages.first,
+              AgentMessageView(
+                id: 'private-partial-message-id',
+                role: 'assistant',
+                content: failure.content,
+                createdAt: '2026-10-11T10:30:00.000Z',
+                status: failure.status,
+                errorCode: 'PRIVATE_RUNNER_REASON',
+              ),
+            ],
+          ),
+          toolCalls: [],
+        );
+        await tester.pumpWidget(agentReviewApp(state));
+        await tester.pumpAndSettle();
+
+        if (failure.content.isNotEmpty) {
+          expect(find.text(partialAnswer), findsOneWidget);
+        } else {
+          expect(find.textContaining('以上为已完成的内容'), findsNothing);
+        }
+        expect(find.text(failure.notice), findsOneWidget);
+        expect(find.textContaining('PRIVATE_RUNNER_REASON'), findsNothing);
+        expect(
+          tester.widget<TextField>(find.byType(TextField)).enabled,
+          isTrue,
+        );
+        await tester.enterText(find.byType(TextField), '继续分析持仓');
+        expect(find.text('继续分析持仓'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 
   testWidgets('新对话使用页面账户范围，切换页面不会修改已有会话', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
@@ -452,7 +681,8 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('未连接服务端'), findsOneWidget);
+    expect(find.text('请先登录 Lyra'), findsOneWidget);
+    expect(find.textContaining('服务端'), findsNothing);
     expect(find.text('开始分析'), findsNothing);
   });
 
@@ -517,7 +747,7 @@ void main() {
       await it.controller.createSession();
       final failed = it.container.read(agentControllerProvider);
       expect(failed, isA<AgentError>());
-      expect((failed as AgentError).message, contains('响应处理失败'));
+      expect((failed as AgentError).message, '暂时无法完成操作，请稍后重试。');
 
       // 错误态提供重试路径：可用性恢复后回到创建视图，并可重新建立会话。
       malformed = false;
@@ -565,7 +795,7 @@ void main() {
       final failed =
           it.container.read(agentControllerProvider) as AgentSessionActive;
       expect(failed.turnInProgress, isFalse);
-      expect(failed.errorMessage, contains('响应处理失败'));
+      expect(failed.errorMessage, '暂时无法完成操作，请稍后重试。');
 
       // 回合锁已解除：输入恢复后重发同一问题并拿到终态快照。
       malformedTurn = false;
@@ -599,7 +829,7 @@ void main() {
       await it.controller.createSession();
       final failed = it.container.read(agentControllerProvider);
       expect(failed, isA<AgentError>());
-      expect((failed as AgentError).message, contains('响应处理失败'));
+      expect((failed as AgentError).message, '暂时无法完成操作，请稍后重试。');
 
       sessionStore.writeFails = false;
       await it.controller.loadAvailability();
@@ -660,14 +890,40 @@ void main() {
 
       final failed =
           it.container.read(agentControllerProvider) as AgentSessionActive;
-      expect(failed.errorMessage, contains('响应处理失败'));
+      expect(failed.errorMessage, '暂时无法完成操作，请稍后重试。');
       expect(failed.turnInProgress, isFalse);
+    });
+
+    test('事件错误隐藏原始原因和错误码，后续成功提问可清除提示', () async {
+      final it = await harness(_routeAgentRequest);
+      await it.controller.createSession();
+      it.controller.handleFrame(
+        const AgentErrorFrame(
+          code: 'AGENT_TOOL_EXECUTION_FAILED',
+          message:
+              'genkit SDK failed at /internal/runner.ts request=private-id',
+        ),
+      );
+      var state =
+          it.container.read(agentControllerProvider) as AgentSessionActive;
+      expect(state.errorMessage, '本次分析未完成，请重试。');
+      it.controller.handleFrame(
+        const AgentErrorFrame(
+          code: 'INTERNAL_RUNNER_REASON',
+          message: 'postgres://private-host tool=secret-command',
+        ),
+      );
+      state = it.container.read(agentControllerProvider) as AgentSessionActive;
+      expect(state.errorMessage, '暂时无法完成操作，请稍后重试。');
+      expect(state.turnInProgress, isFalse);
+      await it.controller.sendTurn('我的现金余额是多少？');
+      state = it.container.read(agentControllerProvider) as AgentSessionActive;
+      expect(state.errorMessage, isNull);
+      expect(state.session.messages.last.content, 'USD 现金余额为 12,345.67。');
     });
   });
 
-  testWidgets('创建会话失败显示可重试错误卡片，重试后恢复创建入口', (
-    WidgetTester tester,
-  ) async {
+  testWidgets('创建会话失败显示可重试错误卡片，重试后恢复创建入口', (WidgetTester tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -675,7 +931,7 @@ void main() {
 
     final store = MemoryCredentialStore();
     await store.write(_snapshot);
-    var malformed = true;
+    var unavailable = true;
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
@@ -686,8 +942,15 @@ void main() {
               clientFactory: (String serverUrl) {
                 return Dio(BaseOptions(baseUrl: serverUrl))
                   ..httpClientAdapter = FakeAgentAdapter((options) async {
-                    if (options.uri.path == '/v1/agent/sessions' && malformed) {
-                      return _jsonResponse('{"session": {"id": 7}}', 201);
+                    if (options.uri.path == '/v1/agent/sessions' &&
+                        unavailable) {
+                      return _jsonResponse(
+                        jsonEncode({
+                          'code': 'AGENT_UNAVAILABLE',
+                          'message': 'genkit runner failed /internal/runner.ts request=private-id',
+                        }),
+                        503,
+                      );
                     }
                     return _routeAgentRequest(options);
                   });
@@ -705,9 +968,14 @@ void main() {
     // 不再停在“正在创建…”且按钮禁用；给出可重试的错误卡片。
     expect(find.text('正在创建…'), findsNothing);
     expect(find.text('AI 助手暂不可用'), findsOneWidget);
+    expect(find.text('助手暂不可用，请稍后重试。'), findsOneWidget);
+    expect(find.textContaining('AGENT_UNAVAILABLE'), findsNothing);
+    expect(find.textContaining('genkit'), findsNothing);
+    expect(find.textContaining('/internal'), findsNothing);
+    expect(find.textContaining('private-id'), findsNothing);
     expect(find.text('重试'), findsOneWidget);
 
-    malformed = false;
+    unavailable = false;
     await tester.tap(find.text('重试'));
     await tester.pumpAndSettle();
     expect(find.text('开始分析'), findsOneWidget);

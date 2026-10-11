@@ -58,7 +58,7 @@ final marketSettingsPendingProvider =
 
 const _sessionChanged = LyraApiError(
   code: 'AUTH_SESSION_CHANGED',
-  message: '登录状态或服务端已变化，请重新打开行情设置。',
+  message: '登录状态已变化，请重新打开行情设置。',
   statusCode: 401,
   retryable: false,
 );
@@ -99,7 +99,7 @@ class MarketSettingsController extends AsyncNotifier<MarketSettings> {
   }) async {
     final client = ref.read(marketAuthenticatedClientProvider);
     if (client == null) throw _sessionChanged;
-    if (_saving) throw StateError('行情设置正在保存');
+    if (_saving) throw StateError('行情来源正在切换，请稍候。');
     final generation = _generation;
     // The sheet may be dismissed while the server is committing. Keep this
     // operation alive so a confirmed same-session save still refreshes quotes.
@@ -147,7 +147,7 @@ final marketPositionsProvider = FutureProvider.autoDispose
         );
       }
       final client = ref.read(sessionProvider.notifier).client;
-      if (client == null) throw StateError('登录会话缺少 API 客户端');
+      if (client == null) throw StateError('登录状态已变化，请重新打开行情。');
       await ref.read(accountScopeProvider.notifier).retryStartupRestore();
       await ref.watch(accountScopeReadyProvider.future);
       bool active() =>
@@ -155,10 +155,10 @@ final marketPositionsProvider = FutureProvider.autoDispose
           identical(client, ref.read(sessionProvider.notifier).client) &&
           settingsRevision == ref.read(marketSettingsRevisionProvider) &&
           query.scope == ref.read(accountScopeProvider).id;
-      if (!active()) throw StateError('账户范围或登录状态已变化');
+      if (!active()) throw StateError('查看范围或登录状态已变化，请重新打开行情。');
       final read = await MarketRepository(client)
           .positions(scope: query.scope, underlying: query.underlying);
-      if (!active()) throw StateError('账户范围或登录状态已变化');
+      if (!active()) throw StateError('查看范围或登录状态已变化，请重新打开行情。');
       if (read.settingsRevision < settingsRevision) {
         throw const LyraApiError(
           code: 'MARKET_SETTINGS_CHANGED',

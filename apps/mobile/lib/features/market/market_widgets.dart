@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/session.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_widgets.dart';
 import '../../core/preferences/app_preferences.dart';
@@ -100,11 +101,14 @@ class MarketPositionsPanel extends ConsumerWidget {
               LyraApiError(code: 'MARKET_LEDGER_CHANGED') =>
                 '持仓已更新，请刷新账本后查看参考估值。',
               LyraApiError(code: 'MARKET_SETTINGS_CHANGED') => '行情来源已切换，请刷新行情。',
-              _ => '行情暂不可用，历史成本与账本记录仍可查看。可稍后刷新行情。',
+              _ => lyraErrorMessage(
+                error,
+                fallback: '行情暂不可用，历史成本与账本记录仍可查看。可稍后刷新行情。',
+              ),
             }),
             data: (read) {
               if (!read.enabled) {
-                return const _Note('行情尚未配置或已关闭。可在“我的 → 行情与估值”中选择来源。');
+                return const _Note('行情暂未开启。可在“我的 → 行情与估值”中查看可用来源。');
               }
               final positions =
                   <({Map<String, Object?> row, String? currency})>[
@@ -291,7 +295,7 @@ class _PositionQuote extends ConsumerWidget {
             const SizedBox(height: 8),
             _Note(
               '${_timingLabel(quote)}${item.status == 'stale' ? ' · 已过期' : ''}'
-              '${item.cached ? ' · 缓存' : ''}\n报价 ${marketTimeLabel(reference.asOf)}',
+              '\n报价 ${marketTimeLabel(reference.asOf)}',
             ),
             if (quote != null) ...[
               const SizedBox(height: 8),
@@ -441,11 +445,11 @@ class _MarketDataSheet extends ConsumerWidget {
               padding: EdgeInsets.only(top: 16),
               child: LinearProgressIndicator(minHeight: 2),
             ),
-            error: (_, _) => Column(
+            error: (error, _) => Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const SizedBox(height: 16),
-                const _Note('暂时无法读取持仓，请稍后重试。'),
+                _Note(lyraErrorMessage(error, fallback: '暂时无法读取持仓，请稍后重试。')),
                 TextButton(
                   onPressed: () => ref.invalidate(ledgerReadProvider(query)),
                   child: const Text('重试'),

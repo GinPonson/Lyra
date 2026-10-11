@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/session.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_date.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_number.dart';
 import '../../core/design/stock_avatar.dart';
@@ -403,15 +404,15 @@ class _LedgerPanelState extends ConsumerState<LedgerPanel> {
     }
     if (session.value is! SessionAuthenticated) {
       return LyraEmpty(
-        title: widget.view == LedgerView.positions ? '你的持仓，从这里展开' : '连接账号，开始查看',
+        title: widget.view == LedgerView.positions ? '你的持仓，从这里展开' : '登录后，开始查看',
         message: widget.view == LedgerView.positions
             ? '导入 Schwab 交易记录后，股票与期权的数量、方向和历史成本将在这里清晰呈现。'
-            : '连接你的账本后，即可按账号查看${widget.view.title}。',
+            : '登录 Lyra 后，即可按证券账户查看${widget.view.title}。',
         icon: widget.view.icon,
         action: FilledButton.icon(
           onPressed: widget.onConnect,
           icon: const Icon(LyraIcons.arrowUpRight, size: 18),
-          label: const Text('前往账号'),
+          label: const Text('前往登录'),
         ),
       );
     }
@@ -672,7 +673,7 @@ class _LedgerPanelState extends ConsumerState<LedgerPanel> {
                 ),
               const SizedBox(height: 24),
               Text(
-                '${scope.label} · 账本 v${read.metadata['ledgerVersion']}\n数据截止 ${read.metadata['asOf']}',
+                '${scope.label}\n数据截至 ${lyraDateTime(read.metadata['asOf'] is String ? read.metadata['asOf'] as String : null)}',
                 style: const TextStyle(
                   fontSize: 11,
                   height: 1.6,
@@ -704,6 +705,14 @@ class _ReportSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final rows = (data['rows'] as List<Object?>).cast<Map<String, Object?>>();
+    final auditPassed =
+        rows.isNotEmpty &&
+        data['ok'] == true &&
+        rows.every((row) => row['status'] == 'pass');
+    final auditPending =
+        view == LedgerView.audit &&
+        rows.any((row) => row['status'] != 'pass' && row['status'] != 'fail');
+    final failed = data['failed'];
     final positionGroups = view == LedgerView.positions
         ? PositionGroup.fromRows(
             rows,
@@ -805,22 +814,26 @@ class _ReportSection extends StatelessWidget {
               padding: const EdgeInsets.all(18),
               margin: const EdgeInsets.only(bottom: 14),
               decoration: BoxDecoration(
-                color: data['ok'] == true
+                color: auditPassed
                     ? LyraColors.accentTint
                     : LyraColors.surfaceSubtle,
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Row(
                 children: [
-                  Icon(
-                    data['ok'] == true ? LyraIcons.confirm : LyraIcons.error,
-                  ),
+                  Icon(auditPassed ? LyraIcons.confirm : LyraIcons.error),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      data['ok'] == true
+                      rows.isEmpty
+                          ? '暂无检查结果'
+                          : auditPending || data['ok'] is! bool
+                          ? '部分检查结果待确认'
+                          : auditPassed
                           ? '账本检查通过'
-                          : '${data['failed']} 项检查需要处理',
+                          : failed is int && failed > 0
+                          ? '$failed 项检查需要处理'
+                          : '有检查需要核对',
                     ),
                   ),
                 ],
@@ -1173,23 +1186,27 @@ class _ReportRow extends ConsumerWidget {
       LedgerView.attribution => ledgerText(record['category']),
       LedgerView.drawdown => ledgerText(record['date']),
       LedgerView.risk ||
-      LedgerView.holdingPeriod => ledgerText(record['bucket']),
+      LedgerView.holdingPeriod => ledgerDayRangeText(record['bucket']),
       LedgerView.streaks => ledgerText(record['kind']),
-      LedgerView.audit => _auditTitle(record['check'] as String),
+      LedgerView.audit => ledgerAuditTitle(record['check']),
       _ => ledgerSecurityText(record, amountsHidden: hidden),
     };
     final subtitle = switch (view) {
       LedgerView.positions || LedgerView.expiring =>
-        '${ledgerText(record['assetType'])} · ${ledgerText(record['direction'])} · ${LyraNumber.quantity(ledgerText(record['quantity']))} ${record['assetType'] == 'option' ? '张' : '股'}${record['expiry'] != null ? '\n${record['expiry']}' : ''}${record['strike'] != null ? ' · ${hidden ? '••••' : LyraNumber.quantity(ledgerText(record['strike']))}' : ''}${record['optionType'] != null ? ' ${ledgerText(record['optionType'])}' : ''}',
+        '${ledgerText(record['assetType'])} · ${ledgerText(record['direction'])} · ${LyraNumber.quantity(ledgerText(record['quantity']))} ${record['assetType'] == 'option' ? '张' : '股'}${record['expiry'] != null ? '\n${ledgerText(record['expiry'])}' : ''}${record['strike'] != null ? ' · ${hidden ? '••••' : LyraNumber.quantity(ledgerText(record['strike']))}' : ''}${record['optionType'] != null ? ' ${ledgerText(record['optionType'])}' : ''}',
       LedgerView.trades || LedgerView.cashflow =>
         '${ledgerText(record['action'])} · ${ledgerText(record['transactionDate'])}',
       LedgerView.realized =>
         '${ledgerText(record['openDate'])} → ${ledgerText(record['closeDate'])}',
       LedgerView.extremes =>
-        '${row['side'] == 'best' ? '最佳' : '最差'} #${row['rank']} · ${ledgerText(record['closeDate'])}',
+        '${row['side'] == 'best'
+            ? '最佳'
+            : row['side'] == 'worst'
+            ? '最差'
+            : '交易排行'} #${ledgerText(row['rank'])} · ${ledgerText(record['closeDate'])}',
       LedgerView.streaks =>
-        '${record['count']} 笔 · ${record['startDate']} — ${record['endDate']}',
-      LedgerView.audit => ledgerText(record['status']),
+        '${ledgerText(record['count'])} 笔 · ${ledgerText(record['startDate'])} — ${ledgerText(record['endDate'])}',
+      LedgerView.audit => ledgerAuditStatusText(record['status']),
       _ => ledgerLabels[view.valueField]!,
     };
     final value = ledgerText(record[view.valueField]);
@@ -1381,18 +1398,6 @@ class _ReportRow extends ConsumerWidget {
       ),
     );
   }
-
-  /// 服务端新增检查仍显示其稳定名称，不能把未知检查误报为通过。
-  String _auditTitle(String check) => switch (check) {
-    'transactions_present' => '原始交易记录',
-    'invalid_trade_fields' => '交易字段完整性',
-    'unreflected_fifo_transactions' => 'FIFO 交易覆盖',
-    'orphan_open_lots' => '持仓引用完整性',
-    'orphan_realized_rows' => '损益引用完整性',
-    'invalid_lot_quantities' => '持仓批次数量',
-    'fifo_derivatives_present' => 'FIFO 重建产物',
-    _ => check.replaceAll('_', ' '),
-  };
 }
 
 /// 真实已实现数据的坐标投影，屏幕阅读器可通过下方逐行金额获得完整信息。

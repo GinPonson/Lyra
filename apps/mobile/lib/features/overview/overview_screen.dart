@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/session.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_date.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
 import '../../core/design/lyra_widgets.dart';
@@ -258,7 +259,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
         const SizedBox(height: 24),
         if (summary.value != null)
           Text(
-            '账本 v${summary.value!.metadata.ledgerVersion} · 截止 ${summary.value!.metadata.asOf}',
+            '数据截至 ${lyraDateTime(summary.value!.metadata.asOf)}',
             style: const TextStyle(
               fontSize: 11,
               height: 1.8,

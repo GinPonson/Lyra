@@ -5,6 +5,7 @@ import '../../app/session.dart';
 import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
 import 'account_repository.dart';
@@ -213,7 +214,7 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
                 textInputAction: TextInputAction.next,
                 maxLength: 32,
                 decoration: const InputDecoration(
-                  labelText: 'Schwab 文件账户标识',
+                  labelText: '文件中的账户编号',
                   hintText: '例如：XXX276',
                   helperText: '使用文件名 Individual_XXX276_… 中的 XXX276，无需完整账号。',
                   helperMaxLines: 3,
@@ -228,7 +229,7 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
                 const Padding(
                   padding: EdgeInsets.only(top: 8),
                   child: Text(
-                    '已从所选文件名填写标识，请核对后创建。',
+                    '已从文件名填入账户编号，请核对后创建。',
                     style: TextStyle(
                       fontSize: 13,
                       height: 1.5,
@@ -265,9 +266,7 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
               if (error != null) ...[
                 const SizedBox(height: 16),
                 Text(
-                  error.code == 'ACCOUNT_ALREADY_EXISTS'
-                      ? '该证券账户已存在，请返回并选择已有账户。'
-                      : '${error.message}（${error.code}）',
+                  lyraErrorMessage(error, fallback: '暂时无法创建证券账户，请重试。'),
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
                 if (error.code == 'ACCOUNT_ALREADY_EXISTS') ...[

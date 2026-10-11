@@ -8,11 +8,13 @@ import '../../app/session.dart';
 import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
 import '../accounts/account_sheet.dart';
 import '../accounts/account_workspace.dart';
 import '../ledger/ledger_workspace.dart';
+import '../ledger/ledger_view.dart';
 import 'import_repository.dart';
 
 typedef ImportFilePicker = Future<XFile?> Function(
@@ -166,7 +168,7 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
       if (!_active(generation)) return;
       setState(() {
         _stage = _ImportStage.idle;
-        _errorMessage = '${error.message}（${error.code}）';
+        _errorMessage = lyraErrorMessage(error, fallback: '暂时无法预览文件，请重试。');
       });
     }
   }
@@ -253,8 +255,14 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
       if (!_active(generation)) return;
       final error = LyraApiError.from(failure);
       setState(() {
-        _stage = _ImportStage.previewReady;
-        _errorMessage = '${error.message}（${error.code}）';
+        final needsPreview = const {
+          'IMPORT_PREVIEW_STALE',
+          'IMPORT_STATE_CONFLICT',
+          'LEDGER_VERSION_CONFLICT',
+        }.contains(error.code);
+        if (needsPreview) _preview = null;
+        _stage = needsPreview ? _ImportStage.idle : _ImportStage.previewReady;
+        _errorMessage = lyraErrorMessage(error, fallback: '暂时无法确认导入，请重试。');
       });
     }
   }
@@ -309,7 +317,7 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
           ),
           const SizedBox(height: 8),
           Text(
-            '支持官方导出的 .csv 与 .xlsx；全部行校验通过后才会原子写入账本。',
+            '支持 Schwab 导出的 CSV 和 Excel 文件。先预览，确认后再导入账本。',
             style: Theme.of(context).textTheme.bodyMedium
                 ?.copyWith(color: LyraColors.muted),
           ),
@@ -319,7 +327,7 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
             icon: const LyraPrimaryIcon(LyraPrimaryGlyph.importFile, size: 20),
             label: Text(switch (_stage) {
               _ImportStage.picking => '打开文件中…',
-              _ImportStage.uploading => '上传解析中…',
+              _ImportStage.uploading => '正在准备预览…',
               _ => '选择文件并预览',
             }),
           ),
@@ -394,8 +402,11 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
             const SizedBox(height: 14),
             Text(
               result.changed
-                  ? '已写入账本：新增 ${result.insertedRows} 行，账本版本 ${result.ledgerVersion}'
-                  : '无新增交易；账本版本保持 ${result.ledgerVersion}',
+                  ? '导入完成：新增 ${result.insertedRows} 条交易'
+                        '${result.skippedRows > 0 ? '，已跳过 ${result.skippedRows} 条重复记录' : ''}。'
+                  : result.skippedRows > 0
+                  ? '这些交易已在账本中，无需重复导入。'
+                  : '文件中没有可导入的交易。',
               style: Theme.of(context).textTheme.bodyLarge
                   ?.copyWith(fontWeight: FontWeight.w500),
             ),
@@ -453,7 +464,7 @@ class _PreviewStats extends StatelessWidget {
           const SizedBox(height: 6),
           Text(
             preview.byAction.entries
-                .map((entry) => '${entry.key} × ${entry.value}')
+                .map((entry) => '${ledgerText(entry.key)} × ${entry.value}')
                 .join(' · '),
             style: Theme.of(context).textTheme.bodySmall
                 ?.copyWith(color: LyraColors.inkSecondary, height: 1.6),

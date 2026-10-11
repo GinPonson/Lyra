@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/session.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
 import 'market_settings.dart';
 import 'market_workspace.dart';
@@ -50,7 +51,10 @@ class MarketSettingsPanel extends ConsumerWidget {
                     _Hint(
                       error is LyraApiError && error.statusCode == 404
                           ? '暂时无法切换行情来源，请稍后重试。'
-                          : '暂时无法读取行情来源，请稍后重试。',
+                          : lyraErrorMessage(
+                              error,
+                              fallback: '暂时无法读取行情来源，请稍后重试。',
+                            ),
                     ),
                     TextButton(
                       key: const ValueKey('market-settings-retry'),
@@ -182,11 +186,11 @@ class _MarketSettingsEditorState extends ConsumerState<_MarketSettingsEditor> {
           const SizedBox(height: 12),
         ],
         if (settings.routes != settings.effectiveRoutes) ...[
-          const _Hint('部分已保存来源当前不可用，请选择其他来源或关闭。'),
+          const _Hint('部分已选来源当前不可用，请选择其他来源或关闭。'),
           const SizedBox(height: 10),
         ],
         if (settings.providers.any((source) => !source.configured)) ...[
-          const _Hint('未配置的来源暂不可选，请先在服务端配置凭据。'),
+          const _Hint('暂不可用的来源无法选择，请稍后再试。'),
           const SizedBox(height: 10),
         ],
         if (busy) ...[
@@ -197,9 +201,11 @@ class _MarketSettingsEditorState extends ConsumerState<_MarketSettingsEditor> {
             liveRegion: true,
             child: _Hint(switch (error.code) {
               'MARKET_SETTINGS_CHANGED' => '其他设备已修改行情来源。请重新加载后再选择。',
-              'MARKET_PROVIDER_NOT_CONFIGURED' => '所选来源尚未配置，已恢复原选择。请重新加载后再选择。',
+              'MARKET_PROVIDER_NOT_CONFIGURED' => '所选来源暂不可用，已恢复原选择。请重新加载后再选择。',
               'INVALID_ARGUMENT' => '来源状态已变化。请重新加载后再选择。',
-              _ => '未能确认切换，界面已恢复原选择。请重试。',
+              _ =>
+                '未能确认切换，界面已恢复原选择。'
+                    '${lyraErrorMessage(error, fallback: '请重试。')}',
             }),
           ),
           if (_needsReload)
@@ -348,7 +354,7 @@ class _SourceSelector extends StatelessWidget {
       if (id.isEmpty) return backup ? '不使用备用' : '关闭';
       final source = settings.source(id);
       if (source == null || !source.supports(assetType)) return '原来源已不可用';
-      return '${source.displayName}${source.configured ? '' : ' · 未配置'}';
+      return '${source.displayName}${source.configured ? '' : ' · 暂不可用'}';
     }
 
     return DropdownButtonFormField<String>(

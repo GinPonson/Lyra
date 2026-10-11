@@ -270,7 +270,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('未配置来源可见但禁用，资产不支持的来源不进入候选', (tester) async {
+  testWidgets('暂不可用来源可见但禁用，资产不支持的来源不进入候选', (tester) async {
     final settings = MarketSettingsFixture.settingsPayload(
       option: [],
       secondConfigured: false,
@@ -285,6 +285,10 @@ void main() {
     });
     final fixture = MarketSettingsFixture(initialSettings: settings);
     await _pump(tester, fixture);
+    expect(find.text('暂不可用的来源无法选择，请稍后再试。'), findsOneWidget);
+    for (final technical in ['服务端', '凭据', '未配置']) {
+      expect(find.textContaining(technical), findsNothing);
+    }
     expect(
       _button(
         tester,
@@ -303,7 +307,7 @@ void main() {
     await tester.ensureVisible(selector);
     await tester.tap(selector);
     await tester.pumpAndSettle();
-    expect(find.text('Second Data · 未配置'), findsWidgets);
+    expect(find.text('Second Data · 暂不可用'), findsWidgets);
     final item = find.byWidgetPredicate(
       (widget) =>
           widget is DropdownMenuItem<String> && widget.value == 'second-feed',
@@ -392,6 +396,8 @@ void main() {
     await _open(tester);
     expect(find.textContaining('暂时无法读取行情来源'), findsOneWidget);
     expect(find.textContaining('暂时无法读取持仓'), findsOneWidget);
+    expect(find.textContaining('Synthetic fixture error'), findsNothing);
+    expect(find.textContaining('QUERY_FAILED'), findsNothing);
     fixture.failRead = false;
     await tester.tap(find.byKey(const ValueKey('market-settings-retry')));
     await tester.pumpAndSettle();
@@ -406,6 +412,8 @@ void main() {
     final container = await _pump(tester, fixture);
     await _select(tester, 'stock', 'second-feed');
     expect(find.textContaining('未能确认切换'), findsOneWidget);
+    expect(find.textContaining('Synthetic fixture error'), findsNothing);
+    expect(find.textContaining('QUERY_FAILED'), findsNothing);
     expect(find.textContaining('已生效'), findsNothing);
     expect(_field(tester, 'stock').initialValue, 'first-feed');
     expect(container.read(marketSettingsRevisionProvider), 0);
@@ -429,7 +437,7 @@ void main() {
     expect(find.textContaining('已生效'), findsOneWidget);
   });
 
-  testWidgets('旧服务端没有设置接口时明确提示更新版本', (tester) async {
+  testWidgets('无法切换来源时显示可操作提示，不展示接口细节', (tester) async {
     final fixture = MarketSettingsFixture()
       ..failRead = true
       ..readFailureStatus = 404;
@@ -481,12 +489,14 @@ void main() {
     expect(find.textContaining('已生效'), findsOneWidget);
   });
 
-  testWidgets('缺少凭据时恢复已确认来源，重载后采用最新配置状态', (tester) async {
+  testWidgets('来源暂不可用时恢复已确认选择，重载后采用最新可用状态', (tester) async {
     final fixture = MarketSettingsFixture()
       ..saveFailure = (code: 'MARKET_PROVIDER_NOT_CONFIGURED', status: 400);
     await _pump(tester, fixture);
     await _select(tester, 'stock', 'second-feed');
-    expect(find.textContaining('所选来源尚未配置'), findsOneWidget);
+    expect(find.textContaining('所选来源暂不可用'), findsOneWidget);
+    expect(find.textContaining('Synthetic fixture error'), findsNothing);
+    expect(find.textContaining('MARKET_PROVIDER_NOT_CONFIGURED'), findsNothing);
     expect(_field(tester, 'stock').initialValue, 'first-feed');
     expect(
       find.byKey(const ValueKey('market-settings-retry-change')),

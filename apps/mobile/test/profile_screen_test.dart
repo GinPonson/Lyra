@@ -38,6 +38,7 @@ class _ProfileFixture extends LedgerFixture {
   final openedUrls = <Uri>[];
   bool offline = false;
   bool logoutOffline = false;
+  bool accountsUnavailable = false;
   final addedAccounts = <Map<String, Object?>>[];
 
   Dio dio(String url) =>
@@ -45,6 +46,13 @@ class _ProfileFixture extends LedgerFixture {
         ..httpClientAdapter = FakeLyraAdapter((options) async {
           requests.add(options);
           final path = options.uri.path;
+          if (accountsUnavailable && path == '/v1/ledger/accounts') {
+            return _json({
+              'code': 'ACCOUNT_READ_FAILED',
+              'message': 'DuckDB /internal/account.ts request_id=private-trace',
+              'retryable': true,
+            }, 503);
+          }
           if (path == '/v1/auth/logout') {
             if (logoutOffline) {
               throw DioException(
@@ -377,6 +385,26 @@ void main() {
       'accountIdentifier': 'XXX678',
       'baseCurrency': 'USD',
     });
+  });
+
+  testWidgets('证券账户读取失败隐藏后台正文，重新加载恢复列表', (tester) async {
+    final fixture = _ProfileFixture()..accountsUnavailable = true;
+    await _pumpProfile(tester, fixture);
+    await _tap(tester, find.byKey(const ValueKey('profile-accounts')));
+    expect(find.text('暂时无法读取证券账户，请重新加载。'), findsOneWidget);
+    for (final text in [
+      'ACCOUNT_READ_FAILED',
+      'DuckDB',
+      '/internal',
+      'request_id',
+    ]) {
+      expect(find.textContaining(text), findsNothing);
+    }
+    fixture.accountsUnavailable = false;
+    await _tap(tester, find.text('重新加载账户'));
+    expect(find.text('长期投资'), findsOneWidget);
+    expect(find.text('暂时无法读取证券账户，请重新加载。'), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('启动账户指定只保存当前身份，取消选择不改变设置', (tester) async {

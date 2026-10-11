@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:dio/dio.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +13,7 @@ import 'package:lyra_mobile/app/lyra_app.dart';
 import 'package:lyra_mobile/app/session.dart';
 import 'package:lyra_mobile/core/preferences/app_preferences.dart';
 import 'package:lyra_mobile/core/security/credential_store.dart';
+import 'package:lyra_mobile/features/import/import_sheet.dart';
 import 'package:lyra_mobile/features/system/system_workspace.dart';
 
 import 'session_flow_test.dart' show FakeLyraAdapter;
@@ -28,10 +30,67 @@ const _cjkFont = String.fromEnvironment('LYRA_CJK_FONT');
 const _flutterRoot = String.fromEnvironment('LYRA_FLUTTER_ROOT');
 const _standardFlutterRoot = String.fromEnvironment('FLUTTER_ROOT');
 const _serverUrl = 'https://demo.lyra.example';
+const _capturePrefix = String.fromEnvironment(
+  'LYRA_CAPTURE_PREFIX',
+  defaultValue: 'lyra-graphite',
+);
 
 /// The approved visual uses this cash balance; other synthetic records remain
 /// exactly those of the shared fixture. No production data is read or changed.
 class _DesignLedgerFixture extends LedgerFixture {
+  @override
+  Future<SessionDependencies> dependencies({bool paired = true}) async {
+    final base = await super.dependencies(paired: paired);
+    return SessionDependencies(
+      credentialStore: base.credentialStore,
+      clientFactory: (url) {
+        final client = base.clientFactory!(url);
+        // Synthetic import responses extend the same actual page flow; all
+        // other requests still use LedgerFixture's in-memory HTTP adapter.
+        client.interceptors.add(
+          InterceptorsWrapper(
+            onRequest: (request, handler) {
+              final Object? body = switch (request.uri.path) {
+                '/v1/imports/preview' => {
+                  'importId': 'visual-import',
+                  'confirmToken': 'synthetic-visual-confirmation',
+                  'preview': {
+                    'fileName': 'Schwab-transactions.csv',
+                    'accountId': LedgerFixture.account,
+                    'baseLedgerVersion': 12,
+                    'totalRows': 3,
+                    'insertableRows': 2,
+                    'existingRows': 1,
+                    'byAction': {'Buy': 2, 'Qualified Dividend': 1},
+                  },
+                },
+                '/v1/imports/visual-import/commit' => {
+                  'changed': true,
+                  'ledgerVersion': 13,
+                  'insertedRows': 2,
+                  'skippedRows': 1,
+                },
+                _ => null,
+              };
+              if (body == null) {
+                handler.next(request);
+              } else {
+                handler.resolve(
+                  Response<Object?>(
+                    requestOptions: request,
+                    statusCode: 200,
+                    data: body,
+                  ),
+                );
+              }
+            },
+          ),
+        );
+        return client;
+      },
+    );
+  }
+
   @override
   Map<String, Object?> payload(String command, Map<String, dynamic> query) {
     final original = super.payload(command, query);
@@ -131,7 +190,7 @@ Future<void> _saveCapture(
       final data = await picture.toByteData(format: ui.ImageByteFormat.png);
       if (data == null) throw StateError('PNG encoding failed for $name');
       final output = File.fromUri(
-        Directory(_reviewDirectory).uri.resolve('lyra-graphite-$name.png'),
+        Directory(_reviewDirectory).uri.resolve('$_capturePrefix-$name.png'),
       );
       await output.writeAsBytes(
         data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
@@ -218,6 +277,13 @@ void main() {
         ProviderScope(
           overrides: [
             sessionDependenciesProvider.overrideWithValue(dependencies),
+            importFilePickerProvider.overrideWithValue(
+              (_) async => XFile.fromData(
+                Uint8List.fromList(utf8.encode('Date,Action\n')),
+                name: 'Schwab-transactions.csv',
+                mimeType: 'text/csv',
+              ),
+            ),
             appPreferencesStoreProvider.overrideWithValue(
               MemoryAppPreferencesStore(
                 initialValue: const AppPreferences(
@@ -272,6 +338,16 @@ void main() {
         await tester.tap(find.byKey(const ValueKey('toggle-amounts')));
         await tester.tap(find.byTooltip('导入文件'));
         await _saveCapture(tester, boundaryKey, 'import-390');
+        await tester.tap(find.text('选择文件并预览'));
+        await _saveCapture(tester, boundaryKey, 'import-preview-390');
+        await tester.tap(find.textContaining('确认写入账本'));
+        await _saveCapture(tester, boundaryKey, 'import-complete-390');
+        Navigator.of(tester.element(find.byType(ImportSheet))).pop();
+        await tester.pumpAndSettle();
+        await _selectDestination(tester, '交易');
+        fixture.failures.add('trades');
+        await tester.tap(find.byTooltip('刷新数据'));
+        await _saveCapture(tester, boundaryKey, 'load-error-390');
       }
 
       await tester.pumpWidget(const SizedBox.shrink());

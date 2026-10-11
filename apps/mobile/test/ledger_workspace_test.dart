@@ -75,7 +75,10 @@ class _MalformedPositionFixture extends LedgerFixture {
     if (malformed && command == 'positions') {
       final rows = (data['rows'] as List).cast<Map<String, Object?>>();
       data['rows'] = <Map<String, Object?>>[
-        <String, Object?>{...rows.first, 'cost': <String, Object?>{'x': 1}},
+        <String, Object?>{
+          ...rows.first,
+          'cost': <String, Object?>{'x': 1},
+        },
         ...rows.skip(1),
       ];
     }
@@ -161,6 +164,9 @@ void main() {
       );
       expect(find.text('查看持仓'), findsNothing);
       expect(find.text('交易记录'), findsNothing);
+      expect(find.text('数据截至 2026年9月8日 08:00:00 UTC'), findsOneWidget);
+      expect(find.textContaining('账本 v'), findsNothing);
+      expect(find.textContaining(LedgerFixture.timestamp), findsNothing);
       expect(find.byTooltip('导入文件'), findsOneWidget);
       final preview = find.byKey(const ValueKey('overview-holdings-preview'));
       expect(
@@ -252,12 +258,13 @@ void main() {
     expect(fixture.requests.last.uri.path, LedgerView.drawdown.path);
     expect(fixture.requests.last.queryParameters['scope'], 'all');
     expect(find.text('+2,846.72'), findsOneWidget);
-    expect(find.textContaining('QUERY_FAILED'), findsOneWidget);
+    expect(find.text('暂时无法读取数据，请重新加载。'), findsOneWidget);
+    expect(find.textContaining('QUERY_FAILED'), findsNothing);
     fixture.failures.clear();
     await tester.ensureVisible(find.text('重新加载'));
     await tester.tap(find.text('重新加载'));
     await tester.pumpAndSettle();
-    expect(find.textContaining('QUERY_FAILED'), findsNothing);
+    expect(find.text('暂时无法读取数据，请重新加载。'), findsNothing);
     expect(find.textContaining('/ 累计损益'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
@@ -342,7 +349,8 @@ void main() {
     await tester.tap(find.byTooltip('刷新数据'));
     await tester.pumpAndSettle();
     expect(find.text('数据未能加载'), findsOneWidget);
-    expect(find.textContaining('QUERY_FAILED'), findsOneWidget);
+    expect(find.text('暂时无法读取数据，请重新加载。'), findsOneWidget);
+    expect(find.textContaining('QUERY_FAILED'), findsNothing);
     expect(find.text('暂无持仓记录'), findsNothing);
     fixture.failures.clear();
     await tester.ensureVisible(find.text('重新加载'));
@@ -412,6 +420,12 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('数据未能加载'), findsNothing);
       expect(fixture.requests.any((r) => r.uri.path == view.path), isTrue);
+      expect(
+        find.textContaining('数据截至 2026年9月8日 08:00:00 UTC'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('账本 v'), findsNothing);
+      expect(find.textContaining(LedgerFixture.timestamp), findsNothing);
       if (view == LedgerView.monthly || view == LedgerView.allocation) {
         await _capture(tester, '${view.command}-390-fixture');
       }
@@ -537,7 +551,9 @@ void main() {
 
   test('金额与标识字段在数据边界校验，畸形取值不进入 build', () {
     for (final row in <Map<String, Object?>>[
-      {'cost': <String, Object?>{'nested': true}},
+      {
+        'cost': <String, Object?>{'nested': true},
+      },
       {'cost': 'abc'},
       {'price': 12.5},
       {'amount': '1e3'},
@@ -607,7 +623,8 @@ void main() {
 
     // 解析错误在异步边界被捕获，页面进入设计的错误态并给出重试入口。
     expect(find.text('数据未能加载'), findsOneWidget);
-    expect(find.textContaining('账本字段 cost'), findsOneWidget);
+    expect(find.text('暂时无法读取数据，请重新加载。'), findsOneWidget);
+    expect(find.textContaining('账本字段 cost'), findsNothing);
     expect(find.text('重新加载'), findsOneWidget);
     expect(tester.takeException(), isNull);
 

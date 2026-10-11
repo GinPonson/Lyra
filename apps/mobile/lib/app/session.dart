@@ -102,7 +102,7 @@ class SessionController extends AsyncNotifier<SessionState> {
     } on Object {
       return _restored(
         generation,
-        const SessionSignedOut(message: '本机登录凭据无法读取，请重新登录以恢复。'),
+        const SessionSignedOut(message: '暂时无法恢复登录，请重新登录。'),
       );
     }
     if (!_authActive(generation)) return _publishedState;
