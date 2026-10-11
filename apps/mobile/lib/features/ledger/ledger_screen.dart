@@ -54,8 +54,9 @@ class _LedgerScreenState extends ConsumerState<LedgerScreen> {
                       views[index].title,
                       style: TextStyle(
                         color: _tab == index
-                            ? LyraColors.surface
+                            ? LyraColors.accent
                             : LyraColors.inkSecondary,
+                        fontWeight: FontWeight.w500,
                       ),
                     ),
                     selected: _tab == index,
@@ -75,7 +76,7 @@ class _LedgerScreenState extends ConsumerState<LedgerScreen> {
           const SizedBox(height: 34),
           const Text(
             '持仓分析',
-            style: TextStyle(fontSize: 19, fontWeight: FontWeight.w600),
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
           ),
           const SizedBox(height: 12),
           for (final view in [LedgerView.risk, LedgerView.stress])
@@ -123,7 +124,11 @@ class ReportLink extends StatelessWidget {
       ),
       subtitle: Text(
         view.basis,
-        style: const TextStyle(fontSize: 11, height: 1.6),
+        style: const TextStyle(
+          fontSize: 12,
+          height: 1.5,
+          color: LyraColors.inkSecondary,
+        ),
       ),
       trailing: const Icon(LyraIcons.disclosure, size: 19),
       onTap: () => Navigator.push(
@@ -158,7 +163,7 @@ class _LedgerTrendPreviewState extends ConsumerState<LedgerTrendPreview> {
             const Expanded(
               child: Text(
                 '收益走势',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
               ),
             ),
             for (final (view, label) in [
@@ -222,7 +227,7 @@ class _LedgerTrendPreviewState extends ConsumerState<LedgerTrendPreview> {
                           Text(
                             '${section.currency ?? '按账户币种'} · 已实现损益',
                             style: const TextStyle(
-                              fontSize: 11,
+                              fontSize: 12,
                               color: LyraColors.muted,
                             ),
                           ),
@@ -256,7 +261,7 @@ class _LedgerTrendPreviewState extends ConsumerState<LedgerTrendPreview> {
   }
 }
 
-/// 账号页的持仓摘要复用股票页查询和展开明细，按币种展示前三个标的。
+/// 总览的持仓摘要复用股票页查询和展开明细，按币种展示前三个标的。
 /// [onOpen] 进入完整持仓；不重算市值、不合并不同币种。
 class LedgerHoldingsPreview extends ConsumerWidget {
   const LedgerHoldingsPreview({super.key, this.onOpen});
@@ -280,10 +285,25 @@ class LedgerHoldingsPreview extends ConsumerWidget {
             const Expanded(
               child: Text(
                 '我的持仓',
-                style: TextStyle(fontSize: 19, fontWeight: FontWeight.w600),
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
               ),
             ),
-            TextButton(onPressed: onOpen, child: const Text('查看全部')),
+            TextButton(
+              style: TextButton.styleFrom(
+                foregroundColor: LyraColors.accent,
+                padding: const EdgeInsets.only(left: 12),
+                minimumSize: const Size(0, 44),
+              ),
+              onPressed: onOpen,
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('查看全部', style: TextStyle(fontSize: 13)),
+                  SizedBox(width: 4),
+                  Icon(LyraIcons.disclosure, size: 19),
+                ],
+              ),
+            ),
           ],
         ),
         read.when(
@@ -530,8 +550,8 @@ class _LedgerPanelState extends ConsumerState<LedgerPanel> {
               child: Text(
                 widget.view.basis,
                 style: const TextStyle(
-                  fontSize: 11,
-                  height: 1.6,
+                  fontSize: 12,
+                  height: 1.5,
                   color: LyraColors.muted,
                 ),
               ),
@@ -647,8 +667,8 @@ class _LedgerPanelState extends ConsumerState<LedgerPanel> {
               Text(
                 '${scope.label} · 账本 v${read.metadata['ledgerVersion']}\n数据截止 ${read.metadata['asOf']}',
                 style: const TextStyle(
-                  fontSize: 10,
-                  height: 1.8,
+                  fontSize: 11,
+                  height: 1.6,
                   color: LyraColors.muted,
                 ),
               ),
@@ -702,33 +722,45 @@ class _ReportSection extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Row(
-            children: [
-              Expanded(
-                child: Text(
+          if (previewLimit != null)
+            Text(
+              countLabel,
+              style: const TextStyle(
+                fontSize: 12,
+                height: 1.5,
+                color: LyraColors.inkSecondary,
+              ),
+            )
+          else
+            Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 12,
+              runSpacing: 6,
+              children: [
+                Text(
                   currency == null ? '记录明细' : '$currency / ${view.title}',
                   style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: .6,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                    color: LyraColors.ink,
                   ),
                 ),
-              ),
-              Text(
-                countLabel,
-                style: const TextStyle(fontSize: 11, color: LyraColors.muted),
-              ),
-            ],
-          ),
+                Text(
+                  countLabel,
+                  style: const TextStyle(fontSize: 12, color: LyraColors.muted),
+                ),
+              ],
+            ),
           if (view == LedgerView.positions) ...[
-            const SizedBox(height: 10),
-            const _PositionColumns(),
+            const SizedBox(height: 18),
+            _PositionColumns(currency: currency),
             if (rows.any((row) => row['assetType'] == 'option'))
               const Padding(
                 padding: EdgeInsets.only(top: 6, bottom: 4),
                 child: Text(
                   '期权历史成本未乘合约乘数',
-                  style: TextStyle(fontSize: 10, color: LyraColors.muted),
+                  style: TextStyle(fontSize: 12, color: LyraColors.muted),
                 ),
               ),
           ] else
@@ -744,7 +776,7 @@ class _ReportSection extends StatelessWidget {
                   Text(
                     ledgerLabels[field]!,
                     style: const TextStyle(
-                      fontSize: 11,
+                      fontSize: 12,
                       color: LyraColors.muted,
                     ),
                   ),
@@ -754,7 +786,7 @@ class _ReportSection extends StatelessWidget {
                     alignment: Alignment.centerLeft,
                     child: LyraAmount(
                       ledgerText(data[field]),
-                      size: 34,
+                      size: 30,
                       colorBySign: ledgerSignedAmountFields.contains(field),
                     ),
                   ),
@@ -863,14 +895,18 @@ class _PositionGroupRow extends ConsumerWidget {
           key: PageStorageKey(
             'position-group-${group.symbol}-${group.currency}-${group.rows}',
           ),
-          tilePadding: const EdgeInsets.symmetric(vertical: 3),
-          minTileHeight: 68,
-          visualDensity: VisualDensity.compact,
-          childrenPadding: const EdgeInsets.only(left: 12, bottom: 8),
+          tilePadding: EdgeInsets.zero,
+          minTileHeight: 74,
+          visualDensity: VisualDensity.standard,
+          iconColor: LyraColors.accent,
+          collapsedIconColor: LyraColors.inkSecondary,
+          textColor: LyraColors.ink,
+          collapsedTextColor: LyraColors.ink,
+          childrenPadding: const EdgeInsets.fromLTRB(12, 4, 0, 12),
           title: Row(
             children: [
-              StockAvatar(symbol: symbol),
-              const SizedBox(width: 10),
+              StockAvatar(symbol: symbol, size: 44),
+              const SizedBox(width: 14),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -879,15 +915,16 @@ class _PositionGroupRow extends ConsumerWidget {
                       symbol,
                       style: const TextStyle(
                         fontSize: 16,
-                        fontWeight: FontWeight.w600,
+                        fontWeight: FontWeight.w500,
                       ),
                     ),
                     const SizedBox(height: 3),
                     Text(
                       types,
                       style: const TextStyle(
-                        fontSize: 10,
-                        color: LyraColors.muted,
+                        fontSize: 12,
+                        height: 1.5,
+                        color: LyraColors.inkSecondary,
                       ),
                     ),
                   ],
@@ -911,7 +948,8 @@ class _PositionGroupRow extends ConsumerWidget {
                       '展开看成本${currencyInHeader || group.currency == null ? '' : ' · ${group.currency}'}',
                       textAlign: TextAlign.end,
                       style: const TextStyle(
-                        fontSize: 10,
+                        fontSize: 12,
+                        height: 1.5,
                         color: LyraColors.muted,
                       ),
                     ),
@@ -937,27 +975,35 @@ class _PositionGroupRow extends ConsumerWidget {
   }
 }
 
-/// 两列表头与持仓行采用相同宽度比例，金额按右边缘对齐。
+/// 明确历史成本口径和币种；币种不统一时，每条记录继续单独标注。
 class _PositionColumns extends StatelessWidget {
-  const _PositionColumns();
+  const _PositionColumns({this.currency});
+  final String? currency;
+
   @override
-  Widget build(BuildContext context) => const Padding(
-    padding: EdgeInsets.only(right: 32, bottom: 6),
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.only(bottom: 10),
+    decoration: const BoxDecoration(
+      border: Border(bottom: BorderSide(color: LyraColors.hairline)),
+    ),
     child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Expanded(
-          flex: 6,
+        const Expanded(
           child: Text(
             '证券 / 合约',
-            style: TextStyle(fontSize: 10, color: LyraColors.muted),
+            style: TextStyle(fontSize: 12, color: LyraColors.inkSecondary),
           ),
         ),
+        const SizedBox(width: 12),
         Expanded(
-          flex: 4,
           child: Text(
-            '数量 / 历史成本',
+            currency == null ? '历史成本' : '历史成本 · $currency',
             textAlign: TextAlign.end,
-            style: TextStyle(fontSize: 10, color: LyraColors.muted),
+            style: const TextStyle(
+              fontSize: 12,
+              color: LyraColors.inkSecondary,
+            ),
           ),
         ),
       ],
@@ -965,7 +1011,7 @@ class _PositionColumns extends StatelessWidget {
   );
 }
 
-/// 紧凑持仓内容只整理显示：证券信息在左，数量与成本在右。
+/// 证券与历史成本同一主行；方向、合约信息与数量在次行。
 /// [currency] 仅在表头无法统一标注币种时显示，避免跨币种混淆。
 class _PositionCells extends ConsumerWidget {
   const _PositionCells({
@@ -988,77 +1034,105 @@ class _PositionCells extends ConsumerWidget {
     final contract = option
         ? '${ledgerText(record['expiry'])}\n$strike ${ledgerText(record['optionType'])}'
         : '股票 · ${ledgerText(record['direction'])}';
-    return Row(
+    final name = Text(
+      nested
+          ? (option ? '$strike ${ledgerText(record['optionType'])}' : '股票')
+          : ticker,
+      style: const TextStyle(
+        fontSize: 16,
+        height: 1.3,
+        fontWeight: FontWeight.w500,
+        color: LyraColors.ink,
+      ),
+    );
+    final description = Text(
+      nested && option ? ledgerText(record['expiry']) : contract,
+      style: const TextStyle(
+        fontSize: 12,
+        height: 1.5,
+        color: LyraColors.inkSecondary,
+      ),
+    );
+    final amount = FittedBox(
+      fit: BoxFit.scaleDown,
+      alignment: Alignment.centerRight,
+      child: LyraAmount(ledgerText(record['cost']), size: 17),
+    );
+    final quantity = Column(
+      crossAxisAlignment: CrossAxisAlignment.end,
       children: [
-        Expanded(
-          flex: 6,
-          child: Row(
-            children: [
-              // 分组标题已展示标的图标，子行将空间留给合约和到期日。
-              if (!nested) ...[
-                StockAvatar(symbol: record['underlying'] as String?),
-                const SizedBox(width: 10),
-              ],
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      nested
-                          ? (option
-                                ? '$strike ${ledgerText(record['optionType'])}'
-                                : '股票')
-                          : ticker,
-                      style: const TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      nested && option
-                          ? ledgerText(record['expiry'])
-                          : contract,
-                      style: const TextStyle(
-                        fontSize: 10,
-                        height: 1.35,
-                        color: LyraColors.muted,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
+        Text(
+          '${LyraNumber.quantity(ledgerText(record['quantity']))} ${option ? '张 · ${ledgerText(record['direction'])}' : '股'}',
+          textAlign: TextAlign.end,
+          style: const TextStyle(
+            fontSize: 12,
+            height: 1.5,
+            color: LyraColors.inkSecondary,
           ),
         ),
-        const SizedBox(width: 8),
-        Expanded(
-          flex: 4,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Text(
-                '${LyraNumber.quantity(ledgerText(record['quantity']))} ${option ? '张 · ${ledgerText(record['direction'])}' : '股'}',
-                textAlign: TextAlign.end,
-                style: const TextStyle(
-                  fontSize: 11,
-                  color: LyraColors.inkSecondary,
-                ),
-              ),
-              const SizedBox(height: 3),
-              FittedBox(
-                fit: BoxFit.scaleDown,
-                child: LyraAmount(ledgerText(record['cost']), size: 16),
-              ),
-              if (currency != null)
-                Text(
-                  currency!,
-                  style: const TextStyle(fontSize: 10, color: LyraColors.muted),
-                ),
-            ],
+        if (currency != null)
+          Text(
+            currency!,
+            style: const TextStyle(fontSize: 12, color: LyraColors.muted),
           ),
-        ),
       ],
+    );
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final textScale = MediaQuery.textScalerOf(context).scale(16) / 16;
+        final contentWidth = constraints.maxWidth - (nested ? 0 : 58);
+        // 大字模式为金额留出完整一行，不把辅助信息挤出视口。
+        final stacked = contentWidth / textScale < 178;
+        return Row(
+          crossAxisAlignment: stacked
+              ? CrossAxisAlignment.start
+              : CrossAxisAlignment.center,
+          children: [
+            // 分组标题已展示标的图标，子行将空间留给合约和到期日。
+            if (!nested) ...[
+              StockAvatar(
+                symbol: hidden ? ticker : record['underlying'] as String?,
+                size: 44,
+              ),
+              const SizedBox(width: 14),
+            ],
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: stacked
+                    ? [
+                        name,
+                        const SizedBox(height: 3),
+                        description,
+                        const SizedBox(height: 8),
+                        Align(alignment: Alignment.centerRight, child: amount),
+                        const SizedBox(height: 3),
+                        quantity,
+                      ]
+                    : [
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(child: name),
+                            const SizedBox(width: 8),
+                            Expanded(child: amount),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(child: description),
+                            const SizedBox(width: 8),
+                            Expanded(child: quantity),
+                          ],
+                        ),
+                      ],
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -1123,14 +1197,14 @@ class _ReportRow extends ConsumerWidget {
           key: PageStorageKey<String>(
             'report-${view.command}-$currency-$index-${row.toString()}',
           ),
-          tilePadding: EdgeInsets.symmetric(
-            vertical: view == LedgerView.positions ? 3 : 10,
-          ),
-          minTileHeight: 68,
-          visualDensity: view == LedgerView.positions
-              ? VisualDensity.compact
-              : VisualDensity.standard,
-          childrenPadding: const EdgeInsets.fromLTRB(4, 0, 4, 20),
+          tilePadding: EdgeInsets.zero,
+          minTileHeight: 74,
+          visualDensity: VisualDensity.standard,
+          iconColor: LyraColors.accent,
+          collapsedIconColor: LyraColors.inkSecondary,
+          textColor: LyraColors.ink,
+          collapsedTextColor: LyraColors.ink,
+          childrenPadding: const EdgeInsets.fromLTRB(4, 6, 4, 20),
           expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
           title: view == LedgerView.positions
               ? _PositionCells(
@@ -1138,92 +1212,112 @@ class _ReportRow extends ConsumerWidget {
                   nested: nestedPosition,
                   currency: currencyInHeader ? null : currency,
                 )
-              : Row(
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    if ([
-                      LedgerView.positions,
+              : LayoutBuilder(
+                  builder: (context, constraints) {
+                    final hasAvatar = [
                       LedgerView.expiring,
                       LedgerView.trades,
-                    ].contains(view)) ...[
-                      StockAvatar(
-                        symbol: hidden
-                            ? ledgerSecurityText(record, amountsHidden: true)
-                            : (record['underlying'] ?? record['symbol'])
-                                  as String?,
-                      ),
-                      const SizedBox(width: 12),
-                    ],
-                    Expanded(
-                      flex: 5,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            title,
-                            style: const TextStyle(
-                              fontSize: 17,
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: -.4,
-                            ),
+                    ].contains(view);
+                    final textScale =
+                        MediaQuery.textScalerOf(context).scale(16) / 16;
+                    final contentWidth =
+                        constraints.maxWidth - (hasAvatar ? 54 : 0);
+                    final stacked = contentWidth / textScale < 230;
+                    final description = Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w500,
+                            height: 1.3,
                           ),
-                          const SizedBox(height: 5),
-                          Text(
-                            subtitle,
-                            style: const TextStyle(
-                              fontSize: 10,
-                              height: 1.6,
-                              color: LyraColors.muted,
-                            ),
+                        ),
+                        const SizedBox(height: 5),
+                        Text(
+                          subtitle,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            height: 1.5,
+                            color: LyraColors.inkSecondary,
                           ),
+                        ),
+                      ],
+                    );
+                    final amount = Column(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        FittedBox(
+                          fit: BoxFit.scaleDown,
+                          alignment: Alignment.centerRight,
+                          child: LyraAmount(
+                            value,
+                            size: 17,
+                            colorBySign: ledgerSignedAmountFields.contains(
+                              view.valueField,
+                            ),
+                            isMonetary: view != LedgerView.audit,
+                            decimals: view == LedgerView.audit ? 0 : 2,
+                          ),
+                        ),
+                        const SizedBox(height: 5),
+                        Text(
+                          view == LedgerView.audit
+                              ? '记录数'
+                              : (currency ?? '按账户币种'),
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: LyraColors.muted,
+                          ),
+                        ),
+                      ],
+                    );
+                    return Row(
+                      crossAxisAlignment: stacked
+                          ? CrossAxisAlignment.start
+                          : CrossAxisAlignment.center,
+                      children: [
+                        if (hasAvatar) ...[
+                          StockAvatar(
+                            symbol: hidden
+                                ? ledgerSecurityText(
+                                    record,
+                                    amountsHidden: true,
+                                  )
+                                : (record['underlying'] ?? record['symbol'])
+                                      as String?,
+                          ),
+                          const SizedBox(width: 12),
                         ],
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Flexible(
-                      flex: 4,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.end,
-                        children: [
-                          FittedBox(
-                            fit: BoxFit.scaleDown,
-                            child: LyraAmount(
-                              value,
-                              size: 18,
-                              colorBySign: ledgerSignedAmountFields.contains(
-                                view.valueField,
-                              ),
-                              isMonetary: view != LedgerView.audit,
-                              decimals: view == LedgerView.audit ? 0 : 2,
-                            ),
-                          ),
-                          const SizedBox(height: 5),
-                          Text(
-                            view == LedgerView.audit
-                                ? '记录数'
-                                : (currency ?? '按账户币种'),
-                            style: const TextStyle(
-                              fontSize: 10,
-                              color: LyraColors.muted,
-                            ),
-                          ),
-                          if (view == LedgerView.positions &&
-                              record['assetType'] == 'option')
-                            const Text(
-                              '成本未乘 100',
-                              style: TextStyle(
-                                fontSize: 9,
-                                color: LyraColors.muted,
-                              ),
-                            ),
-                        ],
-                      ),
-                    ),
-                  ],
+                        Expanded(
+                          child: stacked
+                              // 大字或窄屏时让金融读数独占一行，保留正常
+                              // 字号；超长金额仍可缩放并通过 tooltip 读原值。
+                              ? Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  children: [
+                                    description,
+                                    const SizedBox(height: 10),
+                                    amount,
+                                  ],
+                                )
+                              : Row(
+                                  children: [
+                                    Expanded(flex: 5, child: description),
+                                    const SizedBox(width: 10),
+                                    Flexible(flex: 4, child: amount),
+                                  ],
+                                ),
+                        ),
+                      ],
+                    );
+                  },
                 ),
           children: [
             if (percent != null) ...[
-              Text('历史成本占比 $percent%', style: const TextStyle(fontSize: 11)),
+              Text('历史成本占比 $percent%', style: const TextStyle(fontSize: 12)),
               const SizedBox(height: 8),
               LinearProgressIndicator(
                 value: (double.parse(percent) / 100).clamp(0, 1),
@@ -1243,7 +1337,7 @@ class _ReportRow extends ConsumerWidget {
                       child: Text(
                         ledgerLabels[field]!,
                         style: const TextStyle(
-                          fontSize: 11,
+                          fontSize: 12,
                           color: LyraColors.muted,
                         ),
                       ),
@@ -1254,7 +1348,7 @@ class _ReportRow extends ConsumerWidget {
                         child: ledgerAmountFields.contains(field)
                             ? LyraAmount(
                                 ledgerText(record[field]),
-                                size: 12,
+                                size: 13,
                                 exact: true,
                                 colorBySign: ledgerSignedAmountFields.contains(
                                   field,
@@ -1268,7 +1362,7 @@ class _ReportRow extends ConsumerWidget {
                                   amountsHidden: hidden,
                                 ),
                                 textAlign: TextAlign.end,
-                                style: const TextStyle(fontSize: 12),
+                                style: const TextStyle(fontSize: 13),
                               ),
                       ),
                     ),
@@ -1345,7 +1439,7 @@ class _DataPlotState extends ConsumerState<_DataPlot> {
               SizedBox(height: 5),
               Text(
                 '显示金额后查看收益图表',
-                style: TextStyle(fontSize: 10, color: LyraColors.muted),
+                style: TextStyle(fontSize: 12, color: LyraColors.muted),
               ),
             ],
           ),
@@ -1370,13 +1464,20 @@ class _DataPlotState extends ConsumerState<_DataPlot> {
               Expanded(
                 child: Text(
                   '${ledgerText(rows[selected][dateField])} / ${line ? '累计损益' : '当月损益'}',
-                  style: const TextStyle(fontSize: 11, color: LyraColors.muted),
+                  style: const TextStyle(fontSize: 12, color: LyraColors.muted),
                 ),
               ),
-              LyraAmount(
-                ledgerText(rows[selected][field]),
-                size: 14,
-                colorBySign: true,
+              const SizedBox(width: 12),
+              Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerRight,
+                  child: LyraAmount(
+                    ledgerText(rows[selected][field]),
+                    size: 15,
+                    colorBySign: true,
+                  ),
+                ),
               ),
             ],
           ),
@@ -1419,13 +1520,19 @@ class _DataPlotState extends ConsumerState<_DataPlot> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                ledgerText(rows.first[dateField]),
-                style: const TextStyle(fontSize: 10, color: LyraColors.muted),
+              Flexible(
+                child: Text(
+                  ledgerText(rows.first[dateField]),
+                  style: const TextStyle(fontSize: 11, color: LyraColors.muted),
+                ),
               ),
-              Text(
-                ledgerText(rows.last[dateField]),
-                style: const TextStyle(fontSize: 10, color: LyraColors.muted),
+              const SizedBox(width: 12),
+              Flexible(
+                child: Text(
+                  ledgerText(rows.last[dateField]),
+                  textAlign: TextAlign.end,
+                  style: const TextStyle(fontSize: 11, color: LyraColors.muted),
+                ),
               ),
             ],
           ),

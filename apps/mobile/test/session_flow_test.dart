@@ -215,7 +215,7 @@ void main() {
       find.byKey(const ValueKey<String>('overview-hero-value')),
       findsOneWidget,
     );
-    expect(find.text('12.34'), findsOneWidget);
+    expect(find.text('+12.34'), findsOneWidget);
     expect(find.text('1,000.00'), findsOneWidget);
     expect(find.text('500.00'), findsOneWidget);
     expect(find.textContaining('账本 v3'), findsOneWidget);

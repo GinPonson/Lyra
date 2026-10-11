@@ -59,7 +59,7 @@ Future<ProviderContainer> _pump(
         ),
       ],
       child: MaterialApp(
-        theme: LyraTheme.light,
+        theme: LyraTheme.dark,
         home: Scaffold(body: body),
       ),
     ),
@@ -162,20 +162,22 @@ void main() {
       tester,
       const Column(
         children: [
-          LyraAmount('12.3450', colorBySign: true),
-          LyraAmount('-0.0001', colorBySign: true),
-          LyraAmount('0.0000', colorBySign: true),
+          LyraAmount('12.3450', colorBySign: true, showPositiveSign: true),
+          LyraAmount('-0.0001', colorBySign: true, showPositiveSign: true),
+          LyraAmount('0.0000', colorBySign: true, showPositiveSign: true),
+          LyraAmount('0.0001', colorBySign: true, showPositiveSign: true),
           LyraAmount('620.00'),
           ReportLink(view: LedgerView.stress),
         ],
       ),
     );
-    expect(_textColor(tester, '12.35'), LyraColors.positive);
+    expect(_textColor(tester, '+12.35'), LyraColors.positive);
     expect(_textColor(tester, '> −0.01'), LyraColors.negative);
+    expect(_textColor(tester, '< 0.01'), LyraColors.positive);
     expect(find.byTooltip('原始值：12.3450'), findsOneWidget);
     expect(find.byTooltip('原始值：-0.0001'), findsOneWidget);
     await _setScheme(tester, container, ProfitColorScheme.redUp);
-    expect(_textColor(tester, '12.35'), LyraColors.negative);
+    expect(_textColor(tester, '+12.35'), LyraColors.negative);
     expect(_textColor(tester, '> −0.01'), LyraColors.positive);
     expect(_textColor(tester, '0.00'), LyraColors.ink);
     expect(_textColor(tester, '620.00'), LyraColors.ink);
@@ -204,18 +206,21 @@ void main() {
     }
     expect(find.byTooltip('原始值：-0.0001'), findsNothing);
     await _setScheme(tester, container, ProfitColorScheme.greenUp);
-    expect(find.text('••••'), findsNWidgets(4));
+    expect(find.text('••••'), findsNWidgets(5));
   });
 
-  testWidgets('总览盈亏文字响应设置，品牌渐变保留原配色', (tester) async {
+  testWidgets('总览盈亏文字响应设置，深色卡片不受涨跌配色影响', (tester) async {
     final container = await _pump(tester, const OverviewScreen());
     final card = find.byKey(const ValueKey('overview-summary-card'));
     final before = tester.widget<Container>(card).decoration as BoxDecoration;
-    expect(_textColor(tester, '2,846.72'), LyraColors.positive);
+    expect(before.color, LyraColors.surface);
+    expect(before.gradient, isNull);
+    expect(_textColor(tester, '+2,846.72'), LyraColors.positive);
     await _setScheme(tester, container, ProfitColorScheme.redUp);
-    expect(_textColor(tester, '2,846.72'), LyraColors.negative);
+    expect(_textColor(tester, '+2,846.72'), LyraColors.negative);
     final after = tester.widget<Container>(card).decoration as BoxDecoration;
-    expect(after.gradient, before.gradient);
+    expect(after.color, before.color);
+    expect(after.border, before.border);
     expect(tester.takeException(), isNull);
   });
 

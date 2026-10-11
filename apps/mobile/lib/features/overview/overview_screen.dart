@@ -50,6 +50,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
     context: context,
     isScrollControlled: true,
     useSafeArea: true,
+    showDragHandle: true,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
     ),
@@ -83,49 +84,15 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
       storageKey: 'overview-scroll',
       children: [
         if (paired) ...[
-          const LyraPageTitle(title: '总览'),
-          Row(
-            children: [
-              const Expanded(
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: AccountScopeButton(prominent: true),
-                ),
-              ),
-              Semantics(
-                toggled: !amountsHidden,
-                child: IconButton(
-                  key: const ValueKey('toggle-amounts'),
-                  tooltip: amountsHidden ? '显示金额' : '隐藏金额',
-                  onPressed: () =>
-                      ref.read(amountsHiddenProvider.notifier).toggle(),
-                  icon: Icon(
-                    amountsHidden
-                        ? LyraIcons.showAmounts
-                        : LyraIcons.hideAmounts,
-                    size: 22,
-                  ),
-                ),
-              ),
-              IconButton(
-                tooltip: '导入文件',
-                onPressed: _openImport,
-                icon: const LyraPrimaryIcon(
-                  LyraPrimaryGlyph.importFile,
-                  size: 22,
-                ),
-              ),
-              IconButton(
-                tooltip: '连接管理',
-                onPressed: _openConnection,
-                icon: const LyraPrimaryIcon(
-                  LyraPrimaryGlyph.connection,
-                  size: 22,
-                ),
-              ),
-            ],
+          const SizedBox(height: 8),
+          _OverviewHeader(
+            amountsHidden: amountsHidden,
+            onToggleAmounts: () =>
+                ref.read(amountsHiddenProvider.notifier).toggle(),
+            onImport: _openImport,
+            onConnection: _openConnection,
           ),
-          const SizedBox(height: 18),
+          const SizedBox(height: 14),
         ] else ...[
           LyraPageTitle(
             title: '总览',
@@ -268,8 +235,8 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
                   '收益与报告',
                   style: TextStyle(
                     fontSize: 20,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: -.5,
+                    fontWeight: FontWeight.w500,
+                    letterSpacing: -.2,
                   ),
                 ),
               ),
@@ -301,7 +268,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
           Text(
             '账本 v${summary.value!.metadata.ledgerVersion} · 截止 ${summary.value!.metadata.asOf}',
             style: const TextStyle(
-              fontSize: 10,
+              fontSize: 11,
               height: 1.8,
               color: LyraColors.muted,
             ),
@@ -314,7 +281,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
             Expanded(
               child: Text(
                 '基于已导入交易记录 · 不含实时行情',
-                style: TextStyle(fontSize: 10, color: LyraColors.muted),
+                style: TextStyle(fontSize: 11, color: LyraColors.muted),
               ),
             ),
           ],
@@ -322,6 +289,116 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
       ],
     );
   }
+}
+
+/// 常规手机保持一行；窄屏和大字时把账户范围放到下一行。
+class _OverviewHeader extends StatelessWidget {
+  const _OverviewHeader({
+    required this.amountsHidden,
+    required this.onToggleAmounts,
+    required this.onImport,
+    required this.onConnection,
+  });
+  final bool amountsHidden;
+  final VoidCallback onToggleAmounts;
+  final VoidCallback onImport;
+  final VoidCallback onConnection;
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      const title = Text(
+        '总览',
+        style: TextStyle(
+          fontSize: 22,
+          height: 1.2,
+          fontWeight: FontWeight.w500,
+          letterSpacing: -.2,
+        ),
+      );
+      final actions = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Semantics(
+            toggled: !amountsHidden,
+            child: IconButton(
+              key: const ValueKey('toggle-amounts'),
+              tooltip: amountsHidden ? '显示金额' : '隐藏金额',
+              onPressed: onToggleAmounts,
+              icon: LyraPrimaryIcon(
+                amountsHidden
+                    ? LyraPrimaryGlyph.hideAmounts
+                    : LyraPrimaryGlyph.showAmounts,
+                size: 22,
+              ),
+            ),
+          ),
+          IconButton(
+            tooltip: '导入文件',
+            onPressed: onImport,
+            icon: Container(
+              padding: const EdgeInsets.all(7),
+              decoration: const BoxDecoration(
+                color: LyraColors.accentTint,
+                shape: BoxShape.circle,
+              ),
+              child: const LyraPrimaryIcon(
+                LyraPrimaryGlyph.importFile,
+                size: 22,
+                color: LyraColors.accent,
+              ),
+            ),
+          ),
+          IconButton(
+            tooltip: '连接管理',
+            onPressed: onConnection,
+            icon: const LyraPrimaryIcon(LyraPrimaryGlyph.connection, size: 22),
+          ),
+        ],
+      );
+      final controls = IconButtonTheme(
+        data: IconButtonThemeData(
+          style: IconButton.styleFrom(
+            fixedSize: const Size(44, 44),
+            minimumSize: const Size(44, 44),
+            padding: EdgeInsets.zero,
+            foregroundColor: LyraColors.inkSecondary,
+          ),
+        ),
+        child: actions,
+      );
+      if (constraints.maxWidth < 310 ||
+          MediaQuery.textScalerOf(context).scale(13) > 16) {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(child: title),
+                controls,
+              ],
+            ),
+            const SizedBox(height: 8),
+            const AccountScopeButton(compact: true),
+          ],
+        );
+      }
+      return Row(
+        children: [
+          title,
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: AccountScopeButton(compact: true),
+            ),
+          ),
+          const SizedBox(width: 8),
+          controls,
+        ],
+      );
+    },
+  );
 }
 
 /// 未连接时直接说明可用功能，主按钮继续使用原有登录表单。
@@ -379,15 +456,11 @@ class _AccountSummary extends StatelessWidget {
   Widget build(BuildContext context) => LyraReveal(
     child: Container(
       key: primary ? const ValueKey('overview-summary-card') : null,
-      padding: const EdgeInsets.all(18),
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xFFE9F7F0), Color(0xFFF4F8F6), Color(0xFFFAF9F5)],
-          stops: [0, .58, 1],
-        ),
+        color: LyraColors.surface,
+        border: Border.all(color: LyraColors.hairlineStrong, width: .75),
+        borderRadius: BorderRadius.circular(20),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -398,7 +471,8 @@ class _AccountSummary extends StatelessWidget {
                 child: Text(
                   '已实现损益',
                   style: TextStyle(
-                    fontSize: 13,
+                    fontSize: 14,
+                    height: 1.4,
                     color: LyraColors.inkSecondary,
                   ),
                 ),
@@ -406,8 +480,8 @@ class _AccountSummary extends StatelessWidget {
               Text(
                 entry.currency,
                 style: const TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
                   color: LyraColors.inkSecondary,
                 ),
               ),
@@ -422,16 +496,23 @@ class _AccountSummary extends StatelessWidget {
               key: primary
                   ? const ValueKey<String>('overview-hero-value')
                   : null,
-              size: 34,
+              size: 42,
               colorBySign: true,
+              showPositiveSign: true,
             ),
           ),
-          const SizedBox(height: 5),
+          const SizedBox(height: 8),
           const Text(
             '全部记录 · 已扣除分摊费用',
-            style: TextStyle(fontSize: 10, color: LyraColors.muted),
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.5,
+              color: LyraColors.muted,
+            ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 14),
+          const Divider(height: 1, thickness: .75),
+          const SizedBox(height: 14),
           _MetricStrip(entry: entry),
         ],
       ),
@@ -485,11 +566,12 @@ class _MetricStrip extends StatelessWidget {
                                   Text(
                                     metrics[start + offset].$1,
                                     style: const TextStyle(
-                                      fontSize: 11,
+                                      fontSize: 12,
+                                      height: 1.4,
                                       color: LyraColors.inkSecondary,
                                     ),
                                   ),
-                                  const SizedBox(height: 5),
+                                  const SizedBox(height: 8),
                                   FittedBox(
                                     fit: BoxFit.scaleDown,
                                     child: LyraAmount(
@@ -538,12 +620,12 @@ class _AssistantNote extends StatelessWidget {
                 children: [
                   Text(
                     'AI 账本分析',
-                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
                   ),
                   SizedBox(height: 5),
                   Text(
                     '解读持仓与交易记录',
-                    style: TextStyle(fontSize: 10, color: LyraColors.muted),
+                    style: TextStyle(fontSize: 12, color: LyraColors.muted),
                   ),
                 ],
               ),

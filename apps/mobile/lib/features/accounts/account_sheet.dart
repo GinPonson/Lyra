@@ -6,6 +6,7 @@ import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
+import '../../core/design/lyra_primary_icon.dart';
 import 'account_repository.dart';
 import 'account_workspace.dart';
 
@@ -147,7 +148,7 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
     return PopScope(
       canPop: !_busy,
       child: Padding(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.all(20),
         child: Form(
           key: _formKey,
           child: Column(
@@ -156,7 +157,11 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
             children: [
               Row(
                 children: [
-                  const Icon(LyraIcons.addAccount, color: LyraColors.accent),
+                  const LyraPrimaryIcon(
+                    LyraPrimaryGlyph.brokerage,
+                    color: LyraColors.accent,
+                    size: 22,
+                  ),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
@@ -224,7 +229,11 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
                   padding: EdgeInsets.only(top: 8),
                   child: Text(
                     '已从所选文件名填写标识，请核对后创建。',
-                    style: TextStyle(fontSize: 12, color: LyraColors.accent),
+                    style: TextStyle(
+                      fontSize: 13,
+                      height: 1.5,
+                      color: LyraColors.accent,
+                    ),
                   ),
                 ),
               const SizedBox(height: 16),

@@ -587,7 +587,7 @@ class _SessionViewState extends ConsumerState<_SessionView> {
     return Column(
       children: <Widget>[
         Padding(
-          padding: const EdgeInsets.fromLTRB(8, 12, 20, 12),
+          padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
@@ -597,11 +597,10 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                   Expanded(
                     child: Text(
                       'Lyra 助手',
-                      style: Theme.of(context).textTheme.headlineSmall,
+                      style: Theme.of(context).textTheme.headlineSmall
+                          ?.copyWith(fontSize: 22, fontWeight: FontWeight.w500),
                     ),
                   ),
-                  _StatusChip(session: session),
-                  const SizedBox(width: 8),
                   IconButton(
                     tooltip: '新对话',
                     onPressed: state.turnInProgress
@@ -612,22 +611,40 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                 ],
               ),
               const SizedBox(height: 4),
-              Text(
-                '本次对话：$scopeLabel',
-                key: const ValueKey('agent-session-scope'),
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-              if (selectedScope.id != scopeId)
-                Text(
-                  '页面已选择${selectedScope.label}；新对话将使用该范围。',
-                  style: Theme.of(context).textTheme.bodySmall
-                      ?.copyWith(color: LyraColors.muted),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(
+                          '本次对话：$scopeLabel',
+                          key: const ValueKey('agent-session-scope'),
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        _StatusChip(session: session),
+                      ],
+                    ),
+                    if (selectedScope.id != scopeId) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        '页面已选择${selectedScope.label}；新对话将使用该范围。',
+                        style: Theme.of(context).textTheme.bodySmall
+                            ?.copyWith(color: LyraColors.muted),
+                      ),
+                    ],
+                    const SizedBox(height: 4),
+                    Text(
+                      '账本版本 ${session.ledgerVersion} · 截止 ${session.asOf}',
+                      style: Theme.of(context).textTheme.bodySmall
+                          ?.copyWith(color: LyraColors.muted),
+                    ),
+                  ],
                 ),
-              const SizedBox(height: 4),
-              Text(
-                '账本版本 ${session.ledgerVersion} · 截止 ${session.asOf}',
-                style: Theme.of(context).textTheme.bodySmall
-                    ?.copyWith(color: LyraColors.muted),
               ),
             ],
           ),
@@ -704,7 +721,7 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                       hintText: session.status == 'closed'
                           ? '请新建对话继续分析'
                           : '询问持仓、绩效或风险…',
-                      border: const OutlineInputBorder(),
+                      fillColor: LyraColors.surface,
                       isDense: true,
                     ),
                   ),
@@ -756,8 +773,11 @@ class _CreateView extends ConsumerWidget {
             Expanded(
               child: Text(
                 'Lyra 助手',
-                style: Theme.of(context).textTheme.headlineLarge
-                    ?.copyWith(fontSize: 22, letterSpacing: -0.3),
+                style: Theme.of(context).textTheme.headlineLarge?.copyWith(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w500,
+                  letterSpacing: 0,
+                ),
               ),
             ),
           ],
@@ -790,7 +810,10 @@ class _CreateView extends ConsumerWidget {
                     ? const SizedBox(
                         width: 18,
                         height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: LyraColors.inkSecondary,
+                        ),
                       )
                     : const Icon(LyraIcons.agent, size: 20),
                 label: Text(creating ? '正在创建…' : '开始分析'),
@@ -826,7 +849,7 @@ class _InfoCard extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
       children: <Widget>[
-        // Coinbase 式空状态:居中内容直接铺在画布上,无卡片边框。
+        // 空状态只展示当前状态与下一步操作。
         Padding(
           padding: const EdgeInsets.only(top: 96),
           child: Column(
@@ -969,14 +992,15 @@ class _MessageBubble extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         constraints: const BoxConstraints(maxWidth: 560),
         decoration: BoxDecoration(
-          color: isUser ? LyraColors.accent : LyraColors.surfaceSubtle,
-          borderRadius: BorderRadius.circular(18),
+          color: isUser ? LyraColors.accent : LyraColors.surface,
+          borderRadius: BorderRadius.circular(16),
+          border: isUser ? null : Border.all(color: LyraColors.hairline),
         ),
         child: Text(
           isStreaming ? '$content▍' : content,
           style: TextStyle(
-            color: isUser ? LyraColors.surface : LyraColors.ink,
-            height: 1.5,
+            color: isUser ? LyraColors.onAccent : LyraColors.ink,
+            height: 1.6,
           ),
         ),
       ),
@@ -1010,7 +1034,7 @@ class _SendButton extends StatelessWidget {
           child: Icon(
             LyraIcons.send,
             size: 20,
-            color: enabled ? LyraColors.surface : LyraColors.mutedSoft,
+            color: enabled ? LyraColors.onAccent : LyraColors.mutedSoft,
           ),
         ),
       ),
@@ -1093,7 +1117,8 @@ class _StatusChip extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: LyraColors.surfaceStrong,
+        color: LyraColors.surface,
+        border: Border.all(color: LyraColors.hairlineStrong),
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(
@@ -1132,7 +1157,8 @@ class _ToolCallTile extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: LyraColors.surfaceSubtle,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

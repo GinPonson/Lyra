@@ -9,6 +9,7 @@ import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
+import '../../core/design/lyra_primary_icon.dart';
 import '../accounts/account_sheet.dart';
 import '../accounts/account_workspace.dart';
 import '../ledger/ledger_workspace.dart';
@@ -285,16 +286,16 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
     final result = _result;
     final candidates = _accountCandidates ?? const <ImportAccountView>[];
     return Padding(
-      padding: const EdgeInsets.all(22),
+      padding: const EdgeInsets.all(20),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         mainAxisSize: MainAxisSize.min,
         children: [
           Row(
             children: [
-              const Icon(
-                LyraIcons.importFile,
-                size: 20,
+              const LyraPrimaryIcon(
+                LyraPrimaryGlyph.importFile,
+                size: 22,
                 color: LyraColors.accent,
               ),
               const SizedBox(width: 10),
@@ -315,7 +316,7 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
           const SizedBox(height: 18),
           FilledButton.icon(
             onPressed: _busy || _identityChanged ? null : _pickFile,
-            icon: const Icon(LyraIcons.importFile),
+            icon: const LyraPrimaryIcon(LyraPrimaryGlyph.importFile, size: 20),
             label: Text(switch (_stage) {
               _ImportStage.picking => '打开文件中…',
               _ImportStage.uploading => '上传解析中…',
@@ -327,7 +328,8 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
             Text(
               '已选择：$_pendingFileName',
               style: const TextStyle(
-                fontSize: 12,
+                fontSize: 13,
+                height: 1.5,
                 color: LyraColors.inkSecondary,
               ),
             ),
@@ -348,7 +350,10 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
                 padding: const EdgeInsets.only(bottom: 8),
                 child: OutlinedButton.icon(
                   onPressed: _busy ? null : () => _selectAccount(account),
-                  icon: const Icon(LyraIcons.cash),
+                  icon: const LyraPrimaryIcon(
+                    LyraPrimaryGlyph.brokerage,
+                    size: 20,
+                  ),
                   label: Text(
                     '${account.displayName}（${account.maskedSuffix}）',
                   ),
@@ -392,7 +397,7 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
                   ? '已写入账本：新增 ${result.insertedRows} 行，账本版本 ${result.ledgerVersion}'
                   : '无新增交易；账本版本保持 ${result.ledgerVersion}',
               style: Theme.of(context).textTheme.bodyLarge
-                  ?.copyWith(fontWeight: FontWeight.w700),
+                  ?.copyWith(fontWeight: FontWeight.w500),
             ),
           ],
           if (_errorMessage != null) ...[
@@ -437,7 +442,7 @@ class _PreviewStats extends StatelessWidget {
           Text(
             preview.fileName,
             style: Theme.of(context).textTheme.titleMedium
-                ?.copyWith(color: LyraColors.ink, fontWeight: FontWeight.w700),
+                ?.copyWith(color: LyraColors.ink, fontWeight: FontWeight.w500),
           ),
           const SizedBox(height: 10),
           Text(
@@ -450,8 +455,8 @@ class _PreviewStats extends StatelessWidget {
             preview.byAction.entries
                 .map((entry) => '${entry.key} × ${entry.value}')
                 .join(' · '),
-            style: Theme.of(context).textTheme.labelSmall
-                ?.copyWith(color: LyraColors.ink.withValues(alpha: 0.72)),
+            style: Theme.of(context).textTheme.bodySmall
+                ?.copyWith(color: LyraColors.inkSecondary, height: 1.6),
           ),
         ],
       ),

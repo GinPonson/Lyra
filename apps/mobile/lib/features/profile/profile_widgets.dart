@@ -2,8 +2,9 @@ import 'package:flutter/material.dart';
 
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
+import '../../core/design/lyra_primary_icon.dart';
 
-/// 设置页以细线分组，行高由内容和文字大小决定。
+/// 设置以安静的表面分组，行高由内容和文字大小决定。
 class ProfileSection extends StatelessWidget {
   const ProfileSection({
     super.key,
@@ -16,30 +17,31 @@ class ProfileSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.only(top: 28),
+    padding: const EdgeInsets.only(top: 24),
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Padding(
-          padding: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.only(left: 2, bottom: 8),
           child: Text(
             title,
-            style: Theme.of(context).textTheme.labelLarge
-                ?.copyWith(color: LyraColors.muted),
-          ),
-        ),
-        DecoratedBox(
-          decoration: const BoxDecoration(
-            border: Border(
-              top: BorderSide(color: LyraColors.hairlineStrong),
-              bottom: BorderSide(color: LyraColors.hairlineStrong),
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(
+              color: LyraColors.muted,
+              fontWeight: FontWeight.w500,
+              letterSpacing: 0,
             ),
           ),
+        ),
+        Material(
+          color: LyraColors.surface,
+          borderRadius: BorderRadius.circular(16),
+          clipBehavior: Clip.antiAlias,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               for (final (index, child) in children.indexed) ...[
-                if (index > 0) const Divider(height: 1),
+                if (index > 0)
+                  const Divider(height: 1, indent: 48, endIndent: 14),
                 child,
               ],
             ],
@@ -54,16 +56,20 @@ class ProfileSettingRow extends StatelessWidget {
   const ProfileSettingRow({
     super.key,
     required this.title,
-    required this.icon,
+    this.icon,
+    this.glyph,
     this.subtitle,
+    this.value,
     this.onTap,
     this.trailing,
     this.enabled = true,
-  });
+  }) : assert(icon != null || glyph != null);
 
   final String title;
-  final IconData icon;
+  final IconData? icon;
+  final LyraPrimaryGlyph? glyph;
   final String? subtitle;
+  final String? value;
   final VoidCallback? onTap;
   final Widget? trailing;
   final bool enabled;
@@ -74,29 +80,56 @@ class ProfileSettingRow extends StatelessWidget {
     child: InkWell(
       onTap: enabled ? onTap : null,
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 2),
+        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 14),
         child: Row(
           children: [
             ExcludeSemantics(
-              child: Icon(
-                icon,
-                size: 22,
-                color: enabled ? LyraColors.inkSecondary : LyraColors.mutedSoft,
-              ),
+              child: glyph == null
+                  ? Icon(
+                      icon,
+                      size: 21,
+                      color: enabled
+                          ? LyraColors.inkSecondary
+                          : LyraColors.mutedSoft,
+                    )
+                  : LyraPrimaryIcon(
+                      glyph!,
+                      size: 21,
+                      color: enabled
+                          ? LyraColors.inkSecondary
+                          : LyraColors.mutedSoft,
+                    ),
             ),
-            const SizedBox(width: 14),
+            const SizedBox(width: 12),
             Expanded(
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Text(
-                    title,
-                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                      color: enabled ? LyraColors.ink : LyraColors.muted,
-                    ),
+                  Wrap(
+                    alignment: WrapAlignment.spaceBetween,
+                    spacing: 12,
+                    runSpacing: 4,
+                    children: [
+                      Text(
+                        title,
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          color: enabled ? LyraColors.ink : LyraColors.muted,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      if (value != null)
+                        Text(
+                          value!,
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(
+                                color: LyraColors.inkSecondary,
+                                height: 1.5,
+                              ),
+                        ),
+                    ],
                   ),
                   if (subtitle != null) ...[
-                    const SizedBox(height: 5),
+                    const SizedBox(height: 4),
                     Text(
                       subtitle!,
                       style: Theme.of(context).textTheme.bodySmall
@@ -107,12 +140,12 @@ class ProfileSettingRow extends StatelessWidget {
               ),
             ),
             if (trailing != null || onTap != null) ...[
-              const SizedBox(width: 12),
+              const SizedBox(width: 8),
               trailing ??
                   const ExcludeSemantics(
                     child: Icon(
                       LyraIcons.disclosure,
-                      size: 20,
+                      size: 18,
                       color: LyraColors.mutedSoft,
                     ),
                   ),
@@ -172,7 +205,7 @@ class ProfileSubpage extends StatelessWidget {
     body: SafeArea(
       top: false,
       child: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(24, 12, 24, 36),
+        padding: const EdgeInsets.fromLTRB(20, 12, 20, 32),
         child: Align(
           alignment: Alignment.topCenter,
           child: ConstrainedBox(

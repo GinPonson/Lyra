@@ -134,7 +134,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.text('2,846.72'), findsOneWidget);
+      expect(find.text('+2,846.72'), findsOneWidget);
       // 汇总集中在一张卡内，导入由页头提供，不再重复底部导航功能。
       expect(
         find.byKey(const ValueKey('overview-summary-card')),
@@ -232,7 +232,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(fixture.requests.last.uri.path, LedgerView.drawdown.path);
     expect(fixture.requests.last.queryParameters['scope'], 'all');
-    expect(find.text('2,846.72'), findsOneWidget);
+    expect(find.text('+2,846.72'), findsOneWidget);
     expect(find.textContaining('QUERY_FAILED'), findsOneWidget);
     fixture.failures.clear();
     await tester.ensureVisible(find.text('重新加载'));
@@ -384,7 +384,7 @@ void main() {
             key: _captureKey,
             child: MaterialApp(
               debugShowCheckedModeBanner: false,
-              theme: LyraTheme.light,
+              theme: LyraTheme.dark,
               home: ReportScreen(view: view),
             ),
           ),

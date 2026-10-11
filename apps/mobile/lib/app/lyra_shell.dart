@@ -113,19 +113,22 @@ class _LyraShellState extends State<LyraShell> {
                                   size: 20,
                                   color: index == _selectedIndex
                                       ? LyraColors.accent
-                                      : LyraColors.muted,
+                                      : LyraColors.inkSecondary,
                                 ),
                                 label: Text(destination.label),
                                 style: TextButton.styleFrom(
                                   foregroundColor: index == _selectedIndex
-                                      ? LyraColors.ink
-                                      : LyraColors.muted,
+                                      ? LyraColors.accent
+                                      : LyraColors.inkSecondary,
                                   backgroundColor: index == _selectedIndex
-                                      ? LyraColors.surfaceStrong
+                                      ? LyraColors.accentTint
                                       : Colors.transparent,
                                   padding: const EdgeInsets.symmetric(
                                     horizontal: 18,
                                     vertical: 12,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
                                   ),
                                 ),
                               ),
@@ -150,7 +153,10 @@ class _LyraShellState extends State<LyraShell> {
             : DecoratedBox(
                 decoration: const BoxDecoration(
                   border: Border(
-                    top: BorderSide(color: LyraColors.hairlineStrong),
+                    top: BorderSide(
+                      color: LyraColors.hairlineStrong,
+                      width: 0.75,
+                    ),
                   ),
                 ),
                 child: NavigationBar(
@@ -185,16 +191,16 @@ class _NavigationGlyph extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Container(
-    width: 46,
-    height: 34,
+    width: 52,
+    height: 32,
     alignment: Alignment.center,
     decoration: BoxDecoration(
       color: selected ? LyraColors.accentTint : Colors.transparent,
-      borderRadius: BorderRadius.circular(11),
+      borderRadius: BorderRadius.circular(10),
     ),
     child: LyraPrimaryIcon(
       glyph,
-      color: selected ? LyraColors.accent : LyraColors.muted,
+      color: selected ? LyraColors.accent : LyraColors.inkSecondary,
     ),
   );
 }

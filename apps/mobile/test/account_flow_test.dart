@@ -255,7 +255,7 @@ Future<void> _pumpFixture(
       ],
       child: fullApp
           ? const LyraApp()
-          : MaterialApp(theme: LyraTheme.light, home: const _ImportHarness()),
+          : MaterialApp(theme: LyraTheme.dark, home: const _ImportHarness()),
     ),
   );
   await tester.pumpAndSettle();

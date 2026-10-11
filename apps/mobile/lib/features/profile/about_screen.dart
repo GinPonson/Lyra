@@ -4,6 +4,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
+import '../../core/design/lyra_primary_icon.dart';
 import '../overview/login_panel.dart';
 import '../system/system_workspace.dart';
 import 'profile_widgets.dart';
@@ -43,9 +44,10 @@ class AboutScreen extends ConsumerWidget {
           const Text(
             'lyra',
             style: TextStyle(
-              fontSize: 40,
-              fontWeight: FontWeight.w600,
-              letterSpacing: -2,
+              fontSize: 34,
+              fontWeight: FontWeight.w500,
+              letterSpacing: -1.4,
+              color: LyraColors.ink,
             ),
           ),
           const SizedBox(height: 8),
@@ -58,8 +60,8 @@ class AboutScreen extends ConsumerWidget {
             children: [
               ProfileSettingRow(
                 title: 'App 版本',
-                icon: LyraIcons.about,
-                subtitle: appVersion.when(
+                glyph: LyraPrimaryGlyph.about,
+                value: appVersion.when(
                   data: (value) => value,
                   loading: () => '正在读取…',
                   error: (_, _) => '暂时无法读取版本',
@@ -74,8 +76,8 @@ class AboutScreen extends ConsumerWidget {
               ),
               ProfileSettingRow(
                 title: '服务端版本',
-                icon: LyraIcons.connection,
-                subtitle:
+                glyph: LyraPrimaryGlyph.server,
+                value:
                     server?.when(
                       data: (value) => value.serverVersion,
                       loading: () => '正在读取…',

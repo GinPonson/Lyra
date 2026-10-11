@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:hugeicons/hugeicons.dart';
 
-/// 首批统一的一级入口图形，同一业务在导航与快捷入口使用相同标识。
+/// 导航、账户与偏好共用圆角描边图形，同一业务使用相同标识。
 enum LyraPrimaryGlyph {
   overview(HugeIcons.strokeRoundedDashboardSquare01),
   accounts(HugeIcons.strokeRoundedWallet01),
@@ -9,7 +9,15 @@ enum LyraPrimaryGlyph {
   ledger(HugeIcons.strokeRoundedInvoice03),
   profile(HugeIcons.strokeRoundedUserCircle),
   importFile(HugeIcons.strokeRoundedFileUpload),
-  connection(HugeIcons.strokeRoundedUserSettings01);
+  connection(HugeIcons.strokeRoundedUserSettings01),
+  showAmounts(HugeIcons.strokeRoundedView),
+  hideAmounts(HugeIcons.strokeRoundedViewOffSlash),
+  brokerage(HugeIcons.strokeRoundedBank),
+  accountScope(HugeIcons.strokeRoundedLayers01),
+  profitColors(HugeIcons.strokeRoundedPaintBoard),
+  server(HugeIcons.strokeRoundedServerStack01),
+  about(HugeIcons.strokeRoundedInformationCircle),
+  logout(HugeIcons.strokeRoundedLogout01);
 
   const LyraPrimaryGlyph(this.paths);
   final List<List<dynamic>> paths;

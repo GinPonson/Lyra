@@ -84,7 +84,7 @@ class _StartupAccountSheetState extends ConsumerState<_StartupAccountSheet> {
     final accounts = signedIn ? ref.watch(brokerageAccountsProvider) : null;
     final enabled = !_busy && !_identityChanged && preferences != null;
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -206,7 +206,7 @@ class _ProfitColorSheetState extends ConsumerState<_ProfitColorSheet> {
         ref.watch(appPreferencesProvider).value ??
         ref.read(appPreferencesProvider.notifier).lastSaved;
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -275,44 +275,51 @@ class _ChoiceRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Semantics(
     selected: selected,
-    child: Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 18),
-          child: Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(title, style: Theme.of(context).textTheme.titleSmall),
-                    if (subtitle != null) ...[
-                      const SizedBox(height: 5),
+    child: Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Material(
+        color: selected ? LyraColors.accentTint : Colors.transparent,
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 14),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
                       Text(
-                        subtitle!,
-                        style: const TextStyle(
-                          color: LyraColors.muted,
-                          height: 1.6,
-                        ),
+                        title,
+                        style: Theme.of(context).textTheme.titleSmall
+                            ?.copyWith(fontWeight: FontWeight.w500),
                       ),
+                      if (subtitle != null) ...[
+                        const SizedBox(height: 5),
+                        Text(
+                          subtitle!,
+                          style: const TextStyle(
+                            color: LyraColors.muted,
+                            height: 1.6,
+                          ),
+                        ),
+                      ],
+                      ?detail,
                     ],
-                    ?detail,
-                  ],
+                  ),
                 ),
-              ),
-              const SizedBox(width: 16),
-              ExcludeSemantics(
-                child: Icon(
-                  selected ? LyraIcons.confirm : LyraIcons.unselectedChoice,
-                  color: selected
-                      ? LyraColors.accent
-                      : LyraColors.hairlineStrong,
-                  size: 22,
+                const SizedBox(width: 16),
+                ExcludeSemantics(
+                  child: Icon(
+                    selected ? LyraIcons.confirm : LyraIcons.unselectedChoice,
+                    color: selected ? LyraColors.accent : LyraColors.mutedSoft,
+                    size: 22,
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),

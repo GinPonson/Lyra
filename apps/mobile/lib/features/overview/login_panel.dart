@@ -6,6 +6,7 @@ import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
+import '../../core/design/lyra_primary_icon.dart';
 import '../../core/preferences/app_preferences.dart';
 import '../system/system_repository.dart';
 import '../system/system_workspace.dart';
@@ -346,10 +347,11 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     });
     final busy = _submitting || _savingAddress || state.isLoading;
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: LyraColors.surfaceSubtle,
-        borderRadius: BorderRadius.circular(18),
+        color: LyraColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -365,7 +367,8 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
               Expanded(
                 child: Text(
                   authenticated == null ? '登录 Lyra' : '已登录 Lyra',
-                  style: Theme.of(context).textTheme.titleLarge,
+                  style: Theme.of(context).textTheme.titleLarge
+                      ?.copyWith(fontWeight: FontWeight.w500),
                 ),
               ),
             ],
@@ -390,7 +393,7 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
                     _message = null;
                   });
                 },
-                icon: const Icon(LyraIcons.connection, size: 18),
+                icon: const LyraPrimaryIcon(LyraPrimaryGlyph.server, size: 18),
                 label: const Text('更换服务端'),
               ),
               const SizedBox(height: 8),
@@ -432,7 +435,10 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
                   ? const SizedBox(
                       width: 16,
                       height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: LyraColors.inkSecondary,
+                      ),
                     )
                   : const Icon(LyraIcons.security, size: 20),
               label: Text(

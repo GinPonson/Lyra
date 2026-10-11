@@ -201,7 +201,7 @@ Future<ProviderContainer> _pumpProfile(
         appVersionProvider.overrideWith((ref) async => '1.0.0 (2)'),
       ],
       child: MaterialApp(
-        theme: LyraTheme.light,
+        theme: LyraTheme.dark,
         builder: (context, child) => MediaQuery(
           data: MediaQuery.of(context)
               .copyWith(textScaler: TextScaler.linear(textScale)),

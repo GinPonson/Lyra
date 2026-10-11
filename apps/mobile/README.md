@@ -54,6 +54,12 @@ flutter run --dart-define=LYRA_SERVER_URL=https://lyra.example.com
 
 「服务端连接」显示域名并可重新检测。检测使用公开的 `/v1/system/info` 与 `/v1/health`，区分正常、部分服务不可用、服务不可用和版本不兼容；检测本身不读取令牌，也不会因检测失败而退出登录。更换服务端需确认并重新 Google 登录；先保存新地址，保存失败时保留当前登录。「关于 Lyra」读取已安装 App 的真实版本、服务端版本，并提供 GitHub 项目地址。
 
+## 石墨灰与冰蓝界面
+
+当前界面采用用户批准的 Ticket assistant 风格精修方向：深灰画布与分层表面、冰蓝操作、清楚的数字层级。总览将账户范围与快捷操作放入紧凑页头，主盈亏显示方向正号；持仓以证券与历史成本为主行，类型和数量为次行。我的、报告、登录、导入和助手界面共用同一套暗色控件。
+
+普通手机总览展示前三项持仓；窄屏与放大字体时，账户范围、标题和金额按可用空间换行。金额隐藏及红绿配色仍使用已有偏好，精确值与多币种口径保持一致。实现截图、参考图对照和已修复的排版问题见 [界面验收](../../design-qa.md)。
+
 ## 验证与构建
 
 ```bash
@@ -64,10 +70,10 @@ flutter build apk --debug
 
 调试 APK 位于 `build/app/outputs/flutter-apk/app-debug.apk`，安装后可以在登录表单填写服务端地址。正式分发前需另行配置 Android 发布签名；当前 Gradle 的 release 配置仍使用开发签名，不能据此标记为发布版本。
 
-本轮用户页面安装包为 Lyra `1.0.0`（versionCode 2），包名 `com.lyrafinance.lyra_mobile`，最低 Android SDK 24、目标 SDK 36，包含 `arm64-v8a`、`armeabi-v7a` 和 `x86_64`。`flutter build apk --debug --no-pub` 已成功，APK 为 **167,030,491 字节**，元数据解析和 `apksigner verify` 通过，使用 Android Debug 签名。最终源码一致性、SHA-256 与构建记录见 [实现进度](../../docs/progress.md)。真机安装与运行仍待后续联调。
+本轮深色界面安装包为 Lyra `1.0.0`（versionCode 3），包名 `com.lyrafinance.lyra_mobile`，最低 Android SDK 24、目标 SDK 36，包含 `arm64-v8a`、`armeabi-v7a` 和 `x86_64`。`flutter build apk --debug --no-pub` 已成功，APK 为 **167,049,415 字节**，元数据解析和 `apksigner verify` 通过，使用 Android Debug / v2 签名。SHA-256：`c349c256af67d97dfc9b815681a91d3901585488ff3e35f0f2de8db9e1dab7d1`。最终源码一致性与构建记录见 [实现进度](../../docs/progress.md)。真机安装与运行仍待后续联调。
 
-本轮实际执行 `flutter pub get`，在已有锁文件上新增 `package_info_plus 9.0.1` 和 `package_info_plus_platform_interface 3.2.1`，保留原有依赖版本；版本选择与当前 `flutter_secure_storage 9.2.4` 的平台依赖兼容。Flutter 3.47.2 / Dart 3.13.2 下，`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded --timeout 60s` **162 项全部通过**。
+上一轮用户设置使用真实 `flutter pub get` 新增 `package_info_plus 9.0.1` 和 `package_info_plus_platform_interface 3.2.1`，保留其余依赖版本。本轮界面调整未升级依赖。Flutter 3.47.2 / Dart 3.13.2 下，`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded --timeout 60s` **162 项全部通过**；图片捕获入口默认跳过，单独启用后 4 个场景全部通过。
 
-本轮新增 **71 项回归**：金额隐私 20 项、金融配色 5 项、偏好持久化 11 项、启动账户恢复 11 项、用户页与连接交互 16 项、公开服务检测 8 项。检查真实 Flutter 组件的金额文本、已展开 Tooltip 和语义树，覆盖所有 14 类财务报告的展开详情、图表像素配色、首次加载遮挡、写入失败、身份切换、迟到响应和手动恢复。原有 91 项中的金额精度、多币种、登录、单助手、创建账户与首次导入断言继续通过。
+用户设置阶段新增的 **71 项回归**继续通过：金额隐私 20 项、金融配色 5 项、偏好持久化 11 项、启动账户恢复 11 项、用户页与连接交互 16 项、公开服务检测 8 项。检查真实 Flutter 组件的金额文本、已展开 Tooltip 和语义树，覆盖所有 14 类财务报告的展开详情、图表像素配色、首次加载遮挡、写入失败、身份切换、迟到响应和手动恢复。更早的 91 项中的金额精度、多币种、登录、单助手、创建账户与首次导入断言继续通过；本轮扩大了正盈亏显示在零值、极小值和隐私状态下的检查。
 
-另使用真实 Flutter 界面和合成数据进行渲染检查，包含 390 px 手机、320 px / 1.6 倍字体、1440 px 宽屏、未登录、连接管理、配色、关于和隐藏金额总览。测试环境额外加载中文字体，仅用于截图，不打包为 App 资产。以上测试使用合成数据和受控 HTTP/WebSocket，不能替代真实 Google 账号、模型 API 与 Android 真机验收。
+本轮真实 Flutter 渲染检查输出 **15 张图片**：390 px 手机的总览、股票、交易、我的、连接、配色、导入和隐藏金额；320 px / 1.6 倍字体下的四个主页面；未登录总览与我的；1440 px 宽屏总览。测试环境额外加载中文字体，仅用于截图，不打包为 App 资产。复现方式见 [界面验收](../../design-qa.md#复现)。以上测试使用合成数据和受控 HTTP/WebSocket，不能替代真实 Google 账号、模型 API 与 Android 真机验收。

@@ -5,6 +5,7 @@ import '../../app/session.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
+import '../../core/design/lyra_primary_icon.dart';
 import '../accounts/account_repository.dart';
 import '../accounts/account_sheet.dart';
 import '../accounts/account_workspace.dart';
@@ -52,7 +53,7 @@ class BrokerageAccountsScreen extends ConsumerWidget {
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         for (final (index, account) in rows.indexed) ...[
-                          if (index > 0) const Divider(height: 1),
+                          if (index > 0) const Divider(height: 1, indent: 48),
                           _AccountRow(account: account),
                         ],
                       ],
@@ -79,22 +80,34 @@ class _AccountRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 20),
+    padding: const EdgeInsets.symmetric(vertical: 16),
     child: Row(
       children: [
-        const ExcludeSemantics(
-          child: Icon(LyraIcons.cash, color: LyraColors.accent, size: 24),
+        Container(
+          width: 36,
+          height: 36,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: LyraColors.surface,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: const LyraPrimaryIcon(
+            LyraPrimaryGlyph.brokerage,
+            color: LyraColors.inkSecondary,
+            size: 21,
+          ),
         ),
-        const SizedBox(width: 14),
+        const SizedBox(width: 12),
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
                 account.displayName,
-                style: Theme.of(context).textTheme.titleMedium,
+                style: Theme.of(context).textTheme.titleMedium
+                    ?.copyWith(fontWeight: FontWeight.w500),
               ),
-              const SizedBox(height: 6),
+              const SizedBox(height: 4),
               Text(
                 'Schwab · 尾号 ${account.maskedSuffix} · ${account.baseCurrency}',
                 style: Theme.of(context).textTheme.bodySmall

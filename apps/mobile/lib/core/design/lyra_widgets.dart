@@ -10,6 +10,7 @@ import '../preferences/app_preferences.dart';
 import 'lyra_colors.dart';
 import 'lyra_icons.dart';
 import 'lyra_number.dart';
+import 'lyra_primary_icon.dart';
 import 'lyra_theme.dart';
 
 /// 自适应金融页面：宽屏有边界，窄屏保留阅读留白与可滚动内容。
@@ -32,7 +33,7 @@ class LyraPage extends StatelessWidget {
               key: PageStorageKey<String>(storageKey),
               slivers: [
                 SliverPadding(
-                  padding: EdgeInsets.fromLTRB(gutter, 16, gutter, 32),
+                  padding: EdgeInsets.fromLTRB(gutter, 24, gutter, 32),
                   sliver: SliverToBoxAdapter(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -80,22 +81,28 @@ class LyraPageTitle extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Padding(
     padding: const EdgeInsets.only(bottom: 16),
-    child: Row(
-      children: [
-        Expanded(
-          child: Text(
-            title,
-            style: const TextStyle(
-              fontSize: 25,
-              height: 1.2,
-              fontWeight: FontWeight.w600,
-              letterSpacing: -.6,
-              color: LyraColors.ink,
-            ),
+    child: LayoutBuilder(
+      builder: (context, constraints) {
+        final heading = Text(
+          title,
+          style: const TextStyle(
+            fontSize: 22,
+            height: 1.2,
+            fontWeight: FontWeight.w500,
+            letterSpacing: -.2,
+            color: LyraColors.ink,
           ),
-        ),
-        ?trailing,
-      ],
+        );
+        if (trailing != null &&
+            constraints.maxWidth < 360 &&
+            MediaQuery.textScalerOf(context).scale(22) > 26) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [heading, const SizedBox(height: 8), trailing!],
+          );
+        }
+        return Row(children: [Expanded(child: heading), ?trailing]);
+      },
     ),
   );
 }
@@ -244,6 +251,7 @@ class LyraAmount extends ConsumerWidget {
     this.decimals = 2,
     this.isMonetary = true,
     this.colorBySign = false,
+    this.showPositiveSign = false,
     this.exact = false,
     this.textAlign,
   });
@@ -254,6 +262,9 @@ class LyraAmount extends ConsumerWidget {
   final int decimals;
   final bool isMonetary;
   final bool colorBySign;
+
+  /// 只在方向本身有意义的汇总盈亏上显示正号；不改变服务端数值。
+  final bool showPositiveSign;
 
   /// 明细沿用服务端原始精度，列表仍使用 [decimals] 进行展示舍入。
   final bool exact;
@@ -269,13 +280,23 @@ class LyraAmount extends ConsumerWidget {
               (colorBySign
                   ? lyraProfitColor(value, ref.watch(profitColorSchemeProvider))
                   : LyraColors.ink);
+    var display = hidden
+        ? '••••'
+        : (exact ? value : LyraNumber.amount(value, decimals: decimals));
+    if (!hidden &&
+        showPositiveSign &&
+        !value.startsWith('-') &&
+        RegExp(r'[1-9]').hasMatch(value) &&
+        RegExp(r'^\d').hasMatch(display)) {
+      display = '+$display';
+    }
     final text = Text(
-      '${hidden ? '••••' : (exact ? value : LyraNumber.amount(value, decimals: decimals))}$suffix',
+      '$display$suffix',
       textAlign: textAlign,
       style: LyraTheme.numeric.copyWith(
         fontSize: size,
         color: amountColor,
-        letterSpacing: -size * .025,
+        letterSpacing: -size * .015,
         height: 1.2,
         fontWeight: FontWeight.w500,
       ),
@@ -293,15 +314,22 @@ class LyraAmount extends ConsumerWidget {
 
 /// 范围选择器按需读取获授权账户，所有页面共用同一个选择状态。
 class AccountScopeButton extends ConsumerWidget {
-  const AccountScopeButton({super.key, this.prominent = false});
+  const AccountScopeButton({
+    super.key,
+    this.prominent = false,
+    this.compact = false,
+  });
 
   /// 账号首页可直接使用范围选择器作为页头，其余页面保持紧凑按钮。
   final bool prominent;
+
+  /// 总览单行页头使用短胶囊；长账户名省略但仍可通过提示完整读取。
+  final bool compact;
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final scope = ref.watch(accountScopeProvider);
     final paired = ref.watch(sessionProvider).value is SessionAuthenticated;
-    return TextButton.icon(
+    final button = TextButton.icon(
       onPressed: paired
           ? () => showModalBottomSheet<void>(
               context: context,
@@ -310,7 +338,9 @@ class AccountScopeButton extends ConsumerWidget {
               builder: (context) => const _AccountPicker(),
             )
           : null,
-      icon: prominent ? null : const Icon(LyraIcons.accountScope, size: 17),
+      icon: prominent || compact
+          ? null
+          : const LyraPrimaryIcon(LyraPrimaryGlyph.accountScope, size: 17),
       label: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: prominent ? 230 : 150),
         child: Row(
@@ -319,23 +349,35 @@ class AccountScopeButton extends ConsumerWidget {
             Flexible(
               child: Text(
                 scope.label,
-                style: prominent
-                    ? const TextStyle(fontSize: 19, fontWeight: FontWeight.w600)
-                    : null,
+                style: TextStyle(
+                  fontSize: compact ? 13 : (prominent ? 18 : 14),
+                  fontWeight: FontWeight.w500,
+                ),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
             ),
-            const SizedBox(width: 6),
-            const Icon(LyraIcons.expand, size: 16),
+            SizedBox(width: compact ? 3 : 6),
+            Icon(LyraIcons.expand, size: compact ? 14 : 16),
           ],
         ),
       ),
       style: TextButton.styleFrom(
         foregroundColor: LyraColors.ink,
-        padding: EdgeInsets.symmetric(horizontal: prominent ? 0 : 12),
+        backgroundColor: compact ? LyraColors.surface : null,
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 10 : (prominent ? 0 : 12),
+        ),
+        minimumSize: compact ? const Size(0, 34) : null,
+        shape: compact
+            ? RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+                side: const BorderSide(color: LyraColors.hairline),
+              )
+            : null,
       ),
     );
+    return compact ? Tooltip(message: scope.label, child: button) : button;
   }
 }
 
@@ -356,19 +398,19 @@ class _AccountPicker extends ConsumerWidget {
           maxHeight: MediaQuery.sizeOf(context).height * .75,
         ),
         child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const Text(
                 '选择证券账户',
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w500),
               ),
               const SizedBox(height: 16),
               ListTile(
                 title: const Text('全部账号'),
                 subtitle: const Text('不同币种分别展示'),
-                leading: const Icon(LyraIcons.accountScope),
+                leading: const LyraPrimaryIcon(LyraPrimaryGlyph.accountScope),
                 trailing: scope.id == 'all'
                     ? const Icon(LyraIcons.confirm)
                     : null,
@@ -394,7 +436,9 @@ class _AccountPicker extends ConsumerWidget {
                           subtitle: Text(
                             '${account.maskedSuffix} · ${account.baseCurrency}',
                           ),
-                          leading: const Icon(LyraIcons.cash),
+                          leading: const LyraPrimaryIcon(
+                            LyraPrimaryGlyph.brokerage,
+                          ),
                           trailing: scope.id == account.id
                               ? const Icon(LyraIcons.confirm)
                               : null,

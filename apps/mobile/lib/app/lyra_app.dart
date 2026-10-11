@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/design/lyra_theme.dart';
 import 'lyra_shell.dart';
@@ -12,7 +13,11 @@ class LyraApp extends StatelessWidget {
     return MaterialApp(
       title: 'Lyra',
       debugShowCheckedModeBanner: false,
-      theme: LyraTheme.light,
+      theme: LyraTheme.dark,
+      builder: (context, child) => AnnotatedRegion<SystemUiOverlayStyle>(
+        value: LyraTheme.systemUiOverlayStyle,
+        child: child ?? const SizedBox.shrink(),
+      ),
       home: const LyraShell(),
     );
   }

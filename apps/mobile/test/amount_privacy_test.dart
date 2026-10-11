@@ -151,7 +151,7 @@ Future<ProviderContainer> _pumpFinancialPage(
         ),
       ],
       child: MaterialApp(
-        theme: LyraTheme.light,
+        theme: LyraTheme.dark,
         builder: (context, child) => MediaQuery(
           data: MediaQuery.of(context)
               .copyWith(textScaler: TextScaler.linear(textScale)),
@@ -229,7 +229,7 @@ void main() {
       textScale: 1.6,
     );
     expect(find.text('总览'), findsOneWidget);
-    expect(find.text('2,846.72'), findsOneWidget);
+    expect(find.text('+2,846.72'), findsOneWidget);
     expect(find.byTooltip('隐藏金额').hitTestable(), findsOneWidget);
     expect(tester.takeException(), isNull);
     await tester.tap(find.byKey(const ValueKey('toggle-amounts')));
@@ -243,7 +243,7 @@ void main() {
     expect((await store.read())!.hideAmountsOnStartup, isFalse);
     await tester.tap(find.byKey(const ValueKey('toggle-amounts')));
     await tester.pumpAndSettle();
-    expect(find.text('2,846.72'), findsOneWidget);
+    expect(find.text('+2,846.72'), findsOneWidget);
     expect(store.writes, 0);
     expect(tester.takeException(), isNull);
   });
