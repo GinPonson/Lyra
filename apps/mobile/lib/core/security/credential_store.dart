@@ -58,6 +58,8 @@ class CredentialSnapshot {
     this.authMethod,
     this.userEmail,
     this.googleSubject,
+    this.providerSubject,
+    this.userDisplayName,
   });
 
   final String serverUrl;
@@ -68,6 +70,12 @@ class CredentialSnapshot {
   /// 缺失表示旧版配对凭据，迁移后必须重新登录。
   final String? authMethod;
   final String? userEmail;
+  final String? userDisplayName;
+
+  /// 与 authMethod 成对的稳定主体；Google 旧凭据仍可从历史字段恢复。
+  final String? providerSubject;
+  String? get subject =>
+      providerSubject ?? (authMethod == 'google' ? googleSubject : null);
 
   /// Google OIDC 稳定主体；仅用于同一服务端内的本机偏好隔离。
   final String? googleSubject;
@@ -112,6 +120,8 @@ class SecureCredentialStore implements CredentialStore {
       authMethod: await _storage.read(key: _keyAuthMethod),
       userEmail: await _storage.read(key: _keyUserEmail),
       googleSubject: await _storage.read(key: _keyGoogleSubject),
+      providerSubject: await _storage.read(key: _keyProviderSubject),
+      userDisplayName: await _storage.read(key: _keyUserDisplayName),
     );
   }
 
@@ -124,6 +134,11 @@ class SecureCredentialStore implements CredentialStore {
     await _storage.write(key: _keyAuthMethod, value: snapshot.authMethod);
     await _storage.write(key: _keyUserEmail, value: snapshot.userEmail);
     await _storage.write(key: _keyGoogleSubject, value: snapshot.googleSubject);
+    await _storage.write(key: _keyProviderSubject, value: snapshot.subject);
+    await _storage.write(
+      key: _keyUserDisplayName,
+      value: snapshot.userDisplayName,
+    );
     final privateKey = snapshot.devicePrivateKey;
     if (privateKey != null) {
       await _storage.write(key: _keyDevicePrivateKey, value: privateKey);
@@ -142,12 +157,16 @@ class SecureCredentialStore implements CredentialStore {
     await _storage.delete(key: _keyAuthMethod);
     await _storage.delete(key: _keyUserEmail);
     await _storage.delete(key: _keyGoogleSubject);
+    await _storage.delete(key: _keyProviderSubject);
+    await _storage.delete(key: _keyUserDisplayName);
   }
 
   static const String _keyDevicePrivateKey = 'lyra.devicePrivateKey';
   static const String _keyAuthMethod = 'lyra.authMethod';
   static const String _keyUserEmail = 'lyra.userEmail';
   static const String _keyGoogleSubject = 'lyra.googleSubject';
+  static const String _keyProviderSubject = 'lyra.providerSubject';
+  static const String _keyUserDisplayName = 'lyra.userDisplayName';
 }
 
 /// 测试与未登录状态使用的内存实现；不落盘。

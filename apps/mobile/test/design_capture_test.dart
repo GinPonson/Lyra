@@ -249,7 +249,7 @@ void main() {
         await _saveCapture(tester, boundaryKey, 'ledger-${scenario.name}');
       }
 
-      if (scenario.name != '1440') {
+      if (scenario.signedIn && scenario.name != '1440') {
         await _selectDestination(tester, '我的');
         await _saveCapture(tester, boundaryKey, 'profile-${scenario.name}');
       }

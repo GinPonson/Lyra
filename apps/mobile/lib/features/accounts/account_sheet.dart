@@ -30,7 +30,7 @@ Future<BrokerageAccount?> showCreateAccountSheet(
   ),
 );
 
-/// 证券账户与 Google 身份分开；只在用户确认后提交创建。
+/// 证券账户与登录身份分开；只在用户确认后提交创建。
 class AccountSheet extends ConsumerStatefulWidget {
   const AccountSheet({super.key, this.sourceFileName});
 
@@ -79,7 +79,7 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
       setState(() {
         _error = const LyraApiError(
           code: 'AUTH_REQUIRED',
-          message: '请先使用 Google 登录',
+          message: '请先登录 Lyra',
           statusCode: 401,
           retryable: false,
         );
@@ -178,7 +178,7 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
               ),
               const SizedBox(height: 8),
               const Text(
-                'Google 登录用于访问 Lyra；证券账户用于归集你导入的交易记录。',
+                '登录账号用于访问 Lyra；证券账户用于归集你导入的交易记录。',
                 style: TextStyle(color: LyraColors.inkSecondary, height: 1.6),
               ),
               const SizedBox(height: 20),

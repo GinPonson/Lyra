@@ -156,13 +156,13 @@ bool _validScopeId(Object? value, {bool allowAll = true}) =>
 
 /// 旧凭据没有稳定 subject 时只按设备隔离，绝不使用可能复用的邮箱认领旧设置。
 String preferencesIdentityKey(CredentialSnapshot snapshot) {
-  final subject = snapshot.googleSubject?.trim();
+  final subject = snapshot.subject?.trim();
   return jsonEncode([
     normalizePreferencesServerUrl(snapshot.serverUrl),
-    if (snapshot.authMethod == 'google' &&
+    if (const ['google', 'linuxdo', 'github'].contains(snapshot.authMethod) &&
         subject != null &&
         subject.isNotEmpty) ...[
-      'google',
+      snapshot.authMethod,
       subject,
     ] else ...[
       'device',

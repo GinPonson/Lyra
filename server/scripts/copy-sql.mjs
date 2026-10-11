@@ -15,6 +15,7 @@ const sqlFiles = [
   "agent-genkit-schema.sql",
   "owner-login-schema.sql",
   "market-settings-schema.sql",
+  "owner-login-providers-schema.sql",
 ];
 
 const sourceDirectory = new URL("../src/infrastructure/db/", import.meta.url);

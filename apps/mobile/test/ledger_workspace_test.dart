@@ -448,13 +448,19 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
-      await tester.tap(find.text('股票'));
+      if (paired) {
+        await tester.tap(find.text('股票'));
+      } else {
+        expect(find.byKey(const ValueKey('login-screen')), findsOneWidget);
+        expect(find.byType(NavigationBar), findsNothing);
+        await tester.ensureVisible(find.byKey(const ValueKey('login-google')));
+      }
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
     });
   }
 
-  testWidgets('未登录首屏提供直接连接入口', (tester) async {
+  testWidgets('未登录首屏进入独立登录页并提供三种身份入口', (tester) async {
     viewport(tester, const Size(390, 844));
     final fixture = LedgerFixture();
     final dependencies = await fixture.dependencies(paired: false);
@@ -468,7 +474,11 @@ void main() {
     );
     await tester.pumpAndSettle();
     await _capture(tester, 'welcome-390');
-    expect(find.text('连接我的账户'), findsOneWidget);
+    expect(find.text('登录 Lyra'), findsOneWidget);
+    expect(find.text('使用 Google 登录'), findsOneWidget);
+    expect(find.text('使用 Linux.do 登录'), findsOneWidget);
+    expect(find.text('使用 GitHub 登录'), findsOneWidget);
+    expect(find.byType(NavigationBar), findsNothing);
     expect(tester.takeException(), isNull);
   });
 

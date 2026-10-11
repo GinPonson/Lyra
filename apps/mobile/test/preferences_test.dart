@@ -75,6 +75,60 @@ Future<void> _waitFor(bool Function() predicate) async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('三种登录主体按提供方隔离，旧 Google 偏好身份键保持一致', () {
+    CredentialSnapshot snapshot(String provider, {String subject = '123'}) =>
+        CredentialSnapshot(
+          serverUrl: 'https://lyra.example',
+          deviceId: 'new-device',
+          accessToken: 'access',
+          refreshToken: 'refresh',
+          authMethod: provider,
+          providerSubject: subject,
+          userEmail: 'same@example.com',
+        );
+    final google = preferencesIdentityKey(snapshot('google'));
+    final github = preferencesIdentityKey(snapshot('github'));
+    final linuxdo = preferencesIdentityKey(snapshot('linuxdo'));
+    expect({google, github, linuxdo}, hasLength(3));
+    expect(google, preferencesIdentityKey(_snapshot(subject: '123')));
+    expect(
+      preferencesIdentityKey(snapshot('github', subject: '456')),
+      isNot(github),
+    );
+  });
+
+  test('通用身份与昵称跨安全存储恢复，退出一起清理，不影响 Google 历史字段', () async {
+    FlutterSecureStorage.setMockInitialValues({});
+    const store = SecureCredentialStore();
+    await store.write(_snapshot());
+    expect((await store.read())!.subject, 'google-owner');
+    await store.write(
+      const CredentialSnapshot(
+        serverUrl: 'https://lyra.example',
+        deviceId: 'github-device',
+        accessToken: 'access',
+        refreshToken: 'refresh',
+        authMethod: 'github',
+        providerSubject: '2345',
+        userDisplayName: 'GitHub name',
+      ),
+    );
+    final restored = (await store.read())!;
+    expect(restored.subject, '2345');
+    expect(restored.userDisplayName, 'GitHub name');
+    expect(restored.googleSubject, isNull);
+    expect(restored.userEmail, isNull);
+    await store.clear();
+    expect(
+      await const FlutterSecureStorage().read(key: 'lyra.providerSubject'),
+      isNull,
+    );
+    expect(
+      await const FlutterSecureStorage().read(key: 'lyra.userDisplayName'),
+      isNull,
+    );
+  });
+
   test('首次无存储正常采用默认值，加载前隐藏金额', () async {
     final container = _container(MemoryAppPreferencesStore());
     addTearDown(container.dispose);

@@ -12,6 +12,7 @@ import '../core/api/lyra_api_error.dart';
 import '../core/security/credential_store.dart';
 import '../features/agent/agent_session_store.dart';
 import '../features/auth/auth_repository.dart';
+import '../features/auth/auth_provider.dart';
 import '../features/ledger/ledger_models.dart';
 import '../features/ledger/ledger_repository.dart';
 
@@ -38,8 +39,9 @@ sealed class SessionState {
 }
 
 class SessionSignedOut extends SessionState {
-  const SessionSignedOut({this.message});
+  const SessionSignedOut({this.message, this.retrySignOut = false});
   final String? message;
+  final bool retrySignOut;
 }
 
 class SessionAuthenticated extends SessionState {
@@ -99,12 +101,12 @@ class SessionController extends AsyncNotifier<SessionState> {
     if (snapshot == null) {
       return _restored(generation, const SessionSignedOut());
     }
-    if (snapshot.authMethod != 'google') {
+    if (AuthProvider.fromId(snapshot.authMethod) == null) {
       await _expireIdentity(
         dependencies,
         snapshot,
         generation,
-        '登录方式已更新，请使用 Google 重新登录。',
+        '登录方式已更新，请重新登录。',
       );
       return _publishedState;
     }
@@ -168,6 +170,16 @@ class SessionController extends AsyncNotifier<SessionState> {
   Future<bool> signInWithGoogle({
     required String serverUrl,
     required String displayName,
+  }) => signIn(
+    provider: AuthProvider.google,
+    serverUrl: serverUrl,
+    displayName: displayName,
+  );
+
+  Future<bool> signIn({
+    required AuthProvider provider,
+    required String serverUrl,
+    required String displayName,
   }) async {
     cancelSignIn();
     final generation = _loginGeneration;
@@ -196,7 +208,8 @@ class SessionController extends AsyncNotifier<SessionState> {
       final repository = AuthRepository(
         dio: _bareClient(dependencies, serverUrl),
       );
-      final login = await repository.startGoogleLogin(
+      final login = await repository.startLogin(
+        provider: provider,
         displayName: displayName,
         publicKeyPem: _spkiPem(publicKey.bytes),
         codeChallenge: challenge,
@@ -227,7 +240,8 @@ class SessionController extends AsyncNotifier<SessionState> {
             retryable: true,
           );
         }
-        final credentials = await repository.exchangeGoogleLogin(
+        final credentials = await repository.exchangeLogin(
+          provider: provider,
           loginId: login.loginId,
           codeVerifier: verifier,
           cancelToken: cancel,
@@ -240,8 +254,10 @@ class SessionController extends AsyncNotifier<SessionState> {
             accessToken: credentials.accessToken,
             refreshToken: credentials.refreshToken,
             devicePrivateKey: base64Encode(privateKey),
-            authMethod: 'google',
+            authMethod: provider.id,
             userEmail: credentials.userEmail,
+            userDisplayName: credentials.userDisplayName,
+            providerSubject: credentials.subject,
             googleSubject: credentials.googleSubject,
           );
           return await withCredentialMutation(
@@ -308,7 +324,7 @@ class SessionController extends AsyncNotifier<SessionState> {
   Future<void> signOut() async {
     final pendingRefresh = _pendingRefresh;
     cancelSignIn();
-    ++_authGeneration;
+    final generation = ++_authGeneration;
     final dependencies = ref.read(sessionDependenciesProvider);
     _client?.invalidate();
     _client = null;
@@ -325,6 +341,11 @@ class SessionController extends AsyncNotifier<SessionState> {
         },
       );
     } on Object {
+      if (_authActive(generation)) {
+        _publish(
+          const SessionSignedOut(message: '无法清除本机登录，请重试。', retrySignOut: true),
+        );
+      }
       throw const LyraApiError(
         code: 'LOCAL_LOGOUT_FAILED',
         message: '无法清除本机登录，请重试。',
@@ -353,12 +374,21 @@ class SessionController extends AsyncNotifier<SessionState> {
       }
     }
     try {
-      await repository.logout(accessToken: accessToken);
-    } on LyraApiError catch (error) {
-      if (error.statusCode != 401) rethrow;
-      // 仅为旧设备撤销刷新；绝不写回已退出或另一次登录的凭据。
-      final tokens = await repository.refresh(refreshToken: refreshToken);
-      await repository.logout(accessToken: tokens.accessToken);
+      try {
+        await repository.logout(accessToken: accessToken);
+      } on LyraApiError catch (error) {
+        if (error.statusCode != 401) rethrow;
+        // 仅为旧设备撤销刷新；绝不写回已退出或另一次登录的凭据。
+        final tokens = await repository.refresh(refreshToken: refreshToken);
+        await repository.logout(accessToken: tokens.accessToken);
+      }
+    } on Object {
+      if (_authActive(generation)) {
+        _publish(
+          const SessionSignedOut(message: '已退出此设备登录。服务端暂时无法撤销会话，账本仍保留在服务端。'),
+        );
+      }
+      rethrow;
     }
   }
 
@@ -478,6 +508,8 @@ class SessionController extends AsyncNotifier<SessionState> {
                 devicePrivateKey: current.devicePrivateKey,
                 authMethod: current.authMethod,
                 userEmail: current.userEmail,
+                userDisplayName: current.userDisplayName,
+                providerSubject: current.providerSubject,
                 googleSubject: current.googleSubject,
               );
               await dependencies.credentialStore.write(updated);

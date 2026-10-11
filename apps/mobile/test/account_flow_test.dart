@@ -372,7 +372,7 @@ void main() {
     expect(find.text('先创建一个证券账户'), findsOneWidget);
     expect(fixture.createKeys, isEmpty);
     await _tap(tester, find.text('创建第一个证券账户'));
-    expect(find.textContaining('Google 登录用于访问 Lyra'), findsOneWidget);
+    expect(find.textContaining('登录账号用于访问 Lyra'), findsOneWidget);
     await _fillAccount(tester);
     await _tap(tester, find.byKey(const ValueKey('create-account-submit')));
     expect(find.byType(AccountSheet), findsNothing);

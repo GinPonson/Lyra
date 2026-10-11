@@ -147,7 +147,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
         else if (accounts.value!.isEmpty)
           LyraEmpty(
             title: '先创建一个证券账户',
-            message: '你已使用 Google 登录。添加 Schwab 账户后，即可导入交易并查看持仓。',
+            message: '你已登录 Lyra。添加 Schwab 账户后，即可导入交易并查看持仓。',
             icon: LyraIcons.cash,
             action: FilledButton.icon(
               onPressed: _createAccount,

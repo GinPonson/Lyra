@@ -8,6 +8,8 @@ import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
 import '../../core/preferences/app_preferences.dart';
+import '../auth/auth_provider.dart';
+import '../auth/auth_workspace.dart';
 import '../system/system_repository.dart';
 import '../system/system_workspace.dart';
 
@@ -147,7 +149,9 @@ final _loginPanelOwnerProvider = Provider((ref) => _LoginPanelOwner());
 
 /// 服务端地址与系统浏览器登录；所有入口复用 SessionController。
 class LoginPanel extends ConsumerStatefulWidget {
-  const LoginPanel({super.key});
+  const LoginPanel({super.key, this.framed = true});
+
+  final bool framed;
 
   @override
   ConsumerState<LoginPanel> createState() => _LoginPanelState();
@@ -159,17 +163,20 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
   late final _LoginPanelOwner _loginOwner;
   bool _submitting = false;
   bool _savingAddress = false;
+  bool _clearingLogin = false;
   bool _editingServer = false;
   bool _serverEdited = false;
   int _attempt = 0;
   String? _message;
-  String _progressLabel = '等待 Google 授权…';
+  String _progressLabel = '等待授权…';
+  String? _catalogUrl;
 
   @override
   void initState() {
     super.initState();
     _loginOwner = ref.read(_loginPanelOwnerProvider);
     _serverUrl.text = ref.read(currentServerUrlProvider) ?? '';
+    _catalogUrl = _serverUrl.text.isEmpty ? null : _serverUrl.text;
   }
 
   @override
@@ -203,12 +210,20 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
       _message = null;
     });
     try {
-      await ref
-          .read(appPreferencesProvider.notifier)
-          .setRememberedServerUrl(url);
+      // 更换服务端时先检查新地址支持哪些登录方式；确认登录后才改本机记忆。
+      if (ref.read(sessionProvider).value is! SessionAuthenticated) {
+        await ref
+            .read(appPreferencesProvider.notifier)
+            .setRememberedServerUrl(url);
+      }
       if (!mounted || attempt != _attempt) return;
       _serverUrl.text = url;
-      setState(() => _message = '服务端地址已保存。');
+      setState(() {
+        _catalogUrl = url;
+        _serverEdited = false;
+        _message = null;
+      });
+      ref.invalidate(authProvidersProvider(url));
     } on Object {
       if (!mounted || attempt != _attempt) return;
       setState(() => _message = '服务端地址未能保存，请重试。');
@@ -219,10 +234,21 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     }
   }
 
-  Future<void> _submit({SessionAuthenticated? replace}) async {
+  Future<void> _submit({
+    required AuthProvider provider,
+    SessionAuthenticated? replace,
+  }) async {
     if (_submitting || _savingAddress) return;
     final url = _validatedUrl();
     if (url == null) return;
+    if (replace == null) {
+      final catalog = ref.read(authProvidersProvider(url)).asData?.value;
+      if (_serverEdited ||
+          catalog == null ||
+          !catalog.any((item) => item.provider == provider && item.available)) {
+        return;
+      }
+    }
     final controller = ref.read(sessionProvider.notifier);
     final originalClient = controller.client;
     if (replace != null) {
@@ -237,7 +263,7 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
           title: const Text('更换服务端？'),
           content: Text(
             '将退出此设备在 ${serverDisplayName(replace.snapshot.serverUrl)} 的登录，'
-            '然后在 ${serverDisplayName(url)} 重新使用 Google 登录。'
+            '然后前往 ${serverDisplayName(url)} 的登录页面。'
             '\n\n你的账本仍保存在原服务端。',
           ),
           actions: [
@@ -247,7 +273,7 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
             ),
             FilledButton(
               onPressed: () => Navigator.pop(context, true),
-              child: const Text('更换并登录'),
+              child: const Text('更换并前往登录'),
             ),
           ],
         ),
@@ -264,7 +290,9 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     setState(() {
       _submitting = true;
       _message = null;
-      _progressLabel = replace == null ? '准备 Google 登录…' : '正在更换服务端…';
+      _progressLabel = replace == null
+          ? '准备 ${provider.label} 登录…'
+          : '正在更换服务端…';
     });
     try {
       // 地址保存成功后才开始更换；失败不会清除当前登录。
@@ -293,13 +321,21 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
             ref.read(sessionProvider).value is! SessionSignedOut) {
           return;
         }
+        setState(() {
+          _catalogUrl = url;
+          _serverEdited = false;
+          _editingServer = false;
+          _message = '已更换服务端，请选择登录方式。';
+        });
+        return;
       }
       if (!_active(attempt, owner)) return;
       setState(() {
         _editingServer = false;
-        _progressLabel = '等待 Google 授权…';
+        _progressLabel = '等待 ${provider.label} 授权…';
       });
-      await controller.signInWithGoogle(
+      await controller.signIn(
+        provider: provider,
         serverUrl: url,
         displayName: 'Lyra Mobile',
       );
@@ -320,6 +356,7 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     setState(() {
       _editingServer = false;
       _serverEdited = false;
+      _catalogUrl = _serverUrl.text.isEmpty ? null : _serverUrl.text;
       _message = '登录状态已变化，已停止此次更换。';
     });
   }
@@ -334,6 +371,23 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     });
   }
 
+  Future<void> _retrySignOut() async {
+    if (_clearingLogin) return;
+    final session = ref.read(sessionProvider).value;
+    if (session is! SessionSignedOut || !session.retrySignOut) return;
+    setState(() {
+      _clearingLogin = true;
+      _message = null;
+    });
+    try {
+      await ref.read(sessionProvider.notifier).signOut();
+    } on Object {
+      // 控制器把当前身份对应的安全提示发布给登录页。
+    } finally {
+      if (mounted) setState(() => _clearingLogin = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(sessionProvider);
@@ -342,10 +396,279 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     final sessionMessage = session is SessionSignedOut ? session.message : null;
     ref.listen(currentServerUrlProvider, (_, next) {
       if (!_submitting && !_savingAddress && !_serverEdited && next != null) {
-        _serverUrl.text = next;
+        setState(() {
+          _serverUrl.text = next;
+          _catalogUrl = next;
+        });
       }
     });
-    final busy = _submitting || _savingAddress || state.isLoading;
+    final busy =
+        _submitting || _savingAddress || _clearingLogin || state.isLoading;
+    final requiresLogoutRetry =
+        session is SessionSignedOut && session.retrySignOut;
+    final catalog = _catalogUrl == null || authenticated != null
+        ? null
+        : ref.watch(authProvidersProvider(_catalogUrl!));
+    final entries = catalog?.asData?.value;
+    final identityProvider = AuthProvider.fromId(
+      authenticated?.snapshot.authMethod,
+    );
+    final content = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (widget.framed) ...[
+          Text(
+            authenticated == null ? '登录 Lyra' : '已登录 Lyra',
+            style: Theme.of(context).textTheme.titleLarge
+                ?.copyWith(fontWeight: FontWeight.w500),
+          ),
+          const SizedBox(height: 12),
+        ],
+        if (authenticated != null && !_editingServer && !_submitting) ...[
+          Text(
+            authenticated.snapshot.userEmail ??
+                authenticated.snapshot.userDisplayName ??
+                '${identityProvider?.label ?? '账号'}已登录',
+          ),
+          const SizedBox(height: 6),
+          SelectableText(
+            authenticated.snapshot.serverUrl,
+            style: const TextStyle(color: LyraColors.muted),
+          ),
+          const SizedBox(height: 18),
+          OutlinedButton.icon(
+            onPressed: () {
+              _serverUrl.text = authenticated.snapshot.serverUrl;
+              setState(() {
+                _editingServer = true;
+                _serverEdited = true;
+                _message = null;
+              });
+            },
+            icon: const LyraPrimaryIcon(LyraPrimaryGlyph.server, size: 18),
+            label: const Text('更换服务端'),
+          ),
+          TextButton(
+            onPressed: () => showDeviceSignOutDialog(context),
+            child: const Text('退出登录'),
+          ),
+        ] else ...[
+          if (authenticated == null)
+            for (final provider in AuthProvider.values) ...[
+              _ProviderSignInButton(
+                provider: provider,
+                available:
+                    !busy &&
+                    !requiresLogoutRetry &&
+                    !_serverEdited &&
+                    (entries?.any(
+                          (item) => item.provider == provider && item.available,
+                        ) ??
+                        false),
+                status: _submitting
+                    ? null
+                    : _catalogUrl == null || _serverEdited
+                    ? '待连接'
+                    : catalog?.isLoading == true
+                    ? '检测中'
+                    : entries == null
+                    ? '暂不可用'
+                    : entries.any(
+                        (item) => item.provider == provider && item.available,
+                      )
+                    ? null
+                    : '未配置',
+                onPressed: () =>
+                    _submit(provider: provider, replace: authenticated),
+              ),
+              const SizedBox(height: 12),
+            ],
+          if (_submitting) ...[
+            Semantics(
+              liveRegion: true,
+              child: Text(
+                _progressLabel,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: LyraColors.accent, height: 1.6),
+              ),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              '请在浏览器完成授权，然后返回 Lyra。',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: LyraColors.muted, fontSize: 13),
+            ),
+            TextButton(onPressed: _cancel, child: const Text('取消登录')),
+          ] else if (catalog?.hasError == true && !_serverEdited) ...[
+            Text(
+              catalog!.error is LyraApiError &&
+                      (catalog.error! as LyraApiError).statusCode == 404
+                  ? '服务端尚不支持登录方式查询，请更新服务端。'
+                  : '暂时无法读取登录方式，请检查服务端地址与连接。',
+              style: const TextStyle(color: LyraColors.muted, height: 1.6),
+            ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                key: const ValueKey('login-reload-providers'),
+                onPressed: busy
+                    ? null
+                    : () => ref.invalidate(authProvidersProvider(_catalogUrl!)),
+                icon: const Icon(LyraIcons.sync, size: 17),
+                label: const Text('重新检测'),
+              ),
+            ),
+          ] else if (entries != null &&
+              entries.every((item) => !item.available) &&
+              !_serverEdited)
+            const Text(
+              '这个服务端尚未配置登录方式，请联系服务端管理员。',
+              style: TextStyle(color: LyraColors.muted, height: 1.6),
+            ),
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: LyraColors.surfaceSubtle,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: LyraColors.hairline),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    const LyraPrimaryIcon(LyraPrimaryGlyph.server, size: 18),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        '服务端连接',
+                        style: Theme.of(context).textTheme.titleSmall,
+                      ),
+                    ),
+                    if (_catalogUrl != null &&
+                        !_serverEdited &&
+                        !_editingServer)
+                      TextButton(
+                        key: const ValueKey('login-edit-server'),
+                        onPressed: busy
+                            ? null
+                            : () => setState(() => _serverEdited = true),
+                        child: const Text('更换'),
+                      ),
+                  ],
+                ),
+                if (_catalogUrl == null || _serverEdited || _editingServer) ...[
+                  const SizedBox(height: 12),
+                  TextField(
+                    key: const ValueKey('login-server-url'),
+                    controller: _serverUrl,
+                    enabled: !busy,
+                    keyboardType: TextInputType.url,
+                    autocorrect: false,
+                    textInputAction: TextInputAction.done,
+                    onChanged: (_) => setState(() => _serverEdited = true),
+                    onSubmitted: (_) => busy ? null : _saveAddress(),
+                    decoration: const InputDecoration(
+                      labelText: '服务端地址',
+                      hintText: 'https://lyra.example.com',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  if (authenticated == null)
+                    TextButton.icon(
+                      key: const ValueKey('login-save-server'),
+                      onPressed: busy ? null : _saveAddress,
+                      icon: const Icon(LyraIcons.connection, size: 17),
+                      label: Text(_savingAddress ? '正在连接…' : '连接服务端'),
+                    ),
+                  if (_editingServer)
+                    const Text(
+                      '更换后会前往登录页面。原服务端的账本会保留。',
+                      style: TextStyle(
+                        color: LyraColors.muted,
+                        fontSize: 13,
+                        height: 1.6,
+                      ),
+                    ),
+                ] else ...[
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          serverDisplayName(_catalogUrl!),
+                          style: const TextStyle(
+                            color: LyraColors.inkSecondary,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        key: const ValueKey('login-refresh-providers'),
+                        tooltip: '重新检测登录方式',
+                        onPressed: busy || catalog?.isLoading == true
+                            ? null
+                            : () => ref.invalidate(
+                                authProvidersProvider(_catalogUrl!),
+                              ),
+                        icon: const Icon(LyraIcons.sync, size: 18),
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+          if (_editingServer && !_submitting) ...[
+            const SizedBox(height: 14),
+            FilledButton(
+              key: const ValueKey('login-change-server'),
+              onPressed: busy
+                  ? null
+                  : () => _submit(
+                      provider: identityProvider ?? AuthProvider.google,
+                      replace: authenticated,
+                    ),
+              child: const Text('更换并前往登录'),
+            ),
+          ],
+          if (_editingServer && !_submitting)
+            TextButton(
+              onPressed: busy
+                  ? null
+                  : () => setState(() {
+                      _editingServer = false;
+                      _serverEdited = false;
+                      _serverUrl.text = authenticated!.snapshot.serverUrl;
+                      _catalogUrl = _serverUrl.text;
+                      _message = null;
+                    }),
+              child: const Text('取消更换'),
+            ),
+        ],
+        if (_message != null || sessionMessage != null) ...[
+          const SizedBox(height: 16),
+          Semantics(
+            liveRegion: true,
+            child: Text(
+              _message ?? sessionMessage!,
+              style: const TextStyle(
+                color: LyraColors.inkSecondary,
+                height: 1.6,
+              ),
+            ),
+          ),
+        ],
+        if (requiresLogoutRetry && !widget.framed)
+          TextButton(
+            key: const ValueKey('login-retry-sign-out'),
+            onPressed: busy ? null : _retrySignOut,
+            child: Text(_clearingLogin ? '正在清理…' : '重试清除登录'),
+          ),
+      ],
+    );
+    if (!widget.framed) return content;
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -353,134 +676,71 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: LyraColors.hairline),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              const Icon(
-                LyraIcons.security,
-                size: 20,
-                color: LyraColors.accent,
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  authenticated == null ? '登录 Lyra' : '已登录 Lyra',
-                  style: Theme.of(context).textTheme.titleLarge
-                      ?.copyWith(fontWeight: FontWeight.w500),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          if (authenticated != null) ...[
-            Text(authenticated.snapshot.userEmail ?? 'Google 账号已登录'),
-            const SizedBox(height: 6),
-            SelectableText(
-              authenticated.snapshot.serverUrl,
-              style: Theme.of(context).textTheme.bodySmall
-                  ?.copyWith(color: LyraColors.muted),
-            ),
-            if (!_editingServer && !_submitting) ...[
-              const SizedBox(height: 16),
-              OutlinedButton.icon(
-                onPressed: () {
-                  _serverUrl.text = authenticated.snapshot.serverUrl;
-                  setState(() {
-                    _editingServer = true;
-                    _serverEdited = true;
-                    _message = null;
-                  });
-                },
-                icon: const LyraPrimaryIcon(LyraPrimaryGlyph.server, size: 18),
-                label: const Text('更换服务端'),
-              ),
-              const SizedBox(height: 8),
-              TextButton(
-                onPressed: () => showDeviceSignOutDialog(context),
-                child: const Text('退出登录'),
-              ),
-            ],
-          ] else
-            const Text(
-              '使用 Google 账号登录你的服务端。授权完成后返回 Lyra。',
-              style: TextStyle(color: LyraColors.muted, height: 1.6),
-            ),
-          if (authenticated == null || _editingServer || _submitting) ...[
-            const SizedBox(height: 18),
-            TextField(
-              key: const ValueKey('login-server-url'),
-              controller: _serverUrl,
-              enabled: !busy,
-              keyboardType: TextInputType.url,
-              autocorrect: false,
-              onChanged: (_) => _serverEdited = true,
-              decoration: const InputDecoration(
-                labelText: '服务端地址',
-                hintText: 'https://lyra.example.com',
-              ),
-            ),
-            if (_editingServer) ...[
-              const SizedBox(height: 12),
-              const Text(
-                '更换后需要重新登录，原服务端的账本会保留。',
-                style: TextStyle(height: 1.6),
-              ),
-            ],
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: busy ? null : () => _submit(replace: authenticated),
-              icon: _submitting
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: LyraColors.inkSecondary,
-                      ),
-                    )
-                  : const Icon(LyraIcons.security, size: 20),
-              label: Text(
-                _submitting
-                    ? _progressLabel
-                    : authenticated != null
-                    ? '更换并重新登录'
-                    : '使用 Google 登录',
-              ),
-            ),
-            if (_submitting)
-              TextButton(onPressed: _cancel, child: const Text('取消登录'))
-            else if (_editingServer)
-              TextButton(
-                onPressed: busy
-                    ? null
-                    : () => setState(() {
-                        _editingServer = false;
-                        _message = null;
-                      }),
-                child: const Text('取消更换'),
-              )
-            else
-              TextButton(
-                onPressed: busy ? null : _saveAddress,
-                child: Text(_savingAddress ? '正在保存…' : '保存地址'),
-              ),
-          ],
-          if (_message != null || sessionMessage != null) ...[
-            const SizedBox(height: 12),
-            Text(
-              _message ?? sessionMessage!,
-              style: const TextStyle(
-                color: LyraColors.inkSecondary,
-                height: 1.6,
-              ),
-            ),
-          ],
-        ],
-      ),
+      child: content,
     );
   }
+}
+
+class _ProviderSignInButton extends StatelessWidget {
+  const _ProviderSignInButton({
+    required this.provider,
+    required this.available,
+    required this.status,
+    required this.onPressed,
+  });
+  final AuthProvider provider;
+  final bool available;
+  final String? status;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => OutlinedButton(
+    key: ValueKey('login-${provider.id}'),
+    onPressed: available ? onPressed : null,
+    style: OutlinedButton.styleFrom(
+      minimumSize: const Size.fromHeight(54),
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 15),
+      backgroundColor: available
+          ? LyraColors.surfaceStrong
+          : LyraColors.surface,
+      foregroundColor: LyraColors.ink,
+      side: BorderSide(
+        color: available ? LyraColors.hairlineStrong : LyraColors.hairline,
+      ),
+    ),
+    child: Row(
+      children: [
+        if (provider == AuthProvider.google) ...[
+          ExcludeSemantics(
+            child: Image.asset(
+              'assets/auth/google-g.png',
+              width: 20,
+              height: 20,
+              fit: BoxFit.contain,
+            ),
+          ),
+          const SizedBox(width: 12),
+        ],
+        Expanded(
+          child: Text(
+            '使用 ${provider.label} 登录',
+            textAlign: status == null ? TextAlign.center : TextAlign.left,
+          ),
+        ),
+        if (status != null) ...[
+          const SizedBox(width: 10),
+          Text(
+            status!,
+            style: const TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w400,
+              color: LyraColors.mutedSoft,
+            ),
+          ),
+        ],
+      ],
+    ),
+  );
 }
 
 Future<void> showDeviceSignOutDialog(BuildContext context) {

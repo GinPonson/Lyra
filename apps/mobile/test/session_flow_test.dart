@@ -124,6 +124,30 @@ void main() {
                   ) async {
                     final path = options.uri.path;
                     expect(options.headers['x-lyra-protocol-version'], '2');
+                    if (path == '/v1/auth/providers') {
+                      return _response(
+                        jsonEncode({
+                          'providers': [
+                            {
+                              'id': 'google',
+                              'name': 'Google',
+                              'available': true,
+                            },
+                            {
+                              'id': 'linuxdo',
+                              'name': 'Linux.do',
+                              'available': false,
+                            },
+                            {
+                              'id': 'github',
+                              'name': 'GitHub',
+                              'available': false,
+                            },
+                          ],
+                        }),
+                        200,
+                      );
+                    }
                     if (path == '/v1/auth/google/start') {
                       final body = _requestBody(options);
                       codeChallenge = body['codeChallenge'] as String;
@@ -196,7 +220,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    // 未登录状态只展示 Google 登录，不再要求一次性配对码。
+    // 独立登录页展示三种方式；服务端目录决定哪些按钮可用。
     await scrollUntilVisible(tester, find.text('登录 Lyra'));
     expect(find.text('登录 Lyra'), findsOneWidget);
 
@@ -205,8 +229,14 @@ void main() {
       'http://127.0.0.1:3141',
     );
     expect(find.widgetWithText(TextField, '配对码'), findsNothing);
+    await tester.ensureVisible(find.byKey(const ValueKey('login-save-server')));
+    await tester.tap(find.byKey(const ValueKey('login-save-server')));
+    await tester.pumpAndSettle();
     await scrollUntilVisible(tester, find.text('使用 Google 登录'));
     await tester.tap(find.text('使用 Google 登录'));
+    await tester.pumpAndSettle();
+    // 等待提示本身不使用无限动画；明确推进服务端约定的轮询间隔。
+    await tester.pump(const Duration(seconds: 2));
     await tester.pumpAndSettle();
 
     // 已登录状态展示真实汇总：十进制字符串原样展示，不伪造。先滚回顶部。
@@ -621,9 +651,7 @@ void main() {
     });
   }
 
-  testWidgets('安全存储不可读时降级为可操作的未登录状态而不是重试死循环', (
-    WidgetTester tester,
-  ) async {
+  testWidgets('安全存储不可读时降级为可操作的未登录状态而不是重试死循环', (WidgetTester tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -646,7 +674,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // 读取失败不再留在 build 的 Future 里；用户看到可自助的登录入口与原因。
-    expect(find.text('连接我的账户'), findsOneWidget);
+    expect(find.byKey(const ValueKey('login-screen')), findsOneWidget);
     await scrollUntilVisible(tester, find.text('登录 Lyra'));
     expect(find.text('本机登录凭据无法读取，请重新登录以恢复。'), findsOneWidget);
     expect(tester.takeException(), isNull);

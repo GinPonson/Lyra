@@ -7,6 +7,7 @@ import '../../core/design/lyra_primary_icon.dart';
 import '../../core/preferences/app_preferences.dart';
 import '../accounts/account_repository.dart';
 import '../accounts/account_workspace.dart';
+import '../auth/auth_provider.dart';
 import '../overview/login_panel.dart';
 import '../market/market_widgets.dart';
 import '../system/system_workspace.dart';
@@ -132,7 +133,15 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                 if (session.isLoading)
                   const LinearProgressIndicator(minHeight: 2)
                 else if (identity != null)
-                  _ProfileIdentity(email: identity.snapshot.userEmail)
+                  _ProfileIdentity(
+                    name:
+                        identity.snapshot.userEmail ??
+                        identity.snapshot.userDisplayName,
+                    provider:
+                        AuthProvider.fromId(identity.snapshot.authMethod)
+                            ?.label ??
+                        '账号',
+                  )
                 else
                   const LoginPanel(),
                 ProfileSection(
@@ -254,14 +263,15 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
 }
 
 class _ProfileIdentity extends StatelessWidget {
-  const _ProfileIdentity({this.email});
-  final String? email;
+  const _ProfileIdentity({this.name, required this.provider});
+  final String? name;
+  final String provider;
 
   @override
   Widget build(BuildContext context) {
-    final initial = email == null || email!.isEmpty
+    final initial = name == null || name!.isEmpty
         ? 'L'
-        : email!.characters.first.toUpperCase();
+        : name!.characters.first.toUpperCase();
     return Row(
       children: [
         ExcludeSemantics(
@@ -282,14 +292,14 @@ class _ProfileIdentity extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                email ?? 'Google 账号',
+                name ?? '$provider 账号',
                 style: Theme.of(context).textTheme.titleMedium
                     ?.copyWith(fontSize: 15, fontWeight: FontWeight.w500),
               ),
               const SizedBox(height: 4),
-              const Text(
-                'Google 已登录',
-                style: TextStyle(
+              Text(
+                '$provider 已登录',
+                style: const TextStyle(
                   color: LyraColors.muted,
                   fontSize: 13,
                   height: 1.5,

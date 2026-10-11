@@ -12,12 +12,12 @@ import {
 } from "./application/index.js";
 import { AgentTurnOrchestrator } from "./application/index.js";
 import { createGenkitRuntimeFromEnvironment } from "./infrastructure/agents/genkit-runtime.js";
-import { loadGoogleLoginConfig } from "./infrastructure/auth/google-login-client.js";
+import { loadOwnerLoginProviders } from "./application/owner-login-providers.js";
 import { environmentSchema } from "./infrastructure/config/server-environment.js";
 import { createMarketDataRuntimeFromEnvironment } from "./infrastructure/market-data/market-data-runtime.js";
 import { MarketSettingsService } from "./application/market-settings-service.js";
-import { GoogleLoginService } from "./application/google-login-service.js";
-import { registerGoogleLoginRoutes } from "./transport/google-login-routes.js";
+import { OwnerLoginService } from "./application/owner-login-service.js";
+import { registerLoginRoutes } from "./transport/login-routes.js";
 import { openLyraDatabase } from "./infrastructure/db/database.js";
 import { recoverInterruptedAgentSessions } from "./infrastructure/db/agent-session-repository.js";
 import { CURRENT_SCHEMA_VERSION } from "./infrastructure/db/schema-version.js";
@@ -66,7 +66,7 @@ async function start(): Promise<void> {
   mkdirSync(environment.LYRA_IMPORT_STAGING_DIR, { recursive: true });
 
   // Validate new integration configuration before any irreversible schema upgrade.
-  const loginConfig = loadGoogleLoginConfig(process.env);
+  const loginProviders = loadOwnerLoginProviders(process.env);
   const aiRuntime = createGenkitRuntimeFromEnvironment(process.env);
   const marketRuntime = createMarketDataRuntimeFromEnvironment(process.env);
   const marketData = marketRuntime.reader;
@@ -118,8 +118,8 @@ async function start(): Promise<void> {
     database,
     writeCoordinator,
   });
-  const loginService = loginConfig === null ? null : new GoogleLoginService({
-    config: loginConfig,
+  const loginService = new OwnerLoginService({
+    providers: loginProviders,
     devicePairingService,
   });
   const orchestrator = new AgentTurnOrchestrator({
@@ -151,7 +151,7 @@ async function start(): Promise<void> {
     authenticateDevice,
   });
   const eventConnections = await registerAgentEventsRoute(app, { orchestrator, authenticateDevice });
-  registerGoogleLoginRoutes(app, {
+  registerLoginRoutes(app, {
     loginService,
     pairingService: devicePairingService,
     authenticateDevice,

@@ -26,7 +26,7 @@ class BrokerageAccountsScreen extends ConsumerWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const Text(
-            '证券账户用于归集导入的交易记录，与你的 Google 登录身份分开。',
+            '证券账户用于归集导入的交易记录，与你的 Lyra 登录身份分开。',
             style: TextStyle(color: LyraColors.muted, height: 1.7),
           ),
           const SizedBox(height: 20),

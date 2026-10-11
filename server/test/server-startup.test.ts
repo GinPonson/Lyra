@@ -77,22 +77,31 @@ async function startProcess(overrides: NodeJS.ProcessEnv = {}) {
 }
 
 describe("real server startup", () => {
-  it("boots schema14/protocol2 with Genkit unavailable and keeps OAuth-only enrollment closed until configured", async () => {
+  it("boots schema15/protocol2 with Genkit unavailable and keeps OAuth-only enrollment closed until configured", async () => {
     const server = await startProcess();
     try {
       const info = await (await server.ready()).json() as Record<string, unknown>;
       assert.equal(info.protocol_version, 2);
-      assert.equal(info.schema_version, 14);
+      assert.equal(info.schema_version, 15);
+      const providers = await fetch(`${server.baseUrl}/v1/auth/providers`);
+      assert.equal(providers.status, 200);
+      assert.deepEqual(await providers.json(), { providers: [
+        { id: "google", name: "Google", available: false },
+        { id: "linuxdo", name: "LINUX DO", available: false },
+        { id: "github", name: "GitHub", available: false },
+      ] });
       const headers = { "x-lyra-protocol-version": "2", "content-type": "application/json" };
       const health = await fetch(`${server.baseUrl}/v1/health`);
       assert.equal(health.status, 200);
       assert.equal((await health.json() as Record<string, unknown>).status, "degraded");
-      const login = await fetch(`${server.baseUrl}/v1/auth/google/start`, {
-        method: "POST", headers,
-        body: JSON.stringify({ displayName: "Smoke", publicKeyPem: "unused", codeChallenge: "a".repeat(43), codeChallengeMethod: "S256" }),
-      });
-      assert.equal(login.status, 503);
-      assert.equal((await login.json() as Record<string, unknown>).code, "AUTH_NOT_CONFIGURED");
+      for (const provider of ["google", "linuxdo", "github"]) {
+        const login = await fetch(`${server.baseUrl}/v1/auth/${provider}/start`, {
+          method: "POST", headers,
+          body: JSON.stringify({ displayName: "Smoke", publicKeyPem: "unused", codeChallenge: "a".repeat(43), codeChallengeMethod: "S256" }),
+        });
+        assert.equal(login.status, 503);
+        assert.equal((await login.json() as Record<string, unknown>).code, "AUTH_NOT_CONFIGURED");
+      }
       for (const path of ["/v1/devices/pairing-codes", "/v1/devices/pair", "/mcp"]) {
         assert.equal((await fetch(`${server.baseUrl}${path}`, { method: "POST", headers, body: "{}" })).status, 404);
       }
@@ -124,6 +133,21 @@ describe("real server startup", () => {
       await assert.rejects(access(server.databasePath), { code: "ENOENT" });
     } finally {
       await server.close();
+    }
+  });
+
+  it("rejects partial GitHub or LINUX DO configuration before creating the database", async () => {
+    for (const provider of ["GITHUB", "LINUXDO"] as const) {
+      const server = await startProcess({ [`LYRA_LOGIN_${provider}_CLIENT_SECRET`]: "private-oauth-client-secret" });
+      try {
+        const [code] = await server.exited;
+        assert.equal(code, 1);
+        assert.match(server.stderr(), /server startup failed/u);
+        assert.doesNotMatch(server.stderr(), /private-oauth-client-secret/u);
+        await assert.rejects(access(server.databasePath), { code: "ENOENT" });
+      } finally {
+        await server.close();
+      }
     }
   });
 });

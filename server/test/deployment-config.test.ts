@@ -133,7 +133,7 @@ describe("deployment configuration CLI", () => {
     assert.equal(cliStderr(result.stderr), "");
     assert.match(result.stdout, /\[PASS\] 基础环境与主密钥/u);
     assert.match(result.stdout, /\[PASS\] Google 登录与 owner/u);
-    assert.match(result.stdout, /\[PASS\] 公开 HTTPS origin 与 Google 回调/u);
+    assert.match(result.stdout, /\[PASS\] 公开 HTTPS origin 与登录回调/u);
     assert.match(result.stdout, /\[PASS\] Genkit 配置/u);
     assert.match(result.stdout, /\[PASS\] 部署配置检查/u);
   });
@@ -151,6 +151,46 @@ describe("deployment configuration CLI", () => {
     } });
     assert.equal(result.code, 0, result.output);
     assert.match(result.stdout, /\[SKIP\].*LYRA_PUBLIC_ORIGIN/u);
+  });
+
+  it("accepts GitHub-only and LINUX DO-only deployments with explicit stable owner IDs", async () => {
+    for (const [provider, label] of [["GITHUB", "GitHub"], ["LINUXDO", "LINUX DO"]] as const) {
+      const id = provider.toLowerCase();
+      const result = await checkConfiguration({ overrides: {
+        ...GOOGLE_MISSING,
+        [`LYRA_LOGIN_${provider}_CLIENT_ID`]: "lyra-oauth-client-987654321",
+        [`LYRA_LOGIN_${provider}_CLIENT_SECRET`]: "oauth-client-secret-must-stay-private",
+        [`LYRA_LOGIN_${provider}_REDIRECT_URI`]: `${PUBLIC_ORIGIN}/v1/auth/${id}/callback`,
+        [`LYRA_OWNER_${provider}_SUBJECT`]: "987654321",
+      } });
+      assert.equal(result.code, 0, result.output);
+      assert.ok(result.stdout.includes(`[PASS] ${label} 登录与 owner`));
+      assert.match(result.stdout, /\[SKIP\] Google 登录/u);
+      assert.match(result.stdout, /\[PASS\] 公开 HTTPS origin 与登录回调/u);
+    }
+  });
+
+  it("validates every configured login even when Google already works, without leaking new secrets", async () => {
+    for (const provider of ["GITHUB", "LINUXDO"] as const) {
+      const id = provider.toLowerCase();
+      const configured = {
+        [`LYRA_LOGIN_${provider}_CLIENT_ID`]: "lyra-oauth-client-987654321",
+        [`LYRA_LOGIN_${provider}_CLIENT_SECRET`]: "oauth-client-secret-must-stay-private",
+        [`LYRA_LOGIN_${provider}_REDIRECT_URI`]: `${PUBLIC_ORIGIN}/v1/auth/${id}/callback`,
+        [`LYRA_OWNER_${provider}_SUBJECT`]: "987654321",
+      };
+      for (const overrides of [
+        { [`LYRA_LOGIN_${provider}_CLIENT_SECRET`]: undefined },
+        { [`LYRA_OWNER_${provider}_SUBJECT`]: undefined },
+        { [`LYRA_OWNER_${provider}_SUBJECT`]: "mutable-username-must-stay-private" },
+        { [`LYRA_LOGIN_${provider}_CLIENT_SECRET`]: "replace-with-client-secret" },
+        { [`LYRA_LOGIN_${provider}_REDIRECT_URI`]: `https://other.ginponson.net/v1/auth/${id}/callback` },
+      ]) {
+        const result = await checkConfiguration({ overrides: { ...configured, ...overrides }, existingDatabase: true });
+        assert.equal(result.code, 1, result.output);
+        assert.ok(result.stderr.includes(provider));
+      }
+    }
   });
 
   it("explicitly permits ledger mode only when all AI values are empty, unless AI is required", async () => {
@@ -175,7 +215,7 @@ describe("deployment configuration CLI", () => {
     assert.doesNotMatch(result.stdout, /账本模式/u);
   });
 
-  it("requires Google login and private owner configuration from process.env despite a complete .env file", async () => {
+  it("requires an enabled login and private owner configuration from process.env despite a complete .env file", async () => {
     const noLogin = await checkConfiguration({ overrides: GOOGLE_MISSING });
     assert.equal(noLogin.code, 1);
     assert.match(noLogin.stderr, /LYRA_LOGIN_GOOGLE_CLIENT_ID/u);

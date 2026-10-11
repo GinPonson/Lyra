@@ -2,6 +2,7 @@ import 'package:dio/dio.dart';
 
 import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
+import 'auth_provider.dart';
 
 /// 浏览器授权事务；兑换凭证只在 App 内存中保存，不进入 URL。
 class OAuthLoginStart {
@@ -17,11 +18,13 @@ class OAuthLoginStart {
   final DateTime expiresAt;
   final Duration pollInterval;
 
-  factory OAuthLoginStart.fromJson(Map<String, Object?> json) {
+  factory OAuthLoginStart.fromJson(
+    Map<String, Object?> json, {
+    AuthProvider provider = AuthProvider.google,
+  }) {
     final url = Uri.parse(json['authorizationUrl'] as String);
     final interval = (json['pollIntervalSeconds'] as num).toInt();
-    if (url.scheme != 'https' ||
-        url.host != 'accounts.google.com' ||
+    if (!provider.acceptsAuthorizationUrl(url) ||
         interval < 1 ||
         interval > 30) {
       throw const FormatException('登录响应格式无效');
@@ -35,7 +38,7 @@ class OAuthLoginStart {
   }
 }
 
-/// 登录完成后持久化的 Lyra 凭据，不包含 Google 访问令牌。
+/// 登录完成后持久化的 Lyra 凭据，不包含第三方访问令牌。
 class LoginCredentials {
   const LoginCredentials({
     required this.deviceId,
@@ -45,7 +48,9 @@ class LoginCredentials {
     required this.refreshToken,
     required this.refreshTokenExpiresAt,
     this.userEmail,
-    this.googleSubject,
+    required this.provider,
+    required this.subject,
+    this.userDisplayName,
   });
 
   final String deviceId;
@@ -55,10 +60,21 @@ class LoginCredentials {
   final String refreshToken;
   final String refreshTokenExpiresAt;
   final String? userEmail;
-  final String? googleSubject;
+  final AuthProvider provider;
+  final String subject;
+  final String? userDisplayName;
+  String? get googleSubject => provider == AuthProvider.google ? subject : null;
 
   factory LoginCredentials.fromJson(Map<String, Object?> json) {
     final user = json['user'] as Map<String, Object?>?;
+    final provider = AuthProvider.fromId(user?['provider'] as String?);
+    final subject = user?['subject'];
+    if (provider == null ||
+        subject is! String ||
+        subject.trim().isEmpty ||
+        subject.trim() != subject) {
+      throw const FormatException('登录身份响应格式无效');
+    }
     return LoginCredentials(
       deviceId: json['deviceId'] as String,
       displayName: json['displayName'] as String,
@@ -67,9 +83,9 @@ class LoginCredentials {
       refreshToken: json['refreshToken'] as String,
       refreshTokenExpiresAt: json['refreshTokenExpiresAt'] as String,
       userEmail: user?['email'] as String?,
-      googleSubject: user?['provider'] == 'google'
-          ? (user?['subject'] as String?)
-          : null,
+      provider: provider,
+      subject: subject,
+      userDisplayName: user?['displayName'] as String?,
     );
   }
 }
@@ -103,19 +119,59 @@ class AuthRepository {
 
   final Dio _dio;
 
+  Future<List<AuthProviderAvailability>> providers({
+    CancelToken? cancelToken,
+  }) async {
+    try {
+      final response = await _dio.get<dynamic>(
+        '/v1/auth/providers',
+        cancelToken: cancelToken,
+        options: Options(
+          followRedirects: false,
+          headers: const {'x-lyra-protocol-version': kLyraProtocolVersion},
+        ),
+      );
+      return AuthProviderAvailability.parseCatalog(_body(response));
+    } on DioException catch (error) {
+      if (CancelToken.isCancel(error)) rethrow;
+      throw LyraApiError.fromResponseBody(
+        error.response?.data,
+        error.response?.statusCode ?? 0,
+      );
+    }
+  }
+
   Future<OAuthLoginStart> startGoogleLogin({
     required String displayName,
     required String publicKeyPem,
     required String codeChallenge,
     CancelToken? cancelToken,
+  }) => startLogin(
+    provider: AuthProvider.google,
+    displayName: displayName,
+    publicKeyPem: publicKeyPem,
+    codeChallenge: codeChallenge,
+    cancelToken: cancelToken,
+  );
+
+  Future<OAuthLoginStart> startLogin({
+    required AuthProvider provider,
+    required String displayName,
+    required String publicKeyPem,
+    required String codeChallenge,
+    CancelToken? cancelToken,
   }) async {
-    final response = await _post('/v1/auth/google/start', <String, Object?>{
-      'displayName': displayName,
-      'publicKeyPem': publicKeyPem,
-      'codeChallenge': codeChallenge,
-      'codeChallengeMethod': 'S256',
-    }, cancelToken: cancelToken);
-    return OAuthLoginStart.fromJson(_body(response));
+    final response = await _post(
+      '/v1/auth/${provider.id}/start',
+      <String, Object?>{
+        'displayName': displayName,
+        'publicKeyPem': publicKeyPem,
+        'codeChallenge': codeChallenge,
+        'codeChallengeMethod': 'S256',
+      },
+      cancelToken: cancelToken,
+    );
+    return OAuthLoginStart.fromJson(_body(response), provider: provider);
   }
 
   /// pending 返回 null；成功只能兑换一次，错误由稳定错误码表达。
@@ -123,11 +179,24 @@ class AuthRepository {
     required String loginId,
     required String codeVerifier,
     CancelToken? cancelToken,
+  }) => exchangeLogin(
+    provider: AuthProvider.google,
+    loginId: loginId,
+    codeVerifier: codeVerifier,
+    cancelToken: cancelToken,
+  );
+
+  Future<LoginCredentials?> exchangeLogin({
+    required AuthProvider provider,
+    required String loginId,
+    required String codeVerifier,
+    CancelToken? cancelToken,
   }) async {
-    final response = await _post('/v1/auth/google/exchange', <String, Object?>{
-      'loginId': loginId,
-      'codeVerifier': codeVerifier,
-    }, cancelToken: cancelToken);
+    final response = await _post(
+      '/v1/auth/${provider.id}/exchange',
+      <String, Object?>{'loginId': loginId, 'codeVerifier': codeVerifier},
+      cancelToken: cancelToken,
+    );
     final body = _body(response);
     if (response.statusCode == 202 && body['status'] == 'pending') {
       return null;
@@ -135,7 +204,11 @@ class AuthRepository {
     if (response.statusCode != 200 || body['status'] != 'complete') {
       throw const FormatException('登录响应格式无效');
     }
-    return LoginCredentials.fromJson(body);
+    final credentials = LoginCredentials.fromJson(body);
+    if (credentials.provider != provider) {
+      throw const FormatException('登录身份与所选方式不一致');
+    }
+    return credentials;
   }
 
   Future<RefreshedDeviceTokens> refresh({required String refreshToken}) async {
@@ -169,6 +242,7 @@ class AuthRepository {
         data: body,
         cancelToken: cancelToken,
         options: Options(
+          followRedirects: false,
           headers: <String, Object?>{
             'x-lyra-protocol-version': kLyraProtocolVersion,
             if (accessToken != null) 'authorization': 'Bearer $accessToken',

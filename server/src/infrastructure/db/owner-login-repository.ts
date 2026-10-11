@@ -1,21 +1,22 @@
 import { ApplicationError } from "../../application/app-error.js";
-import type { GoogleLoginIdentity } from "../auth/google-login-client.js";
+import type { LoginIdentity } from "../auth/login-provider.js";
 import type { LyraDatabase } from "./database.js";
 
-/** 必须在单写队列的凭据签发事务内调用；邮箱只允许首次绑定指定的 owner。 */
+/** 每个提供方固定一个 owner subject；调用前必须通过该提供方的明确准入配置。 */
 export async function claimServerOwnerIdentity(
   database: LyraDatabase,
-  identity: GoogleLoginIdentity,
+  identity: LoginIdentity,
   now: Date,
 ): Promise<void> {
   const reader = await database.connection.runAndReadAll(
-    "SELECT provider, subject FROM server_owner_identity WHERE singleton_key = 1",
+    "SELECT provider, subject FROM server_owner_identity WHERE singleton_key = 1 AND provider = $provider",
+    { provider: identity.provider },
   );
   const owner = reader.getRowObjectsJson()[0];
   if (owner !== undefined && (owner.provider !== identity.provider || owner.subject !== identity.subject)) {
     throw new ApplicationError({
       code: "LOGIN_DENIED",
-      message: "此 Google 账户不是这台 Lyra 服务已绑定的所有者",
+      message: "此账户不是这台 Lyra 服务在该登录方式下已绑定的所有者",
       statusCode: 403,
       retryable: false,
     });
@@ -37,8 +38,11 @@ export async function claimServerOwnerIdentity(
     await database.connection.run(`
       UPDATE server_owner_identity SET email = $email, display_name = $display_name,
         updated_at = CAST($now AS TIMESTAMPTZ)
-      WHERE singleton_key = 1
-    `, { email: identity.email, display_name: identity.displayName, now: now.toISOString() });
+      WHERE singleton_key = 1 AND provider = $provider
+    `, {
+      provider: identity.provider, email: identity.email,
+      display_name: identity.displayName, now: now.toISOString(),
+    });
   }
 }
 

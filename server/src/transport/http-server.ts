@@ -20,6 +20,9 @@ const PUBLIC_V1_ROUTES = new Set<string>([
   "/v1/system/info",
   "/v1/health",
   "/v1/auth/google/callback",
+  "/v1/auth/linuxdo/callback",
+  "/v1/auth/github/callback",
+  "/v1/auth/providers",
 ]);
 
 /**

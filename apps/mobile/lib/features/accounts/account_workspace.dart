@@ -14,7 +14,7 @@ final brokerageAccountsProvider =
       if (session is! SessionAuthenticated || client == null) {
         throw const LyraApiError(
           code: 'AUTH_REQUIRED',
-          message: '请先使用 Google 登录',
+          message: '请先登录 Lyra',
           statusCode: 401,
           retryable: false,
         );

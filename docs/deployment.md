@@ -1,17 +1,18 @@
 # 在 VPS 部署 Lyra
 
-本方案运行一个 Lyra 服务进程，以 Docker volume 保存 DuckDB，使用可选的 Caddy 提供 HTTPS。适用于当前 `feat/genkit-oauth` 分支、协议 **2** 和 schema **14**。界面切源需要构建当前移动端源码；此前交付的 Android **1.0.0+3** APK 不包含该功能。
+本方案运行一个 Lyra 服务进程，以 Docker volume 保存 DuckDB，使用可选的 Caddy 提供 HTTPS。适用于当前 `feat/genkit-oauth` 分支、协议 **2** 和 schema **15**。独立登录页与 Google / Linux.do / GitHub 入口需要构建当前移动端源码；本轮尚未重新打包 Android APK。此前 APK 的版本与验证范围见[进度记录](progress.md)。
 
-配置检查、服务探测和真实联调是三个不同步骤：检查命令不会打开数据库或调用第三方；服务探测读取公开状态，并向已移除的 `/mcp` 发送无 RPC 方法的空对象检查 POST 路由；Google 授权、模型工具调用和手机交互需要最后在 App 内验收。
+配置检查、服务探测和真实联调是三个不同步骤：检查命令不会打开数据库或调用第三方；服务探测读取公开状态，并向已移除的 `/mcp` 发送无 RPC 方法的空对象检查 POST 路由；已启用来源的真实 OAuth 授权、模型工具调用和手机交互需要最后在 App 内验收。
 
 ## 1. 先准备这些信息
 
 | 项目 | 填写位置 | 要求 |
 | --- | --- | --- |
 | 服务域名 | `deploy/.env` 的 `LYRA_DOMAIN` | 纯主机名，例如 `lyra.your-domain.com`；不要带协议、端口或路径 |
-| Google Web OAuth client ID / secret | `deploy/server.env` | Web application 类型；密钥只存服务端 |
-| Google redirect URI | Google 控制台及 `deploy/server.env` | `https://你的域名/v1/auth/google/callback`，两端完全一致 |
-| 允许登录的 Google 邮箱 | `LYRA_OWNER_EMAIL` | 使用自己已验证的 Google 邮箱；也可使用稳定 subject |
+| 至少一种登录来源的 client ID / secret | `deploy/server.env` 对应的 `LYRA_LOGIN_*` 组 | Google Web application、Linux DO Connect 或 GitHub OAuth App；密钥只存服务端 |
+| 各来源的 redirect URI | 对应开发者控制台及 `deploy/server.env` | `https://你的域名/v1/auth/{google\|linuxdo\|github}/callback`，各方分别登记且完全一致 |
+| Google 所有者（启用时） | `LYRA_OWNER_EMAIL` 或 `LYRA_OWNER_GOOGLE_SUBJECT` | 已验证邮箱或稳定 `sub`；两项同时设置时须同时匹配 |
+| GitHub / Linux.do 所有者（启用时） | `LYRA_OWNER_GITHUB_SUBJECT` / `LYRA_OWNER_LINUXDO_SUBJECT` | 自己在该来源的不可变正整数用户 ID；不填用户名、昵称或邮箱 |
 | 模型基址、模型名、API key | 三项 `LYRA_GENKIT_*` | 支持流式 Chat Completions 和 tool calling 的兼容服务 |
 
 主机需要 Docker Engine、**Docker Compose 2.30 或更高版本**；`init-env.mjs` 和 `probe.mjs` 使用 Node.js 22 或更高版本。服务本身运行在 Node 24 Debian 容器中。已有其他反向代理时，可以只启动 Lyra 容器。
@@ -36,13 +37,29 @@ node deploy/init-env.mjs
 
 `deploy/server.env` 使用 Compose 的 `format: raw`：**一行一个 `KEY=value`，值外面不要加引号，注释单独一行**。美元符号等字符会原样传给服务，避免 API key 被 Compose 变量替换。此格式要求 Compose 2.30+，详见[官方 env_file 说明](https://docs.docker.com/reference/compose-file/services/#format)。它与 `node --env-file=server/.env` 的普通 dotenv 格式分开，不能混用引号规则。
 
+### 启用登录来源
+
+模板将三种登录全部写成注释，避免未使用来源的占位值被误认为配置。**至少完整启用一组**，也可同时启用多组；不使用的组保持整组未设置。每组都包含 client ID、client secret、完整回调以及明确的所有者限制，任一组部分填写都会失败，不能因另一组可用而忽略错误配置。
+
+| 来源 | 注册应用 | 回调路径 | 所有者配置 |
+| --- | --- | --- | --- |
+| Google | Google Cloud 的 Web application OAuth client | `/v1/auth/google/callback` | 已验证邮箱或稳定 `sub` |
+| Linux.do | [Linux DO Connect](https://connect.linux.do) 的应用接入 | `/v1/auth/linuxdo/callback` | Connect 用户资料返回的稳定数字 `id` |
+| GitHub | GitHub Developer settings → OAuth apps | `/v1/auth/github/callback` | GitHub 用户 API 返回的稳定数字 `id` |
+
+在相应开发者控制台登记自己的完整 HTTPS 回调，再在服务器本地填写同一地址。GitHub 数字 ID 可从官方公开用户接口查询；Linux.do ID 按 Connect 官方接入示例核对自己的用户资料。具体变量、ID 核对和官方说明见 [Genkit 与多来源登录](genkit-oauth.md#3-配置-googlelinuxdo-与-github)。不要把示例用户名或数字当作自己的 ID，也不要为取得 ID 而移除所有者限制。
+
+多种来源访问同一份私有账本，各来源都须显式声明允许的身份。首次成功兑换后，数据库按来源固定 `subject`；相同邮箱或昵称不会自动关联，修改环境变量不能让其他账号接管已经绑定的来源。新增来源声明的是对这份账本的访问权限，当前不是多用户独立账本服务。
+
+修改登录配置后先预检，再重启服务器，在 App 登录页重新检测即可看到来源可用性。配置完整不等于真实凭据已通过提供方验证；关闭来源只阻止新的授权，不代替撤销已经签发的设备会话。
+
 如果暂时只使用账本，完整删除或注释三项 `LYRA_GENKIT_BASE_URL`、`LYRA_GENKIT_MODEL`、`LYRA_GENKIT_API_KEY`，之后使用不带 `--require-ai` 的检查命令。部分填写或保留占位值会被拒绝。未使用 Gmail 导入时，保持其三项变量为注释，不填写空值。
 
 ### 可选：启用历史或延迟行情
 
 模板默认 `LYRA_MARKET_STOCK_PROVIDERS=none`、`LYRA_MARKET_OPTION_PROVIDERS=none`，推荐保留这两个值。需要行情时，先在服务器填写供应商的完整凭据，执行配置预检并重启；对应来源随后在 App 中变为可选，填写密钥本身不会启用远程读取。
 
-之后在 **「我的 → 行情与估值」** 分别为股票和期权选择主来源、可选备用来源或关闭；每次选择都会自动提交，服务端确认后立即对新行情查询生效，日常切源无需重启。等待时显示「正在切换」并防止重复提交，失败时界面恢复最后已确认的选择并提示重试。选择持久化到服务端 schema 14，对同一所有者的全部设备与 Genkit 共用，随数据库备份并在重启后恢复。
+之后在 **「我的 → 行情与估值」** 分别为股票和期权选择主来源、可选备用来源或关闭；每次选择都会自动提交，服务端确认后立即对新行情查询生效，日常切源无需重启。等待时显示「正在切换」并防止重复提交，失败时界面恢复最后已确认的选择并提示重试。选择通过 schema 14 引入的配置表持久化在服务端，对同一所有者的全部设备与 Genkit 共用，随数据库备份并在重启后恢复。
 
 例如，两类资产都使用 MarketData 历史模式时，服务器填写 `LYRA_MARKETDATA_API_TOKEN`，保留 `LYRA_MARKETDATA_MODE=historical` 和每日本地请求上限 `80`；在 App 内依次将两类主来源选为 MarketData，每次选择会自动提交。该模式显式向上游请求 `mode=historical`，以实际报价时间为准；不保证收盘后立即可取，也没有后台定时任务。数据模式权限以提供方账户为准。
 
@@ -68,7 +85,7 @@ node deploy/init-env.mjs
   node server/dist/src/cli/check-config.js --require-ai
 ```
 
-检查成功退出码为 `0`，错误为 `1`，参数用法错误为 `2`。检查会复用正式入口的基础配置、Google、Genkit 和可选行情解析，额外拒绝示例值、缺失的所有者约束、不一致的公开 origin / Google 回调及不完整的模型 / 行情配置。输出只包含检查项及变量名，**不会打开或迁移数据库，也不会验证真实凭据是否有效**。
+检查成功退出码为 `0`，错误为 `1`，参数用法错误为 `2`。检查会复用正式入口的基础配置、三种登录来源、Genkit 和可选行情解析。至少一种登录配置须完整可用，其余来源完全未设置时跳过；部分配置、占位值、缺失的所有者约束、不一致的公开 origin / 任一已启用登录回调及不完整的模型 / 行情配置都会被拒绝。输出只包含检查项及变量名，**不会打开或迁移数据库，也不会验证真实凭据是否有效**。
 
 容器的正常启动入口也会先执行这项检查，通过后才 `exec` 正式服务。不要通过手动运行 `main.js` 来做配置预检，因为它会自动迁移数据库。
 
@@ -97,7 +114,7 @@ node deploy/probe.mjs https://你的域名
 ./deploy/compose.sh logs --tail 100 lyra caddy
 ```
 
-健康检查接受账本可用的 `degraded` 状态；可选 AI 未配置不应阻止账本服务启动。Genkit 的本地 `available` 仅表示配置完整，不能据此判断模型额度、API key、工具调用或 Google 授权已经验证。
+健康检查接受账本可用的 `degraded` 状态；可选 AI 未配置不应阻止账本服务启动。Genkit 的本地 `available` 仅表示配置完整，不能据此判断模型额度、API key、工具调用或任何登录来源的真实授权已经验证。
 
 ### 已有 Nginx、Caddy 或其他 HTTPS 入口
 
@@ -108,7 +125,7 @@ node deploy/probe.mjs https://你的域名
 node deploy/probe.mjs http://127.0.0.1:3141
 ```
 
-Compose 将应用端口只发布到 VPS 的 `127.0.0.1:3141`；将现有反向代理指向它。公开 App 地址和 Google 回调仍使用 HTTPS 域名。代理需要保留 `/v1` 路径、Authorization、`X-Lyra-Protocol-Version`、`Idempotency-Key` 和上传头，并支持 `/v1/events` WebSocket。
+Compose 将应用端口只发布到 VPS 的 `127.0.0.1:3141`；将现有反向代理指向它。公开 App 地址和每个已启用来源的回调仍使用同一个 HTTPS origin。代理需要保留 `/v1` 路径、Authorization、`X-Lyra-Protocol-Version`、`Idempotency-Key` 和上传头，并支持 `/v1/events` WebSocket。
 
 Caddy 的 `reverse_proxy` 原生支持 WebSocket，无需额外手写 Upgrade 头，见[官方说明](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)。不要给 AI 消息请求设置短于回合上限的代理响应超时。内置 Caddy 没有启用访问日志，并从默认运行日志中移除请求 URI，覆盖上游故障时的错误日志，避免记录 OAuth 回调中的 code/state；过滤语法见[官方日志说明](https://caddyserver.com/docs/caddyfile/directives/log#filter)。
 
@@ -137,17 +154,21 @@ tar -tzf "$backup_file" >/dev/null
 
 完成备份后更新代码，重新构建并预检，再使用与首次部署相同的 `up -d --wait` 命令更新服务。不要同时启动旧程序和新程序访问该数据卷。
 
-schema 14 只新增行情选择的持久化，不撤销 schema 13 的有效 OAuth 设备凭据。若从 schema 12 或更早版本升级，则仍会经过 schema 13 的旧匿名配对凭据撤销，需要重新 Google 登录。
+schema 14 只新增行情选择的持久化，不撤销 schema 13 的有效 OAuth 设备凭据。schema 15 将所有者绑定扩展为按来源固定 subject，并允许新来源没有邮箱；已有 Google 绑定、有效 OAuth 设备会话、账本及行情选择保留。若从 schema 12 或更早版本升级，则仍会经过 schema 13 的旧匿名配对凭据撤销，需要使用已配置的来源重新登录。
 
-回退需要使用**升级前备份 + 相匹配的旧服务和旧 App**；不能直接拿旧程序打开已经迁移到新 schema 的库。具体迁移规则见 [Genkit 与 Google 登录](genkit-oauth.md#7-启动与升级)。
+回退需要使用**升级前备份 + 相匹配的旧服务和旧 App**；不能直接拿旧程序打开已经迁移到新 schema 的库。具体迁移规则见 [Genkit 与多来源登录](genkit-oauth.md#7-启动与升级)。
 
 ## 6. 手机上完成真实联调
 
-安装与当前服务端匹配的 App，在「我的 → 服务端连接」填入 HTTPS 地址，然后依次验证。此前交付的深色界面版 `1.0.0+3` 不含后来新增的行情面板和界面切源，行情验收前需要重新构建当前移动端源码。
+安装与当前服务端匹配的 App，在独立登录页填写并检测 HTTPS 地址，然后依次验证；已登录后仍可从「我的 → 服务端连接」管理地址。此前版本的 APK 不包含本轮独立登录页与新增登录方式，当前验收需要重新构建移动端源码。
 
 | 操作 | 通过条件 |
 | --- | --- |
-| Google 登录 | 系统浏览器完成授权，返回 App 后显示允许的邮箱；其他身份不能接管账本 |
+| 独立登录页 | 未登录显示 Google / Linux.do / GitHub 三个入口与连接配置；未配置来源禁用，检测失败可重试，完成授权后进入四 Tab 工作台 |
+| Google 登录（已启用时） | 系统浏览器完成授权，返回 App 后显示 Google 身份；原有绑定和有效会话在升级后保留，其他 Google 身份不能接管账本 |
+| Linux.do 登录（已启用时） | 仅配置的稳定用户 ID 可访问；无邮箱仍可显示 Linux.do 来源与显示名，取消或授权失败可重新发起 |
+| GitHub 登录（已启用时） | 仅配置的稳定用户 ID 可访问；使用昵称或相同邮箱不能绕过限制，不要求用户公开邮箱 |
+| 多来源与已绑定身份 | 显式配置的各来源访问同一账本；改变某来源 owner ID 不能覆盖该来源已绑定的身份，跨来源事务和兑换不能混用 |
 | 建证券账户 | 新账户可选；此时没有新增交易 |
 | CSV/XLSX 导入 | 预览账户与行数正确；确认后才出现持仓和交易；重复导入不重复入账 |
 | 仓位问答 | 新建当前账户范围的 Lyra 对话，真实模型调用 `positions` / `summary` 等工具，界面收到流式结果 |
@@ -155,24 +176,24 @@ schema 14 只新增行情选择的持久化，不撤销 schema 13 的有效 OAut
 | 行情与参考估值 | 启用已具备权限的来源后，总览 / 股票显示实际报价时间、来源和选价依据；缺失或过期报价不补零、不计入完整合计；多空期权按合约乘数核对 |
 | 界面切源 | 「我的 → 行情与估值」每次选择股票 / 期权主备来源或关闭即自动提交，确认后刷新行情；等待时防重复、失败恢复已确认选择；重启与其他设备可读回，未配置源不可选，冲突提示重新加载再选择 |
 | 取消与重连 | 生成中取消能结束回合；手机切网、后台返回后可恢复会话状态 |
-| 设置与退出 | 隐藏金额、启动账户、涨跌配色有效；退出后旧凭据不能继续访问账本 |
+| 设置与退出 | 隐藏金额、启动账户、涨跌配色有效；成功退出后返回独立登录页，服务端已撤销的本设备凭据不能继续访问；撤销失败有明确提示 |
 
-客户端使用系统浏览器登录，不需要在 APK 中放 Google client secret 或模型 API key。Google 登录不会提供模型额度，Gmail 授权也继续独立。
+客户端使用系统浏览器登录，三种来源的 client secret 和模型 API key 都只保存在服务端。身份登录不会提供模型额度，Gmail 授权继续独立；GitHub / Linux.do 不需要经验证邮箱来访问显式获准的账本。
 
 ## 7. 当前验证边界
 
-当前工作环境没有 Docker Engine，因此不能将 Compose/schema 静态校验、Node 本机测试或配置检查当作镜像构建和 VPS 验收。镜像构建、Caddy 真实证书、公开域名、真实 Google/模型及 Android 真机结果应在执行后再更新 [进度记录](progress.md)。
+当前工作环境没有 Docker Engine，因此不能将 Compose/schema 静态校验、Node 本机测试或配置检查当作镜像构建和 VPS 验收。镜像构建、Caddy 真实证书、公开域名、Google / Linux.do / GitHub 真实授权、真实模型及 Android 真机结果应在执行后再更新 [进度记录](progress.md)。
 
-本次界面切源改动尚未用真实行情 Key 联调，未部署到 VPS，也未重新构建 APK。
+本轮独立登录页与多来源登录的服务端 `npm run check` 已通过 **132 套件 / 400 项**，0 失败、0 取消、0 跳过；该结果来自受控身份提供方与本地测试，不代表真实 OAuth 已上线。本轮未部署到 VPS、未重新构建 APK，也未用真实行情 Key 完成联调。
 
-部署前只需确定域名、服务器环境和需要使用的兼容模型服务；凭据在服务器本地配置。真实环境联调完成前，现有迁移 PR 继续保持草稿。
+部署前需要确定域名、服务器环境、至少一个登录来源及其所有者 ID，以及按需使用的兼容模型服务；凭据在服务器本地配置。真实环境联调完成前，现有迁移 PR 继续保持草稿。
 
 ## 8. 登录入口的已知安全边界
 
-当前登录流程的**事务绑定的是发起方，而不是在浏览器里完成授权的人**（完整说明见 [Genkit 与 Google 登录的安全边界](genkit-oauth.md#app-登录过程)）。任何能访问登录入口的人都可以自行创建登录事务，把生成好的 Google 授权链接发给所有者，诱导其完成授权后领取所有者的设备凭据。
+当前登录流程的**事务绑定的是发起方，而不是在浏览器里完成授权的人**（完整说明见 [多来源登录的安全边界](genkit-oauth.md#app-登录过程)）。Google、Linux.do 和 GitHub 均沿用这一流程；任何能访问登录入口的人都可以自行创建登录事务，把生成好的授权链接发给所有者，诱导其完成授权后领取所有者的设备凭据。来源隔离、state 与 PKCE 不能证明浏览器授权者持有发起设备。
 
 该问题本轮未修复（需要引入只有人类可传递的共享秘密，属协议与交互改动）。在该改动落地前，运维必须遵守：
 
-- 只使用 App 内「使用 Google 登录」生成的授权页，**不要点击或转发他人提供的 Lyra 授权链接**；
+- 只使用自己在 App 内选择 Google、Linux.do 或 GitHub 后生成的授权页，**不要点击或转发他人提供的 Lyra 授权链接**；
 - 不要把登录入口暴露在不受信任的网络或公开索引中；公网部署应限制来源范围，并优先保证只有所有者本人访问该域名；
-- 发现异常登录时，用「我的 → 确认退出」撤销该设备凭据，并检查服务端日志中的登录事务创建时间。
+- 「我的 → 确认退出」只请求撤销当前设备凭据；不能将当前设备退出视为其他设备已撤销，服务端撤销失败时也不能视为凭据已失效。

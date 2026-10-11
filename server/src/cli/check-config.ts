@@ -5,6 +5,11 @@ import {
   GOOGLE_LOGIN_CALLBACK_PATH,
   loadGoogleLoginConfig,
 } from "../infrastructure/auth/google-login-client.js";
+import {
+  GITHUB_LOGIN_CALLBACK_PATH,
+  LINUXDO_LOGIN_CALLBACK_PATH,
+  loadOAuthLoginConfig,
+} from "../infrastructure/auth/oauth-login-client.js";
 import { environmentSchema } from "../infrastructure/config/server-environment.js";
 import { marketDataEnvironmentSchema, MARKET_ENVIRONMENT_VARIABLES } from "../infrastructure/market-data/market-data-runtime.js";
 
@@ -15,11 +20,29 @@ const LOGIN_REQUIRED = [
 ] as const;
 const OWNER_VARIABLES = ["LYRA_OWNER_EMAIL", "LYRA_OWNER_GOOGLE_SUBJECT"] as const;
 const LOGIN_VARIABLES = [...LOGIN_REQUIRED, ...OWNER_VARIABLES] as const;
+const OAUTH_LOGIN_SETTINGS = {
+  github: {
+    name: "GitHub",
+    required: ["LYRA_LOGIN_GITHUB_CLIENT_ID", "LYRA_LOGIN_GITHUB_CLIENT_SECRET", "LYRA_LOGIN_GITHUB_REDIRECT_URI"],
+    owner: "LYRA_OWNER_GITHUB_SUBJECT",
+    callbackPath: GITHUB_LOGIN_CALLBACK_PATH,
+  },
+  linuxdo: {
+    name: "LINUX DO",
+    required: ["LYRA_LOGIN_LINUXDO_CLIENT_ID", "LYRA_LOGIN_LINUXDO_CLIENT_SECRET", "LYRA_LOGIN_LINUXDO_REDIRECT_URI"],
+    owner: "LYRA_OWNER_LINUXDO_SUBJECT",
+    callbackPath: LINUXDO_LOGIN_CALLBACK_PATH,
+  },
+} as const;
+type AdditionalLoginVariable =
+  typeof OAUTH_LOGIN_SETTINGS[keyof typeof OAUTH_LOGIN_SETTINGS]["required"][number]
+  | typeof OAUTH_LOGIN_SETTINGS[keyof typeof OAUTH_LOGIN_SETTINGS]["owner"];
 const AI_VARIABLES = ["LYRA_GENKIT_BASE_URL", "LYRA_GENKIT_MODEL", "LYRA_GENKIT_API_KEY"] as const;
 const AI_LIMIT_VARIABLES = ["LYRA_AGENT_TURN_TIMEOUT_MS", "LYRA_AGENT_MAX_TURNS"] as const;
 
 type EnvironmentVariable = keyof typeof environmentSchema.shape
   | typeof LOGIN_VARIABLES[number]
+  | AdditionalLoginVariable
   | typeof AI_VARIABLES[number]
   | typeof AI_LIMIT_VARIABLES[number]
   | typeof MARKET_ENVIRONMENT_VARIABLES[number]
@@ -136,11 +159,72 @@ function checkPublicOrigin(environment: NodeJS.ProcessEnv): boolean {
   if (url === null || url.protocol !== "https:" || origin !== url.origin
     || isPlaceholderHostname(url.hostname)) {
     errors.add("LYRA_PUBLIC_ORIGIN");
-  } else if (value(environment, "LYRA_LOGIN_GOOGLE_REDIRECT_URI") !== `${origin}${GOOGLE_LOGIN_CALLBACK_PATH}`) {
-    errors.add("LYRA_PUBLIC_ORIGIN");
-    errors.add("LYRA_LOGIN_GOOGLE_REDIRECT_URI");
+  } else {
+    const callbacks: [EnvironmentVariable, string][] = [];
+    if (LOGIN_VARIABLES.some((name) => value(environment, name))) {
+      callbacks.push(["LYRA_LOGIN_GOOGLE_REDIRECT_URI", GOOGLE_LOGIN_CALLBACK_PATH]);
+    }
+    for (const settings of Object.values(OAUTH_LOGIN_SETTINGS)) {
+      if ([...settings.required, settings.owner].some((name) => value(environment, name))) {
+        callbacks.push([settings.required[2], settings.callbackPath]);
+      }
+    }
+    for (const [name, path] of callbacks) {
+      if (value(environment, name) !== `${origin}${path}`) {
+        errors.add("LYRA_PUBLIC_ORIGIN");
+        errors.add(name);
+      }
+    }
   }
-  return report("公开 HTTPS origin 与 Google 回调", errors);
+  return report("公开 HTTPS origin 与登录回调", errors);
+}
+
+function checkOAuthLogin(environment: NodeJS.ProcessEnv, provider: keyof typeof OAUTH_LOGIN_SETTINGS): boolean {
+  const settings = OAUTH_LOGIN_SETTINGS[provider];
+  const names = [...settings.required, settings.owner];
+  const errors = new Set<EnvironmentVariable>();
+  for (const name of names) {
+    if (!value(environment, name) || isPlaceholder(value(environment, name))) errors.add(name);
+  }
+  try {
+    loadOAuthLoginConfig(environment, provider);
+  } catch (error: unknown) {
+    const found = namedVariables(error, names);
+    for (const name of found.length > 0 ? found : names) errors.add(name);
+  }
+  const callbackName = settings.required[2];
+  const callback = value(environment, callbackName);
+  const url = parseUrl(callback);
+  if (url === null || isPlaceholderHostname(url.hostname)
+    || callback !== `${url.origin}${settings.callbackPath}`) {
+    errors.add(callbackName);
+  }
+  return report(`${settings.name} 登录与 owner`, errors);
+}
+
+/** 部署至少启用一种方式；其他方式可完全省略，部分配置不能被忽略。 */
+function checkLogins(environment: NodeJS.ProcessEnv): boolean {
+  const checks: boolean[] = [];
+  if (LOGIN_VARIABLES.some((name) => value(environment, name))) {
+    checks.push(checkGoogleLogin(environment));
+  } else {
+    process.stdout.write("[SKIP] Google 登录（未配置）\n");
+  }
+  for (const provider of ["linuxdo", "github"] as const) {
+    const settings = OAUTH_LOGIN_SETTINGS[provider];
+    if ([...settings.required, settings.owner].some((name) => value(environment, name))) {
+      checks.push(checkOAuthLogin(environment, provider));
+    } else {
+      process.stdout.write(`[SKIP] ${settings.name} 登录（未配置）\n`);
+    }
+  }
+  if (checks.length === 0) {
+    return report("至少配置一种登录方式及其 owner", new Set<EnvironmentVariable>([
+      ...LOGIN_VARIABLES,
+      ...Object.values(OAUTH_LOGIN_SETTINGS).flatMap((settings) => [...settings.required, settings.owner]),
+    ]));
+  }
+  return checks.every(Boolean);
 }
 
 function checkGenkit(environment: NodeJS.ProcessEnv, requireAI: boolean): boolean {
@@ -199,14 +283,14 @@ function run(): number {
   }
   if (args.includes("--help")) {
     process.stdout.write("用法：node dist/src/cli/check-config.js [--require-ai]\n"
-      + "检查部署环境中的基础配置、Google owner 登录、可选 Genkit 和行情配置；仅读取 process.env。\n"
+      + "检查基础配置、Google / LINUX DO / GitHub owner 登录、可选 Genkit 和行情配置；仅读取 process.env。\n"
       + "--require-ai 要求完整 AI 配置，否则 AI 三项全空时允许账本模式。\n");
     return 0;
   }
   // 不读取 .env、不引入 main、不打开数据库，不执行迁移、建账户或外部请求。
   const checks = [
     checkBaseEnvironment(process.env),
-    checkGoogleLogin(process.env),
+    checkLogins(process.env),
     checkPublicOrigin(process.env),
     checkGenkit(process.env, args.includes("--require-ai")),
     checkMarketData(process.env),

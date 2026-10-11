@@ -28,7 +28,7 @@ import {
   findDeviceIdByPublicKey,
   revokeDeviceCredentials,
 } from "../infrastructure/db/owner-login-repository.js";
-import type { GoogleLoginIdentity } from "../infrastructure/auth/google-login-client.js";
+import type { LoginIdentity } from "../infrastructure/auth/login-provider.js";
 import { loadPairedDeviceAuthRecord } from "../infrastructure/db/device-access-token-repository.js";
 import type { LyraDatabase } from "../infrastructure/db/database.js";
 import { ApplicationError } from "./app-error.js";
@@ -37,7 +37,7 @@ import type { WriteCoordinator } from "./write-coordinator.js";
 const ACCESS_TOKEN_TTL_MILLISECONDS = 15 * 60 * 1000;
 const REFRESH_TOKEN_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1000;
 
-/** OAuth 登录成功后 App 获得的 Lyra 凭据，不含任何 Google token。 */
+/** OAuth 登录成功后 App 获得的 Lyra 凭据，不含任何第三方 token。 */
 export interface DevicePairingHttpResponse {
   deviceId: string;
   displayName: string;
@@ -75,7 +75,7 @@ export class DevicePairingService {
 
   /** 仅由已验证 OAuth + App PKCE 的应用用例调用；所有写入原子提交。 */
   async authorizeOwnerDevice(input: {
-    identity: GoogleLoginIdentity;
+    identity: LoginIdentity;
     displayName: string;
     publicKeyPem: string;
   }): Promise<DevicePairingHttpResponse> {
