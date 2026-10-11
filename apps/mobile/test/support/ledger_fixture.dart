@@ -32,7 +32,10 @@ class LedgerFixture {
           Dio(BaseOptions(baseUrl: url))
             ..httpClientAdapter = FakeLyraAdapter((options) async {
               requests.add(options);
-              final command = options.uri.path.split('/').last;
+              final market = options.uri.path == '/v1/market/positions';
+              final command = market
+                  ? 'market-positions'
+                  : options.uri.path.split('/').last;
               return ResponseBody.fromString(
                 jsonEncode(
                   failures.contains(command)
@@ -41,6 +44,8 @@ class LedgerFixture {
                           'message': '测试连接中断',
                           'retryable': true,
                         }
+                      : market
+                      ? marketResponse(options.queryParameters)
                       : response(command, options.queryParameters),
                 ),
                 failures.contains(command) ? 503 : 200,
@@ -68,6 +73,63 @@ class LedgerFixture {
         ],
       },
       'data': data,
+    };
+  }
+
+  /// Market data is optional in existing ledger tests. A separate response
+  /// keeps the standard ledger payload and all historical costs untouched.
+  Map<String, Object?> marketResponse(Map<String, dynamic> query) {
+    final ledger = response('positions', query);
+    final positions = ((ledger['data'] as Map<String, Object?>)['rows'] as List)
+        .cast<Map<String, Object?>>();
+    return {
+      'metadata': ledger['metadata'],
+      'data': {
+        'rows': [
+          for (final position in positions)
+            {
+              ...position,
+              'currency': 'USD',
+              'instrumentKey': null,
+              'quote': {
+                'status': 'unavailable',
+                'quote': null,
+                'referencePrice': null,
+                'issue': 'not_configured',
+                'cached': false,
+              },
+              'valuation': {
+                'marketValue': null,
+                'unrealizedPnl': null,
+                'multiplier': null,
+                'basis': 'reference_price_excluding_fees',
+              },
+            },
+        ],
+        'count': positions.length,
+        'pricedCount': 0,
+        'complete': positions.isEmpty,
+        'basis': 'current_positions_at_quote_times_excluding_fees',
+        'marketData': {
+          'enabled': false,
+          'routes': {'stock': <String>[], 'option': <String>[]},
+          'providers': <Object?>[],
+        },
+        'currencyGroups': [
+          if (positions.isNotEmpty)
+            {
+              'currency': 'USD',
+              'accountIds': [account],
+              'positions': positions.length,
+              'pricedPositions': 0,
+              'complete': false,
+              'marketValue': null,
+              'unrealizedPnl': null,
+              'asOfFrom': null,
+              'asOfTo': null,
+            },
+        ],
+      },
     };
   }
 

@@ -37,6 +37,9 @@ import type {
 import type { RawTransactionFields } from "../src/domain/ledger/index.js";
 import { openLyraDatabase, type LyraDatabase } from "../src/infrastructure/db/database.js";
 import { persistImportCommit } from "../src/infrastructure/db/import-commit-repository.js";
+import { MarketDataService } from "../src/application/market-data-service.js";
+import type { MarketPositionView } from "../src/application/market-position-view.js";
+import { marketInstrumentKey } from "../src/domain/market-data/types.js";
 
 const USD_ACCOUNT_ID = "61000000-0000-4000-8000-000000000001";
 const EUR_ACCOUNT_ID = "61000000-0000-4000-8000-000000000002";
@@ -157,7 +160,7 @@ function context(accountScope: AgentToolContext["accountScope"]): AgentToolConte
 }
 
 describe("real DuckDB financial tool runtime", () => {
-  it("从同一账本快照公开全部 17 个确定性金融工具", async () => {
+  it("从同一账本快照公开金融工具，外部行情采用独立注入", async () => {
     const directory = await mkdtemp(join(tmpdir(), "lyra-financial-tools-"));
     const database = await openLyraDatabase(join(directory, "ledger.duckdb"));
     try {
@@ -342,6 +345,56 @@ describe("real DuckDB financial tool runtime", () => {
           return true;
         },
       );
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("App/Agent共享行情估值、先检查账本权限且刷新行情不改变历史结果", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "lyra-market-runtime-"));
+    const database = await openLyraDatabase(join(directory, "ledger.duckdb"));
+    try {
+      await seedFinancialLedger(database);
+      let calls = 0;
+      const marketData = new MarketDataService({
+        providers: [{
+          id: "fixture", assetTypes: ["stock", "option"],
+          fetchQuote: async (instrument) => {
+            calls += 1;
+            return { status: "available", quote: {
+              instrumentKey: marketInstrumentKey(instrument), providerId: "fixture", feed: "delayed fixture",
+              currency: "USD", bid: { value: "3", asOf: "2026-08-31T11:30:00.000Z" },
+              ask: { value: "5", asOf: "2026-08-31T11:30:00.000Z" }, last: null, close: null,
+              timing: { kind: "delayed", delayMinutes: 15 }, fetchedAt: "2026-08-31T12:00:00.000Z",
+            } };
+          },
+        }],
+        routes: { stock: ["fixture"], option: ["fixture"] },
+        policies: { fixture: { cacheTtlMs: 60_000, maxRequestsPerMinute: 20, maxRequestsPerDay: null } },
+        now: () => new Date("2026-08-31T12:00:00.000Z"),
+      });
+      const registry = createFinancialToolRegistry(database, marketData);
+      const before = await registry.invoke("summary", {}, context({ kind: "all" }));
+      for (const accountScope of [{ kind: "all" as const }, { kind: "account" as const, account: USD_ACCOUNT_ID }]) {
+        const result = await registry.invoke("market-positions", {}, context(accountScope)) as MarketPositionView;
+        assert.equal(result.rows[0]?.valuation.marketValue, "400");
+        assert.equal(result.rows[0]?.valuation.unrealizedPnl, "200");
+        assert.equal(result.rows[0]?.cost, "2");
+        assert.equal(result.rows[0]?.quote.referencePrice?.asOf, "2026-08-31T11:30:00.000Z");
+        assert.equal(result.rows[0]?.accountId, USD_ACCOUNT_ID);
+        assert.doesNotMatch(JSON.stringify(result), /SCHWAB-USD|transactionHash|sourceReference/);
+      }
+      assert.equal(calls, 1);
+      assert.deepEqual(await registry.invoke("summary", {}, context({ kind: "all" })), before);
+      await assert.rejects(() => registry.invoke("market-positions", {}, { ...context({ kind: "all" }), ledgerVersion: 0 }), {
+        code: "LEDGER_VERSION_CONFLICT",
+      });
+      await assert.rejects(() => registry.invoke("market-positions", {}, context({ kind: "account", account: "not-authorized" })));
+      assert.equal(calls, 1);
+      const eur = await registry.invoke("market-positions", {}, context({ kind: "account", account: EUR_ACCOUNT_ID })) as MarketPositionView;
+      assert.equal(eur.count, 0);
+      assert.equal(calls, 1);
     } finally {
       database.close();
       await rm(directory, { recursive: true, force: true });

@@ -14,6 +14,7 @@ import { AgentTurnOrchestrator } from "./application/index.js";
 import { createGenkitRuntimeFromEnvironment } from "./infrastructure/agents/genkit-runtime.js";
 import { loadGoogleLoginConfig } from "./infrastructure/auth/google-login-client.js";
 import { environmentSchema } from "./infrastructure/config/server-environment.js";
+import { createMarketDataServiceFromEnvironment } from "./infrastructure/market-data/market-data-runtime.js";
 import { GoogleLoginService } from "./application/google-login-service.js";
 import { registerGoogleLoginRoutes } from "./transport/google-login-routes.js";
 import { openLyraDatabase } from "./infrastructure/db/database.js";
@@ -46,10 +47,11 @@ async function start(): Promise<void> {
   // Validate new integration configuration before any irreversible schema upgrade.
   const loginConfig = loadGoogleLoginConfig(process.env);
   const aiRuntime = createGenkitRuntimeFromEnvironment(process.env);
+  const marketData = createMarketDataServiceFromEnvironment(process.env);
   const database = await openLyraDatabase(environment.LYRA_DATABASE_PATH);
   const writeCoordinator = new WriteCoordinator();
   await writeCoordinator.enqueue(() => recoverInterruptedAgentSessions(database, new Date()));
-  const registry = createFinancialToolRegistry(database);
+  const registry = createFinancialToolRegistry(database, marketData);
   mkdirSync(environment.LYRA_IMPORT_STAGING_DIR, { recursive: true });
   const importService = new ImportService({
     database,

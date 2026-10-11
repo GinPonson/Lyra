@@ -6,7 +6,9 @@
 
 `server/src/infrastructure/agents/genkit-runtime.ts` 使用 Genkit 的 `generateStream` 和动态工具定义。每次调用进入 `AgentTurnOrchestrator`，由现有金融注册表执行并保存工具审计。
 
-可用工具为 `accounts`、`summary`、`positions`、`expiring`、`trades`、`realized`、`cashflow`、`monthly`、`allocation`、`attribution`、`drawdown`、`risk`、`holding-period`、`extremes`、`streaks`、`stress`、`audit`。
+可用工具为 `accounts`、`summary`、`positions`、`expiring`、`trades`、`realized`、`cashflow`、`monthly`、`allocation`、`attribution`、`drawdown`、`risk`、`holding-period`、`extremes`、`streaks`、`stress`、`audit`、`market-positions`，共 18 个。
+
+`market-positions` 是独立的外部只读行情工具，与 App 的 `GET /v1/market/positions` 共用供应商无关的估值层。模型不能指定供应商、任意 URL 或密钥。工具返回当前持仓的参考估值、来源、报价时间、选价依据和缺失 / 过期状态；不提供历史组合净值或当日盈亏。已有 17 个账本工具的计算口径保持原样。配置和换源见[行情接入与换源](market-data.md)。
 
 账户范围、账本版本与截止时间来自服务端会话。模型只能提交工具公开允许的参数，不能覆盖这些数据边界。无效工具名、非法参数和试图覆盖范围的请求进入拒绝审计；合法工具经过同一执行路径。
 
@@ -106,7 +108,7 @@ Google 登录成功后，新数据库还没有证券账户。先在「我的 →
 
 成功返回 `201` 与 `{ "account": ... }`，公开账户对象仅包含 ID、显示名、券商、脱敏后缀、币种、状态与时间。完整导入标识不回传至账户列表或模型工具。标识会进行大小写规范化；同一标识不能重复创建，包括已归档的账户。
 
-App 为一次创建保留 `Idempotency-Key`，请求响应丢失时可重试并取回原账户。同设备、同键、同规范化请求在 24 小时内重放原成功结果；同键改换请求返回 `IDEMPOTENCY_KEY_REUSED`，重复标识返回 `ACCOUNT_ALREADY_EXISTS`。新增账户是 App 的明确写操作，不在 Genkit 的 17 个只读工具中。
+App 为一次创建保留 `Idempotency-Key`，请求响应丢失时可重试并取回原账户。同设备、同键、同规范化请求在 24 小时内重放原成功结果；同键改换请求返回 `IDEMPOTENCY_KEY_REUSED`，重复标识返回 `ACCOUNT_ALREADY_EXISTS`。新增账户是 App 的明确写操作，不在 Genkit 的只读工具中。
 
 ## 6. 用户页面与本机设置
 
@@ -158,11 +160,11 @@ v12 保留旧消息和工具审计，记录旧 provider，将旧会话归档，�
 
 Genkit 集成验证使用 Genkit 的真实工具循环、可控假模型、真实 DuckDB，以及运行在本机的兼容 HTTP/SSE 模型端点；不需要外部模型账号。OAuth 测试替换外部 Google 边界，验证状态、身份规则与真实数据库凭据流程。
 
-最新完整服务端回归为 **117 个套件、279 项测试通过**，0 失败、0 跳过。首次账户与导入用例从真实空数据库开始，经受控 Google 身份验证后签发设备凭据，创建账户、预览并确认 CSV，最后读取真实持仓与已实现盈亏；大小写不同的文件名重复上传仍不会重复入账。
+首次账户与导入阶段的服务端回归为 **117 个套件、279 项测试通过**，0 失败、0 跳过。该用例从真实空数据库开始，经受控 Google 身份验证后签发设备凭据，创建账户、预览并确认 CSV，最后读取真实持仓与已实现盈亏；大小写不同的文件名重复上传仍不会重复入账。此后的部署和行情改动及最新全量统计见[实现进度](progress.md)。
 
 本轮用户页面已执行 `flutter pub get` 并保存真实解析的锁文件，新增兼容现有平台依赖的 `package_info_plus 9.0.1`；`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded --timeout 60s` **162 项全部通过**。新增 71 项覆盖金额隐私与图表配色、持久偏好、启动账户恢复、用户页面及连接管理；原有 91 项继续通过。检查期间修复了启动读取失败后手动选择仍无法查询，以及偏好保存失败后服务端地址退回默认值的恢复路径。该批改动没有修改服务端，117 套件 / 279 项为上一轮服务端完整回归结果。
 
-最新深色界面 Android 调试 APK 已通过 `flutter build apk --debug --no-pub` 构建，版本 `1.0.0` / versionCode **3**，167,049,415 字节；元数据解析与 `apksigner verify` 通过。产物位于 `apps/mobile/build/app/outputs/flutter-apk/app-debug.apk`，使用开发签名，尚未进行真机安装与运行验收。实际 Flutter 组件已完成手机、放大字体与宽屏渲染检查。真实 Google 浏览器登录、真实模型供应商及手机完整联调仍需要部署配置，不能用受控测试代替。
+此前交付的深色界面 Android 调试 APK 已通过 `flutter build apk --debug --no-pub` 构建，版本 `1.0.0` / versionCode **3**，167,049,415 字节；元数据解析与 `apksigner verify` 通过。该 APK 使用开发签名，尚未进行真机安装与运行验收，也不包含后来新增的行情面板；体验行情需重新构建当前移动端源码。深色界面阶段的 Flutter 组件已完成手机、放大字体与宽屏渲染检查。真实 Google 浏览器登录、真实模型 / 行情供应商及手机完整联调仍需要部署配置，不能用受控测试代替。
 
 最新执行结果记录在 [`docs/progress.md`](progress.md)。这些待验证项完成前，保持迁移 PR 为草稿。
 

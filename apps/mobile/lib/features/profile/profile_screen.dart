@@ -8,6 +8,7 @@ import '../../core/preferences/app_preferences.dart';
 import '../accounts/account_repository.dart';
 import '../accounts/account_workspace.dart';
 import '../overview/login_panel.dart';
+import '../market/market_widgets.dart';
 import '../system/system_workspace.dart';
 import 'about_screen.dart';
 import 'brokerage_accounts_screen.dart';
@@ -214,6 +215,13 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                           ? '设置服务端地址'
                           : '${serverDisplayName(url)} · $connectionLabel',
                       onTap: () => showConnectionManagementSheet(context),
+                    ),
+                    ProfileSettingRow(
+                      key: const ValueKey('profile-market-data'),
+                      title: '行情与估值',
+                      icon: Icons.query_stats_outlined,
+                      subtitle: '参考价格、报价时点与数据状态',
+                      onTap: () => showMarketDataSheet(context),
                     ),
                     ProfileSettingRow(
                       key: const ValueKey('profile-about'),

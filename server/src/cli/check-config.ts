@@ -6,6 +6,7 @@ import {
   loadGoogleLoginConfig,
 } from "../infrastructure/auth/google-login-client.js";
 import { environmentSchema } from "../infrastructure/config/server-environment.js";
+import { marketDataEnvironmentSchema, MARKET_ENVIRONMENT_VARIABLES } from "../infrastructure/market-data/market-data-runtime.js";
 
 const LOGIN_REQUIRED = [
   "LYRA_LOGIN_GOOGLE_CLIENT_ID",
@@ -21,6 +22,7 @@ type EnvironmentVariable = keyof typeof environmentSchema.shape
   | typeof LOGIN_VARIABLES[number]
   | typeof AI_VARIABLES[number]
   | typeof AI_LIMIT_VARIABLES[number]
+  | typeof MARKET_ENVIRONMENT_VARIABLES[number]
   | "LYRA_PUBLIC_ORIGIN";
 
 /** 输出只能来自固定文案与允许的变量名，绝不转发 URL/Zod/供应商的错误消息。 */
@@ -169,6 +171,23 @@ function checkGenkit(environment: NodeJS.ProcessEnv, requireAI: boolean): boolea
   return report(ledgerOnly && !requireAI ? "Genkit 配置（账本模式，AI 未启用）" : "Genkit 配置", errors);
 }
 
+function checkMarketData(environment: NodeJS.ProcessEnv): boolean {
+  const errors = new Set<EnvironmentVariable>();
+  const result = marketDataEnvironmentSchema.safeParse(environment);
+  if (!result.success) {
+    for (const issue of result.error.issues) {
+      const name = issue.path[0];
+      if (typeof name === "string" && (MARKET_ENVIRONMENT_VARIABLES as readonly string[]).includes(name)) {
+        errors.add(name as typeof MARKET_ENVIRONMENT_VARIABLES[number]);
+      }
+    }
+  }
+  for (const name of ["LYRA_ALPACA_API_KEY", "LYRA_ALPACA_SECRET_KEY", "LYRA_MARKETDATA_API_TOKEN"] as const) {
+    if (isPlaceholder(value(environment, name))) errors.add(name);
+  }
+  return report("行情数据源配置（仅检查配置，不验证远端权限）", errors);
+}
+
 function run(): number {
   const args = process.argv.slice(2);
   if (args.some((argument) => argument !== "--require-ai" && argument !== "--help")) {
@@ -177,7 +196,7 @@ function run(): number {
   }
   if (args.includes("--help")) {
     process.stdout.write("用法：node dist/src/cli/check-config.js [--require-ai]\n"
-      + "检查部署环境中的基础配置、Google owner 登录和可选 Genkit 配置；仅读取 process.env。\n"
+      + "检查部署环境中的基础配置、Google owner 登录、可选 Genkit 和行情配置；仅读取 process.env。\n"
       + "--require-ai 要求完整 AI 配置，否则 AI 三项全空时允许账本模式。\n");
     return 0;
   }
@@ -187,6 +206,7 @@ function run(): number {
     checkGoogleLogin(process.env),
     checkPublicOrigin(process.env),
     checkGenkit(process.env, args.includes("--require-ai")),
+    checkMarketData(process.env),
   ];
   const passed = checks.every(Boolean);
   (passed ? process.stdout : process.stderr).write(`[${passed ? "PASS" : "FAIL"}] 部署配置检查\n`);

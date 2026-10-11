@@ -39,6 +39,7 @@ const LEDGER_TOOL_ROUTES: readonly { path: string; tool: FinancialToolName }[] =
   { path: "/v1/analytics/extremes", tool: "extremes" },
   { path: "/v1/analytics/streaks", tool: "streaks" },
   { path: "/v1/analytics/stress", tool: "stress" },
+  { path: "/v1/market/positions", tool: "market-positions" },
 ];
 
 /**

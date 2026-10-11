@@ -10,6 +10,7 @@ import '../../core/design/lyra_number.dart';
 import '../../core/design/stock_avatar.dart';
 import '../../core/design/lyra_widgets.dart';
 import '../../core/preferences/app_preferences.dart';
+import '../market/market_widgets.dart';
 import 'ledger_view.dart';
 import 'ledger_workspace.dart';
 import 'position_group.dart';
@@ -325,6 +326,7 @@ class LedgerHoldingsPreview extends ConsumerWidget {
                   currency: section.currency,
                   previewLimit: 3,
                 ),
+              MarketPositionsPanel(ledger: result),
             ],
           ),
         ),
@@ -633,6 +635,11 @@ class _LedgerPanelState extends ConsumerState<LedgerPanel> {
                   read: read,
                   data: section.data,
                   currency: section.currency,
+                ),
+              if (widget.view == LedgerView.positions)
+                MarketPositionsPanel(
+                  ledger: read,
+                  underlying: _symbol.isEmpty ? null : _symbol,
                 ),
               if (widget.view.paginated)
                 Row(

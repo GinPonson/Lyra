@@ -40,6 +40,9 @@ import {
 import type { LyraDatabase } from "../infrastructure/db/database.js";
 import { resolveAccountScope, type ResolvedAccountScope } from "./account-scope.js";
 import { createPublicAccountList } from "./account-view.js";
+import { MarketDataService } from "./market-data-service.js";
+import { createMarketPositionView } from "./market-position-view.js";
+import type { MarketDataReader } from "../domain/market-data/types.js";
 import {
   createPublicExpiringPositions,
   createPublicPositionList,
@@ -67,7 +70,7 @@ export type AgentAccountSummaryResult = AgentCurrencyGroupedResult<
 >;
 
 /**
- * 创建连接真实 DuckDB 的完整 17 工具金融注册表。
+ * 创建连接真实 DuckDB 的金融注册表；行情单独注入，历史账本工具不访问行情源。
  *
  * 每次工具调用都使用凭据中的账本版本读取单条 SQL 快照，再把 Lyra 账户 UUID
  * 映射成旧账本键供既有确定性计算内核使用。输出通过 App 共用公开投影去除旧账户
@@ -75,7 +78,12 @@ export type AgentAccountSummaryResult = AgentCurrencyGroupedResult<
  *
  * @param database - 单一 TypeScript 服务持有的 DuckDB。
  */
-export function createFinancialToolRegistry(database: LyraDatabase): FinancialToolRegistry {
+export function createFinancialToolRegistry(
+  database: LyraDatabase,
+  marketData: MarketDataReader = new MarketDataService({
+    providers: [], routes: { stock: [], option: [] }, policies: {},
+  }),
+): FinancialToolRegistry {
   return new FinancialToolRegistry({
     accounts: async ({ context }) => {
       const prepared = await prepareAuthorizedSnapshot(database, context);
@@ -236,6 +244,15 @@ export function createFinancialToolRegistry(database: LyraDatabase): FinancialTo
         },
         { kind: "all" },
       );
+    },
+    "market-positions": async ({ arguments: arguments_, context }) => {
+      const prepared = await prepareAuthorizedSnapshot(database, context);
+      const positions = aggregatePositions(
+        prepared.snapshot.openLots,
+        { kind: "all" },
+        optionalString(arguments_, "underlying"),
+      );
+      return createMarketPositionView(positions, prepared.scope, marketData);
     },
   });
 }

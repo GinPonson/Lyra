@@ -207,7 +207,7 @@ describe("brokerage account creation REST and first import", () => {
     assert.equal(JSON.stringify(rows).includes("XXX276"), false);
     assert.equal(JSON.stringify(rows).includes("长期账户"), false);
     assert.deepEqual(JSON.parse(String(rows[0]!.metadata_json)), { broker: "schwab", base_currency: "USD" });
-    assert.equal(f.registry.availableToolDefinitions().length, 17);
+    assert.equal(f.registry.availableToolDefinitions().length, 18);
     assert.equal(f.registry.availableToolDefinitions().some(({ name }) => name === ("account.create" as string)), false);
   });
 

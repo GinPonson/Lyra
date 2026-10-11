@@ -54,6 +54,14 @@ flutter run --dart-define=LYRA_SERVER_URL=https://lyra.example.com
 
 「服务端连接」显示域名并可重新检测。检测使用公开的 `/v1/system/info` 与 `/v1/health`，区分正常、部分服务不可用、服务不可用和版本不兼容；检测本身不读取令牌，也不会因检测失败而退出登录。更换服务端需确认并重新 Google 登录；先保存新地址，保存失败时保留当前登录。「关于 Lyra」读取已安装 App 的真实版本、服务端版本，并提供 GitHub 项目地址。
 
+## 行情与参考估值
+
+总览和股票持仓页的成本列表下提供「参考估值」面板，按币种显示市值和未实现盈亏，展开后可查看参考价、买卖价、选价依据、来源及各自报价时间。「我的 → 行情与估值」按需打开同一通用界面；供应商密钥及切换配置保留在服务端，见[行情接入与换源](../../docs/market-data.md)。
+
+金额由服务端以十进制字符串返回，App 不计算价格或期权乘数。行情按完整账户和证券身份与当前持仓匹配；启动账户恢复前不先请求全部账户，切换身份或范围后忽略旧响应。账本版本不一致时提示刷新，报价失败不影响成本列表。
+
+缺价保持 `—`，过期报价明确标注，缺失或过期的币种组不展示完整合计。参考估值按当前持仓与各自报价时点计算，未实现盈亏不含费用；这不是历史组合净值或当日盈亏。金额隐私同时覆盖价格、估值、期权代码里的行权价、Tooltip 和读屏语义。
+
 ## 石墨灰与冰蓝界面
 
 当前界面采用用户批准的 Ticket assistant 风格精修方向：深灰画布与分层表面、冰蓝操作、清楚的数字层级。总览将账户范围与快捷操作放入紧凑页头，主盈亏显示方向正号；持仓以证券与历史成本为主行，类型和数量为次行。我的、报告、登录、导入和助手界面共用同一套暗色控件。
@@ -70,7 +78,9 @@ flutter build apk --debug
 
 调试 APK 位于 `build/app/outputs/flutter-apk/app-debug.apk`，安装后可以在登录表单填写服务端地址。正式分发前需另行配置 Android 发布签名；当前 Gradle 的 release 配置仍使用开发签名，不能据此标记为发布版本。
 
-本轮深色界面安装包为 Lyra `1.0.0`（versionCode 3），包名 `com.lyrafinance.lyra_mobile`，最低 Android SDK 24、目标 SDK 36，包含 `arm64-v8a`、`armeabi-v7a` 和 `x86_64`。`flutter build apk --debug --no-pub` 已成功，APK 为 **167,049,415 字节**，元数据解析和 `apksigner verify` 通过，使用 Android Debug / v2 签名。SHA-256：`c349c256af67d97dfc9b815681a91d3901585488ff3e35f0f2de8db9e1dab7d1`。最终源码一致性与构建记录见 [实现进度](../../docs/progress.md)。真机安装与运行仍待后续联调。
+此前深色界面安装包为 Lyra `1.0.0`（versionCode 3），包名 `com.lyrafinance.lyra_mobile`，最低 Android SDK 24、目标 SDK 36，包含 `arm64-v8a`、`armeabi-v7a` 和 `x86_64`。`flutter build apk --debug --no-pub` 已成功，APK 为 **167,049,415 字节**，元数据解析和 `apksigner verify` 通过，使用 Android Debug / v2 签名。SHA-256：`c349c256af67d97dfc9b815681a91d3901585488ff3e35f0f2de8db9e1dab7d1`。该包不包含后来新增的行情面板，体验行情需重新构建当前源码。本轮未重建 APK，真机安装与运行仍待后续联调；构建记录见 [实现进度](../../docs/progress.md)。
+
+行情接入后的最终验证为 `flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded --timeout 60s --concurrency=2` **178 项通过**，默认图片捕获入口 1 项跳过。新增 16 项模型和界面回归覆盖完整证券身份、金额精度 / 隐私、缺价 / 过期、320 px 大字体、账户与会话切换、启动范围恢复及账本版本变化；未修改依赖版本。以下 162 项与 15 张截图是此前深色界面阶段的记录。
 
 上一轮用户设置使用真实 `flutter pub get` 新增 `package_info_plus 9.0.1` 和 `package_info_plus_platform_interface 3.2.1`，保留其余依赖版本。本轮界面调整未升级依赖。Flutter 3.47.2 / Dart 3.13.2 下，`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded --timeout 60s` **162 项全部通过**；图片捕获入口默认跳过，单独启用后 4 个场景全部通过。
 

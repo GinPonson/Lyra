@@ -14,7 +14,7 @@ export interface FinancialToolAnnotations {
   readOnlyHint: true;
   destructiveHint: false;
   idempotentHint: true;
-  openWorldHint: false;
+  openWorldHint: boolean;
 }
 
 /** 单一金融工具定义；不包含 handler 或任何会话授权数据。 */
@@ -51,7 +51,7 @@ const PAGINATION_PROPERTIES = {
 } as const;
 
 /**
- * 第一阶段 17 个确定性只读金融工具的唯一公开定义。
+ * 账本分析与外部行情估值共用的唯一只读工具定义。
  *
  * 账户范围、账本版本和 asOf 由服务端会话凭据注入，因此不会出现在模型可控
  * schema 中。Genkit 注册、REST 调用和审计展示都必须读取本清单。
@@ -234,6 +234,16 @@ export const FINANCIAL_TOOL_DEFINITIONS = [
     description: "检查当前账本版本的 FIFO 产物完整性、孤立记录和非法数量。",
     inputSchema: EMPTY_INPUT_SCHEMA,
     annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: "market-positions",
+    description: "查询授权当前持仓的外部延迟或历史报价、参考市值与未实现盈亏（不含费用）。须说明每项报价日期、价格口径、缺失和陈旧状态；不同报价时点的估值不是历史净值或今日账户盈亏。",
+    inputSchema: {
+      type: "object",
+      properties: { underlying: { type: "string", minLength: 1, maxLength: 32 } },
+      additionalProperties: false,
+    },
+    annotations: { ...READ_ONLY_ANNOTATIONS, openWorldHint: true },
   },
 ] as const satisfies readonly FinancialToolDefinition[];
 

@@ -9,8 +9,8 @@ import {
 import { CASH_ACTIONS, POSITION_ACTIONS } from "../src/domain/ledger/index.js";
 
 describe("financial tool definitions", () => {
-  it("以单一有序清单公开 17 个非破坏性闭域工具", () => {
-    assert.equal(FINANCIAL_TOOL_DEFINITIONS.length, 17);
+  it("以单一有序清单公开账本工具并明确外部行情能力", () => {
+    assert.equal(FINANCIAL_TOOL_DEFINITIONS.length, 18);
     assert.deepEqual(
       FINANCIAL_TOOL_DEFINITIONS.map((definition) => definition.name),
       FINANCIAL_TOOL_NAMES,
@@ -25,7 +25,7 @@ describe("financial tool definitions", () => {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: false,
+        openWorldHint: definition.name === "market-positions",
       });
       assert.equal("accountScope" in definition.inputSchema.properties, false);
       assert.equal("ledgerVersion" in definition.inputSchema.properties, false);

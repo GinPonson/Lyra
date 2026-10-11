@@ -255,4 +255,27 @@ describe("deployment configuration CLI", () => {
     assert.equal(invalid.code, 2);
     assert.doesNotMatch(invalid.output, /private-argument-value/u);
   });
+
+  it("validates optional market routing offline and never exposes provider credentials", async () => {
+    const valid = await checkConfiguration({ overrides: {
+      LYRA_MARKET_STOCK_PROVIDERS: "alpaca,marketdata",
+      LYRA_MARKET_OPTION_PROVIDERS: "marketdata",
+      LYRA_ALPACA_API_KEY: "alpaca-private-key-value",
+      LYRA_ALPACA_SECRET_KEY: "alpaca-private-secret-value",
+      LYRA_MARKETDATA_API_TOKEN: "market-private-token-value",
+    } });
+    assert.equal(valid.code, 0, valid.output);
+    assert.match(valid.stdout, /\[PASS\] 行情数据源配置/u);
+    for (const overrides of [
+      { LYRA_MARKET_STOCK_PROVIDERS: "unknown-private-provider" },
+      { LYRA_MARKET_STOCK_PROVIDERS: "alpaca" },
+      { LYRA_ALPACA_API_KEY: "partial-private-key" },
+      { LYRA_MARKET_OPTION_PROVIDERS: "marketdata" },
+      { LYRA_MARKETDATA_API_TOKEN: "replace-with-marketdata-api-token" },
+    ]) {
+      const invalid = await checkConfiguration({ overrides });
+      assert.equal(invalid.code, 1);
+      assert.match(invalid.stderr, /行情数据源配置/u);
+    }
+  });
 });

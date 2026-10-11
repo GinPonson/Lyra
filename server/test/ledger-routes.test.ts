@@ -160,6 +160,24 @@ describe("Ledger read REST routes", () => {
       assert.equal(drawdown.statusCode, 200);
       assert.equal(drawdown.json().metadata.accountScope.kind, "all");
 
+      const marketNoAuth = await app.inject({
+        method: "GET", url: "/v1/market/positions?scope=all",
+        headers: { "x-lyra-protocol-version": "2" },
+      });
+      assert.equal(marketNoAuth.statusCode, 401);
+      const marketMissingScope = await app.inject({ method: "GET", url: "/v1/market/positions", headers });
+      assert.equal(marketMissingScope.statusCode, 400);
+      const market = await app.inject({ method: "GET", url: "/v1/market/positions?scope=all", headers });
+      assert.equal(market.statusCode, 200);
+      assert.equal(market.json().data.marketData.enabled, false);
+      assert.equal(market.json().data.basis, "current_positions_at_quote_times_excluding_fees");
+      assert.equal(market.json().metadata.ledgerVersion, 0);
+      const arbitrarySource = await app.inject({
+        method: "GET", url: "/v1/market/positions", headers,
+        query: { scope: "all", provider: "untrusted", url: "https://untrusted.invalid" },
+      });
+      assert.equal(arbitrarySource.statusCode, 400);
+
       await app.close();
     } finally {
       await database.close();

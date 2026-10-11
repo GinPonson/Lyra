@@ -280,7 +280,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
             SizedBox(width: 6),
             Expanded(
               child: Text(
-                '基于已导入交易记录 · 不含实时行情',
+                '已实现损益来自交易记录 · 参考估值另列报价时间',
                 style: TextStyle(fontSize: 11, color: LyraColors.muted),
               ),
             ),
