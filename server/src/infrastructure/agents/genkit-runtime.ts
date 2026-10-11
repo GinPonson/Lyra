@@ -92,8 +92,9 @@ export function createGenkitTurnExecutor(options: {
   }
   return async (input) => {
     const timeout = new AbortController();
+    // 定时器必须持有事件循环：模型调用若只是挂起的 Promise（无其它 handle），
+    // unref 会让进程在截止时间到达前就判定事件循环已空，超时永不触发。
     const timer = setTimeout(() => timeout.abort(new Error("Genkit turn timed out")), timeoutMs);
-    timer.unref();
     const signal = AbortSignal.any([input.abortSignal, timeout.signal]);
     let active = true;
     let totalTokens = 0;
@@ -129,10 +130,15 @@ export function createGenkitTurnExecutor(options: {
           const response = await next(request, context);
           signal.throwIfAborted();
           if (!active) throw new Error("Agent 回合已结束");
-          const tokens = response.usage?.totalTokens
-            ?? ((response.usage?.inputTokens ?? 0) + (response.usage?.outputTokens ?? 0));
-          if (response.usage && Number.isFinite(tokens) && tokens >= 0) {
-            totalTokens += tokens;
+          // 供应方可能返回 usage 对象但不含任何 token 计数；此时用量是“未知”，
+          // 不能退化成 0 上报，否则界面会把未知显示成精确的零消耗。
+          const usage = response.usage;
+          const counted = usage?.totalTokens
+            ?? (usage?.inputTokens !== undefined || usage?.outputTokens !== undefined
+              ? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
+              : undefined);
+          if (typeof counted === "number" && Number.isFinite(counted) && counted >= 0) {
+            totalTokens += counted;
             hasUsage = true;
           }
           for (const part of response.message?.content ?? []) {

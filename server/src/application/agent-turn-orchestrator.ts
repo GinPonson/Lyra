@@ -281,10 +281,20 @@ export class AgentTurnOrchestrator {
       session: runtime.snapshot,
       finishedAt: this.#now().toISOString(),
     });
-    if (isTurnCompletionPlan(finalized)) {
-      await this.#enqueue(() => persistAgentTurnCompletion(this.#database, finalized));
-    } else {
-      await this.#enqueue(() => persistAgentTurnFailure(this.#database, finalized));
+    try {
+      if (isTurnCompletionPlan(finalized)) {
+        await this.#enqueue(() => persistAgentTurnCompletion(this.#database, finalized));
+      } else {
+        await this.#enqueue(() => persistAgentTurnFailure(this.#database, finalized));
+      }
+    } catch (error: unknown) {
+      // 结算落库失败时必须释放内存中的活跃回合：否则 startTurn/cancelTurn/
+      // closeAgentSessionForRequest 会永久以“已有进行中的回合”拒绝，形成只能
+      // 靠重启恢复的毒丸会话。同时丢弃缓存运行时，让后续请求重新读取数据库
+      // 的权威状态，而不是继续使用与库不一致的内存快照。错误本身照常上抛。
+      runtime.turn = null;
+      this.#runtimes.delete(sessionId.trim());
+      throw error;
     }
     runtime.snapshot = finalized.session;
     runtime.lastEventSequence = finalized.event.sequence;

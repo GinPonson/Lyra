@@ -62,7 +62,7 @@ describe("AgentEventSequencer", () => {
         type: "message.delta",
         messageId: "message-1",
         occurredAt: "2026-08-31T05:00:00Z",
-        payload: { delta: "A" },
+        payload: { text: "A" },
       }),
       sequencer.next({
         type: "message.completed",

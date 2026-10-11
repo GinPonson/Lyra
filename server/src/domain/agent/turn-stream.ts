@@ -101,7 +101,9 @@ export function applyAgentTurnStreamSignal(input: {
         return { state, event: null };
       }
       state = { ...state, visibleContent: state.visibleContent + input.signal.delta };
-      eventInput = { type: "message.delta", payload: { delta: input.signal.delta } };
+      // 公开事件字段名必须与 App 读取的键一致（`payload.text`）；两端改名会
+      // 静默丢掉全部增量，App 只会在终态快照时一次性看到全文。
+      eventInput = { type: "message.delta", payload: { text: input.signal.delta } };
       break;
     }
     case "reasoning_delta": {

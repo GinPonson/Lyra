@@ -69,6 +69,9 @@ describe("Agent turn stream aggregation", () => {
     });
 
     assert.equal(text.event?.type, "message.delta");
+    // App 读取 `payload.text` 累积流式正文；键名漂移会让增量在客户端被静默丢弃。
+    assert.equal(text.event?.payload.text, "临时");
+    assert.equal("delta" in (text.event?.payload ?? {}), false);
     assert.equal(reasoning.event?.type, "reasoning.delta");
     assert.deepEqual(reasoning.event?.payload, {
       state: "active",
