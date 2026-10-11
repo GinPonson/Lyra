@@ -710,17 +710,19 @@ class _ProviderSignInButton extends StatelessWidget {
     ),
     child: Row(
       children: [
-        if (provider == AuthProvider.google) ...[
-          ExcludeSemantics(
-            child: Image.asset(
-              'assets/auth/google-g.png',
-              width: 20,
-              height: 20,
-              fit: BoxFit.contain,
-            ),
+        ExcludeSemantics(
+          child: Image.asset(
+            switch (provider) {
+              AuthProvider.google => 'assets/auth/google-g.png',
+              AuthProvider.linuxdo => 'assets/auth/linuxdo.png',
+              AuthProvider.github => 'assets/auth/github-white.png',
+            },
+            width: 20,
+            height: 20,
+            fit: BoxFit.contain,
           ),
-          const SizedBox(width: 12),
-        ],
+        ),
+        const SizedBox(width: 12),
         Expanded(
           child: Text(
             '使用 ${provider.label} 登录',

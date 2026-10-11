@@ -70,6 +70,8 @@ flutter:
   assets:
     - assets/stocks/
     - assets/auth/google-g.png
+    - assets/auth/linuxdo.png
+    - assets/auth/github-white.png
 
   # To add assets to your application, add an assets section, like this:
   # assets:

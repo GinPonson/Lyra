@@ -77,7 +77,7 @@ flutter run --dart-define=LYRA_SERVER_URL=https://lyra.example.com
 
 ## 独立登录页截图
 
-实际 Flutter 组件渲染见：[390 px 登录页](../../docs/plans/assets/login-20261011-390.png)、[320 px / 1.6 倍字体](../../docs/plans/assets/login-20261011-320-large.png)、[未配置来源](../../docs/plans/assets/login-20261011-390-unavailable.png)。三张均使用合成目录和 `demo.lyra.example` 地址，不读取真实账号。Google G 使用[未修改的官方资产](assets/auth/README.md)，另外两个按钮采用品牌文字。
+实际 Flutter 组件渲染见：[390 px 登录页](../../docs/plans/assets/login-20261011-390.png)、[320 px / 1.6 倍字体](../../docs/plans/assets/login-20261011-320-large.png)、[未配置来源](../../docs/plans/assets/login-20261011-390-unavailable.png)。三张均使用合成目录和 `demo.lyra.example` 地址，不读取真实账号。Google、Linux.do、GitHub 均使用[未修改的官方品牌资产](assets/auth/README.md)，图标占位统一为 20 × 20 逻辑像素，与文字间距为 12 逻辑像素。
 
 复现时提供输出目录、测试用中文字体和 Flutter SDK 根目录：
 
