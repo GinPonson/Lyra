@@ -10,6 +10,8 @@ import 'package:lyra_mobile/app/lyra_app.dart';
 import 'package:lyra_mobile/app/session.dart';
 import 'package:lyra_mobile/core/preferences/app_preferences.dart';
 import 'package:lyra_mobile/features/auth/auth_provider.dart';
+import 'package:lyra_mobile/features/auth/auth_workspace.dart';
+import 'package:lyra_mobile/features/system/system_workspace.dart';
 
 import 'support/login_fixture.dart';
 
@@ -52,18 +54,40 @@ void main() {
     await Directory(_directory).create(recursive: true);
   });
   for (final scenario in [
-    (name: '390', size: const Size(390, 844), scale: 1.0, unavailable: false),
+    (
+      name: '390',
+      size: const Size(390, 844),
+      scale: 1.0,
+      unavailable: false,
+      page: 'login',
+    ),
     (
       name: '320-large',
       size: const Size(320, 740),
       scale: 1.6,
       unavailable: false,
+      page: 'login',
     ),
     (
       name: '390-unavailable',
       size: const Size(390, 844),
       scale: 1.0,
       unavailable: true,
+      page: 'login',
+    ),
+    (
+      name: 'profile-390',
+      size: const Size(390, 844),
+      scale: 1.0,
+      unavailable: false,
+      page: 'profile',
+    ),
+    (
+      name: 'about-390',
+      size: const Size(390, 844),
+      scale: 1.0,
+      unavailable: false,
+      page: 'about',
     ),
   ]) {
     testWidgets('capture dedicated login ${scenario.name}', (tester) async {
@@ -79,8 +103,10 @@ void main() {
       await tester.pumpWidget(
         ProviderScope(
           overrides: [
+            configuredServerUrlProvider.overrideWithValue(loginFixtureServer),
+            appVersionProvider.overrideWith((ref) async => '1.0.0 (3)'),
             sessionDependenciesProvider.overrideWithValue(
-              await fixture.dependencies(),
+              await fixture.dependencies(paired: scenario.page != 'login'),
             ),
             appPreferencesStoreProvider.overrideWithValue(
               MemoryAppPreferencesStore(
@@ -94,6 +120,17 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
+      if (scenario.page != 'login') {
+        await tester.tap(find.text('我的'));
+        await tester.pumpAndSettle();
+        if (scenario.page == 'about') {
+          final about = find.byKey(const ValueKey('profile-about'));
+          await tester.ensureVisible(about);
+          await tester.pumpAndSettle();
+          await tester.tap(about);
+          await tester.pumpAndSettle();
+        }
+      }
       expect(tester.takeException(), isNull);
       await tester.runAsync(() async {
         for (final element in find.byType(Image).evaluate()) {

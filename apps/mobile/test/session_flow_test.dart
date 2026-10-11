@@ -12,6 +12,7 @@ import 'package:lyra_mobile/app/session.dart';
 import 'package:lyra_mobile/core/security/credential_store.dart';
 import 'package:lyra_mobile/core/api/lyra_api_error.dart';
 import 'package:lyra_mobile/features/agent/agent_session_store.dart';
+import 'package:lyra_mobile/features/auth/auth_workspace.dart';
 
 import 'support/faulty_stores.dart';
 
@@ -109,6 +110,9 @@ void main() {
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
+          configuredServerUrlProvider.overrideWithValue(
+            'http://127.0.0.1:3141',
+          ),
           sessionDependenciesProvider.overrideWithValue(
             SessionDependencies(
               credentialStore: store,
@@ -224,14 +228,8 @@ void main() {
     await scrollUntilVisible(tester, find.text('登录 Lyra'));
     expect(find.text('登录 Lyra'), findsOneWidget);
 
-    await tester.enterText(
-      find.widgetWithText(TextField, '服务端地址'),
-      'http://127.0.0.1:3141',
-    );
+    expect(find.widgetWithText(TextField, '服务端地址'), findsNothing);
     expect(find.widgetWithText(TextField, '配对码'), findsNothing);
-    await tester.ensureVisible(find.byKey(const ValueKey('login-save-server')));
-    await tester.tap(find.byKey(const ValueKey('login-save-server')));
-    await tester.pumpAndSettle();
     await scrollUntilVisible(tester, find.text('使用 Google 登录'));
     await tester.tap(find.text('使用 Google 登录'));
     await tester.pumpAndSettle();

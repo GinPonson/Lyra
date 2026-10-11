@@ -49,8 +49,8 @@ class MarketSettingsPanel extends ConsumerWidget {
                   children: [
                     _Hint(
                       error is LyraApiError && error.statusCode == 404
-                          ? '服务端版本较旧，请更新服务端后使用界面切源。'
-                          : '暂时无法读取行情来源，请检查服务端连接。',
+                          ? '暂时无法切换行情来源，请稍后重试。'
+                          : '暂时无法读取行情来源，请稍后重试。',
                     ),
                     TextButton(
                       key: const ValueKey('market-settings-retry'),

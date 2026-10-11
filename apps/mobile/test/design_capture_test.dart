@@ -257,7 +257,6 @@ void main() {
       if (scenario.name == '390') {
         for (final sheet in [
           (key: 'profile-profit-colors', name: 'profit-colors-390'),
-          (key: 'profile-connection', name: 'connection-390'),
         ]) {
           final row = find.byKey(ValueKey(sheet.key));
           await tester.ensureVisible(row);

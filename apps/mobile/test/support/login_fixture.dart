@@ -30,6 +30,7 @@ class LoginFixture extends LedgerFixture {
   bool pending = false;
   bool browserAvailable = true;
   bool logoutOffline = false;
+  bool credentialsExpired = false;
   String? loginError;
   int? catalogStatus;
   AuthProvider? exchangedProvider;
@@ -40,6 +41,14 @@ class LoginFixture extends LedgerFixture {
     ..httpClientAdapter = FakeLyraAdapter((options) async {
       requests.add(options);
       final path = options.uri.path;
+      if (credentialsExpired &&
+          (path == '/v1/ledger/summary' || path == '/v1/devices/tokens')) {
+        return json({
+          'code': 'AUTH_REQUIRED',
+          'message': '登录已过期，请重新登录。',
+          'retryable': false,
+        }, 401);
+      }
       if (path == '/v1/auth/providers') {
         if (catalogGate != null) return catalogGate!.future;
         if (catalogStatus != null) {

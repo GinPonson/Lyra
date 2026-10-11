@@ -10,7 +10,6 @@ import '../accounts/account_workspace.dart';
 import '../auth/auth_provider.dart';
 import '../overview/login_panel.dart';
 import '../market/market_widgets.dart';
-import '../system/system_workspace.dart';
 import 'about_screen.dart';
 import 'brokerage_accounts_screen.dart';
 import 'profile_preferences.dart';
@@ -102,13 +101,6 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
     final accounts = identity == null
         ? null
         : ref.watch(brokerageAccountsProvider);
-    final url = ref.watch(currentServerUrlProvider);
-    final connection = url == null ? null : ref.watch(systemInfoProvider(url));
-    final connectionLabel = connection?.when(
-      data: (value) => connectionStatusLabel(value.status),
-      loading: () => '正在检测…',
-      error: (_, _) => '暂时无法连接，可重新检测',
-    );
     return SafeArea(
       bottom: false,
       child: SingleChildScrollView(
@@ -214,17 +206,8 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                   ],
                 ),
                 ProfileSection(
-                  title: '服务与应用',
+                  title: '应用',
                   children: [
-                    ProfileSettingRow(
-                      key: const ValueKey('profile-connection'),
-                      title: '服务端连接',
-                      glyph: LyraPrimaryGlyph.server,
-                      subtitle: url == null
-                          ? '设置服务端地址'
-                          : '${serverDisplayName(url)} · $connectionLabel',
-                      onTap: () => showConnectionManagementSheet(context),
-                    ),
                     ProfileSettingRow(
                       key: const ValueKey('profile-market-data'),
                       title: '行情与估值',

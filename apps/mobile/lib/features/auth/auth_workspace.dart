@@ -6,6 +6,11 @@ import '../system/system_repository.dart';
 import 'auth_provider.dart';
 import 'auth_repository.dart';
 
+/// 由发布构建注入后台地址，普通用户不需要填写或管理连接。
+final configuredServerUrlProvider = Provider<String>(
+  (ref) => const String.fromEnvironment('LYRA_SERVER_URL'),
+);
+
 /// 登录方式发现只发送公开请求；与携带设备令牌的账本客户端独立。
 final authProvidersProvider = FutureProvider.autoDispose
     .family<List<AuthProviderAvailability>, String>((ref, rawUrl) async {

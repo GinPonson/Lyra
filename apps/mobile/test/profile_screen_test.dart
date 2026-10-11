@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
@@ -10,7 +9,6 @@ import 'package:lyra_mobile/core/design/lyra_theme.dart';
 import 'package:lyra_mobile/core/preferences/app_preferences.dart';
 import 'package:lyra_mobile/core/security/credential_store.dart';
 import 'package:lyra_mobile/features/agent/agent_session_store.dart';
-import 'package:lyra_mobile/features/overview/login_panel.dart';
 import 'package:lyra_mobile/features/profile/profile_screen.dart';
 import 'package:lyra_mobile/features/system/system_workspace.dart';
 
@@ -40,8 +38,6 @@ class _ProfileFixture extends LedgerFixture {
   final openedUrls = <Uri>[];
   bool offline = false;
   bool logoutOffline = false;
-  bool pendingLogin = false;
-  Completer<ResponseBody>? delayedAccounts;
   final addedAccounts = <Map<String, Object?>>[];
 
   Dio dio(String url) =>
@@ -80,7 +76,6 @@ class _ProfileFixture extends LedgerFixture {
             }, 201);
           }
           if (path == '/v1/auth/google/exchange') {
-            if (pendingLogin) return _json({'status': 'pending'}, 202);
             return _json({
               'status': 'complete',
               'user': {
@@ -127,9 +122,6 @@ class _ProfileFixture extends LedgerFixture {
             addedAccounts.add(account);
             return _json({'account': account}, 201);
           }
-          if (path == '/v1/ledger/accounts' && delayedAccounts != null) {
-            return delayedAccounts!.future;
-          }
           return _json(response(path.split('/').last, options.queryParameters));
         });
 
@@ -170,22 +162,6 @@ class _FailablePreferencesStore extends MemoryAppPreferencesStore {
   }
 }
 
-class _DeferredPreferencesStore extends MemoryAppPreferencesStore {
-  _DeferredPreferencesStore({super.initialValue});
-  final writeStarted = Completer<void>();
-  final releaseWrite = Completer<void>();
-  int writes = 0;
-
-  @override
-  Future<void> write(AppPreferences preferences) async {
-    if (++writes == 1) {
-      writeStarted.complete();
-      await releaseWrite.future;
-    }
-    await super.write(preferences);
-  }
-}
-
 Future<ProviderContainer> _pumpProfile(
   WidgetTester tester,
   _ProfileFixture fixture, {
@@ -193,7 +169,7 @@ Future<ProviderContainer> _pumpProfile(
   AppPreferencesStore? preferencesStore,
   Size size = const Size(390, 844),
   double textScale = 1,
-  Widget page = const ProfileScreen(),
+  Future<String> Function()? loadAppVersion,
 }) async {
   tester.view.physicalSize = size;
   tester.view.devicePixelRatio = 1;
@@ -208,7 +184,9 @@ Future<ProviderContainer> _pumpProfile(
           preferencesStore ?? MemoryAppPreferencesStore(),
         ),
         systemDioFactoryProvider.overrideWithValue(fixture.dio),
-        appVersionProvider.overrideWith((ref) async => '1.0.0 (2)'),
+        appVersionProvider.overrideWith(
+          (ref) => loadAppVersion?.call() ?? Future.value('1.0.0 (2)'),
+        ),
       ],
       child: MaterialApp(
         theme: LyraTheme.dark,
@@ -217,14 +195,12 @@ Future<ProviderContainer> _pumpProfile(
               .copyWith(textScaler: TextScaler.linear(textScale)),
           child: child!,
         ),
-        home: Scaffold(body: page),
+        home: const Scaffold(body: ProfileScreen()),
       ),
     ),
   );
   await tester.pumpAndSettle();
-  return ProviderScope.containerOf(
-    tester.element(find.byType(page.runtimeType)),
-  );
+  return ProviderScope.containerOf(tester.element(find.byType(ProfileScreen)));
 }
 
 Future<void> _tap(WidgetTester tester, Finder finder) async {
@@ -237,9 +213,8 @@ Future<void> _tap(WidgetTester tester, Finder finder) async {
 Future<void> _replaceIdentity(
   WidgetTester tester,
   ProviderContainer container,
-  _ProfileFixture fixture, {
-  bool settle = true,
-}) async {
+  _ProfileFixture fixture,
+) async {
   final logout = expectLater(
     container.read(sessionProvider.notifier).signOut(),
     completes,
@@ -258,11 +233,7 @@ Future<void> _replaceIdentity(
     ),
   );
   container.invalidate(sessionProvider);
-  if (settle) {
-    await tester.pumpAndSettle();
-  } else {
-    await tester.pump(const Duration(milliseconds: 100));
-  }
+  await tester.pumpAndSettle();
 }
 
 void main() {
@@ -285,18 +256,55 @@ void main() {
         expect(find.text('Google 已登录'), findsOneWidget);
         expect(find.text('Lyra Mobile'), findsNothing);
         expect(find.text('启动时隐藏金额'), findsOneWidget);
+        expect(find.textContaining('服务端'), findsNothing);
+        expect(find.textContaining('fixture.invalid'), findsNothing);
+        expect(find.textContaining('正在检测'), findsNothing);
         await _tap(tester, find.byKey(const ValueKey('profile-profit-colors')));
         expect(find.text('红涨绿跌'), findsOneWidget);
         expect(tester.takeException(), isNull);
         await _tap(tester, find.byTooltip('关闭'));
         await _tap(tester, find.byKey(const ValueKey('profile-about')));
+        expect(find.text('App 版本'), findsOneWidget);
         expect(find.text('1.0.0 (2)'), findsOneWidget);
-        expect(find.text('1.2.3'), findsOneWidget);
+        expect(find.text('1.2.3'), findsNothing);
+        expect(find.textContaining('服务端'), findsNothing);
+        expect(find.textContaining('fixture.invalid'), findsNothing);
         expect(find.text('https://github.com/GinPonson/Lyra'), findsOneWidget);
         expect(tester.takeException(), isNull);
       },
     );
   }
+
+  testWidgets('关于页的 App 版本读取失败可重试，不查询连接状态', (tester) async {
+    final fixture = _ProfileFixture();
+    var versionAvailable = false;
+    await _pumpProfile(
+      tester,
+      fixture,
+      loadAppVersion: () async {
+        if (!versionAvailable) throw StateError('test version unavailable');
+        return '1.0.0 (2)';
+      },
+    );
+    await _tap(tester, find.byKey(const ValueKey('profile-about')));
+    expect(find.text('暂时无法读取版本'), findsOneWidget);
+    expect(find.text('https://github.com/GinPonson/Lyra'), findsOneWidget);
+    expect(find.textContaining('服务端'), findsNothing);
+
+    versionAvailable = true;
+    await _tap(tester, find.byTooltip('重新读取 App 版本'));
+    expect(find.text('1.0.0 (2)'), findsOneWidget);
+    expect(find.text('暂时无法读取版本'), findsNothing);
+    expect(find.byTooltip('重新读取 App 版本'), findsNothing);
+    expect(
+      fixture.requests.where(
+        (request) =>
+            request.uri.path == '/v1/system/info' ||
+            request.uri.path == '/v1/health',
+      ),
+      isEmpty,
+    );
+  });
 
   testWidgets('未登录可保存本机偏好，金额开关失败可重试且不假报成功', (tester) async {
     final fixture = _ProfileFixture();
@@ -322,8 +330,8 @@ void main() {
     );
     expect(find.text('隐藏金额设置未能保存，请重试。'), findsOneWidget);
     expect((await store.read())!.hideAmountsOnStartup, isFalse);
-    expect(find.text('saved.example.com'), findsOneWidget);
-    expect(find.textContaining('saved.example.com ·'), findsOneWidget);
+    expect(find.textContaining('saved.example.com'), findsNothing);
+    expect(find.textContaining('服务端'), findsNothing);
     store.failWrites = false;
     await _tap(tester, find.byKey(const ValueKey('startup-hide-amounts')));
     expect((await store.read())!.hideAmountsOnStartup, isTrue);
@@ -376,6 +384,8 @@ void main() {
     final store = MemoryAppPreferencesStore();
     await _pumpProfile(tester, fixture, preferencesStore: store);
     await _tap(tester, find.byKey(const ValueKey('profile-startup-account')));
+    expect(find.textContaining('当前登录账号'), findsOneWidget);
+    expect(find.textContaining('服务端'), findsNothing);
     await _tap(tester, find.text('长期投资').hitTestable());
     final saved = (await store.read())!;
     expect(saved.startupAccountMode, StartupAccountMode.specific);
@@ -388,19 +398,18 @@ void main() {
     expect((await store.read())!.toJson(), saved.toJson());
   });
 
-  testWidgets('离线保留 Google 登录和本机设置，检测恢复不会退出登录', (tester) async {
+  testWidgets('离线保留登录和本机偏好，不显示连接检测信息', (tester) async {
     final fixture = _ProfileFixture()..offline = true;
     final store = MemoryAppPreferencesStore();
     await _pumpProfile(tester, fixture, preferencesStore: store);
     expect(find.text('Google 已登录'), findsOneWidget);
     expect(find.text('登录 Lyra'), findsNothing);
-    expect(find.textContaining('暂时无法连接，可重新检测'), findsOneWidget);
+    expect(find.text('暂时无法读取账户'), findsOneWidget);
+    expect(find.textContaining('服务端'), findsNothing);
+    expect(find.textContaining('fixture.invalid'), findsNothing);
+    expect(find.textContaining('检测'), findsNothing);
     await _tap(tester, find.byKey(const ValueKey('startup-hide-amounts')));
     expect((await store.read())!.hideAmountsOnStartup, isTrue);
-    await _tap(tester, find.byKey(const ValueKey('profile-connection')));
-    fixture.offline = false;
-    await _tap(tester, find.text('重新检测连接').hitTestable());
-    expect(find.text('连接正常').hitTestable(), findsOneWidget);
     expect((await fixture.store.read())!.deviceId, _snapshot.deviceId);
     expect(
       fixture.requests.where(
@@ -408,9 +417,17 @@ void main() {
       ),
       isEmpty,
     );
+    expect(
+      fixture.requests.where(
+        (request) =>
+            request.uri.path == '/v1/system/info' ||
+            request.uri.path == '/v1/health',
+      ),
+      isEmpty,
+    );
   });
 
-  testWidgets('退出先确认，可取消；退出后本机偏好与服务端地址保留', (tester) async {
+  testWidgets('退出先确认，可取消；退出后本机偏好保留', (tester) async {
     final fixture = _ProfileFixture();
     final preferences = MemoryAppPreferencesStore(
       initialValue: const AppPreferences(
@@ -442,6 +459,7 @@ void main() {
       _snapshot.serverUrl,
     );
     expect(find.text('使用 Google 登录'), findsOneWidget);
+    expect(find.textContaining('fixture.invalid'), findsNothing);
   });
 
   testWidgets('退出确认期间身份变化，不退出后来登录的身份', (tester) async {
@@ -463,191 +481,7 @@ void main() {
     );
   });
 
-  testWidgets('保存服务地址无需登录；非 HTTPS 远程地址被拒绝', (tester) async {
-    final fixture = _ProfileFixture();
-    final preferences = MemoryAppPreferencesStore();
-    await _pumpProfile(
-      tester,
-      fixture,
-      signedIn: false,
-      preferencesStore: preferences,
-    );
-    await tester.enterText(
-      find.byKey(const ValueKey('login-server-url')),
-      'http://remote.example.com',
-    );
-    await _tap(tester, find.text('连接服务端'));
-    expect(find.text('请输入 HTTPS 服务端地址（本机开发可使用 HTTP）。'), findsOneWidget);
-    expect(await preferences.read(), isNull);
-    await tester.enterText(
-      find.byKey(const ValueKey('login-server-url')),
-      'https://saved.example.com/',
-    );
-    await _tap(tester, find.text('连接服务端'));
-    expect(
-      (await preferences.read())!.rememberedServerUrl,
-      'https://saved.example.com',
-    );
-    expect(fixture.openedUrls, isEmpty);
-    expect(await fixture.store.read(), isNull);
-  });
-
-  testWidgets('更换服务端取消不改登录；确认后重新选择身份且旧令牌不发往新服务端', (tester) async {
-    final fixture = _ProfileFixture();
-    final preferences = MemoryAppPreferencesStore();
-    await _pumpProfile(
-      tester,
-      fixture,
-      preferencesStore: preferences,
-      page: const SingleChildScrollView(child: LoginPanel()),
-    );
-    await _tap(tester, find.text('更换服务端'));
-    await tester.enterText(
-      find.byKey(const ValueKey('login-server-url')),
-      'https://new.example.com/',
-    );
-    await _tap(tester, find.byKey(const ValueKey('login-change-server')));
-    await _tap(tester, find.text('取消').hitTestable());
-    expect((await fixture.store.read())!.serverUrl, _snapshot.serverUrl);
-    await _tap(tester, find.byKey(const ValueKey('login-change-server')));
-    await _tap(tester, find.widgetWithText(FilledButton, '更换并前往登录').last);
-    expect(await fixture.store.read(), isNull);
-    expect(fixture.openedUrls, isEmpty);
-    await _tap(tester, find.byKey(const ValueKey('login-google')));
-    final saved = (await fixture.store.read())!;
-    expect(saved.serverUrl, 'https://new.example.com');
-    expect(saved.deviceId, 'new-device');
-    expect(saved.accessToken, 'new-access');
-    expect(saved.googleSubject, 'new-owner');
-    expect(
-      (await preferences.read())!.rememberedServerUrl,
-      'https://new.example.com',
-    );
-    expect(fixture.openedUrls, hasLength(1));
-    final logout = fixture.requests.singleWhere(
-      (request) => request.uri.path == '/v1/auth/logout',
-    );
-    expect(logout.uri.host, 'fixture.invalid');
-    expect(logout.headers['authorization'], 'Bearer profile-access');
-    final starts = fixture.requests.where(
-      (request) => request.uri.path == '/v1/auth/google/start',
-    );
-    expect(starts.single.uri.host, 'new.example.com');
-    for (final request in fixture.requests.where(
-      (request) => request.uri.host == 'new.example.com',
-    )) {
-      expect(request.headers['authorization'], isNot('Bearer profile-access'));
-      expect(request.headers['authorization'], isNot('Bearer profile-refresh'));
-    }
-  });
-
-  testWidgets('更换服务端的地址保存失败保留原登录，可以重试', (tester) async {
-    final fixture = _ProfileFixture();
-    final preferences = _FailablePreferencesStore();
-    await _pumpProfile(
-      tester,
-      fixture,
-      preferencesStore: preferences,
-      page: const SingleChildScrollView(child: LoginPanel()),
-    );
-    await _tap(tester, find.text('更换服务端'));
-    await tester.enterText(
-      find.byKey(const ValueKey('login-server-url')),
-      'https://new.example.com',
-    );
-    preferences.failWrites = true;
-    await _tap(tester, find.byKey(const ValueKey('login-change-server')));
-    await _tap(tester, find.widgetWithText(FilledButton, '更换并前往登录').last);
-    expect((await fixture.store.read())!.deviceId, _snapshot.deviceId);
-    expect(
-      fixture.requests.where(
-        (request) =>
-            request.uri.path.startsWith('/v1/auth/') &&
-            request.uri.path != '/v1/auth/providers',
-      ),
-      isEmpty,
-    );
-    expect(find.text('已登录 Lyra'), findsOneWidget);
-    preferences.failWrites = false;
-    await _tap(tester, find.byKey(const ValueKey('login-change-server')));
-    await _tap(tester, find.widgetWithText(FilledButton, '更换并前往登录').last);
-    expect(await fixture.store.read(), isNull);
-    await _tap(tester, find.byKey(const ValueKey('login-google')));
-    expect((await fixture.store.read())!.serverUrl, 'https://new.example.com');
-  });
-
-  testWidgets('更换服务端保存期间身份改变，迟到保存不退出新身份或发起旧登录', (tester) async {
-    final fixture = _ProfileFixture();
-    final preferences = _DeferredPreferencesStore();
-    final container = await _pumpProfile(
-      tester,
-      fixture,
-      preferencesStore: preferences,
-      page: const SingleChildScrollView(child: LoginPanel()),
-    );
-    await _tap(tester, find.text('更换服务端'));
-    await tester.enterText(
-      find.byKey(const ValueKey('login-server-url')),
-      'https://new.example.com',
-    );
-    await _tap(tester, find.byKey(const ValueKey('login-change-server')));
-    await tester.tap(find.widgetWithText(FilledButton, '更换并前往登录').last);
-    await tester.pump(const Duration(milliseconds: 100));
-    expect(preferences.writeStarted.isCompleted, isTrue);
-    await _replaceIdentity(tester, container, fixture, settle: false);
-    preferences.releaseWrite.complete();
-    await tester.pumpAndSettle();
-    expect((await fixture.store.read())!.deviceId, 'different-device');
-    expect(
-      fixture.requests.where(
-        (request) => request.uri.path == '/v1/auth/logout',
-      ),
-      hasLength(1),
-    );
-    expect(
-      fixture.requests.where(
-        (request) => request.uri.path == '/v1/auth/google/start',
-      ),
-      isEmpty,
-    );
-    expect(find.text('登录状态已变化，已停止此次更换。'), findsOneWidget);
-    expect(find.byKey(const ValueKey('login-change-server')), findsNothing);
-  });
-
-  testWidgets('取消等待中的地址保存后重新登录，旧尝试完成不会取消新尝试', (tester) async {
-    final fixture = _ProfileFixture();
-    final preferences = _DeferredPreferencesStore(
-      initialValue: const AppPreferences(
-        rememberedServerUrl: 'https://new.example.com',
-      ),
-    );
-    await _pumpProfile(
-      tester,
-      fixture,
-      signedIn: false,
-      preferencesStore: preferences,
-      page: const SingleChildScrollView(child: LoginPanel()),
-    );
-    await tester.tap(find.text('使用 Google 登录'));
-    await tester.pump(const Duration(milliseconds: 100));
-    expect(preferences.writeStarted.isCompleted, isTrue);
-    await tester.tap(find.text('取消登录'));
-    await tester.pump();
-    await tester.tap(find.text('使用 Google 登录'));
-    await tester.pump(const Duration(milliseconds: 100));
-    preferences.releaseWrite.complete();
-    await tester.pumpAndSettle();
-    expect((await fixture.store.read())!.deviceId, 'new-device');
-    expect(
-      fixture.requests.where(
-        (request) => request.uri.path == '/v1/auth/google/start',
-      ),
-      hasLength(1),
-    );
-    expect(fixture.openedUrls, hasLength(1));
-  });
-
-  testWidgets('服务端离线时显式退出仍清除本机凭据，并说明撤销未完成', (tester) async {
+  testWidgets('离线时仍可退出此设备，并完成退出提示', (tester) async {
     final fixture = _ProfileFixture()..logoutOffline = true;
     await _pumpProfile(tester, fixture);
     await _tap(tester, find.byKey(const ValueKey('profile-sign-out')));
@@ -656,10 +490,11 @@ void main() {
     expect(
       find.descendant(
         of: find.byType(AlertDialog),
-        matching: find.text('已退出此设备登录。服务端暂时无法撤销会话，账本仍保留在服务端。'),
+        matching: find.textContaining('已退出此设备'),
       ),
       findsOneWidget,
     );
+    expect(find.textContaining('服务端'), findsNothing);
     await _tap(tester, find.text('完成'));
     expect(find.text('使用 Google 登录'), findsOneWidget);
   });

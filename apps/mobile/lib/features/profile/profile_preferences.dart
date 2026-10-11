@@ -92,7 +92,7 @@ class _StartupAccountSheetState extends ConsumerState<_StartupAccountSheet> {
           const ProfileSheetHeader(title: '启动账户'),
           const SizedBox(height: 8),
           const Text(
-            '下次打开 Lyra 时使用。指定账户只对当前服务端和当前登录身份生效。',
+            '下次打开 Lyra 时使用。指定账户仅用于当前登录账号。',
             style: TextStyle(color: LyraColors.muted, height: 1.6),
           ),
           const SizedBox(height: 16),
@@ -115,7 +115,7 @@ class _StartupAccountSheetState extends ConsumerState<_StartupAccountSheet> {
           const Divider(height: 24),
           Text('指定证券账户', style: Theme.of(context).textTheme.titleSmall),
           if (_identityChanged)
-            const ProfileNotice(message: '登录身份已变化，请关闭后重新打开此设置。')
+            const ProfileNotice(message: '登录账号已变化，请关闭后重新打开此设置。')
           else if (!signedIn)
             const ProfileNotice(message: '登录后可以从你的证券账户中选择。')
           else
@@ -125,7 +125,7 @@ class _StartupAccountSheetState extends ConsumerState<_StartupAccountSheet> {
                 child: LinearProgressIndicator(minHeight: 2),
               ),
               error: (_, _) => ProfileNotice(
-                message: '暂时无法读取账户，连接恢复后可以继续选择。',
+                message: '暂时无法读取账户，请稍后重试。',
                 onRetry: () => ref.invalidate(brokerageAccountsProvider),
                 retryLabel: '重新加载账户',
               ),

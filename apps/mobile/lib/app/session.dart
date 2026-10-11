@@ -9,6 +9,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../core/api/lyra_api_client.dart';
 import '../core/api/lyra_api_error.dart';
+import '../core/preferences/app_preferences.dart';
 import '../core/security/credential_store.dart';
 import '../features/agent/agent_session_store.dart';
 import '../features/auth/auth_repository.dart';
@@ -39,9 +40,16 @@ sealed class SessionState {
 }
 
 class SessionSignedOut extends SessionState {
-  const SessionSignedOut({this.message, this.retrySignOut = false});
+  const SessionSignedOut({
+    this.message,
+    this.retrySignOut = false,
+    this.serverUrl,
+  });
   final String? message;
   final bool retrySignOut;
+
+  /// 只保留原账本的路由，不保留身份或令牌；偏好写失败时仍可原地重新登录。
+  final String? serverUrl;
 }
 
 class SessionAuthenticated extends SessionState {
@@ -322,13 +330,17 @@ class SessionController extends AsyncNotifier<SessionState> {
 
   /// 本机先退出；随后只用捕获的旧设备凭据撤销服务端会话。
   Future<void> signOut() async {
+    final serverUrl = switch (_publishedState) {
+      SessionAuthenticated(:final snapshot) => snapshot.serverUrl,
+      SessionSignedOut(:final serverUrl) => serverUrl,
+    };
     final pendingRefresh = _pendingRefresh;
     cancelSignIn();
     final generation = ++_authGeneration;
     final dependencies = ref.read(sessionDependenciesProvider);
     _client?.invalidate();
     _client = null;
-    _publish(const SessionSignedOut());
+    _publish(SessionSignedOut(serverUrl: serverUrl));
     final CredentialSnapshot? snapshot;
     try {
       snapshot = await withCredentialMutation(
@@ -343,7 +355,11 @@ class SessionController extends AsyncNotifier<SessionState> {
     } on Object {
       if (_authActive(generation)) {
         _publish(
-          const SessionSignedOut(message: '无法清除本机登录，请重试。', retrySignOut: true),
+          SessionSignedOut(
+            message: '无法清除本机登录，请重试。',
+            retrySignOut: true,
+            serverUrl: serverUrl,
+          ),
         );
       }
       throw const LyraApiError(
@@ -353,6 +369,7 @@ class SessionController extends AsyncNotifier<SessionState> {
         retryable: true,
       );
     }
+    await _rememberLoginServer(snapshot?.serverUrl ?? serverUrl, generation);
     if (snapshot == null) return;
     final repository = AuthRepository(
       dio: _bareClient(dependencies, snapshot.serverUrl),
@@ -385,7 +402,10 @@ class SessionController extends AsyncNotifier<SessionState> {
     } on Object {
       if (_authActive(generation)) {
         _publish(
-          const SessionSignedOut(message: '已退出此设备登录。服务端暂时无法撤销会话，账本仍保留在服务端。'),
+          SessionSignedOut(
+            message: '已退出此设备登录，但暂时无法完成全部退出操作。',
+            serverUrl: serverUrl,
+          ),
         );
       }
       rethrow;
@@ -430,18 +450,54 @@ class SessionController extends AsyncNotifier<SessionState> {
     CredentialSnapshot identity,
     int generation,
     String message,
-  ) {
-    return withCredentialMutation(dependencies.credentialStore, () async {
-      if (!_authActive(generation)) return;
-      final latest = await dependencies.credentialStore.read();
-      if (!_authActive(generation) || !_sameIdentity(latest, identity)) return;
-      ++_authGeneration;
-      _client?.invalidate();
-      _client = null;
-      _publish(SessionSignedOut(message: message));
-      await dependencies.credentialStore.clear();
-      await _sessionStore(dependencies).clear();
-    });
+  ) async {
+    final expiredGeneration = await withCredentialMutation<int?>(
+      dependencies.credentialStore,
+      () async {
+        if (!_authActive(generation)) return null;
+        final latest = await dependencies.credentialStore.read();
+        if (!_authActive(generation) || !_sameIdentity(latest, identity)) {
+          return null;
+        }
+        final expiredGeneration = ++_authGeneration;
+        _client?.invalidate();
+        _client = null;
+        _publish(
+          SessionSignedOut(message: message, serverUrl: identity.serverUrl),
+        );
+        try {
+          await dependencies.credentialStore.clear();
+          await _sessionStore(dependencies).clear();
+        } on Object {
+          if (_authActive(expiredGeneration)) {
+            _publish(
+              SessionSignedOut(
+                message: '无法清除本机登录，请重试。',
+                retrySignOut: true,
+                serverUrl: identity.serverUrl,
+              ),
+            );
+          }
+          rethrow;
+        }
+        return expiredGeneration;
+      },
+    );
+    if (expiredGeneration != null) {
+      await _rememberLoginServer(identity.serverUrl, expiredGeneration);
+    }
+  }
+
+  /// 凭据清理完成后再保存地址，偏好存储故障不能延长失效身份的生命周期。
+  Future<void> _rememberLoginServer(String? serverUrl, int generation) async {
+    if (serverUrl == null || !_authActive(generation)) return;
+    try {
+      await ref
+          .read(appPreferencesProvider.notifier)
+          .setRememberedServerUrl(serverUrl);
+    } on Object {
+      // 当前未登录状态仍携带原地址；后续登录保存成功时会补齐持久化。
+    }
   }
 
   AgentSessionStore _sessionStore(SessionDependencies dependencies) =>

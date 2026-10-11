@@ -445,7 +445,7 @@ class _MarketDataSheet extends ConsumerWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const SizedBox(height: 16),
-                const _Note('暂时无法读取持仓，请检查服务端连接。'),
+                const _Note('暂时无法读取持仓，请稍后重试。'),
                 TextButton(
                   onPressed: () => ref.invalidate(ledgerReadProvider(query)),
                   child: const Text('重试'),

@@ -34,7 +34,7 @@ class OverviewScreen extends ConsumerStatefulWidget {
 class _OverviewScreenState extends ConsumerState<OverviewScreen> {
   final _loginKey = GlobalKey();
 
-  /// 保留原有内联登录流程，主按钮把表单滚入视口并保留已填写字段。
+  /// 保留原有内联登录流程，主按钮把登录方式滚入视口。
   void _revealLogin() {
     final target = _loginKey.currentContext;
     if (target != null) {
@@ -70,9 +70,6 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
     }
   }
 
-  /// 连接管理复用已验证表单，不创建另一套凭据或登录实现。
-  void _openConnection() => showConnectionManagementSheet(context);
-
   @override
   Widget build(BuildContext context) {
     final session = ref.watch(sessionProvider);
@@ -90,7 +87,6 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
             onToggleAmounts: () =>
                 ref.read(amountsHiddenProvider.notifier).toggle(),
             onImport: _openImport,
-            onConnection: _openConnection,
           ),
           const SizedBox(height: 14),
         ] else ...[
@@ -98,26 +94,22 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
             title: '总览',
             trailing: LyraIconButton(
               icon: LyraIcons.accountCenter,
-              label: '连接管理',
-              onPressed: paired ? _openConnection : _revealLogin,
+              label: '登录',
+              onPressed: _revealLogin,
             ),
           ),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               const AccountScopeButton(),
-              Row(
+              const Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(
-                    paired ? LyraIcons.confirm : LyraIcons.security,
-                    size: 13,
-                    color: LyraColors.accent,
-                  ),
-                  const SizedBox(width: 5),
+                  Icon(LyraIcons.security, size: 13, color: LyraColors.accent),
+                  SizedBox(width: 5),
                   Text(
-                    paired ? '已登录' : '等待连接',
-                    style: const TextStyle(
+                    '尚未登录',
+                    style: TextStyle(
                       fontSize: 11,
                       color: LyraColors.inkSecondary,
                     ),
@@ -136,7 +128,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
         else if (session.isLoading)
           const LyraSkeleton()
         else if (!paired)
-          LyraReveal(child: _WelcomeHero(onConnect: _revealLogin))
+          LyraReveal(child: _WelcomeHero(onLogin: _revealLogin))
         else if (accounts!.isLoading)
           const LyraSkeleton()
         else if (accounts.hasError)
@@ -297,12 +289,10 @@ class _OverviewHeader extends StatelessWidget {
     required this.amountsHidden,
     required this.onToggleAmounts,
     required this.onImport,
-    required this.onConnection,
   });
   final bool amountsHidden;
   final VoidCallback onToggleAmounts;
   final VoidCallback onImport;
-  final VoidCallback onConnection;
 
   @override
   Widget build(BuildContext context) => LayoutBuilder(
@@ -348,11 +338,6 @@ class _OverviewHeader extends StatelessWidget {
                 color: LyraColors.accent,
               ),
             ),
-          ),
-          IconButton(
-            tooltip: '连接管理',
-            onPressed: onConnection,
-            icon: const LyraPrimaryIcon(LyraPrimaryGlyph.connection, size: 22),
           ),
         ],
       );
@@ -401,10 +386,10 @@ class _OverviewHeader extends StatelessWidget {
   );
 }
 
-/// 未连接时直接说明可用功能，主按钮继续使用原有登录表单。
+/// 未登录时直接说明可用功能，主按钮继续使用原有登录方式。
 class _WelcomeHero extends StatelessWidget {
-  const _WelcomeHero({required this.onConnect});
-  final VoidCallback onConnect;
+  const _WelcomeHero({required this.onLogin});
+  final VoidCallback onLogin;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -419,7 +404,7 @@ class _WelcomeHero extends StatelessWidget {
         const Icon(LyraIcons.accountCenter, size: 30, color: LyraColors.accent),
         const SizedBox(height: 20),
         const Text(
-          '连接你的投资账号',
+          '登录 Lyra',
           style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
         ),
         const SizedBox(height: 10),
@@ -435,9 +420,9 @@ class _WelcomeHero extends StatelessWidget {
         SizedBox(
           width: double.infinity,
           child: FilledButton.icon(
-            onPressed: onConnect,
+            onPressed: onLogin,
             icon: const Icon(LyraIcons.accountCenter, size: 18),
-            label: const Text('连接我的账户'),
+            label: const Text('登录'),
           ),
         ),
       ],
@@ -521,7 +506,7 @@ class _AccountSummary extends StatelessWidget {
 }
 
 /// 汇总指标通常为三列两行；小屏或放大字体改为两列，避免压缩阅读空间。
-/// 未连接时保留原有三个缺失金额占位，不生成模拟数据。
+/// 未登录时保留原有三个缺失金额占位，不生成模拟数据。
 class _MetricStrip extends StatelessWidget {
   const _MetricStrip({this.entry});
   final LedgerSummaryEntry? entry;

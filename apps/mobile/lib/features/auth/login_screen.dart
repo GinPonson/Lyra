@@ -19,85 +19,88 @@ class LoginScreen extends ConsumerWidget {
         child: LayoutBuilder(
           builder: (context, constraints) => SingleChildScrollView(
             key: const PageStorageKey('login-scroll'),
-            padding: EdgeInsets.fromLTRB(
-              24,
-              constraints.maxHeight > 780 ? 56 : 32,
-              24,
-              28,
-            ),
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 400),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          LyraIcons.cost,
-                          size: 36,
-                          color: LyraColors.accent,
-                        ),
-                        SizedBox(width: 10),
-                        Text(
-                          'lyra',
-                          textScaler: TextScaler.noScaling,
-                          style: TextStyle(
-                            fontSize: 43,
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: -2.6,
-                            height: 1.2,
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 40),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                minHeight: constraints.maxHeight > 80
+                    ? constraints.maxHeight - 80
+                    : 0,
+              ),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 400),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            LyraIcons.cost,
+                            size: 36,
+                            color: LyraColors.accent,
                           ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    const Text(
-                      '你的投资，清晰可见。',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: LyraColors.muted, fontSize: 14),
-                    ),
-                    const SizedBox(height: 44),
-                    Text(
-                      '登录 Lyra',
-                      textAlign: TextAlign.center,
-                      style: Theme.of(context).textTheme.headlineLarge
-                          ?.copyWith(fontSize: 27, letterSpacing: -.5),
-                    ),
-                    const SizedBox(height: 10),
-                    const Text(
-                      '选择一个账号，继续你的投资工作台。',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: LyraColors.muted,
-                        fontSize: 13,
-                        height: 1.7,
+                          SizedBox(width: 10),
+                          Text(
+                            'lyra',
+                            textScaler: TextScaler.noScaling,
+                            style: TextStyle(
+                              fontSize: 43,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: -2.6,
+                              height: 1.2,
+                            ),
+                          ),
+                        ],
                       ),
-                    ),
-                    const SizedBox(height: 28),
-                    if (session.isLoading)
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 40),
-                        child: Text(
-                          '正在恢复登录…',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: LyraColors.muted),
-                        ),
-                      )
-                    else
-                      const LoginPanel(framed: false),
-                    const SizedBox(height: 30),
-                    const Text(
-                      '在浏览器完成授权后，返回 Lyra 即可。',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: LyraColors.mutedSoft,
-                        fontSize: 12,
-                        height: 1.7,
+                      const SizedBox(height: 12),
+                      const Text(
+                        '你的投资，清晰可见。',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: LyraColors.muted, fontSize: 14),
                       ),
-                    ),
-                  ],
+                      const SizedBox(height: 44),
+                      Text(
+                        '登录 Lyra',
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.headlineLarge
+                            ?.copyWith(fontSize: 27, letterSpacing: -.5),
+                      ),
+                      const SizedBox(height: 10),
+                      const Text(
+                        '选择一个账号，继续你的投资工作台。',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: LyraColors.muted,
+                          fontSize: 13,
+                          height: 1.7,
+                        ),
+                      ),
+                      const SizedBox(height: 28),
+                      if (session.isLoading)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 40),
+                          child: Text(
+                            '正在恢复登录…',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: LyraColors.muted),
+                          ),
+                        )
+                      else
+                        const LoginPanel(framed: false),
+                      const SizedBox(height: 30),
+                      const Text(
+                        '在浏览器完成授权后，返回 Lyra 即可。',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: LyraColors.mutedSoft,
+                          fontSize: 12,
+                          height: 1.7,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),

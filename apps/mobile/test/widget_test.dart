@@ -32,6 +32,9 @@ void main() {
       await tester.pumpWidget(await _app());
       await tester.pumpAndSettle();
       expect(find.text('总览'), findsNWidgets(2));
+      expect(find.byTooltip('连接管理'), findsNothing);
+      expect(find.byTooltip('导入文件'), findsOneWidget);
+      expect(find.byKey(const ValueKey('toggle-amounts')), findsOneWidget);
       expect(find.byKey(const ValueKey('overview-hero-value')), findsOneWidget);
       expect(tester.takeException(), isNull);
 
@@ -55,7 +58,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('使用偏好'), findsOneWidget);
       expect(find.text('启动时隐藏金额'), findsOneWidget);
-      expect(find.text('服务与应用'), findsOneWidget);
+      expect(find.text('应用'), findsOneWidget);
       expect(find.text('Google 已登录'), findsOneWidget);
       expect(tester.takeException(), isNull);
     });

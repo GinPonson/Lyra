@@ -434,8 +434,8 @@ void main() {
       ..failRead = true
       ..readFailureStatus = 404;
     await _pump(tester, fixture);
-    expect(find.text('服务端版本较旧，请更新服务端后使用界面切源。'), findsOneWidget);
-    expect(find.textContaining('请检查服务端连接'), findsNothing);
+    expect(find.text('暂时无法切换行情来源，请稍后重试。'), findsOneWidget);
+    expect(find.textContaining('服务端'), findsNothing);
   });
 
   testWidgets('409 恢复确认值并要求重新加载，不自动覆盖另一设备选择', (tester) async {

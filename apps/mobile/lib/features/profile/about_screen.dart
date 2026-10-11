@@ -5,7 +5,6 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
-import '../overview/login_panel.dart';
 import '../system/system_workspace.dart';
 import 'profile_widgets.dart';
 
@@ -33,8 +32,6 @@ class AboutScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final appVersion = ref.watch(appVersionProvider);
-    final url = ref.watch(currentServerUrlProvider);
-    final server = url == null ? null : ref.watch(systemInfoProvider(url));
     return ProfileSubpage(
       title: '关于 Lyra',
       child: Column(
@@ -70,25 +67,6 @@ class AboutScreen extends ConsumerWidget {
                     ? IconButton(
                         tooltip: '重新读取 App 版本',
                         onPressed: () => ref.invalidate(appVersionProvider),
-                        icon: const Icon(LyraIcons.sync),
-                      )
-                    : null,
-              ),
-              ProfileSettingRow(
-                title: '服务端版本',
-                glyph: LyraPrimaryGlyph.server,
-                value:
-                    server?.when(
-                      data: (value) => value.serverVersion,
-                      loading: () => '正在读取…',
-                      error: (_, _) => '暂时无法读取版本',
-                    ) ??
-                    '尚未设置服务端',
-                trailing: server?.hasError == true
-                    ? IconButton(
-                        tooltip: '重新读取服务端版本',
-                        onPressed: () =>
-                            ref.invalidate(systemInfoProvider(url!)),
                         icon: const Icon(LyraIcons.sync),
                       )
                     : null,
