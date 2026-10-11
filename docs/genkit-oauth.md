@@ -148,7 +148,7 @@ Genkit 集成验证使用 Genkit 的真实工具循环、可控假模型、真�
 
 Flutter 工具链已恢复。本轮已经执行 `flutter pub get` 并保存真实解析的锁文件；`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded` **91 项全部通过**。检查期间修复了空值类型问题、凭据存储之间的队列相互阻塞，以及账户创建和导入恢复路径；同一生产安全存储仍串行处理登录、刷新、退出及助手会话 ID。
 
-Android 调试 APK 正在完成原生构建。真实 Google 浏览器登录、真实模型供应商及手机完整联调仍需要部署配置，不能用受控测试代替。
+Android 调试 APK 已通过 `flutter build apk --debug --no-pub` 构建，产物位于 `apps/mobile/build/app/outputs/flutter-apk/app-debug.apk`；使用开发签名，尚未进行真机安装与运行验收。真实 Google 浏览器登录、真实模型供应商及手机完整联调仍需要部署配置，不能用受控测试代替。
 
 最新执行结果记录在 [`docs/progress.md`](progress.md)。这些待验证项完成前，保持迁移 PR 为草稿。
 

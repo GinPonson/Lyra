@@ -46,6 +46,8 @@ flutter build apk --debug
 
 调试 APK 位于 `build/app/outputs/flutter-apk/app-debug.apk`，安装后可以在登录表单填写服务端地址。正式分发前需另行配置 Android 发布签名；当前 Gradle 的 release 配置仍使用开发签名，不能据此标记为发布版本。
 
-本轮已经实际执行 `flutter pub get` 并保存生成的 `pubspec.lock`：新增 `url_launcher 6.3.3` 及其平台依赖，没有升级原有业务依赖。Flutter 3.47.2 / Dart 3.13.2 下，`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded` **91 项全部通过**。Android 调试 APK 正在执行原生构建，结果同步记录在 [实现进度](../../docs/progress.md)。
+本轮安装包为 Lyra `1.0.0`（versionCode 1），包名 `com.lyrafinance.lyra_mobile`，最低 Android SDK 24，包含 `arm64-v8a`、`armeabi-v7a` 和 `x86_64`。APK 元数据可正常解析，`apksigner verify` 通过，确认为 Android Debug 签名。
+
+本轮已经实际执行 `flutter pub get` 并保存生成的 `pubspec.lock`：新增 `url_launcher 6.3.3` 及其平台依赖，没有升级原有业务依赖。Flutter 3.47.2 / Dart 3.13.2 下，`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded` **91 项全部通过**。完整 JDK 17 环境中的 `flutter build apk --debug --no-pub` 已成功生成 Android 调试 APK（166,921,699 字节），结果同步记录在 [实现进度](../../docs/progress.md)。真机安装与运行仍待后续联调。
 
 测试覆盖 OAuth 开始/等待/完成、取消与失败、旧凭据失效、刷新轮换和退出，以及单助手会话、账户范围、实时事件与恢复。本轮新增 18 项回归，覆盖创建证券账户与首次导入、同文件重试、凭据存储队列和汇总乱序响应。原有金额精度、多币种、页面布局与范围断言继续通过。测试使用合成数据和假 HTTP/WebSocket，不能替代真实 Google 账号与模型 API 的端到端验收。

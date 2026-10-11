@@ -20,11 +20,11 @@
 | Flutter 登录、单助手与首次账户界面 | 已完成 | 空账户首页与账户选择器提供创建入口；导入保留原文件、创建后继续预览；创建重试、重复账户、预览失败恢复、取消、身份切换和组件卸载均有通过的回归；空库账本版本保持 0，首次财务导入才变为 1 |
 | Flutter 凭据队列与汇总刷新 | 已完成 | 按凭据存储归属排队，所有生产 SecureCredentialStore 实例保持共享队列；独立内存存储互不阻塞，队列失败/空闲后正确释放；登录、刷新、退出及助手会话 ID 保持串行。汇总刷新有身份与请求代次检查，旧成功/失败不能覆盖较新的结果 |
 | Flutter 依赖、分析与测试 | 已完成 | Flutter 3.47.2 / Dart 3.13.2；真实 `flutter pub get` 生成 lockfile，新增 url_launcher 及平台依赖；最终 analyze 零问题、91 项测试全部通过（本轮新增 18 项），旧金额/多币种/范围/UI 断言未削弱 |
-| Android 调试 APK | 进行中 | Android SDK 与 Flutter 引擎缓存已恢复，正在完成首次 Gradle 依赖下载与原生打包；官方 CI 模式和禁用遥测配置跳过无关云环境探测 |
+| Android 调试 APK | 已完成 | Flutter 3.47.2 / Dart 3.13.2、完整 JDK 17 与 Android SDK 环境下，`flutter build apk --debug --no-pub` 退出码 0；生成 166,921,699 字节 APK，元数据解析及 `apksigner verify` 通过，使用开发签名；真机安装与运行尚待联调 |
 | 真实 Google / 模型 / 手机联调 | 待开始 | 尚未配置真实 OAuth Web client、公开回调域名和模型凭据；现有测试使用受控外部边界，不代表真实第三方服务已验收 |
-| GitHub 草稿 PR 交付 | 已完成 | 本轮账户/导入改动、真实 Flutter 锁文件与最新服务端/Flutter 测试结果已更新到[草稿 PR #1](https://github.com/GinPonson/Lyra/pull/1)；Android 打包和真实 Google / 模型 / 手机联调继续验证，保持草稿；未合并、未部署 |
+| GitHub 草稿 PR 交付 | 已完成 | 本轮账户/导入改动、真实 Flutter 锁文件及服务端/Flutter 测试、Android 打包结果已更新到[草稿 PR #1](https://github.com/GinPonson/Lyra/pull/1)；真实 Google / 模型 / 手机联调尚待验收，保持草稿；未合并、未部署 |
 
-配置模板在 [`server/.env.example`](../server/.env.example)，启动、升级和待验步骤见 [迁移说明](genkit-oauth.md)。App 与服务端需一起更新；迁移前备份数据库并保留原加密主密钥，迁移后重新登录并新建 Lyra 会话。Flutter 验证和真实联调完成前，迁移 PR 保持草稿。
+配置模板在 [`server/.env.example`](../server/.env.example)，启动、升级和待验步骤见 [迁移说明](genkit-oauth.md)。App 与服务端需一起更新；迁移前备份数据库并保留原加密主密钥，迁移后重新登录并新建 Lyra 会话。真实 Google / 模型 / 手机联调完成前，迁移 PR 保持草稿。
 
 ## 进度状态
 
