@@ -6,6 +6,7 @@ import '../../features/accounts/account_sheet.dart';
 import '../../features/accounts/account_workspace.dart';
 import '../../features/ledger/ledger_workspace.dart';
 import '../api/lyra_api_error.dart';
+import '../preferences/app_preferences.dart';
 import 'lyra_colors.dart';
 import 'lyra_icons.dart';
 import 'lyra_number.dart';
@@ -220,8 +221,20 @@ class LyraSkeleton extends StatelessWidget {
   );
 }
 
-/// 金额按展示精度排版；长按或悬停查看原始值，辅助阅读同样保留精度。
-class LyraAmount extends StatelessWidget {
+/// 只为盈亏等带方向的金融数值选色；品牌和成功状态不读取此规则。
+Color lyraProfitColor(String value, ProfitColorScheme scheme) {
+  if (!RegExp(r'^-?\d+(?:\.\d+)?$').hasMatch(value) ||
+      !RegExp(r'[1-9]').hasMatch(value)) {
+    return LyraColors.ink;
+  }
+  final positive = !value.startsWith('-');
+  final green = positive == (scheme == ProfitColorScheme.greenUp);
+  return green ? LyraColors.positive : LyraColors.negative;
+}
+
+/// 金额按展示精度排版；隐藏时同时移除原始值提示与辅助阅读内容。
+/// 股数、笔数等复用数字排版时须显式设置 [isMonetary] 为 false。
+class LyraAmount extends ConsumerWidget {
   const LyraAmount(
     this.value, {
     super.key,
@@ -229,26 +242,53 @@ class LyraAmount extends StatelessWidget {
     this.color,
     this.currency,
     this.decimals = 2,
+    this.isMonetary = true,
+    this.colorBySign = false,
+    this.exact = false,
+    this.textAlign,
   });
   final String value;
   final double size;
   final Color? color;
   final String? currency;
   final int decimals;
+  final bool isMonetary;
+  final bool colorBySign;
+
+  /// 明细沿用服务端原始精度，列表仍使用 [decimals] 进行展示舍入。
+  final bool exact;
+  final TextAlign? textAlign;
   @override
-  Widget build(BuildContext context) => Tooltip(
-    message: '原始值：$value${currency == null ? '' : ' $currency'}',
-    child: Text(
-      '${LyraNumber.amount(value, decimals: decimals)}${currency == null ? '' : ' $currency'}',
+  Widget build(BuildContext context, WidgetRef ref) {
+    final hidden =
+        isMonetary && value != '—' && ref.watch(amountsHiddenProvider);
+    final suffix = currency == null ? '' : ' $currency';
+    final amountColor = hidden
+        ? LyraColors.ink
+        : color ??
+              (colorBySign
+                  ? lyraProfitColor(value, ref.watch(profitColorSchemeProvider))
+                  : LyraColors.ink);
+    final text = Text(
+      '${hidden ? '••••' : (exact ? value : LyraNumber.amount(value, decimals: decimals))}$suffix',
+      textAlign: textAlign,
       style: LyraTheme.numeric.copyWith(
         fontSize: size,
-        color: color ?? LyraColors.ink,
+        color: amountColor,
         letterSpacing: -size * .025,
         height: 1.2,
         fontWeight: FontWeight.w500,
       ),
-    ),
-  );
+    );
+    if (hidden) {
+      return Semantics(
+        label: '金额已隐藏${currency == null ? '' : '，$currency'}',
+        excludeSemantics: true,
+        child: text,
+      );
+    }
+    return Tooltip(message: '原始值：$value$suffix', child: text);
+  }
 }
 
 /// 范围选择器按需读取获授权账户，所有页面共用同一个选择状态。

@@ -216,6 +216,101 @@ const ledgerLabels = <String, String>{
   'recoveryDate': '恢复日期',
 };
 
+/// 字段性质由公开账本协议定义，不能把数量、日期或百分比当作金额遮挡。
+const ledgerAmountFields = <String>{
+  'cost',
+  'premiumDollars',
+  'amount',
+  'price',
+  'fees',
+  'pnl',
+  'netPnl',
+  'costBasis',
+  'drawdown',
+  'longPremiumPaid',
+  'shortPremiumReceived',
+  'lossIfZero',
+  'totalPnl',
+  'totalFees',
+  'total',
+  'totalCostBasis',
+  'endingCumulativePnl',
+  'maxDrawdown',
+  'totalLongPremiumPaid',
+  'totalShortPremiumReceived',
+  'allLongOptionsLossIfZero',
+  'topThreeLossIfZero',
+  'strike',
+  'openPrice',
+  'closePrice',
+  'openFees',
+  'closeFees',
+  'grossProfit',
+  'grossLoss',
+  'dailyPnl',
+  'cumulativePnl',
+  'runningPeak',
+  'averageLotPnl',
+  'premiumAtRisk',
+};
+
+/// 正负方向表达收益或现金流；成本、费用和假设损失的正数仍使用中性色。
+const ledgerSignedAmountFields = <String>{
+  'amount',
+  'pnl',
+  'netPnl',
+  'totalPnl',
+  'total',
+  'endingCumulativePnl',
+  'grossProfit',
+  'grossLoss',
+  'dailyPnl',
+  'cumulativePnl',
+  'averageLotPnl',
+};
+
+bool _isOptionRecord(Map<String, Object?> record) =>
+    record['assetType'] == 'option' ||
+    record['strike'] != null ||
+    record['optionType'] != null;
+
+/// 期权完整代码可能包含行权价；隐藏金额时标题与头像只读取独立标的字段。
+String ledgerSecurityText(
+  Map<String, Object?> record, {
+  required bool amountsHidden,
+}) {
+  if (amountsHidden && _isOptionRecord(record)) {
+    return ledgerText(record['underlying'] ?? '期权合约');
+  }
+  return ledgerText(
+    record['underlying'] ??
+        record['symbol'] ??
+        record['symbolKey'] ??
+        record['action'],
+  );
+}
+
+/// 原文说明和完整期权代码可能含金额；结构化数量、日期及比例仍正常展示。
+String ledgerFieldText(
+  String field,
+  Map<String, Object?> record, {
+  required bool amountsHidden,
+}) {
+  final value = record[field];
+  if (amountsHidden && value != null) {
+    if (field == 'description') return '说明已隐藏';
+    if ((field == 'symbol' || field == 'symbolKey') &&
+        _isOptionRecord(record)) {
+      return [
+        ledgerSecurityText(record, amountsHidden: true),
+        if (record['expiry'] != null) ledgerText(record['expiry']),
+        if (record['optionType'] != null) ledgerText(record['optionType']),
+      ].join(' · ');
+    }
+  }
+  return ledgerText(value);
+}
+
 /// 枚举值翻译保持金融语义；未知券商动作仍保留原文供核对。
 String ledgerText(Object? value) => switch (value) {
   null => '—',

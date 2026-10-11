@@ -9,6 +9,7 @@ import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_number.dart';
 import '../../core/design/stock_avatar.dart';
 import '../../core/design/lyra_widgets.dart';
+import '../../core/preferences/app_preferences.dart';
 import 'ledger_view.dart';
 import 'ledger_workspace.dart';
 import 'position_group.dart';
@@ -751,7 +752,11 @@ class _ReportSection extends StatelessWidget {
                   FittedBox(
                     fit: BoxFit.scaleDown,
                     alignment: Alignment.centerLeft,
-                    child: LyraAmount(ledgerText(data[field]), size: 34),
+                    child: LyraAmount(
+                      ledgerText(data[field]),
+                      size: 34,
+                      colorBySign: ledgerSignedAmountFields.contains(field),
+                    ),
                   ),
                 ],
               ),
@@ -822,7 +827,7 @@ class _ReportSection extends StatelessWidget {
 }
 
 /// 多条同标的持仓折叠为一行；股票、期权及多空记录展开后各自保留。
-class _PositionGroupRow extends StatelessWidget {
+class _PositionGroupRow extends ConsumerWidget {
   const _PositionGroupRow({
     required this.group,
     required this.currencyInHeader,
@@ -831,7 +836,7 @@ class _PositionGroupRow extends StatelessWidget {
   final bool currencyInHeader;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     if (group.rows.length == 1) {
       return _ReportRow(
         view: LedgerView.positions,
@@ -845,6 +850,9 @@ class _PositionGroupRow extends StatelessWidget {
         .map((row) => ledgerText(row['assetType']))
         .toSet()
         .join(' · ');
+    final symbol = ref.watch(amountsHiddenProvider)
+        ? ledgerSecurityText(group.rows.first, amountsHidden: true)
+        : group.symbol;
     return Theme(
       data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
       child: DecoratedBox(
@@ -861,14 +869,14 @@ class _PositionGroupRow extends StatelessWidget {
           childrenPadding: const EdgeInsets.only(left: 12, bottom: 8),
           title: Row(
             children: [
-              StockAvatar(symbol: group.symbol),
+              StockAvatar(symbol: symbol),
               const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      group.symbol,
+                      symbol,
                       style: const TextStyle(
                         fontSize: 16,
                         fontWeight: FontWeight.w600,
@@ -959,7 +967,7 @@ class _PositionColumns extends StatelessWidget {
 
 /// 紧凑持仓内容只整理显示：证券信息在左，数量与成本在右。
 /// [currency] 仅在表头无法统一标注币种时显示，避免跨币种混淆。
-class _PositionCells extends StatelessWidget {
+class _PositionCells extends ConsumerWidget {
   const _PositionCells({
     required this.record,
     this.currency,
@@ -970,11 +978,15 @@ class _PositionCells extends StatelessWidget {
   final String? currency;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final hidden = ref.watch(amountsHiddenProvider);
     final option = record['assetType'] == 'option';
-    final ticker = ledgerText(record['underlying'] ?? record['symbolKey']);
+    final ticker = ledgerSecurityText(record, amountsHidden: hidden);
+    final strike = hidden
+        ? '••••'
+        : LyraNumber.quantity(ledgerText(record['strike']));
     final contract = option
-        ? '${ledgerText(record['expiry'])}\n${LyraNumber.quantity(ledgerText(record['strike']))} ${ledgerText(record['optionType'])}'
+        ? '${ledgerText(record['expiry'])}\n$strike ${ledgerText(record['optionType'])}'
         : '股票 · ${ledgerText(record['direction'])}';
     return Row(
       children: [
@@ -994,7 +1006,7 @@ class _PositionCells extends StatelessWidget {
                     Text(
                       nested
                           ? (option
-                                ? '${LyraNumber.quantity(ledgerText(record['strike']))} ${ledgerText(record['optionType'])}'
+                                ? '$strike ${ledgerText(record['optionType'])}'
                                 : '股票')
                           : ticker,
                       style: const TextStyle(
@@ -1052,7 +1064,7 @@ class _PositionCells extends StatelessWidget {
 }
 
 /// 紧凑持仓行与展开明细共用同一权威记录，不构造虚假收益曲线。
-class _ReportRow extends StatelessWidget {
+class _ReportRow extends ConsumerWidget {
   const _ReportRow({
     required this.view,
     required this.row,
@@ -1069,7 +1081,8 @@ class _ReportRow extends StatelessWidget {
   final bool nestedPosition;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final hidden = ref.watch(amountsHiddenProvider);
     final record = view == LedgerView.extremes
         ? row['trade'] as Map<String, Object?>
         : row;
@@ -1082,16 +1095,11 @@ class _ReportRow extends StatelessWidget {
       LedgerView.holdingPeriod => ledgerText(record['bucket']),
       LedgerView.streaks => ledgerText(record['kind']),
       LedgerView.audit => _auditTitle(record['check'] as String),
-      _ => ledgerText(
-        record['underlying'] ??
-            record['symbol'] ??
-            record['symbolKey'] ??
-            record['action'],
-      ),
+      _ => ledgerSecurityText(record, amountsHidden: hidden),
     };
     final subtitle = switch (view) {
       LedgerView.positions || LedgerView.expiring =>
-        '${ledgerText(record['assetType'])} · ${ledgerText(record['direction'])} · ${LyraNumber.quantity(ledgerText(record['quantity']))} ${record['assetType'] == 'option' ? '张' : '股'}${record['expiry'] != null ? '\n${record['expiry']}' : ''}${record['strike'] != null ? ' · ${LyraNumber.quantity(ledgerText(record['strike']))}' : ''}${record['optionType'] != null ? ' ${ledgerText(record['optionType'])}' : ''}',
+        '${ledgerText(record['assetType'])} · ${ledgerText(record['direction'])} · ${LyraNumber.quantity(ledgerText(record['quantity']))} ${record['assetType'] == 'option' ? '张' : '股'}${record['expiry'] != null ? '\n${record['expiry']}' : ''}${record['strike'] != null ? ' · ${hidden ? '••••' : LyraNumber.quantity(ledgerText(record['strike']))}' : ''}${record['optionType'] != null ? ' ${ledgerText(record['optionType'])}' : ''}',
       LedgerView.trades || LedgerView.cashflow =>
         '${ledgerText(record['action'])} · ${ledgerText(record['transactionDate'])}',
       LedgerView.realized =>
@@ -1104,9 +1112,6 @@ class _ReportRow extends StatelessWidget {
       _ => ledgerLabels[view.valueField]!,
     };
     final value = ledgerText(record[view.valueField]);
-    final color = ['pnl', 'netPnl', 'amount'].contains(view.valueField)
-        ? (value.startsWith('-') ? LyraColors.negative : LyraColors.positive)
-        : LyraColors.ink;
     final percent = record['allocationPct'] as String?;
     return Container(
       decoration: const BoxDecoration(
@@ -1142,9 +1147,10 @@ class _ReportRow extends StatelessWidget {
                       LedgerView.trades,
                     ].contains(view)) ...[
                       StockAvatar(
-                        symbol:
-                            (record['underlying'] ?? record['symbol'])
-                                as String?,
+                        symbol: hidden
+                            ? ledgerSecurityText(record, amountsHidden: true)
+                            : (record['underlying'] ?? record['symbol'])
+                                  as String?,
                       ),
                       const SizedBox(width: 12),
                     ],
@@ -1184,7 +1190,10 @@ class _ReportRow extends StatelessWidget {
                             child: LyraAmount(
                               value,
                               size: 18,
-                              color: color,
+                              colorBySign: ledgerSignedAmountFields.contains(
+                                view.valueField,
+                              ),
+                              isMonetary: view != LedgerView.audit,
                               decimals: view == LedgerView.audit ? 0 : 2,
                             ),
                           ),
@@ -1242,11 +1251,25 @@ class _ReportRow extends StatelessWidget {
                     const SizedBox(width: 18),
                     Expanded(
                       child: SelectionArea(
-                        child: Text(
-                          ledgerText(record[field]),
-                          textAlign: TextAlign.end,
-                          style: const TextStyle(fontSize: 12),
-                        ),
+                        child: ledgerAmountFields.contains(field)
+                            ? LyraAmount(
+                                ledgerText(record[field]),
+                                size: 12,
+                                exact: true,
+                                colorBySign: ledgerSignedAmountFields.contains(
+                                  field,
+                                ),
+                                textAlign: TextAlign.end,
+                              )
+                            : Text(
+                                ledgerFieldText(
+                                  field,
+                                  record,
+                                  amountsHidden: hidden,
+                                ),
+                                textAlign: TextAlign.end,
+                                style: const TextStyle(fontSize: 12),
+                              ),
                       ),
                     ),
                   ],
@@ -1272,7 +1295,7 @@ class _ReportRow extends StatelessWidget {
 }
 
 /// 真实已实现数据的坐标投影，屏幕阅读器可通过下方逐行金额获得完整信息。
-class _DataPlot extends StatefulWidget {
+class _DataPlot extends ConsumerStatefulWidget {
   const _DataPlot({
     super.key,
     required this.rows,
@@ -1285,10 +1308,10 @@ class _DataPlot extends StatefulWidget {
   final bool line;
   final bool compact;
   @override
-  State<_DataPlot> createState() => _DataPlotState();
+  ConsumerState<_DataPlot> createState() => _DataPlotState();
 }
 
-class _DataPlotState extends State<_DataPlot> {
+class _DataPlotState extends ConsumerState<_DataPlot> {
   int? _selected;
 
   /// 指针坐标仅选择记录索引，金额读数始终保留服务端十进制字符串。
@@ -1302,6 +1325,34 @@ class _DataPlotState extends State<_DataPlot> {
 
   @override
   Widget build(BuildContext context) {
+    if (ref.watch(amountsHiddenProvider)) {
+      // 不保留坐标、选中读数或图形比例，防止隐藏后仍由形状推断金额规模。
+      return Semantics(
+        label: '金额已隐藏，收益图表已收起',
+        excludeSemantics: true,
+        child: SizedBox(
+          key: const ValueKey('ledger-amounts-hidden'),
+          height: widget.compact ? 142 : 222,
+          child: const Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(LyraIcons.hideAmounts, color: LyraColors.muted, size: 22),
+              SizedBox(height: 10),
+              Text(
+                '金额已隐藏',
+                style: TextStyle(fontSize: 12, color: LyraColors.inkSecondary),
+              ),
+              SizedBox(height: 5),
+              Text(
+                '显示金额后查看收益图表',
+                style: TextStyle(fontSize: 10, color: LyraColors.muted),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    final scheme = ref.watch(profitColorSchemeProvider);
     final rows = widget.rows;
     final field = widget.field;
     final line = widget.line;
@@ -1322,7 +1373,11 @@ class _DataPlotState extends State<_DataPlot> {
                   style: const TextStyle(fontSize: 11, color: LyraColors.muted),
                 ),
               ),
-              LyraAmount(ledgerText(rows[selected][field]), size: 14),
+              LyraAmount(
+                ledgerText(rows[selected][field]),
+                size: 14,
+                colorBySign: true,
+              ),
             ],
           ),
           const SizedBox(height: 12),
@@ -1352,6 +1407,8 @@ class _DataPlotState extends State<_DataPlot> {
                         line,
                         progress,
                         selected,
+                        positiveColor: lyraProfitColor('1', scheme),
+                        negativeColor: lyraProfitColor('-1', scheme),
                       ),
                     ),
                   ),
@@ -1379,11 +1436,26 @@ class _DataPlotState extends State<_DataPlot> {
 }
 
 class _LedgerPlotPainter extends CustomPainter {
-  _LedgerPlotPainter(this.values, this.line, this.progress, this.selected);
+  _LedgerPlotPainter(
+    this.values,
+    this.line,
+    this.progress,
+    this.selected, {
+    required this.positiveColor,
+    required this.negativeColor,
+  });
   final List<double> values;
   final bool line;
   final double progress;
   final int selected;
+  final Color positiveColor;
+  final Color negativeColor;
+
+  Color _colorFor(double value) => value == 0
+      ? LyraColors.ink
+      : value < 0
+      ? negativeColor
+      : positiveColor;
   @override
   void paint(Canvas canvas, Size size) {
     final low = math.min(0.0, values.reduce(math.min));
@@ -1409,22 +1481,32 @@ class _LedgerPlotPainter extends CustomPainter {
       double xFor(int index) => values.length == 1
           ? size.width / 2
           : index * size.width / (values.length - 1);
-      final path = Path();
-      for (int i = 0; i < values.length; i++) {
-        final x = xFor(i);
-        if (i == 0) {
-          path.moveTo(x, y(values[i]));
+      void segment(Offset from, Offset to, double value) => canvas.drawLine(
+        from,
+        to,
+        Paint()
+          ..color = _colorFor(value)
+          ..strokeWidth = 2.5
+          ..strokeCap = StrokeCap.round,
+      );
+      for (int i = 1; i < values.length; i++) {
+        final previous = values[i - 1];
+        final current = values[i];
+        final from = Offset(xFor(i - 1), y(previous));
+        final to = Offset(xFor(i), y(current));
+        if ((previous < 0 && current > 0) || (previous > 0 && current < 0)) {
+          // 穿越零轴时两侧各用真实盈亏方向，避免整条曲线被涂成盈利色。
+          final crossing = Offset.lerp(
+            from,
+            to,
+            previous.abs() / (previous.abs() + current.abs()),
+          )!;
+          segment(from, crossing, previous);
+          segment(crossing, to, current);
         } else {
-          path.lineTo(x, y(values[i]));
+          segment(from, to, current == 0 ? previous : current);
         }
       }
-      canvas.drawPath(
-        path,
-        Paint()
-          ..color = LyraColors.accent
-          ..strokeWidth = 2.5
-          ..style = PaintingStyle.stroke,
-      );
       final point = Offset(xFor(selected), y(values[selected]));
       canvas.drawLine(
         Offset(point.dx, 0),
@@ -1432,7 +1514,7 @@ class _LedgerPlotPainter extends CustomPainter {
         Paint()..color = LyraColors.hairlineStrong,
       );
       canvas.drawCircle(point, 5, Paint()..color = LyraColors.surface);
-      canvas.drawCircle(point, 3, Paint()..color = LyraColors.accent);
+      canvas.drawCircle(point, 3, Paint()..color = _colorFor(values[selected]));
     } else {
       final step = size.width / values.length;
       for (int i = 0; i < values.length; i++) {
@@ -1447,7 +1529,7 @@ class _LedgerPlotPainter extends CustomPainter {
             const Radius.circular(3),
           ),
           Paint()
-            ..color = (values[i] < 0 ? LyraColors.negative : LyraColors.accent)
+            ..color = _colorFor(values[i])
                 .withValues(alpha: i == selected ? 1 : .65),
         );
       }
@@ -1460,5 +1542,7 @@ class _LedgerPlotPainter extends CustomPainter {
       oldDelegate.values != values ||
       oldDelegate.progress != progress ||
       oldDelegate.line != line ||
-      oldDelegate.selected != selected;
+      oldDelegate.selected != selected ||
+      oldDelegate.positiveColor != positiveColor ||
+      oldDelegate.negativeColor != negativeColor;
 }

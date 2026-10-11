@@ -231,6 +231,7 @@ class SessionController extends AsyncNotifier<SessionState> {
             devicePrivateKey: base64Encode(privateKey),
             authMethod: 'google',
             userEmail: credentials.userEmail,
+            googleSubject: credentials.googleSubject,
           );
           return await withCredentialMutation(
             dependencies.credentialStore,
@@ -466,6 +467,7 @@ class SessionController extends AsyncNotifier<SessionState> {
                 devicePrivateKey: current.devicePrivateKey,
                 authMethod: current.authMethod,
                 userEmail: current.userEmail,
+                googleSubject: current.googleSubject,
               );
               await dependencies.credentialStore.write(updated);
               if (!_authActive(generation)) return null;

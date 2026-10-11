@@ -21,14 +21,14 @@ void main() {
     const Size(390, 844),
     const Size(1440, 960),
   ]) {
-    testWidgets('账号、股票、交易在 ${size.width} 宽度可导航且无溢出', (tester) async {
+    testWidgets('总览、股票、交易、我的在 ${size.width} 宽度可导航且无溢出', (tester) async {
       tester.view.physicalSize = size;
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
-      expect(find.text('我的账号'), findsOneWidget);
+      expect(find.text('总览'), findsNWidgets(2));
       expect(find.text('连接我的账户'), findsOneWidget);
       expect(find.text('—'), findsNWidgets(3));
       expect(tester.takeException(), isNull);
@@ -47,6 +47,14 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('交易记录'), findsOneWidget);
       expect(find.text('全部交易'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+
+      await tester.tap(find.text('我的'));
+      await tester.pumpAndSettle();
+      expect(find.text('使用偏好'), findsOneWidget);
+      expect(find.text('启动时隐藏金额'), findsOneWidget);
+      expect(find.text('服务与应用'), findsOneWidget);
+      expect(find.text('使用 Google 登录'), findsOneWidget);
       expect(tester.takeException(), isNull);
     });
   }
@@ -67,6 +75,6 @@ void main() {
     expect(find.text('AI 分析'), findsOneWidget);
     await tester.pageBack();
     await tester.pumpAndSettle();
-    expect(find.text('我的账号'), findsOneWidget);
+    expect(find.text('总览'), findsNWidgets(2));
   });
 }

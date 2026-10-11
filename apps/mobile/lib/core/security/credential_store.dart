@@ -55,6 +55,7 @@ class CredentialSnapshot {
     this.devicePrivateKey,
     this.authMethod,
     this.userEmail,
+    this.googleSubject,
   });
 
   final String serverUrl;
@@ -65,6 +66,9 @@ class CredentialSnapshot {
   /// 缺失表示旧版配对凭据，迁移后必须重新登录。
   final String? authMethod;
   final String? userEmail;
+
+  /// Google OIDC 稳定主体；仅用于同一服务端内的本机偏好隔离。
+  final String? googleSubject;
 
   /// 设备 Ed25519 私钥（base64）；留在系统安全存储，不进入日志或缓存。
   final String? devicePrivateKey;
@@ -102,6 +106,7 @@ class SecureCredentialStore implements CredentialStore {
       devicePrivateKey: await _storage.read(key: _keyDevicePrivateKey),
       authMethod: await _storage.read(key: _keyAuthMethod),
       userEmail: await _storage.read(key: _keyUserEmail),
+      googleSubject: await _storage.read(key: _keyGoogleSubject),
     );
   }
 
@@ -113,6 +118,7 @@ class SecureCredentialStore implements CredentialStore {
     await _storage.write(key: _keyRefreshToken, value: snapshot.refreshToken);
     await _storage.write(key: _keyAuthMethod, value: snapshot.authMethod);
     await _storage.write(key: _keyUserEmail, value: snapshot.userEmail);
+    await _storage.write(key: _keyGoogleSubject, value: snapshot.googleSubject);
     final privateKey = snapshot.devicePrivateKey;
     if (privateKey != null) {
       await _storage.write(key: _keyDevicePrivateKey, value: privateKey);
@@ -130,11 +136,13 @@ class SecureCredentialStore implements CredentialStore {
     await _storage.delete(key: _keyDevicePrivateKey);
     await _storage.delete(key: _keyAuthMethod);
     await _storage.delete(key: _keyUserEmail);
+    await _storage.delete(key: _keyGoogleSubject);
   }
 
   static const String _keyDevicePrivateKey = 'lyra.devicePrivateKey';
   static const String _keyAuthMethod = 'lyra.authMethod';
   static const String _keyUserEmail = 'lyra.userEmail';
+  static const String _keyGoogleSubject = 'lyra.googleSubject';
 }
 
 /// 测试与未登录状态使用的内存实现；不落盘。

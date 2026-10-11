@@ -3,9 +3,11 @@ import 'package:hugeicons/hugeicons.dart';
 
 /// 首批统一的一级入口图形，同一业务在导航与快捷入口使用相同标识。
 enum LyraPrimaryGlyph {
+  overview(HugeIcons.strokeRoundedDashboardSquare01),
   accounts(HugeIcons.strokeRoundedWallet01),
   stocks(HugeIcons.strokeRoundedChartCandlestick),
   ledger(HugeIcons.strokeRoundedInvoice03),
+  profile(HugeIcons.strokeRoundedUserCircle),
   importFile(HugeIcons.strokeRoundedFileUpload),
   connection(HugeIcons.strokeRoundedUserSettings01);
 

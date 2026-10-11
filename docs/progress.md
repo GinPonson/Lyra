@@ -3,7 +3,7 @@
 > 本表只记录已经落盘的实现和实际验证结果。未通过验证的功能不得标记为完成。  
 > 当前架构与部署方式见 [Genkit 与 Google 登录](genkit-oauth.md)。早期总体方案见 [Lyra 移动资产账本与 AI Agent 应用完整方案](plans/lyra-product-technical-design.md)。
 
-## 当前迁移：Genkit、Google 登录与首次导入
+## 当前迁移：Genkit、Google 登录与用户设置
 
 本节记录当前分支状态。下方历史进度保留当时的实现与验证；其中 MCP、多 CLI、供应商切换和匿名配对设计已被本次迁移替代。
 
@@ -19,12 +19,28 @@
 | 服务端完整回归 | 已完成 | Node 24.19.0，`npm run check` 干净 TypeScript 构建通过；117 套件、279 项测试通过，0 失败、0 跳过；包含实际 `main.js` 进程启动和账户写路由鉴权测试。已删除的旧适配器测试不计入当前统计 |
 | Flutter 登录、单助手与首次账户界面 | 已完成 | 空账户首页与账户选择器提供创建入口；导入保留原文件、创建后继续预览；创建重试、重复账户、预览失败恢复、取消、身份切换和组件卸载均有通过的回归；空库账本版本保持 0，首次财务导入才变为 1 |
 | Flutter 凭据队列与汇总刷新 | 已完成 | 按凭据存储归属排队，所有生产 SecureCredentialStore 实例保持共享队列；独立内存存储互不阻塞，队列失败/空闲后正确释放；登录、刷新、退出及助手会话 ID 保持串行。汇总刷新有身份与请求代次检查，旧成功/失败不能覆盖较新的结果 |
-| Flutter 依赖、分析与测试 | 已完成 | Flutter 3.47.2 / Dart 3.13.2；真实 `flutter pub get` 生成 lockfile，新增 url_launcher 及平台依赖；最终 analyze 零问题、91 项测试全部通过（本轮新增 18 项），旧金额/多币种/范围/UI 断言未削弱 |
-| Android 调试 APK | 已完成 | Flutter 3.47.2 / Dart 3.13.2、完整 JDK 17 与 Android SDK 环境下，`flutter build apk --debug --no-pub` 退出码 0；生成 166,921,699 字节 APK，元数据解析及 `apksigner verify` 通过，使用开发签名；真机安装与运行尚待联调 |
+| Flutter 用户页面与账户管理 | 已完成 | 四个主入口为总览、股票、交易、我的；用户页显示邮箱/Google 身份、证券账户列表与新增、偏好、连接、关于和确认退出；未登录仍可访问设置。手机和宽屏导航、账户创建刷新、取消与失败恢复回归通过 |
+| 金额隐私与金融配色 | 已完成 | 启动隐藏与本次眼睛按钮分离；财务金额、价格/费用/行权价、期权代码、Tooltip、读屏语义及金额图表同步处理；数量/日期/比例保留，AI 对话文字不处理。20 项隐私与 5 项配色回归通过，包含 14 类报告展开明细与图表像素检查 |
+| 本机偏好与启动账户 | 已完成 | 独立安全存储键、串行读改写、失败保留最后成功值；Google subject 传播并与服务端共同隔离账户偏好；恢复验证活跃账户，失效回 all，迟到恢复不覆盖主动选择。11 项偏好与 11 项启动范围回归通过；失败后手选单账户或 all 均可恢复查询 |
+| 连接检测与版本信息 | 已完成 | 使用既有公开 info/health 接口和独立无凭据客户端，检测失败不退出；换服务器先保存地址，再退出和重新 Google 登录；保存失败保留当前地址/登录。实际 App 版本由 package_info_plus 读取；用户页交互 16 项、公开检查 8 项通过 |
+| Flutter 依赖、分析与测试 | 已完成 | Flutter 3.47.2 / Dart 3.13.2；真实 pub get 新增 package_info_plus 9.0.1 及 platform_interface 3.2.1，原依赖保持；最终 analyze 零问题、162 项测试全部通过（本轮新增 71 项），原有 91 项断言继续通过 |
+| Flutter 界面渲染检查 | 已完成 | 实际 Flutter 组件使用合成数据渲染并目视检查：390 px、320 px / 1.6 倍字体、1440 px、未登录、连接/配色/关于及隐藏总览；没有溢出。截图专用中文字体不进入生产资产；该检查不是 Android 真机验收 |
+| Android 调试 APK | 已完成 | 本轮用户设置版 1.0.0 / versionCode 2 已通过 `flutter build apk --debug --no-pub`；167,030,491 字节，元数据解析与 `apksigner verify` 通过，Android Debug 签名。构建前后 112 个源码/配置/资产文件一致；真机安装与运行尚待联调 |
 | 真实 Google / 模型 / 手机联调 | 待开始 | 尚未配置真实 OAuth Web client、公开回调域名和模型凭据；现有测试使用受控外部边界，不代表真实第三方服务已验收 |
-| GitHub 草稿 PR 交付 | 已完成 | 本轮账户/导入改动、真实 Flutter 锁文件及服务端/Flutter 测试、Android 打包结果已更新到[草稿 PR #1](https://github.com/GinPonson/Lyra/pull/1)；真实 Google / 模型 / 手机联调尚待验收，保持草稿；未合并、未部署 |
+| GitHub 草稿 PR 交付 | 已完成 | Genkit/OAuth、账户与首次导入、用户页/常用设置、真实锁文件、测试与 Android 打包结果更新到[草稿 PR #1](https://github.com/GinPonson/Lyra/pull/1)；真实 Google / 模型 / 手机联调尚待验收，保持草稿；未合并、未部署 |
 
 配置模板在 [`server/.env.example`](../server/.env.example)，启动、升级和待验步骤见 [迁移说明](genkit-oauth.md)。App 与服务端需一起更新；迁移前备份数据库并保留原加密主密钥，迁移后重新登录并新建 Lyra 会话。真实 Google / 模型 / 手机联调完成前，迁移 PR 保持草稿。
+
+### 用户页面交付验证（2026-10-11）
+
+- `flutter analyze --no-pub`：零问题。
+- `flutter test --no-pub --reporter expanded --timeout 60s`：**162 项全部通过**；原有 91 项 + 新增 71 项，没有放宽既有财务或身份断言。
+- 实际 Flutter 渲染检查：390 px 手机、320 px / 1.6 倍字体、1440 px 宽屏，以及未登录、连接、配色、关于与隐藏金额总览；均使用合成数据，未连接真实账户。
+- `flutter build apk --debug --no-pub`：最终退出码 0。首次打包因原生库合并目录残留临时文件导致符号处理失败；仅清理对应生成中间产物后重建成功，没有修改 SDK、签名规则或应用源码。
+- APK：`1.0.0` / versionCode `2`，`com.lyrafinance.lyra_mobile`；min SDK 24、target SDK 36，arm64-v8a / armeabi-v7a / x86_64；**167,030,491 字节**。`aapt dump badging` 与 `apksigner verify --verbose --print-certs` 通过，Android Debug / v2 签名。
+- APK SHA-256：`d1409d9e5ac9e0f5ea25734e1c4b77e4b090e7f9211cea0866f3f0b26f957596`。
+- 构建前后核对 112 个移动端源码、Android 配置、依赖锁文件和资产；内容清单 SHA-256 为 `d79078a11b7a2f5a264fe415e531ab525540ace8e534cb57ae01731ca7be93bf`，交付副本与原构建 APK 哈希一致。
+- 本轮没有服务端改动；117 套件 / 279 项是上一轮服务端完整回归的通过结果。本轮仍未进行真实 Google、真实模型或 Android 真机验收。
 
 ## 进度状态
 

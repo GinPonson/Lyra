@@ -6,6 +6,7 @@ import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
 import '../../core/design/lyra_widgets.dart';
+import '../../core/preferences/app_preferences.dart';
 import '../accounts/account_sheet.dart';
 import '../accounts/account_workspace.dart';
 import '../import/import_sheet.dart';
@@ -69,38 +70,41 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
   }
 
   /// 连接管理复用已验证表单，不创建另一套凭据或登录实现。
-  void _openConnection() => showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    showDragHandle: true,
-    useSafeArea: true,
-    builder: (context) => SingleChildScrollView(
-      padding: EdgeInsets.fromLTRB(
-        16,
-        0,
-        16,
-        MediaQuery.viewInsetsOf(context).bottom + 24,
-      ),
-      child: const LoginPanel(),
-    ),
-  );
+  void _openConnection() => showConnectionManagementSheet(context);
 
   @override
   Widget build(BuildContext context) {
     final session = ref.watch(sessionProvider);
     final paired = session.value is SessionAuthenticated;
+    final amountsHidden = ref.watch(amountsHiddenProvider);
     final summary = ref.watch(scopedSummaryProvider);
     final accounts = paired ? ref.watch(brokerageAccountsProvider) : null;
     return LyraPage(
       storageKey: 'overview-scroll',
       children: [
         if (paired) ...[
+          const LyraPageTitle(title: '总览'),
           Row(
             children: [
               const Expanded(
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: AccountScopeButton(prominent: true),
+                ),
+              ),
+              Semantics(
+                toggled: !amountsHidden,
+                child: IconButton(
+                  key: const ValueKey('toggle-amounts'),
+                  tooltip: amountsHidden ? '显示金额' : '隐藏金额',
+                  onPressed: () =>
+                      ref.read(amountsHiddenProvider.notifier).toggle(),
+                  icon: Icon(
+                    amountsHidden
+                        ? LyraIcons.showAmounts
+                        : LyraIcons.hideAmounts,
+                    size: 22,
+                  ),
                 ),
               ),
               IconButton(
@@ -124,7 +128,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
           const SizedBox(height: 18),
         ] else ...[
           LyraPageTitle(
-            title: '我的账号',
+            title: '总览',
             trailing: LyraIconButton(
               icon: LyraIcons.accountCenter,
               label: '连接管理',
@@ -419,9 +423,7 @@ class _AccountSummary extends StatelessWidget {
                   ? const ValueKey<String>('overview-hero-value')
                   : null,
               size: 34,
-              color: entry.realizedPnlTotal.startsWith('-')
-                  ? LyraColors.negative
-                  : LyraColors.ink,
+              colorBySign: true,
             ),
           ),
           const SizedBox(height: 5),
@@ -446,14 +448,14 @@ class _MetricStrip extends StatelessWidget {
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, constraints) {
-      final metrics = <(String, String, int)>[
-        ('净入金', entry?.netDeposits ?? '—', 2),
-        ('现金余额', entry?.cashBalance ?? '—', 2),
-        ('股息收入', entry?.dividends ?? '—', 2),
+      final metrics = <(String, String, int, bool)>[
+        ('净入金', entry?.netDeposits ?? '—', 2, true),
+        ('现金余额', entry?.cashBalance ?? '—', 2, true),
+        ('股息收入', entry?.dividends ?? '—', 2, true),
         if (entry != null) ...[
-          ('累计费用', entry!.totalFees, 2),
-          ('持仓条目', '${entry!.openPositions}', 0),
-          ('交易笔数', '${entry!.transactionCount}', 0),
+          ('累计费用', entry!.totalFees, 2, true),
+          ('持仓条目', '${entry!.openPositions}', 0, false),
+          ('交易笔数', '${entry!.transactionCount}', 0, false),
         ],
       ];
       final columns =
@@ -494,6 +496,7 @@ class _MetricStrip extends StatelessWidget {
                                       metrics[start + offset].$2,
                                       size: 18,
                                       decimals: metrics[start + offset].$3,
+                                      isMonetary: metrics[start + offset].$4,
                                     ),
                                   ),
                                 ],

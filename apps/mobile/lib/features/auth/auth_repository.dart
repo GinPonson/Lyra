@@ -45,6 +45,7 @@ class LoginCredentials {
     required this.refreshToken,
     required this.refreshTokenExpiresAt,
     this.userEmail,
+    this.googleSubject,
   });
 
   final String deviceId;
@@ -54,6 +55,7 @@ class LoginCredentials {
   final String refreshToken;
   final String refreshTokenExpiresAt;
   final String? userEmail;
+  final String? googleSubject;
 
   factory LoginCredentials.fromJson(Map<String, Object?> json) {
     final user = json['user'] as Map<String, Object?>?;
@@ -65,6 +67,9 @@ class LoginCredentials {
       refreshToken: json['refreshToken'] as String,
       refreshTokenExpiresAt: json['refreshTokenExpiresAt'] as String,
       userEmail: user?['email'] as String?,
+      googleSubject: user?['provider'] == 'google'
+          ? (user?['subject'] as String?)
+          : null,
     );
   }
 }

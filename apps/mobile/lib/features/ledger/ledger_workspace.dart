@@ -1,33 +1,170 @@
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/session.dart';
 import '../../core/api/lyra_api_error.dart';
+import '../../core/preferences/app_preferences.dart';
+import '../accounts/account_repository.dart' show BrokerageAccount;
+import '../accounts/account_workspace.dart';
 import 'ledger_models.dart';
 import 'ledger_repository.dart';
 
 /// 跨账号、股票与交易页共享的显式账户范围；不改变既有 AI 会话范围。
 class AccountScopeController extends Notifier<({String id, String label})> {
+  Completer<void>? _ready;
+  String? _identity;
+  int _generation = 0;
+  int _manualRevision = 0;
+  bool _restoreFailed = false;
+
   @override
   ({String id, String label}) build() {
-    ref.watch(
-      sessionProvider.select((value) {
-        final session = value.value;
-        return session is SessionAuthenticated
-            ? '${session.snapshot.serverUrl}/${session.snapshot.deviceId}'
-            : null;
-      }),
-    );
+    ref.watch(_scopeSessionIdentityProvider);
+    final session = ref.read(sessionProvider).value;
+    _identity = session is SessionAuthenticated
+        ? preferencesIdentityKey(session.snapshot)
+        : null;
+    ++_generation;
+    _manualRevision = 0;
+    _restoreFailed = false;
+    final previous = _ready;
+    if (previous != null && !previous.isCompleted) {
+      previous.completeError(StateError('登录状态已变化'));
+    }
+    _ready = Completer<void>()..future.ignore();
+    ref.onDispose(() {
+      ++_generation;
+      final ready = _ready;
+      if (ready != null && !ready.isCompleted) {
+        ready.completeError(StateError('账户范围已关闭'));
+      }
+    });
+    // A successful settings retry can unblock startup without rebuilding the
+    // session or applying subsequent preference changes to the current scope.
+    ref.listen(appPreferencesProvider, (_, next) {
+      if (_restoreFailed &&
+          next.hasValue &&
+          !next.hasError &&
+          !next.isLoading) {
+        unawaited(retryStartupRestore().catchError((Object _) {}));
+      }
+    });
+    if (_identity == null) {
+      _ready!.complete();
+    } else {
+      unawaited(_restore(_generation, _manualRevision, _identity!));
+    }
     return (id: 'all', label: '全部账号');
   }
 
+  Future<void> get ready => _ready!.future;
+
   /// [id] 为服务端公开 UUID 或 all；[label] 为可见账户名称。
-  void select(String id, String label) => state = (id: id, label: label);
+  /// 明确选择优先于尚未完成的启动恢复；只持久化该次调用捕获的登录身份。
+  void select(String id, String label) {
+    final replaceFailedReady = _restoreFailed;
+    ++_manualRevision;
+    _restoreFailed = false;
+    if (replaceFailedReady) _ready = Completer<void>()..future.ignore();
+    state = (id: id, label: label);
+    if (!_ready!.isCompleted) _ready!.complete();
+    // Selecting all after a failed startup can keep the same visible scope,
+    // but the failed readiness future still needs to be replaced and observed.
+    if (replaceFailedReady) ref.notifyListeners();
+    final identity = _identity;
+    if (identity != null) {
+      unawaited(
+        ref
+            .read(appPreferencesProvider.notifier)
+            .rememberAccountScope(identity, id)
+            .catchError((Object _) {
+              // The preferences controller retains AsyncError for retry. A local
+              // settings failure must not undo an explicit, valid UI selection.
+            }),
+      );
+    }
+  }
+
+  /// 查询/设置读取恢复后可重试；成功后的偏好修改只影响下一次启动。
+  Future<void> retryStartupRestore() async {
+    if (!_restoreFailed || _identity == null || _manualRevision > 0) return;
+    _restoreFailed = false;
+    _ready = Completer<void>()..future.ignore();
+    ref.invalidate(brokerageAccountsProvider);
+    // Notify this provider's listeners when the readiness future changes. A
+    // notifier cannot invalidate a provider which already depends on itself.
+    ref.notifyListeners();
+    await _restore(_generation, _manualRevision, _identity!);
+    await ready;
+  }
+
+  Future<void> _restore(int generation, int revision, String identity) async {
+    bool active() =>
+        ref.mounted &&
+        generation == _generation &&
+        revision == _manualRevision &&
+        identity == _identity;
+    try {
+      final preferences = await ref.read(appPreferencesProvider.future);
+      if (!active()) return;
+      final saved = preferences.forIdentity(identity);
+      final target = switch (preferences.startupAccountMode) {
+        StartupAccountMode.all => 'all',
+        StartupAccountMode.rememberLast => saved.lastScopeId,
+        StartupAccountMode.specific => saved.specificAccountId ?? 'all',
+      };
+      var selected = (id: 'all', label: '全部账号');
+      if (target != 'all') {
+        final subscription = ref.listen(brokerageAccountsProvider, (_, _) {});
+        final List<BrokerageAccount> accounts;
+        try {
+          accounts = await ref.read(brokerageAccountsProvider.future);
+        } finally {
+          subscription.close();
+        }
+        if (!active()) return;
+        final matches = accounts.where(
+          (account) => account.id == target && account.isActive,
+        );
+        if (matches.isNotEmpty) {
+          final account = matches.first;
+          selected = (id: account.id, label: account.displayName);
+        }
+      }
+      if (!active()) return;
+      state = selected;
+      if (!_ready!.isCompleted) _ready!.complete();
+    } on Object catch (error, stack) {
+      if (!active()) return;
+      _restoreFailed = true;
+      if (!_ready!.isCompleted) _ready!.completeError(error, stack);
+    }
+  }
 }
+
+/// Token refresh and ledger refresh retain scope; a new login/device restores
+/// from the stable user's preferences after revalidating account availability.
+final _scopeSessionIdentityProvider = Provider<Object?>((ref) {
+  final session = ref.watch(sessionProvider).value;
+  return session is SessionAuthenticated
+      ? (preferencesIdentityKey(session.snapshot), session.snapshot.deviceId)
+      : null;
+});
 
 final accountScopeProvider =
     NotifierProvider<AccountScopeController, ({String id, String label})>(
       AccountScopeController.new,
     );
+
+/// 金融查询在账户默认值及其有效性确认前等待，避免先显示全部账户的金额。
+final accountScopeReadyProvider = FutureProvider<void>((ref) {
+  ref.watch(_scopeSessionIdentityProvider);
+  final controller = ref.read(accountScopeProvider.notifier);
+  // A restored/manual selection completes this same future. Selecting only its
+  // identity prevents that state change from canceling the in-flight wait.
+  return ref.watch(accountScopeProvider.select((_) => controller.ready));
+}, retry: (retryCount, error) => null);
 
 /// 值类型查询键使同范围、同筛选的读请求共享缓存，切换范围不会串数据。
 typedef LedgerQuery = ({String path, String parameters, String scope});
@@ -127,6 +264,15 @@ final ledgerReadProvider = FutureProvider.autoDispose
       }
       final client = ref.read(sessionProvider.notifier).client;
       if (client == null) throw StateError('登录会话缺少 API 客户端');
+      await ref.read(accountScopeProvider.notifier).retryStartupRestore();
+      await ref.watch(accountScopeReadyProvider.future);
+      if (!ref.mounted ||
+          !identical(client, ref.read(sessionProvider.notifier).client)) {
+        throw StateError('登录状态已变化');
+      }
+      if (query.scope != ref.read(accountScopeProvider).id) {
+        throw StateError('账户范围已变化，请使用当前范围重新读取');
+      }
       final response = await client.get<Map<String, Object?>>(
         query.path,
         <String, String>{
@@ -146,6 +292,11 @@ final scopedSummaryProvider = FutureProvider.autoDispose<LedgerSummaryRead?>((
   final scope = ref.watch(accountScopeProvider);
   final session = await ref.watch(sessionProvider.future);
   if (session is! SessionAuthenticated) return null;
+  await ref.read(accountScopeProvider.notifier).retryStartupRestore();
+  await ref.watch(accountScopeReadyProvider.future);
+  if (!ref.mounted || scope.id != ref.read(accountScopeProvider).id) {
+    return null;
+  }
   if (scope.id == 'all' && session.summary != null) return session.summary;
   final client = ref.read(sessionProvider.notifier).client;
   if (client == null) throw StateError('登录会话缺少 API 客户端');

@@ -226,6 +226,7 @@ void main() {
     expect(stored?.deviceId, 'd1000000-0000-4000-8000-000000000001');
     expect(stored?.authMethod, 'google');
     expect(stored?.userEmail, 'owner@example.com');
+    expect(stored?.googleSubject, 'test-user');
     expect(stored?.devicePrivateKey, isNotEmpty);
     expect(openedUrls.single.host, 'accounts.google.com');
     expect(exchangeCount, 2);
@@ -559,6 +560,7 @@ void main() {
     await controller.client!.get<Object?>('/second', {});
     expect(refreshedWith, ['refresh-token-1', 'refresh-token-2']);
     expect((await store.read())?.authMethod, 'google');
+    expect((await store.read())?.googleSubject, 'test-user');
     await controller.signOut();
     expect(logoutCalled, isTrue);
     expect(await store.read(), isNull);
@@ -624,6 +626,7 @@ const _authenticatedSnapshot = CredentialSnapshot(
   accessToken: 'access-token-1',
   refreshToken: 'refresh-token-1',
   authMethod: 'google',
+  googleSubject: 'test-user',
 );
 
 String _startResponse() => jsonEncode({

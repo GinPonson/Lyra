@@ -6,12 +6,14 @@ import '../core/design/lyra_primary_icon.dart';
 import '../features/agent/agent_screen.dart';
 import '../features/ledger/ledger_screen.dart';
 import '../features/overview/overview_screen.dart';
+import '../features/profile/profile_screen.dart';
 
-/// 账号与股票为核心，交易提供记录追溯；AI 从页内进入独立二级页。
+/// 金融工作台与个人设置分开；AI 从页内进入独立二级页。
 enum LyraDestination {
-  accounts('账号', LyraPrimaryGlyph.accounts),
+  overview('总览', LyraPrimaryGlyph.overview),
   stocks('股票', LyraPrimaryGlyph.stocks),
-  ledger('交易', LyraPrimaryGlyph.ledger);
+  ledger('交易', LyraPrimaryGlyph.ledger),
+  profile('我的', LyraPrimaryGlyph.profile);
 
   const LyraDestination(this.label, this.icon);
   final String label;
@@ -70,6 +72,9 @@ class _LyraShellState extends State<LyraShell> {
                   onConnect: () => _selectDestination(0),
                 )
               : const SizedBox.shrink(),
+          _visited.contains(3)
+              ? const ProfileScreen()
+              : const SizedBox.shrink(),
         ],
       );
       return Scaffold(
@@ -79,8 +84,11 @@ class _LyraShellState extends State<LyraShell> {
               SafeArea(
                 bottom: false,
                 child: Container(
-                  height: 72,
-                  padding: const EdgeInsets.symmetric(horizontal: 48),
+                  constraints: const BoxConstraints(minHeight: 72),
+                  padding: EdgeInsets.symmetric(
+                    horizontal: constraints.maxWidth >= 1200 ? 48 : 24,
+                    vertical: 8,
+                  ),
                   decoration: const BoxDecoration(
                     border: Border(
                       bottom: BorderSide(color: LyraColors.hairlineStrong),
@@ -89,36 +97,42 @@ class _LyraShellState extends State<LyraShell> {
                   child: Row(
                     children: [
                       const _LyraWordmark(),
-                      const Spacer(),
-                      for (final (index, destination)
-                          in LyraDestination.values.indexed)
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          child: TextButton.icon(
-                            onPressed: () => _selectDestination(index),
-                            icon: LyraPrimaryIcon(
-                              destination.icon,
-                              size: 20,
-                              color: index == _selectedIndex
-                                  ? LyraColors.accent
-                                  : LyraColors.muted,
-                            ),
-                            label: Text(destination.label),
-                            style: TextButton.styleFrom(
-                              foregroundColor: index == _selectedIndex
-                                  ? LyraColors.ink
-                                  : LyraColors.muted,
-                              backgroundColor: index == _selectedIndex
-                                  ? LyraColors.surfaceStrong
-                                  : Colors.transparent,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 22,
-                                vertical: 12,
+                      const SizedBox(width: 24),
+                      Expanded(
+                        child: Wrap(
+                          alignment: WrapAlignment.center,
+                          spacing: 8,
+                          runSpacing: 4,
+                          children: [
+                            for (final (index, destination)
+                                in LyraDestination.values.indexed)
+                              TextButton.icon(
+                                onPressed: () => _selectDestination(index),
+                                icon: LyraPrimaryIcon(
+                                  destination.icon,
+                                  size: 20,
+                                  color: index == _selectedIndex
+                                      ? LyraColors.accent
+                                      : LyraColors.muted,
+                                ),
+                                label: Text(destination.label),
+                                style: TextButton.styleFrom(
+                                  foregroundColor: index == _selectedIndex
+                                      ? LyraColors.ink
+                                      : LyraColors.muted,
+                                  backgroundColor: index == _selectedIndex
+                                      ? LyraColors.surfaceStrong
+                                      : Colors.transparent,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 18,
+                                    vertical: 12,
+                                  ),
+                                ),
                               ),
-                            ),
-                          ),
+                          ],
                         ),
-                      const Spacer(),
+                      ),
+                      const SizedBox(width: 24),
                       TextButton.icon(
                         onPressed: _openAgent,
                         icon: const Icon(LyraIcons.agent, size: 18),
