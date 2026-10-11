@@ -98,7 +98,6 @@ export class MarketSettingsService {
     return this.#writeCoordinator.enqueue(async () => {
       await input.authorize();
       if (this.#state === null) throw new Error("行情设置尚未初始化");
-      this.#assertSelectableRoutes(request.routes);
       // Re-read inside the shared queue so an additional Service instance cannot
       // apply an old revision over a newer committed selection.
       const current = await this.#readStoredView();
@@ -117,6 +116,7 @@ export class MarketSettingsService {
           details: { revision: current.revision },
         });
       }
+      this.#assertSelectableChanges(request.routes, current.routes);
       if (current.revision >= Number.MAX_SAFE_INTEGER) {
         throw new Error("行情设置版本已超出安全整数范围");
       }
@@ -165,9 +165,14 @@ export class MarketSettingsService {
     }
   }
 
-  #assertSelectableRoutes(routes: MarketRoutes): void {
+  /** Permit one control at a time to repair saved choices that became unavailable. */
+  #assertSelectableChanges(routes: MarketRoutes, current: MarketRoutes): void {
     for (const assetType of ASSET_TYPES) {
-      for (const id of routes[assetType]) {
+      for (const [index, id] of routes[assetType].entries()) {
+        // Retaining an unavailable source in its existing slot never enables it:
+        // #view still filters it. Moving it or selecting it again elsewhere must
+        // meet the same availability checks as a newly introduced source.
+        if (current[assetType][index] === id) continue;
         const provider = this.#providerById.get(id);
         if (provider === undefined || !provider.assetTypes.includes(assetType)) {
           throw new ApplicationError({

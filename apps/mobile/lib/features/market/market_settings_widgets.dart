@@ -25,7 +25,7 @@ class MarketSettingsPanel extends ConsumerWidget {
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
         ),
         const SizedBox(height: 6),
-        const _Hint('股票与期权可分别选择。保存后对所有账户与设备生效。'),
+        const _Hint('选择后自动生效，对所有账户与设备同步。'),
         const SizedBox(height: 14),
         if (session.isLoading && client == null)
           const LinearProgressIndicator(minHeight: 2)
@@ -79,33 +79,22 @@ class _MarketSettingsEditor extends ConsumerStatefulWidget {
 }
 
 class _MarketSettingsEditorState extends ConsumerState<_MarketSettingsEditor> {
-  late MarketSettings _base;
-  late MarketRoutes _draft;
-  bool _saving = false;
-  bool _saved = false;
+  MarketRoutes? _retryRoutes;
+  int? _retryRevision;
+  bool _applied = false;
   LyraApiError? _error;
 
-  bool get _dirty => _draft != _base.routes;
-
-  @override
-  void initState() {
-    super.initState();
-    _base = widget.settings;
-    _draft = _base.routes;
-  }
-
-  @override
-  void didUpdateWidget(covariant _MarketSettingsEditor oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (!_saving && !_dirty && oldWidget.settings != widget.settings) {
-      _base = widget.settings;
-      _draft = _base.routes;
-    }
-  }
+  bool get _needsReload => const {
+    'MARKET_SETTINGS_CHANGED',
+    'MARKET_PROVIDER_NOT_CONFIGURED',
+    'INVALID_ARGUMENT',
+  }.contains(_error?.code);
 
   void _choose(String assetType, {required bool backup, required String id}) {
-    if (_saving) return;
-    final route = _draft.forAsset(assetType);
+    if (ref.read(marketSettingsPendingProvider) != null || _needsReload) return;
+    final settings =
+        ref.read(marketSettingsProvider).asData?.value ?? widget.settings;
+    final route = settings.routes.forAsset(assetType);
     final primary = route.isEmpty ? '' : route.first;
     final previousBackup = route.length == 2 ? route.last : '';
     final next = backup
@@ -120,34 +109,36 @@ class _MarketSettingsEditorState extends ConsumerState<_MarketSettingsEditor> {
                 previousBackup != id)
               previousBackup,
           ];
-    setState(() {
-      _draft = _draft.replace(assetType, next);
-      _saved = false;
-      _error = null;
-    });
+    final routes = settings.routes.replace(assetType, next);
+    if (routes == settings.routes) return;
+    _apply(routes, expectedRevision: settings.revision);
   }
 
-  Future<void> _save() async {
-    if (_saving || !_dirty || !_base.accepts(_draft)) return;
+  Future<void> _apply(
+    MarketRoutes routes, {
+    required int expectedRevision,
+  }) async {
+    if (ref.read(marketSettingsPendingProvider) != null) return;
     final client = ref.read(marketAuthenticatedClientProvider);
+    if (client == null) return;
     setState(() {
-      _saving = true;
-      _saved = false;
+      _retryRoutes = routes;
+      _retryRevision = expectedRevision;
+      _applied = false;
       _error = null;
     });
     try {
-      final saved = await ref
+      await ref
           .read(marketSettingsProvider.notifier)
-          .save(expectedRevision: _base.revision, routes: _draft);
+          .save(expectedRevision: expectedRevision, routes: routes);
       if (!mounted ||
           !identical(client, ref.read(marketAuthenticatedClientProvider))) {
         return;
       }
       setState(() {
-        _base = saved;
-        _draft = saved.routes;
-        _saved = true;
-        _saving = false;
+        _retryRoutes = null;
+        _retryRevision = null;
+        _applied = true;
       });
     } on Object catch (error) {
       if (!mounted ||
@@ -155,101 +146,87 @@ class _MarketSettingsEditorState extends ConsumerState<_MarketSettingsEditor> {
         return;
       }
       setState(() {
-        _saving = false;
         _error = LyraApiError.from(error);
       });
     }
   }
 
-  void _cancel() => setState(() {
-    _base = widget.settings;
-    _draft = _base.routes;
-    _error = null;
-    _saved = false;
-  });
-
   void _reload() {
-    // Explicit reload discards the draft even when a fast GET completes before
-    // Flutter paints its loading frame; the next snapshot must replace it.
-    _cancel();
+    setState(() {
+      _retryRoutes = null;
+      _retryRevision = null;
+      _applied = false;
+      _error = null;
+    });
     ref.invalidate(marketSettingsProvider);
   }
 
   @override
   Widget build(BuildContext context) {
     final error = _error;
+    final settings = widget.settings;
+    final pending = ref.watch(marketSettingsPendingProvider);
+    final routes = pending ?? settings.routes;
+    final busy = pending != null;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         for (final asset in ['stock', 'option']) ...[
           _RouteCard(
             assetType: asset,
-            settings: _base,
-            route: _draft.forAsset(asset),
-            saving: _saving,
+            settings: settings,
+            route: routes.forAsset(asset),
+            saving: busy || _needsReload,
             onChoose: (backup, id) => _choose(asset, backup: backup, id: id),
           ),
           const SizedBox(height: 12),
         ],
-        if (_base.routes != _base.effectiveRoutes) ...[
+        if (settings.routes != settings.effectiveRoutes) ...[
           const _Hint('部分已保存来源当前不可用，请选择其他来源或关闭。'),
           const SizedBox(height: 10),
         ],
-        if (_base.providers.any((source) => !source.configured)) ...[
+        if (settings.providers.any((source) => !source.configured)) ...[
           const _Hint('未配置的来源暂不可选，请先在服务端配置凭据。'),
           const SizedBox(height: 10),
         ],
-        if (error != null) ...[
+        if (busy) ...[
+          Semantics(liveRegion: true, child: const _Hint('正在切换…')),
+          const SizedBox(height: 10),
+        ] else if (error != null) ...[
           Semantics(
             liveRegion: true,
             child: _Hint(switch (error.code) {
-              'MARKET_SETTINGS_CHANGED' => '其他设备已修改行情来源。请重新加载后再保存。',
-              'MARKET_PROVIDER_NOT_CONFIGURED' =>
-                '所选来源尚未配置。选择已保留，请重新加载或改选其他来源。',
-              _ => '保存失败，选择已保留。请检查连接后重试。',
+              'MARKET_SETTINGS_CHANGED' => '其他设备已修改行情来源。请重新加载后再选择。',
+              'MARKET_PROVIDER_NOT_CONFIGURED' => '所选来源尚未配置，已恢复原选择。请重新加载后再选择。',
+              'INVALID_ARGUMENT' => '来源状态已变化。请重新加载后再选择。',
+              _ => '未能确认切换，界面已恢复原选择。请重试。',
             }),
           ),
-          if ([
-            'MARKET_SETTINGS_CHANGED',
-            'MARKET_PROVIDER_NOT_CONFIGURED',
-          ].contains(error.code))
+          if (_needsReload)
             Align(
               alignment: Alignment.centerLeft,
               child: TextButton(
                 key: const ValueKey('market-settings-reload'),
-                onPressed: _saving ? null : _reload,
+                onPressed: _reload,
                 child: const Text('重新加载'),
               ),
+            )
+          else if (_retryRoutes != null && _retryRevision != null)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                key: const ValueKey('market-settings-retry-change'),
+                onPressed: () =>
+                    _apply(_retryRoutes!, expectedRevision: _retryRevision!),
+                child: const Text('重试切换'),
+              ),
             ),
           const SizedBox(height: 10),
         ],
-        if (_saved) ...[
-          Semantics(liveRegion: true, child: const _Hint('已保存，新的行情来源已生效。')),
+        if (!busy && error == null && _applied) ...[
+          Semantics(liveRegion: true, child: const _Hint('已切换，新的行情来源已生效。')),
           const SizedBox(height: 10),
         ],
-        Row(
-          children: [
-            Expanded(
-              child: OutlinedButton(
-                key: const ValueKey('market-settings-cancel'),
-                onPressed: _saving || (!_dirty && _error == null)
-                    ? null
-                    : _cancel,
-                child: const Text('取消'),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: FilledButton(
-                key: const ValueKey('market-settings-save'),
-                onPressed: _saving || !_dirty || !_base.accepts(_draft)
-                    ? null
-                    : _save,
-                child: Text(_saving ? '保存中…' : '保存'),
-              ),
-            ),
-          ],
-        ),
       ],
     );
   }

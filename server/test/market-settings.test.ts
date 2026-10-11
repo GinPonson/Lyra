@@ -79,6 +79,23 @@ async function fixture(t: TestContext) {
   return { database, path, writeCoordinator, runtime, service, now, authorize, save };
 }
 
+async function restoreWithUnavailableSources(f: Awaited<ReturnType<typeof fixture>>) {
+  const runtime = createController();
+  const providers: readonly MarketProviderOption[] = [
+    ...PROVIDERS.map((provider) => ({ ...provider, configured: false })),
+    { ...PROVIDERS[0]!, id: "replacement", displayName: "Replacement", configured: true },
+  ];
+  const service = new MarketSettingsService({
+    database: f.database, writeCoordinator: f.writeCoordinator, marketData: runtime.controller,
+    providers, defaultRoutes: DEFAULT_ROUTES, now: f.now,
+  });
+  await service.initialize();
+  const save = (routes: MarketRoutes, expectedRevision: number) => service.save({
+    request: { routes, expectedRevision }, requestId: "repair-test", authorize: f.authorize,
+  });
+  return { runtime, service, save };
+}
+
 function hasCode(code: string) {
   return (error: unknown) => error instanceof ApplicationError && error.code === code;
 }
@@ -172,7 +189,7 @@ describe("persistent owner market settings", () => {
     assert.deepEqual(restored.getSettings().effectiveRoutes, { stock: ["alpaca"], option: [] });
     assert.equal(restored.getSettings().revision, 1);
     await assert.rejects(restored.save({
-      request: { expectedRevision: 1, routes: { stock: ["marketdata"], option: [] } },
+      request: { expectedRevision: 1, routes: { stock: ["alpaca", "marketdata"], option: [] } },
       requestId: "unconfigured", authorize: f.authorize,
     }), hasCode("MARKET_PROVIDER_NOT_CONFIGURED"));
     const repaired = await restored.save({
@@ -198,10 +215,77 @@ describe("persistent owner market settings", () => {
     assert.deepEqual(restored.getSettings().routes.stock, ["retired_vendor", "alpaca"]);
     assert.deepEqual(restored.getSettings().effectiveRoutes.stock, ["alpaca"]);
     await assert.rejects(restored.save({
-      request: { expectedRevision: 1, routes: { stock: ["retired_vendor"], option: [] } },
+      request: { expectedRevision: 1, routes: { stock: ["alpaca", "retired_vendor"], option: [] } },
       requestId: "unknown", authorize: f.authorize,
     }), hasCode("INVALID_ARGUMENT"));
     assert.deepEqual((await loadMarketSettings(f.database))!.routes.stock, ["retired_vendor", "alpaca"]);
+    const remaining = { stock: ["retired_vendor"], option: [] };
+    const saved = await restored.save({
+      request: { expectedRevision: 1, routes: remaining }, requestId: "remove-backup", authorize: f.authorize,
+    });
+    assert.equal(saved.revision, 2);
+    assert.deepEqual(saved.effectiveRoutes, { stock: [], option: [] });
+    assert.deepEqual(await restored.save({
+      request: { expectedRevision: 1, routes: remaining }, requestId: "retry-response", authorize: f.authorize,
+    }), saved);
+  });
+
+  it("repairs unavailable stock and option choices independently without clearing the other asset", async (t) => {
+    const f = await fixture(t);
+    await f.save({ stock: ["marketdata"], option: ["alpaca"] });
+    const restored = await restoreWithUnavailableSources(f);
+    assert.deepEqual(restored.service.getSettings().effectiveRoutes, { stock: [], option: [] });
+
+    const partial = await restored.save({ stock: ["replacement"], option: ["alpaca"] }, 1);
+    assert.equal(partial.revision, 2);
+    assert.deepEqual(partial.routes, { stock: ["replacement"], option: ["alpaca"] });
+    assert.deepEqual(partial.effectiveRoutes, { stock: ["replacement"], option: [] });
+    assert.deepEqual((await loadMarketSettings(f.database))!.routes, partial.routes);
+
+    const complete = await restored.save({ stock: ["replacement"], option: ["replacement"] }, 2);
+    assert.equal(complete.revision, 3);
+    assert.deepEqual(complete.routes, complete.effectiveRoutes);
+    assert.deepEqual(restored.runtime.calls.at(-1), { routes: complete.routes, revision: 3 });
+  });
+
+  it("repairs two unavailable slots one at a time and accepts a lost-response retry with an unrepaired slot", async (t) => {
+    const f = await fixture(t);
+    await f.save({ stock: ["alpaca", "marketdata"], option: [] });
+    const restored = await restoreWithUnavailableSources(f);
+    const routes = { stock: ["alpaca", "replacement"], option: [] };
+
+    const partial = await restored.save(routes, 1);
+    assert.equal(partial.revision, 2);
+    assert.deepEqual(partial.routes, routes);
+    assert.deepEqual(partial.effectiveRoutes, { stock: ["replacement"], option: [] });
+    assert.deepEqual(await restored.save(routes, 1), partial);
+    assert.equal((await loadMarketSettings(f.database))!.revision, 2);
+    assert.equal(restored.runtime.calls.length, 2);
+
+    const complete = await restored.save({ stock: ["replacement"], option: [] }, 2);
+    assert.equal(complete.revision, 3);
+    assert.deepEqual(complete.routes, complete.effectiveRoutes);
+  });
+
+  it("rejects new or relocated unavailable sources and returns conflicts before source validation", async (t) => {
+    const f = await fixture(t);
+    const original = { stock: ["alpaca", "marketdata"], option: ["alpaca"] };
+    await f.save(original);
+    const restored = await restoreWithUnavailableSources(f);
+    const before = restored.service.getSettings();
+
+    for (const routes of [
+      { stock: ["marketdata", "alpaca"], option: ["alpaca"] },
+      { stock: ["alpaca", "marketdata"], option: ["marketdata"] },
+      { stock: ["alpaca", "marketdata"], option: ["alpaca", "marketdata"] },
+    ]) {
+      await assert.rejects(restored.save(routes, 1), hasCode("MARKET_PROVIDER_NOT_CONFIGURED"));
+    }
+    await assert.rejects(restored.save({ stock: ["new_unavailable"], option: ["alpaca"] }, 1), hasCode("INVALID_ARGUMENT"));
+    await assert.rejects(restored.save({ stock: ["new_unavailable"], option: ["alpaca"] }, 0), hasCode("MARKET_SETTINGS_CHANGED"));
+    assert.deepEqual(restored.service.getSettings(), before);
+    assert.deepEqual((await loadMarketSettings(f.database))!.routes, original);
+    assert.equal(restored.runtime.calls.length, 1);
   });
 
   it("rejects malformed, duplicate, URL, key, unknown and unsupported source choices without writing", async (t) => {

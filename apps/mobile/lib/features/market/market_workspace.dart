@@ -38,6 +38,24 @@ final marketSettingsRevisionProvider =
       MarketSettingsRevisionController.new,
     );
 
+class MarketSettingsPendingController extends Notifier<MarketRoutes?> {
+  @override
+  MarketRoutes? build() {
+    ref.watch(marketAuthenticatedClientProvider);
+    return null;
+  }
+
+  void begin(MarketRoutes routes) => state = routes;
+  void finish() => state = null;
+}
+
+/// Shared with reopened sheets while an immediate change is still committing.
+/// A different authenticated client resets it without affecting that client.
+final marketSettingsPendingProvider =
+    NotifierProvider<MarketSettingsPendingController, MarketRoutes?>(
+      MarketSettingsPendingController.new,
+    );
+
 const _sessionChanged = LyraApiError(
   code: 'AUTH_SESSION_CHANGED',
   message: '登录状态或服务端已变化，请重新打开行情设置。',
@@ -87,6 +105,7 @@ class MarketSettingsController extends AsyncNotifier<MarketSettings> {
     // operation alive so a confirmed same-session save still refreshes quotes.
     final keepAlive = ref.keepAlive();
     _saving = true;
+    ref.read(marketSettingsPendingProvider.notifier).begin(routes);
     try {
       final saved = await MarketRepository(client)
           .saveSettings(expectedRevision: expectedRevision, routes: routes);
@@ -98,7 +117,10 @@ class MarketSettingsController extends AsyncNotifier<MarketSettings> {
       state = AsyncData(saved);
       return saved;
     } finally {
-      if (_active(client, generation)) _saving = false;
+      if (_active(client, generation)) {
+        _saving = false;
+        ref.read(marketSettingsPendingProvider.notifier).finish();
+      }
       keepAlive.close();
     }
   }

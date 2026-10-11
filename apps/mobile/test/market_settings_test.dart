@@ -114,11 +114,12 @@ Future<void> _select(
   String asset,
   String id, {
   bool backup = false,
+  bool settle = true,
 }) async {
   final selector = _selector(asset, backup: backup);
   await tester.ensureVisible(selector);
   await tester.tap(selector);
-  await tester.pumpAndSettle();
+  await _finishFrames(tester, settle: settle);
   final item = find.byWidgetPredicate(
     (widget) => widget is DropdownMenuItem<String> && widget.value == id,
   );
@@ -126,22 +127,32 @@ Future<void> _select(
   final text = find.descendant(of: item, matching: find.byType(Text));
   await tester.ensureVisible(text);
   await tester.tap(text);
-  await tester.pumpAndSettle();
+  await _finishFrames(tester, settle: settle);
   expect(tester.takeException(), isNull);
 }
 
-Future<void> _save(WidgetTester tester) async {
-  final button = find.byKey(const ValueKey('market-settings-save'));
+Future<void> _finishFrames(WidgetTester tester, {bool settle = true}) async {
+  if (settle) {
+    await tester.pumpAndSettle();
+  } else {
+    for (var count = 0; count < 12; count++) {
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+  }
+}
+
+Future<void> _retryChange(WidgetTester tester) async {
+  final button = find.byKey(const ValueKey('market-settings-retry-change'));
   await tester.ensureVisible(button);
   await tester.tap(button);
   await tester.pumpAndSettle();
 }
 
-Future<void> _open(WidgetTester tester) async {
+Future<void> _open(WidgetTester tester, {bool settle = true}) async {
   final entry = find.byKey(const ValueKey('profile-market-data'));
   await tester.ensureVisible(entry);
   await tester.tap(entry);
-  await tester.pumpAndSettle();
+  await _finishFrames(tester, settle: settle);
 }
 
 void main() {
@@ -178,7 +189,7 @@ void main() {
     });
   });
 
-  testWidgets('我的入口读取动态目录，分别保存主备源并在重新打开后还原', (tester) async {
+  testWidgets('我的入口每次选择立即切源，主备分别持久化且重开后还原', (tester) async {
     final fixture = MarketSettingsFixture();
     final container = await _pump(
       tester,
@@ -192,21 +203,41 @@ void main() {
       isEmpty,
     );
     await _open(tester);
+    expect(find.byKey(const ValueKey('market-settings-save')), findsNothing);
+    expect(find.byKey(const ValueKey('market-settings-cancel')), findsNothing);
+    expect(find.text('保存'), findsNothing);
+    expect(find.text('取消'), findsNothing);
     final ledgerReads = fixture.requests
         .where((request) => request.uri.path == '/v1/ledger/positions')
         .length;
     await _select(tester, 'stock', 'second-feed');
+    expect((fixture.settings['routes']! as Map)['stock'], ['second-feed']);
+    expect(container.read(marketSettingsRevisionProvider), 1);
     await _select(tester, 'stock', 'first-feed', backup: true);
+    expect((fixture.settings['routes']! as Map)['stock'], [
+      'second-feed',
+      'first-feed',
+    ]);
     await _select(tester, 'option', 'first-feed');
-    await _save(tester);
-    expect(find.text('已保存，新的行情来源已生效。'), findsOneWidget);
-    final put = fixture.requests.singleWhere(
-      (request) => request.method == 'PUT',
+    final puts = fixture.requests
+        .where((request) => request.method == 'PUT')
+        .toList();
+    expect(puts, hasLength(3));
+    expect(puts.map((request) => (request.data as Map)['expectedRevision']), [
+      0,
+      1,
+      2,
+    ]);
+    expect(
+      puts.every(
+        (request) =>
+            request.uri.path == '/v1/market/settings' &&
+            request.headers['authorization'] == 'Bearer test-only-token',
+      ),
+      isTrue,
     );
-    expect(put.uri.path, '/v1/market/settings');
-    expect(put.headers['authorization'], 'Bearer test-only-token');
-    expect(put.data, {
-      'expectedRevision': 0,
+    expect(puts.last.data, {
+      'expectedRevision': 2,
       'routes': {
         'stock': ['second-feed', 'first-feed'],
         'option': ['first-feed'],
@@ -218,7 +249,8 @@ void main() {
       ),
       hasLength(ledgerReads),
     );
-    expect(container.read(marketSettingsRevisionProvider), 1);
+    expect(container.read(marketSettingsRevisionProvider), 3);
+    expect(find.textContaining('已生效'), findsOneWidget);
     expect(find.byType(TextField), findsNothing);
     await tester.ensureVisible(find.byTooltip('关闭'));
     await tester.tap(find.byTooltip('关闭'));
@@ -287,7 +319,7 @@ void main() {
     );
   });
 
-  testWidgets('主备不重复，取消还原草稿，关闭主来源同时清空备用', (tester) async {
+  testWidgets('主备不重复，重复选择不发送请求，关闭立即清空主备来源', (tester) async {
     final fixture = MarketSettingsFixture(
       initialSettings: MarketSettingsFixture.settingsPayload(
         stock: ['first-feed', 'second-feed'],
@@ -304,51 +336,56 @@ void main() {
     );
     await _select(tester, 'stock', 'second-feed');
     expect(_field(tester, 'stock', backup: true).initialValue, '');
-    final cancel = find.byKey(const ValueKey('market-settings-cancel'));
-    await tester.ensureVisible(cancel);
-    await tester.tap(cancel);
-    await tester.pumpAndSettle();
-    expect(_field(tester, 'stock').initialValue, 'first-feed');
-    expect(_field(tester, 'stock', backup: true).initialValue, 'second-feed');
+    expect((fixture.settings['routes']! as Map)['stock'], ['second-feed']);
+    await _select(tester, 'stock', 'second-feed');
+    expect(
+      fixture.requests.where((request) => request.method == 'PUT'),
+      hasLength(1),
+    );
+    await _select(tester, 'stock', '');
+    expect((fixture.settings['routes']! as Map)['stock'], isEmpty);
+    expect(_field(tester, 'stock', backup: true).initialValue, '');
+    expect(_field(tester, 'stock', backup: true).onChanged, isNull);
+    await _select(tester, 'option', '');
+    expect(fixture.settings['routes'], {'stock': [], 'option': []});
+    expect(fixture.settings['revision'], 3);
+  });
+
+  testWidgets('股票和期权同时含旧失效来源时可以逐类修复，不静默更改另一类', (tester) async {
+    final settings = MarketSettingsFixture.settingsPayload(
+      stock: ['removed-stock-feed'],
+      option: ['removed-option-feed'],
+    );
+    settings['effectiveRoutes'] = {'stock': [], 'option': []};
+    final fixture = MarketSettingsFixture(initialSettings: settings);
+    await _pump(tester, fixture);
+    expect(_field(tester, 'stock').initialValue, 'removed-stock-feed');
+    expect(_field(tester, 'option').initialValue, 'removed-option-feed');
+    expect(find.text('原来源已不可用'), findsWidgets);
     expect(
       fixture.requests.where((request) => request.method == 'PUT'),
       isEmpty,
     );
-    await _select(tester, 'stock', '');
-    await _select(tester, 'option', '');
-    expect(_field(tester, 'stock', backup: true).initialValue, '');
-    expect(_field(tester, 'stock', backup: true).onChanged, isNull);
-    await _save(tester);
-    expect(fixture.settings['routes'], {'stock': [], 'option': []});
-  });
-
-  testWidgets('失效的已保存来源保留显示，必须主动改选才能保存', (tester) async {
-    final settings = MarketSettingsFixture.settingsPayload(
-      stock: ['removed-feed'],
-    );
-    settings['effectiveRoutes'] = {
-      'stock': [],
-      'option': ['second-feed'],
-    };
-    final fixture = MarketSettingsFixture(initialSettings: settings);
-    await _pump(tester, fixture);
-    expect(_field(tester, 'stock').initialValue, 'removed-feed');
-    expect(find.text('原来源已不可用'), findsWidgets);
-    expect(
-      tester
-          .widget<FilledButton>(
-            find.byKey(const ValueKey('market-settings-save')),
-          )
-          .onPressed,
-      isNull,
-    );
     await _select(tester, 'stock', 'first-feed');
-    await _save(tester);
-    expect((fixture.settings['routes']! as Map)['stock'], ['first-feed']);
+    expect(fixture.settings['routes'], {
+      'stock': ['first-feed'],
+      'option': ['removed-option-feed'],
+    });
+    expect(_field(tester, 'option').initialValue, 'removed-option-feed');
+    await _select(tester, 'option', 'second-feed');
+    expect(fixture.settings['routes'], {
+      'stock': ['first-feed'],
+      'option': ['second-feed'],
+    });
+    expect(fixture.settings['revision'], 2);
+    expect(
+      fixture.requests.where((request) => request.method == 'PUT'),
+      hasLength(2),
+    );
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('来源读取失败可以重试，不依赖持仓读取成功', (tester) async {
+  testWidgets('来源读取失败可以重试，账本读取失败时仍可立即切源', (tester) async {
     final fixture = MarketSettingsFixture()..failRead = true;
     fixture.failures.add('positions');
     await _pump(tester, fixture, page: const Scaffold(body: ProfileScreen()));
@@ -359,25 +396,37 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('market-settings-retry')));
     await tester.pumpAndSettle();
     await _select(tester, 'stock', 'second-feed');
-    await _save(tester);
-    expect(find.text('已保存，新的行情来源已生效。'), findsOneWidget);
+    expect((fixture.settings['routes']! as Map)['stock'], ['second-feed']);
+    expect(find.textContaining('已生效'), findsOneWidget);
   });
 
-  testWidgets('保存失败保留选择与旧报价状态，重试成功后才推进设置版本', (tester) async {
+  testWidgets('切换失败恢复已确认来源，重试成功后才推进版本', (tester) async {
     final fixture = MarketSettingsFixture()
       ..saveFailure = (code: 'QUERY_FAILED', status: 503);
     final container = await _pump(tester, fixture);
     await _select(tester, 'stock', 'second-feed');
-    await _save(tester);
-    expect(find.textContaining('保存失败，选择已保留'), findsOneWidget);
-    expect(find.text('已保存，新的行情来源已生效。'), findsNothing);
-    expect(_field(tester, 'stock').initialValue, 'second-feed');
+    expect(find.textContaining('未能确认切换'), findsOneWidget);
+    expect(find.textContaining('已生效'), findsNothing);
+    expect(_field(tester, 'stock').initialValue, 'first-feed');
     expect(container.read(marketSettingsRevisionProvider), 0);
     expect((fixture.settings['routes']! as Map)['stock'], ['first-feed']);
+    // The result was uncertain: the same target may already have reached the
+    // server before the user retries. Replay the original expectedRevision.
+    fixture.settings = MarketSettingsFixture.settingsPayload(
+      revision: 1,
+      stock: ['second-feed'],
+    );
     fixture.saveFailure = null;
-    await _save(tester);
+    await _retryChange(tester);
+    expect(_field(tester, 'stock').initialValue, 'second-feed');
     expect(container.read(marketSettingsRevisionProvider), 1);
-    expect(find.text('已保存，新的行情来源已生效。'), findsOneWidget);
+    expect(
+      fixture.requests
+          .where((request) => request.method == 'PUT')
+          .map((request) => (request.data as Map)['expectedRevision']),
+      [0, 0],
+    );
+    expect(find.textContaining('已生效'), findsOneWidget);
   });
 
   testWidgets('旧服务端没有设置接口时明确提示更新版本', (tester) async {
@@ -389,22 +438,34 @@ void main() {
     expect(find.textContaining('请检查服务端连接'), findsNothing);
   });
 
-  testWidgets('409 保留草稿并要求重新加载，不自动覆盖另一设备选择', (tester) async {
+  testWidgets('409 恢复确认值并要求重新加载，不自动覆盖另一设备选择', (tester) async {
     final fixture = MarketSettingsFixture();
     await _pump(tester, fixture);
-    await _select(tester, 'stock', 'second-feed');
     fixture.settings = MarketSettingsFixture.settingsPayload(
       revision: 1,
       stock: [],
       option: ['first-feed'],
     );
-    await _save(tester);
+    await _select(tester, 'stock', 'second-feed');
     expect(find.textContaining('其他设备已修改行情来源'), findsOneWidget);
-    expect(_field(tester, 'stock').initialValue, 'second-feed');
+    expect(_field(tester, 'stock').initialValue, 'first-feed');
     expect(
       fixture.requests.where((request) => request.method == 'PUT'),
       hasLength(1),
     );
+    expect(
+      fixture.requests.where(
+        (request) =>
+            request.uri.path == '/v1/market/settings' &&
+            request.method == 'GET',
+      ),
+      hasLength(1),
+    );
+    expect(
+      find.byKey(const ValueKey('market-settings-retry-change')),
+      findsNothing,
+    );
+    expect(_field(tester, 'stock').onChanged, isNull);
     await tester.ensureVisible(
       find.byKey(const ValueKey('market-settings-reload')),
     );
@@ -413,22 +474,24 @@ void main() {
     expect(_field(tester, 'stock').initialValue, '');
     expect(_field(tester, 'option').initialValue, 'first-feed');
     await _select(tester, 'stock', 'second-feed');
-    await _save(tester);
     final put = fixture.requests.lastWhere(
       (request) => request.method == 'PUT',
     );
     expect((put.data as Map)['expectedRevision'], 1);
-    expect(find.text('已保存，新的行情来源已生效。'), findsOneWidget);
+    expect(find.textContaining('已生效'), findsOneWidget);
   });
 
-  testWidgets('缺少凭据错误保留草稿，并可重新加载最新配置状态', (tester) async {
+  testWidgets('缺少凭据时恢复已确认来源，重载后采用最新配置状态', (tester) async {
     final fixture = MarketSettingsFixture()
       ..saveFailure = (code: 'MARKET_PROVIDER_NOT_CONFIGURED', status: 400);
     await _pump(tester, fixture);
     await _select(tester, 'stock', 'second-feed');
-    await _save(tester);
     expect(find.textContaining('所选来源尚未配置'), findsOneWidget);
-    expect(_field(tester, 'stock').initialValue, 'second-feed');
+    expect(_field(tester, 'stock').initialValue, 'first-feed');
+    expect(
+      find.byKey(const ValueKey('market-settings-retry-change')),
+      findsNothing,
+    );
     fixture.settings = MarketSettingsFixture.settingsPayload(
       option: [],
       secondConfigured: false,
@@ -447,55 +510,42 @@ void main() {
     );
   });
 
-  testWidgets('保存等待期间禁止重复提交、取消或变更选择', (tester) async {
+  testWidgets('切换等待期间禁用所有选择且不重复提交，成功后恢复操作', (tester) async {
     final gate = Completer<void>();
     final fixture = MarketSettingsFixture()..saveResponseGate = gate;
     await _pump(tester, fixture);
-    await _select(tester, 'stock', 'second-feed');
-    await _save(tester);
-    expect(find.text('保存中…'), findsOneWidget);
-    expect(
-      tester
-          .widget<FilledButton>(
-            find.byKey(const ValueKey('market-settings-save')),
-          )
-          .onPressed,
-      isNull,
-    );
-    expect(
-      tester
-          .widget<OutlinedButton>(
-            find.byKey(const ValueKey('market-settings-cancel')),
-          )
-          .onPressed,
-      isNull,
-    );
+    await _select(tester, 'stock', 'second-feed', settle: false);
+    expect(find.text('正在切换…'), findsOneWidget);
+    expect(find.byKey(const ValueKey('market-settings-save')), findsNothing);
+    expect(find.byKey(const ValueKey('market-settings-cancel')), findsNothing);
     expect(_field(tester, 'stock').onChanged, isNull);
+    expect(_field(tester, 'option').onChanged, isNull);
+    expect(_field(tester, 'stock', backup: true).onChanged, isNull);
     expect(
       fixture.requests.where((request) => request.method == 'PUT'),
       hasLength(1),
     );
     gate.complete();
     await tester.pumpAndSettle();
-    expect(find.text('已保存，新的行情来源已生效。'), findsOneWidget);
+    expect(find.text('正在切换…'), findsNothing);
+    expect(_field(tester, 'option').onChanged, isNotNull);
+    expect(find.textContaining('已生效'), findsOneWidget);
   });
 
-  testWidgets('同会话刷新账本不丢失保存中的草稿与成功结果', (tester) async {
+  testWidgets('同会话刷新账本不打断正在切换的来源与成功结果', (tester) async {
     final gate = Completer<void>();
     final fixture = MarketSettingsFixture()..saveResponseGate = gate;
     final container = await _pump(tester, fixture);
     final client = container.read(marketAuthenticatedClientProvider);
-    await _select(tester, 'stock', 'second-feed');
-    await _save(tester);
+    await _select(tester, 'stock', 'second-feed', settle: false);
     final refreshing = container.read(sessionProvider.notifier).refreshLedger();
-    await tester.pumpAndSettle();
+    await _finishFrames(tester, settle: false);
     expect(await refreshing, isTrue);
     expect(
       identical(client, container.read(marketAuthenticatedClientProvider)),
       isTrue,
     );
-    expect(find.text('保存中…'), findsOneWidget);
-    expect(_field(tester, 'stock').initialValue, 'second-feed');
+    expect(find.text('正在切换…'), findsOneWidget);
     expect(
       fixture.requests.where(
         (request) =>
@@ -506,11 +556,12 @@ void main() {
     );
     gate.complete();
     await tester.pumpAndSettle();
+    expect(_field(tester, 'stock').initialValue, 'second-feed');
     expect(container.read(marketSettingsRevisionProvider), 1);
-    expect(find.text('已保存，新的行情来源已生效。'), findsOneWidget);
+    expect(find.textContaining('已生效'), findsOneWidget);
   });
 
-  testWidgets('保存后刷新所有行情查询，旧来源迟到响应不能覆盖新版本', (tester) async {
+  testWidgets('选择即刷新所有行情查询，旧来源迟到响应不能覆盖新版本', (tester) async {
     final fixture = MarketSettingsFixture();
     final container = await _pump(tester, fixture);
     final gate = Completer<void>();
@@ -535,7 +586,6 @@ void main() {
       hasLength(2),
     );
     await _select(tester, 'stock', 'second-feed');
-    await _save(tester);
     final fresh = container
         .read(marketPositionsProvider(allQuery))
         .requireValue;
@@ -586,7 +636,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('保存中关闭面板仍接收同会话成功结果并淘汰旧行情', (tester) async {
+  testWidgets('切换中关闭重开仍禁用选择，关闭后成功也淘汰旧行情', (tester) async {
     final fixture = MarketSettingsFixture();
     final container = await _pump(
       tester,
@@ -603,27 +653,28 @@ void main() {
     final quoteGate = Completer<void>();
     fixture.nextPositionGate = quoteGate;
     container.invalidate(marketPositionsProvider(query));
-    for (var count = 0; count < 10; count++) {
-      await tester.pump(const Duration(milliseconds: 30));
-    }
-    // The settings controls remain usable while the independent quote read waits.
-    final controller = container.read(marketSettingsProvider.notifier);
-    final saveGate = Completer<void>();
-    fixture.saveResponseGate = saveGate;
-    final save = controller.save(
-      expectedRevision: 0,
-      routes: MarketRoutes(stock: ['second-feed'], option: ['first-feed']),
-    );
-    for (var count = 0; count < 4; count++) {
-      await tester.pump(const Duration(milliseconds: 30));
-    }
+    await _finishFrames(tester, settle: false);
+    final switchGate = Completer<void>();
+    fixture.saveResponseGate = switchGate;
+    await _select(tester, 'stock', 'second-feed', settle: false);
+    expect(find.text('正在切换…'), findsOneWidget);
     await tester.ensureVisible(find.byTooltip('关闭'));
     await tester.tap(find.byTooltip('关闭'));
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('market-source-settings')), findsNothing);
-    saveGate.complete();
+    await _open(tester, settle: false);
+    expect(find.text('正在切换…'), findsOneWidget);
+    expect(_field(tester, 'stock').onChanged, isNull);
+    expect(_field(tester, 'option').onChanged, isNull);
+    expect(
+      fixture.requests.where((request) => request.method == 'PUT'),
+      hasLength(1),
+    );
+    await tester.ensureVisible(find.byTooltip('关闭'));
+    await tester.tap(find.byTooltip('关闭'));
     await tester.pumpAndSettle();
-    expect((await save).revision, 1);
+    switchGate.complete();
+    await tester.pumpAndSettle();
     expect(container.read(marketSettingsRevisionProvider), 1);
     expect(
       container
@@ -647,16 +698,15 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  for (final pending in ['read', 'save']) {
+  for (final pending in ['read', 'switch']) {
     testWidgets('切换服务端后忽略旧会话迟到的设置 $pending 响应', (tester) async {
       final gate = Completer<void>();
       final fixture = MarketSettingsFixture();
       if (pending == 'read') fixture.nextReadGate = gate;
       final container = await _pump(tester, fixture, settle: pending != 'read');
-      if (pending == 'save') {
+      if (pending == 'switch') {
         fixture.saveResponseGate = gate;
-        await _select(tester, 'stock', 'second-feed');
-        await _save(tester);
+        await _select(tester, 'stock', 'second-feed', settle: false);
       }
       final other = MarketSettingsFixture(
         initialSettings: MarketSettingsFixture.settingsPayload(
@@ -688,7 +738,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(_field(tester, 'stock').initialValue, '');
       expect(container.read(marketSettingsRevisionProvider), 0);
-      expect(find.text('已保存，新的行情来源已生效。'), findsNothing);
+      expect(find.textContaining('已生效'), findsNothing);
       expect(
         other.requests
             .where((request) => request.uri.path == '/v1/market/settings')
@@ -700,7 +750,7 @@ void main() {
     });
   }
 
-  testWidgets('320 宽大字号下可操作所有选择与保存，空持仓不阻断设置', (tester) async {
+  testWidgets('320 宽大字号下可立即切源，空持仓不阻断设置', (tester) async {
     final fixture = MarketSettingsFixture(
       emptyPositions: true,
       initialSettings: MarketSettingsFixture.settingsPayload(
@@ -718,9 +768,14 @@ void main() {
     await _open(tester);
     await _select(tester, 'stock', 'second-feed');
     await _select(tester, 'option', 'first-feed');
-    await _save(tester);
-    expect(find.text('已保存，新的行情来源已生效。'), findsOneWidget);
+    expect(fixture.settings['routes'], {
+      'stock': ['second-feed'],
+      'option': ['first-feed'],
+    });
+    expect(fixture.settings['revision'], 2);
+    expect(find.textContaining('已生效'), findsOneWidget);
     expect(find.textContaining('暂无持仓'), findsOneWidget);
+    expect(find.text('保存'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 

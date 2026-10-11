@@ -91,7 +91,7 @@ Future<void> _capture(WidgetTester tester, GlobalKey key, String name) async {
     final image = await boundary.toImage(pixelRatio: 2);
     try {
       final data = await image.toByteData(format: ui.ImageByteFormat.png);
-      await File('$_directory/market-settings-20261011-$name.png').writeAsBytes(
+      await File('$_directory/market-settings-instant-20261011-$name.png').writeAsBytes(
         data!.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
         flush: true,
       );
@@ -195,6 +195,9 @@ void main() {
       await tester.tap(entry);
       await tester.pumpAndSettle();
       await _choose(tester, 'stock', 'second-feed', backup: true);
+      expect(fixture.settings['revision'], 1);
+      expect(find.text('保存'), findsNothing);
+      expect(find.text('取消'), findsNothing);
       if (scenario.name == '390') {
         await tester.ensureVisible(find.byTooltip('关闭'));
         await _capture(tester, boundaryKey, scenario.name);
@@ -203,7 +206,7 @@ void main() {
         await _capture(tester, boundaryKey, '390-picker');
       } else {
         await Scrollable.ensureVisible(
-          tester.element(find.byKey(const ValueKey('market-settings-save'))),
+          tester.element(_field('option', backup: true)),
           alignment: 1,
         );
         await _capture(tester, boundaryKey, scenario.name);

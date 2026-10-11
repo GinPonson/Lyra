@@ -79,14 +79,54 @@ class MarketSettingsFixture extends MarketFixture {
               final failure = saveFailure;
               if (failure != null) return _error(failure.code, failure.status);
               final data = (options.data as Map).cast<String, Object?>();
+              if (jsonEncode(data['routes']) ==
+                  jsonEncode(settings['routes'])) {
+                return _body(_clone(settings));
+              }
               if (data['expectedRevision'] != settings['revision']) {
                 return _error('MARKET_SETTINGS_CHANGED', 409);
+              }
+              final requested = data['routes']! as Map;
+              final previous = settings['routes']! as Map;
+              for (final asset in ['stock', 'option']) {
+                final next = requested[asset]! as List;
+                final before = previous[asset]! as List;
+                for (var index = 0; index < next.length; index++) {
+                  if (index < before.length && next[index] == before[index]) {
+                    continue;
+                  }
+                  final candidates = (settings['providers']! as List)
+                      .cast<Map>()
+                      .where(
+                        (source) =>
+                            source['id'] == next[index] &&
+                            (source['assetTypes']! as List).contains(asset),
+                      );
+                  if (candidates.isEmpty) {
+                    return _error('INVALID_ARGUMENT', 400);
+                  }
+                  if (candidates.single['configured'] != true) {
+                    return _error('MARKET_PROVIDER_NOT_CONFIGURED', 400);
+                  }
+                }
               }
               settings = {
                 ...settings,
                 'revision': (settings['revision']! as int) + 1,
                 'routes': data['routes'],
-                'effectiveRoutes': data['routes'],
+                'effectiveRoutes': {
+                  for (final asset in ['stock', 'option'])
+                    asset: [
+                      for (final id in requested[asset]! as List)
+                        if ((settings['providers']! as List).cast<Map>().any(
+                          (source) =>
+                              source['id'] == id &&
+                              source['configured'] == true &&
+                              (source['assetTypes']! as List).contains(asset),
+                        ))
+                          id,
+                    ],
+                },
                 'updatedAt': '2026-10-11T04:00:00.000Z',
               };
               final saved = _clone(settings);
