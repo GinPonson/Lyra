@@ -1,0 +1,18 @@
+{
+    # Proxy error logs may contain request URIs even with access logging off.
+    # Remove the URI from the default logger so OAuth code/state stay out.
+    log default {
+        format filter {
+            wrap json
+            fields {
+                request>uri delete
+            }
+        }
+    }
+}
+
+{$LYRA_DOMAIN} {
+    # Caddy handles HTTP->HTTPS, certificate renewal, and WebSocket upgrades.
+    # Keep access logging disabled; the global filter covers runtime errors too.
+    reverse_proxy lyra:3141
+}

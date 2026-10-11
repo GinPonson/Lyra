@@ -13,6 +13,7 @@ import {
 import { AgentTurnOrchestrator } from "./application/index.js";
 import { createGenkitRuntimeFromEnvironment } from "./infrastructure/agents/genkit-runtime.js";
 import { loadGoogleLoginConfig } from "./infrastructure/auth/google-login-client.js";
+import { environmentSchema } from "./infrastructure/config/server-environment.js";
 import { GoogleLoginService } from "./application/google-login-service.js";
 import { registerGoogleLoginRoutes } from "./transport/google-login-routes.js";
 import { openLyraDatabase } from "./infrastructure/db/database.js";
@@ -31,18 +32,6 @@ import { registerGmailRoutes } from "./transport/gmail-routes.js";
 import { registerDeviceRoutes } from "./transport/device-routes.js";
 import { ImportService, GmailService, GmailSyncService, DevicePairingService } from "./application/index.js";
 import { SecretCipher } from "./infrastructure/security/index.js";
-
-const environmentSchema = z.object({
-  LYRA_HOST: z.string().trim().min(1).default("127.0.0.1"),
-  LYRA_PORT: z.coerce.number().int().min(1).max(65_535).default(3_141),
-  LYRA_DATABASE_PATH: z.string().trim().min(1),
-  LYRA_IMPORT_STAGING_DIR: z.string().trim().min(1),
-  /** 32 字节 hex 主密钥；Gmail refresh token 等敏感数据经 AES-256-GCM 加密。 */
-  LYRA_SECRET_MASTER_KEY: z.string().regex(/^[0-9a-fA-F]{64}$/),
-  LYRA_GOOGLE_CLIENT_ID: z.string().trim().min(1).default(""),
-  LYRA_GOOGLE_CLIENT_SECRET: z.string().trim().min(1).default(""),
-  LYRA_GOOGLE_REDIRECT_URI: z.string().trim().min(1).default(""),
-});
 
 const packageSchema = z.object({
   version: z.string().trim().min(1),

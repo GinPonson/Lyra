@@ -11,6 +11,8 @@
 
 部署、模型配置、Google OAuth 设置及升级步骤见 **[Genkit 与 Google 登录](docs/genkit-oauth.md)**。
 
+VPS 的 Docker Compose、HTTPS 代理、配置预检、备份与手机联调命令见 **[服务端部署](docs/deployment.md)**。容器启动会先检查配置，再打开数据库。
+
 ## 服务端开发
 
 需要 Node.js 22 或更高版本。在仓库根目录执行：

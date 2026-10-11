@@ -122,6 +122,8 @@ App 主导航为「总览、股票、交易、我的」。「我的」统一显�
 
 ## 7. 启动与升级
 
+VPS 部署可使用已提供的 Dockerfile、Compose 与 Caddy 模板，具体命令见 [服务端部署](deployment.md)。其配置预检不打开数据库；下面保留直接运行 Node 的方式。
+
 环境变量模板见 [`server/.env.example`](../server/.env.example)。以下命令均从仓库根目录执行：
 
 ```bash
@@ -160,7 +162,7 @@ Genkit 集成验证使用 Genkit 的真实工具循环、可控假模型、真�
 
 本轮用户页面已执行 `flutter pub get` 并保存真实解析的锁文件，新增兼容现有平台依赖的 `package_info_plus 9.0.1`；`flutter analyze --no-pub` 零问题，`flutter test --no-pub --reporter expanded --timeout 60s` **162 项全部通过**。新增 71 项覆盖金额隐私与图表配色、持久偏好、启动账户恢复、用户页面及连接管理；原有 91 项继续通过。检查期间修复了启动读取失败后手动选择仍无法查询，以及偏好保存失败后服务端地址退回默认值的恢复路径。该批改动没有修改服务端，117 套件 / 279 项为上一轮服务端完整回归结果。
 
-本轮用户页面 Android 调试 APK 已通过 `flutter build apk --debug --no-pub` 构建，版本 `1.0.0` / versionCode **2**，167,030,491 字节；元数据解析与 `apksigner verify` 通过。产物位于 `apps/mobile/build/app/outputs/flutter-apk/app-debug.apk`，使用开发签名，尚未进行真机安装与运行验收。实际 Flutter 组件已完成手机、放大字体与宽屏渲染检查。真实 Google 浏览器登录、真实模型供应商及手机完整联调仍需要部署配置，不能用受控测试代替。
+最新深色界面 Android 调试 APK 已通过 `flutter build apk --debug --no-pub` 构建，版本 `1.0.0` / versionCode **3**，167,049,415 字节；元数据解析与 `apksigner verify` 通过。产物位于 `apps/mobile/build/app/outputs/flutter-apk/app-debug.apk`，使用开发签名，尚未进行真机安装与运行验收。实际 Flutter 组件已完成手机、放大字体与宽屏渲染检查。真实 Google 浏览器登录、真实模型供应商及手机完整联调仍需要部署配置，不能用受控测试代替。
 
 最新执行结果记录在 [`docs/progress.md`](progress.md)。这些待验证项完成前，保持迁移 PR 为草稿。
 

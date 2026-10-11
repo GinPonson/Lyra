@@ -1,0 +1,68 @@
+name: lyra
+
+services:
+  lyra:
+    image: lyra-server:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        NODE_IMAGE: ${LYRA_NODE_IMAGE:-node:24-bookworm-slim}
+    env_file:
+      - path: ./server.env
+        format: raw
+    environment:
+      NODE_ENV: production
+      LYRA_HOST: 0.0.0.0
+      LYRA_PORT: "3141"
+      LYRA_DATABASE_PATH: /var/lib/lyra/lyra.duckdb
+      LYRA_IMPORT_STAGING_DIR: /tmp/lyra-import-staging
+      LYRA_PUBLIC_ORIGIN: https://${LYRA_DOMAIN:?Set LYRA_DOMAIN in deploy/.env}
+    ports:
+      - "127.0.0.1:3141:3141"
+    volumes:
+      - ledger_data:/var/lib/lyra
+    tmpfs:
+      - /tmp:mode=1777,size=268435456
+    read_only: true
+    init: true
+    restart: unless-stopped
+    # Covers the allowed 600s turn timeout plus shutdown/write-queue overhead.
+    stop_grace_period: 11m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: ${LYRA_CADDY_IMAGE:-caddy:2-alpine}
+    profiles: [https]
+    environment:
+      LYRA_DOMAIN: ${LYRA_DOMAIN:?Set LYRA_DOMAIN in deploy/.env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      lyra:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ledger_data:
+  caddy_data:
+  caddy_config:

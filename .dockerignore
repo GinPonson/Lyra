@@ -1,0 +1,20 @@
+# Only the locked server build inputs enter the Docker context.
+**
+!package.json
+!package-lock.json
+!server/
+!server/package.json
+!server/tsconfig.json
+!server/scripts/
+!server/scripts/**
+!server/src/
+!server/src/**
+!server/test/
+!server/test/**
+**/node_modules/
+**/dist/
+**/.env
+**/.env.*
+**/*.duckdb
+**/*.duckdb.wal
+**/*.upload

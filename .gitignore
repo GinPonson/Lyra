@@ -21,6 +21,8 @@ uploads/
 .env.*
 !.env.example
 application-gin.yml
+deploy/server.env
+deploy/backups/
 
 # IDE and operating-system files
 .DS_Store
