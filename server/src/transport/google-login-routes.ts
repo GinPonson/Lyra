@@ -49,7 +49,8 @@ export function registerGoogleLoginRoutes(app: FastifyInstance, options: GoogleL
     if (!body.success) {
       throw invalidArgument();
     }
-    return reply.code(201).send(service().start(body.data));
+    // `/start` 无凭据：按来源限流，避免单一来源批量创建登录事务。
+    return reply.code(201).send(service().start(body.data, request.ip));
   });
 
   app.post("/v1/auth/google/exchange", async (request, reply) => {

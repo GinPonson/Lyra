@@ -14,7 +14,12 @@ import { ApplicationError } from "./app-error.js";
 import type { DevicePairingHttpResponse, DevicePairingService } from "./device-pairing-service.js";
 
 const LOGIN_TTL_MILLISECONDS = 10 * 60 * 1_000;
+/** 终态事务的保留时长：短暂保留可让重放得到准确的 409/410，随后立即释放容量。 */
+const TERMINAL_RETENTION_MILLISECONDS = 60 * 1_000;
 const MAX_LOGIN_ATTEMPTS = 128;
+/** 单个来源的滚动窗口限流；`/start` 无凭据，必须防止单点占满全局容量。 */
+const SOURCE_WINDOW_MILLISECONDS = 60 * 1_000;
+const MAX_STARTS_PER_SOURCE_WINDOW = 20;
 
 export interface GoogleLoginStartInput {
   displayName: string;
@@ -43,6 +48,8 @@ interface LoginAttempt {
   publicKeyPem: string;
   displayName: string;
   expiresAt: number;
+  /** 进入 consumed/failed 的时间；null 表示仍在进行中。 */
+  terminatedAt: number | null;
   status: "pending" | "verifying" | "approved" | "exchanging" | "consumed" | "failed";
   identity: GoogleLoginIdentity | null;
   error: ApplicationError | null;
@@ -60,6 +67,8 @@ export class GoogleLoginService {
   readonly #now: () => Date;
   readonly #attempts = new Map<string, LoginAttempt>();
   readonly #states = new Map<string, string>();
+  /** 每个来源在滚动窗口内的 /start 时间戳，用于无凭据端点的限流。 */
+  readonly #sourceStarts = new Map<string, number[]>();
 
   constructor(input: {
     config: GoogleLoginConfig;
@@ -74,7 +83,7 @@ export class GoogleLoginService {
     this.#now = input.now ?? (() => new Date());
   }
 
-  start(input: GoogleLoginStartInput): GoogleLoginStartResponse {
+  start(input: GoogleLoginStartInput, sourceKey?: string): GoogleLoginStartResponse {
     if (
       input.codeChallengeMethod !== "S256"
       || !/^[A-Za-z\d_-]{43}$/u.test(input.codeChallenge)
@@ -97,10 +106,16 @@ export class GoogleLoginService {
       });
     }
     this.#pruneExpired();
-    if (this.#attempts.size >= MAX_LOGIN_ATTEMPTS) {
-      throw new ApplicationError({
-        code: "LOGIN_RATE_LIMITED", message: "登录请求过多，请稍后重试", statusCode: 429, retryable: true,
-      });
+    this.#assertSourceBudget(sourceKey);
+    // 容量被滥用时淘汰最早的事务，而不是对所有人返回 429：否则未认证的
+    // 攻击者只要占满 128 个槽位，就能让所有者永久无法发起新登录。
+    // 淘汰顺序按 Map 的插入顺序（最早优先），最新请求始终可以继续。
+    while (this.#attempts.size >= MAX_LOGIN_ATTEMPTS) {
+      const oldest = this.#attempts.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.#dropAttempt(oldest);
     }
     const now = this.#now();
     const state = randomBytes(32).toString("base64url");
@@ -115,6 +130,7 @@ export class GoogleLoginService {
       publicKeyPem,
       displayName: input.displayName.trim(),
       expiresAt: now.getTime() + LOGIN_TTL_MILLISECONDS,
+      terminatedAt: null,
       status: "pending",
       identity: null,
       error: null,
@@ -168,6 +184,7 @@ export class GoogleLoginService {
       attempt.status = "approved";
     } catch (error: unknown) {
       attempt.status = "failed";
+      attempt.terminatedAt = this.#now().getTime();
       attempt.error = error instanceof ApplicationError ? error : loginFailed();
       throw attempt.error;
     }
@@ -203,10 +220,12 @@ export class GoogleLoginService {
         displayName: attempt.displayName,
       });
       attempt.status = "consumed";
+      attempt.terminatedAt = this.#now().getTime();
       attempt.identity = null;
       return { status: "complete", ...credentials, user: identity };
     } catch (error: unknown) {
       attempt.status = "failed";
+      attempt.terminatedAt = this.#now().getTime();
       attempt.identity = null;
       attempt.error = error instanceof ApplicationError ? error : loginFailed();
       throw attempt.error;
@@ -231,11 +250,55 @@ export class GoogleLoginService {
   #pruneExpired(): void {
     const now = this.#now().getTime();
     for (const attempt of this.#attempts.values()) {
-      if (now >= attempt.expiresAt) {
-        this.#attempts.delete(attempt.id);
-        this.#states.delete(attempt.stateHash);
+      const expired = now >= attempt.expiresAt;
+      // 终态事务只短暂保留，否则一次正常登录会占用全局容量直到 TTL 结束。
+      const finished = attempt.terminatedAt !== null
+        && now >= attempt.terminatedAt + TERMINAL_RETENTION_MILLISECONDS;
+      if (expired || finished) {
+        this.#dropAttempt(attempt.id);
       }
     }
+    // 顺手清空已无时间戳的来源窗口，避免限流表随来源数无限增长。
+    for (const [source, timestamps] of this.#sourceStarts) {
+      const recent = timestamps.filter((at) => now - at < SOURCE_WINDOW_MILLISECONDS);
+      if (recent.length === 0) {
+        this.#sourceStarts.delete(source);
+      } else if (recent.length !== timestamps.length) {
+        this.#sourceStarts.set(source, recent);
+      }
+    }
+  }
+
+  /** 释放一个事务：同时移除登录 ID 与 state 哈希两个索引，避免残留。 */
+  #dropAttempt(loginId: string): void {
+    const attempt = this.#attempts.get(loginId);
+    if (attempt === undefined) {
+      return;
+    }
+    this.#attempts.delete(loginId);
+    this.#states.delete(attempt.stateHash);
+  }
+
+  /**
+   * 无凭据端点的单来源滚动窗口限流。
+   *
+   * `/start` 生成 state/nonce 与 Google 授权 URL，必须防止单一来源在窗口内
+   * 批量创建事务（容量已改为淘汰最早事务，限流用于压制攻击节奏）。
+   */
+  #assertSourceBudget(sourceKey: string | undefined): void {
+    if (sourceKey === undefined || sourceKey.length === 0) {
+      return;
+    }
+    const now = this.#now().getTime();
+    const recent = (this.#sourceStarts.get(sourceKey) ?? [])
+      .filter((at) => now - at < SOURCE_WINDOW_MILLISECONDS);
+    if (recent.length >= MAX_STARTS_PER_SOURCE_WINDOW) {
+      throw new ApplicationError({
+        code: "LOGIN_RATE_LIMITED", message: "登录请求过多，请稍后重试", statusCode: 429, retryable: true,
+      });
+    }
+    recent.push(now);
+    this.#sourceStarts.set(sourceKey, recent);
   }
 }
 
