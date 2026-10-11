@@ -315,7 +315,8 @@ describe("Market data identifier and HTTP boundary", () => {
   });
 
   it("maps HTTP authentication, throttling, redirects and failures without leaking response bodies", async () => {
-    const cases = [[401, "credentials_rejected"], [403, "credentials_rejected"], [429, "rate_limited"],
+    // 403 在这两个供应商处通常表示缺少 SIP / OPRA 权限，不是密钥失效，故不报 credentials_rejected。
+    const cases = [[401, "credentials_rejected"], [403, "provider_unavailable"], [429, "rate_limited"],
       [500, "provider_unavailable"], [302, "provider_unavailable"], [404, "provider_unavailable"]] as const;
     for (const create of [alpaca, marketData]) {
       for (const [status, reason] of cases) {

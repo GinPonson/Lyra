@@ -62,7 +62,10 @@ export async function requestMarketJson(
 
 /** No provider body or transport exception is copied into a user-visible error. */
 function httpFailure(status: number): MarketQuoteIssue | null {
-  if (status === 401 || status === 403) return "credentials_rejected";
+  // 401 才是密钥无效；403 在这些供应商处通常表示账号缺少 SIP / OPRA 权限，
+  // 归为来源不可用，避免把权限缺失误报成需要更换凭据。
+  if (status === 401) return "credentials_rejected";
+  if (status === 403) return "provider_unavailable";
   if (status === 429) return "rate_limited";
   if (status === 200 || status === 203 || status === 404) return null;
   return "provider_unavailable";

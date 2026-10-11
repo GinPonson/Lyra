@@ -73,13 +73,13 @@ export async function createMarketPositionView(
     if (source === undefined || currency === undefined) {
       throw new Error("持仓公开投影与账户币种范围不一致");
     }
-    if (!source.quantity.isFinite() || !source.quantity.gt(0)
-      || !source.cost.isFinite() || source.cost.lt(0)
-      || (source.direction !== "long" && source.direction !== "short")) {
-      throw new RangeError("持仓数量、历史成本或方向无效");
-    }
-    const instrument = currency === "USD" ? positionInstrument(source) : null;
-    return { position, source, currency, instrument };
+    // 单行数量、历史成本或方向异常只降级该行：本层对缺价已经宽容，不能因为一行坏数据
+    // 让整份组合估值 500。降级行不发请求，并按 unsupported_instrument 标的不可估值。
+    const valid = source.quantity.isFinite() && source.quantity.gt(0)
+      && source.cost.isFinite() && !source.cost.lt(0)
+      && (source.direction === "long" || source.direction === "short");
+    const instrument = valid && currency === "USD" ? positionInstrument(source) : null;
+    return { position, source, currency, instrument, valid };
   });
   const instruments = new Map<string, MarketInstrument>();
   for (const { instrument } of prepared) {
@@ -88,10 +88,10 @@ export async function createMarketPositionView(
   // A source switch during a queued portfolio read must not mix routing revisions.
   const snapshot = reader.snapshot?.() ?? reader;
   const lookups = await readQuotes(instruments, snapshot);
-  const rows: MarketPosition[] = prepared.map(({ position, source, currency, instrument }) => {
+  const rows: MarketPosition[] = prepared.map(({ position, source, currency, instrument, valid }) => {
     const instrumentKey = instrument === null ? null : marketInstrumentKey(instrument);
     const quote = instrumentKey === null
-      ? unavailable(currency === "USD" ? "unsupported_instrument" : "currency_unsupported")
+      ? unavailable(valid && currency !== "USD" ? "currency_unsupported" : "unsupported_instrument")
       : lookups.get(instrumentKey) ?? unavailable("provider_unavailable");
     const multiplier = instrument === null ? null : instrument.assetType === "option" ? "100" : "1";
     let marketValue: string | null = null;

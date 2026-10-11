@@ -29,7 +29,7 @@ flowchart TD
 | 设置保存 | 设备鉴权、版本冲突、DuckDB 持久化与热切换 | `server/src/application/market-settings-service.ts`、`server/src/infrastructure/db/market-settings-repository.ts` |
 | 移动端 | 读取标准结果、匹配当前持仓、展示时间与隐私状态 | `apps/mobile/lib/features/market/` |
 
-App 使用已鉴权的 `GET /v1/market/positions?scope=all`，可带 `underlying` 筛选；单账户范围沿用现有 `scope` 规则。协议头仍为 `X-Lyra-Protocol-Version: 2`。响应复用账本的 `metadata` / `data` 信封，包含账户范围和 `ledgerVersion`，`data.marketData.settingsRevision` 标明本次估值使用的来源设置版本。
+App 使用已鉴权的 `GET /v1/market/positions?scope=all`，可带 `underlying` 筛选；单账户范围沿用现有 `scope` 规则。重复或非字符串的查询参数返回 `400 / INVALID_ARGUMENT`，不会静默忽略筛选条件后返回未过滤结果。协议头仍为 `X-Lyra-Protocol-Version: 2`。响应复用账本的 `metadata` / `data` 信封，包含账户范围和 `ledgerVersion`，`data.marketData.settingsRevision` 标明本次估值使用的来源设置版本。
 
 Genkit 的 `market-positions` 工具通过同一估值层执行，只公开可选的 `underlying` 参数。供应商、任意 URL、账户权限和密钥均不能由模型参数覆盖。工具标记为外部只读；调用继续接受既有范围及账本版本校验，并保存工具审计。
 
@@ -78,7 +78,7 @@ interface MarketDataReader {
 
 所有供应商共用以下选价顺序：
 
-1. 同一快照时点、有数值且未交叉的买卖价，取 `(bid + ask) / 2`；允许零买价，但卖价必须大于零。
+1. 同一快照时点、卖价不低于买价且两者都大于零的买卖价，取 `(bid + ask) / 2`；零买价按缺失处理，不产生中间价。
 2. 无有效中间价时，使用大于零的 `last`。
 3. 再尝试大于零的 `close`，并标明“区间收盘价”。
 
@@ -181,7 +181,7 @@ App 每次改变来源选择都会自动调用 PUT，严格请求示例：
 | Alpaca | 历史 SIP 买卖报价，读取不晚于请求时点减 16 分钟的最新一条 | 历史 OPRA 一分钟 K 线，读取已结束且不晚于同一截止时点的收盘价 | 回看最多 7 天。期权没有该接口提供的 bid / ask，保持空值；没有使用改写价格的 indicative feed |
 | MarketData | 单证券报价中的 bid / ask / last | 单合约报价中的 bid / ask / last | 显式请求 historical 或 delayed；当前只读取该模式下最近可得的快照，不传 `date` / `from` / `to`，也不提供期权链或 Greeks |
 
-适配器使用固定 HTTPS 端点，密钥仅放在请求头；只在单一符号、列结构、价格和时间均有效时归一化。MarketData 接受形状一致的 HTTP 200 / 203 成功响应。HTTP 层限制响应体为 64 KiB，拒绝重定向，支持取消和完整响应体读取超时，不自动重试。
+适配器使用固定 HTTPS 端点，密钥仅放在请求头；只在单一符号、列结构、价格和时间均有效时归一化。MarketData 接受形状一致的 HTTP 200 / 203 成功响应。HTTP 401 归为凭据拒绝，HTTP 403（这些供应商通常表示账号缺少 SIP / OPRA 权限，而非密钥失效）归为来源不可用。HTTP 层限制响应体为 64 KiB，拒绝重定向，支持取消和完整响应体读取超时，不自动重试。
 
 这些是已落盘的请求与解析规则。具体账号能否取得 SIP / OPRA 或某种模式的数据，还需用自己的凭据验证；没有真实 Key 时，不将单元测试视为供应商验收。
 
@@ -205,7 +205,7 @@ App 每次改变来源选择都会自动调用 PUT，严格请求示例：
 
 **刷新按需发生**：读取时命中 TTL 就复用，否则尝试更新。没有后台定时任务，也不保证每天某一时刻更新。24 小时 TTL 可能推迟看到供应商刚更新的日终数据。
 
-限流后冷却 15 分钟，凭据拒绝后冷却 5 分钟，一般故障冷却 1 分钟；单证券无数据或不支持的结果短期缓存，不阻断该源的其他证券。刷新失败时可保留已有报价并标为 `stale`；有显式备用源时优先尝试取得可用报价。全失败或未配置时只影响行情面板，账本成本和既有分析仍可读取。
+限流后冷却 15 分钟，凭据拒绝后冷却 5 分钟，一般故障冷却 1 分钟；单证券的无数据、不支持标的、币种不支持或报价形状无效（例如交叉盘口）只短期缓存该证券，不阻断同一来源的其他证券。只有传输、鉴权和限流状态才冷却整个来源。刷新失败时可保留已有报价并标为 `stale`；有显式备用源时优先尝试取得可用报价。全失败或未配置时只影响行情面板，账本成本和既有分析仍可读取。
 
 缓存、并发合并和预算都在当前进程内，重启后清空。这里的每日本地计数是请求数，不是供应商 credits 余额，也不能约束同一 Key 在其他应用里的消费；服务商自身限额始终有效。
 

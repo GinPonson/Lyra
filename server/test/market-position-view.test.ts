@@ -303,14 +303,28 @@ describe("market position public view", () => {
     assert.equal(result.rows[2]?.instrumentKey, result.rows[3]?.instrumentKey);
   });
 
-  it("rejects all account and amount inconsistencies before starting external reads", async () => {
+  it("rejects scope inconsistencies but degrades a single invalid row instead of failing the portfolio", async () => {
     const { reader, calls } = readerFor((instrument) => available(instrument));
     await assert.rejects(createMarketPositionView([
       stock(), stock({ account: "PRIVATE-UNKNOWN" }),
     ], scope, reader), /授权范围外账户/u);
     await assert.rejects(createMarketPositionView([stock()], { ...scope, currencyGroups: [] }, reader), /币种分组不完整/u);
-    for (const quantity of [new Decimal(0), new Decimal(-1), new Decimal(NaN)]) {
-      await assert.rejects(createMarketPositionView([stock({ quantity })], scope, reader), /持仓数量/u);
+    // 单行数量、成本或方向异常只让该行不可估值：不抛错、不拼零价，压低整组 complete。
+    for (const overrides of [
+      { quantity: new Decimal(0) }, { quantity: new Decimal(-1) }, { quantity: new Decimal(NaN) },
+      { cost: new Decimal(-1) }, { cost: new Decimal(NaN) },
+      { direction: "flat" as PositionRow["direction"] },
+    ]) {
+      const result = await createMarketPositionView([stock(overrides)], scope, reader);
+      const row = result.rows[0]!;
+      assert.equal(row.quote.issue, "unsupported_instrument");
+      assert.equal(row.quote.status, "unavailable");
+      assert.equal(row.valuation.marketValue, null);
+      assert.equal(row.valuation.unrealizedPnl, null);
+      assert.equal(row.valuation.multiplier, null);
+      assert.equal(result.pricedCount, 0);
+      assert.equal(result.complete, false);
+      assert.equal(result.currencyGroups.find((group) => group.currency === "USD")?.marketValue, null);
     }
     assert.equal(calls.length, 0);
   });

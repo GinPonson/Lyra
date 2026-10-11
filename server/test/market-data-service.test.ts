@@ -246,8 +246,8 @@ describe("provider-neutral market data service", () => {
       { bid: { value: "100", asOf: "2027-01-01T00:00:00.000Z" } },
       { bid: { value: "100", asOf: "2026-10-09T19:40:00" } },
       { bid: { value: "100", asOf: "2026-02-31T19:40:00Z" } },
+      // 交叉盘口（买价 200 高于卖价 100.04）是数据形状错误，保持 invalid_response。
       { bid: { value: "200", asOf: QUOTE_TIME } },
-      { bid: null, ask: null, last: { value: "0", asOf: QUOTE_TIME } },
     ];
     for (const overrides of invalid) {
       const data = service([provider("first", async (instrument) => ({
@@ -258,6 +258,43 @@ describe("provider-neutral market data service", () => {
       assert.equal(result.issue, "invalid_response");
       assert.equal(result.referencePrice, null);
     }
+  });
+
+  it("reports a shape-valid quote without any usable reference price as absent data", async () => {
+    // 只有买价的单边盘口形状合法，但挑不出参考价；这属于缺数据，不能误报成 invalid_response。
+    const oneSided = service([provider("first", async (instrument) => ({
+      status: "available", quote: quote(instrument, "first", { ask: null }),
+    }))]);
+    const absent = await oneSided.getQuote(stock());
+    assert.equal(absent.status, "unavailable");
+    assert.equal(absent.issue, "no_data");
+    assert.equal(absent.referencePrice, null);
+    // 零价点同样没有可用参考价（适配器本就把供应商 0 视为缺失）。
+    const zeroPrice = service([provider("first", async (instrument) => ({
+      status: "available",
+      quote: quote(instrument, "first", { bid: null, ask: null, last: { value: "0", asOf: QUOTE_TIME } }),
+    }))]);
+    assert.equal((await zeroPrice.getQuote(stock())).issue, "no_data");
+  });
+
+  it("keeps a per-symbol invalid quote from cooling down the whole provider", async () => {
+    const calls: string[] = [];
+    const source = provider("first", async (instrument) => {
+      calls.push(marketInstrumentKey(instrument));
+      return marketInstrumentKey(instrument) === marketInstrumentKey(stock("AMD"))
+        // AMD 报价交叉盘口 → 单证券 invalid_response，不得连带冷却整个来源。
+        ? { status: "available", quote: quote(instrument, "first", { bid: { value: "200", asOf: QUOTE_TIME } }) }
+        : { status: "available", quote: quote(instrument) };
+    });
+    const data = service([source], { concurrency: 1 });
+    const bad = await data.getQuote(stock("AMD"));
+    assert.equal(bad.issue, "invalid_response");
+    assert.equal(bad.referencePrice, null);
+    const good = await data.getQuote(stock("INTC"));
+    assert.equal(good.status, "available");
+    assert.equal(good.issue, null);
+    assert.equal(good.referencePrice?.value, "100.025");
+    assert.equal(calls.length, 2);
   });
 
   it("distinguishes an old market price from a newly fetched quote", async () => {
@@ -309,5 +346,13 @@ describe("provider-neutral market data service", () => {
       ask: { value: "1234567890123456.123456789014", asOf: QUOTE_TIME },
     });
     assert.equal(selectMarketReferencePrice(precise)?.value, "1234567890123456.123456789013");
+    // 零买价按缺失处理：不能拿一半卖价当作中间价，应回退到正价的 last/close。
+    assert.equal(selectMarketReferencePrice(quote(stock(), "first", {
+      bid: { value: "0", asOf: QUOTE_TIME }, ask: { value: "1", asOf: QUOTE_TIME },
+    })), null);
+    assert.deepEqual(selectMarketReferencePrice(quote(stock(), "first", {
+      bid: { value: "0", asOf: QUOTE_TIME }, ask: { value: "1", asOf: QUOTE_TIME },
+      last: { value: "0.75", asOf: QUOTE_TIME },
+    })), { value: "0.75", asOf: QUOTE_TIME, basis: "last" });
   });
 });

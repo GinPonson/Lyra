@@ -151,7 +151,13 @@ function parseScopeQuery(value: unknown): { kind: "all" } | { kind: "account"; a
   });
 }
 
-/** 按工具公开 schema 把数值型查询字符串收窄为数字，其余保持文本。 */
+/**
+ * 按工具公开 schema 把数值型查询字符串收窄为数字，其余保持文本。
+ *
+ * 重复查询参数会被解析为数组（`?underlying=A&underlying=B`）。静默跳过非字符串值等于
+ * 丢弃用户的筛选条件并返回未过滤结果，因此这里显式以 INVALID_ARGUMENT 拒绝，而不是忽略。
+ * `scope` 由 parseScopeQuery 单独校验。
+ */
 function coerceQueryArguments(
   schema: Readonly<Record<string, unknown>>,
   query: Readonly<Record<string, unknown>>,
@@ -161,8 +167,16 @@ function coerceQueryArguments(
   }>>;
   const args: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(query)) {
-    if (key === "scope" || typeof value !== "string") {
+    if (key === "scope") {
       continue;
+    }
+    if (typeof value !== "string") {
+      throw new ApplicationError({
+        code: "INVALID_ARGUMENT",
+        message: "账本查询参数必须是单个字符串",
+        statusCode: 400,
+        retryable: false,
+      });
     }
     const propertyType = properties[key]?.type;
     if ((propertyType === "integer" || propertyType === "number")

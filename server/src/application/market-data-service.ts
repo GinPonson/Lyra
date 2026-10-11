@@ -1,4 +1,4 @@
-import { selectMarketReferencePrice } from "../domain/market-data/reference-price.js";
+import { isCrossedMarket, selectMarketReferencePrice } from "../domain/market-data/reference-price.js";
 import type { MarketRouteController, MarketRoutes } from "../domain/market-data/settings.js";
 import {
   marketInstrumentKey,
@@ -47,6 +47,17 @@ interface ProviderBudget {
 }
 
 const DAY_MS = 86_400_000;
+
+/**
+ * 只影响单个证券的失败状态。
+ *
+ * 这些状态来自单证券的数据缺失、标的不支持或报价形状校验，必须只短期缓存该证券；
+ * 若拿去冷却整个来源，一个坏符号会连带让同来源的其他符号在冷却期内全部失败。
+ * 供应商级冷却只保留传输、鉴权和限流状态。
+ */
+const PER_INSTRUMENT_ISSUES: readonly MarketQuoteIssue[] = [
+  "no_data", "unsupported_instrument", "currency_unsupported", "invalid_response",
+];
 
 /**
  * A replaceable provider registry with explicit routing, request coalescing and bounded cache.
@@ -214,8 +225,8 @@ export class MarketDataService implements MarketDataReader, MarketRouteControlle
           : result.reason === "credentials_rejected" ? 5 * 60_000
             : result.reason === "no_data" || result.reason === "unsupported_instrument" ? 15 * 60_000
               : 60_000;
-        // Per-symbol absence must not disable a whole provider.
-        if (denied === null && !["no_data", "unsupported_instrument", "currency_unsupported"].includes(result.reason)) {
+        // Per-symbol absence, unsupported identity or malformed quote must not disable a whole provider.
+        if (denied === null && !PER_INSTRUMENT_ISSUES.includes(result.reason)) {
           const budget = this.budgets.get(providerId)!;
           budget.blockedUntil = Math.max(budget.blockedUntil, completedAt + cooldown);
           budget.blockedReason = result.reason;
@@ -251,10 +262,13 @@ export class MarketDataService implements MarketDataReader, MarketRouteControlle
         && typeof result.reason === "string" && (MARKET_QUOTE_ISSUES as readonly string[]).includes(result.reason)) {
         return { status: "unavailable", reason: result.reason as MarketQuoteIssue };
       }
-      const normalized = isRecord(result) && result.status === "available"
-        ? normalizeQuote(result.quote, instrument, provider.id, this.now()) : null;
-      return normalized === null ? { status: "unavailable", reason: "invalid_response" }
-        : { status: "available", quote: normalized };
+      if (!isRecord(result) || result.status !== "available") {
+        return { status: "unavailable", reason: "invalid_response" };
+      }
+      const normalized = normalizeQuote(result.quote, instrument, provider.id, this.now());
+      return normalized.ok
+        ? { status: "available", quote: normalized.quote }
+        : { status: "unavailable", reason: normalized.reason };
     } catch {
       return { status: "unavailable", reason: controller.signal.aborted ? "timeout" : "provider_unavailable" };
     } finally {
@@ -292,20 +306,32 @@ export class MarketDataService implements MarketDataReader, MarketRouteControlle
   }
 }
 
-function normalizeQuote(raw: unknown, instrument: MarketInstrument, providerId: string, now: Date): MarketQuote | null {
+/** 归一化结果：`invalid_response` 表示报价形状/身份不合法，`no_data` 表示形状合法但无可用参考价。 */
+type NormalizedQuote =
+  | { ok: true; quote: MarketQuote }
+  | { ok: false; reason: "invalid_response" | "no_data" };
+
+function normalizeQuote(
+  raw: unknown,
+  instrument: MarketInstrument,
+  providerId: string,
+  now: Date,
+): NormalizedQuote {
   if (!isRecord(raw) || raw.instrumentKey !== marketInstrumentKey(instrument) || raw.providerId !== providerId
     || raw.currency !== instrument.currency || typeof raw.feed !== "string" || raw.feed.length < 1 || raw.feed.length > 100
     || !validTimestamp(raw.fetchedAt, now) || !isRecord(raw.timing)
     || (raw.timing.kind !== "delayed" && raw.timing.kind !== "end_of_day")
     || (raw.timing.delayMinutes !== null
-      && (typeof raw.timing.delayMinutes !== "number" || !Number.isFinite(raw.timing.delayMinutes) || raw.timing.delayMinutes < 0))) return null;
+      && (typeof raw.timing.delayMinutes !== "number" || !Number.isFinite(raw.timing.delayMinutes) || raw.timing.delayMinutes < 0))) {
+    return { ok: false, reason: "invalid_response" };
+  }
   const points: Pick<MarketQuote, "bid" | "ask" | "last" | "close"> = { bid: null, ask: null, last: null, close: null };
   for (const field of ["bid", "ask", "last", "close"] as const) {
     const point = raw[field];
     if (point === null) continue;
     if (!isRecord(point) || typeof point.value !== "string"
       || !/^(?:0|[1-9]\d{0,15})(?:\.\d{1,12})?$/.test(point.value)
-      || !validTimestamp(point.asOf, now)) return null;
+      || !validTimestamp(point.asOf, now)) return { ok: false, reason: "invalid_response" };
     points[field] = { value: point.value, asOf: new Date(point.asOf).toISOString() };
   }
   // Explicit projection strips unknown vendor fields (including accidental credential fields).
@@ -315,7 +341,12 @@ function normalizeQuote(raw: unknown, instrument: MarketInstrument, providerId: 
     timing: { kind: raw.timing.kind, delayMinutes: raw.timing.delayMinutes },
     fetchedAt: new Date(raw.fetchedAt).toISOString(),
   };
-  return selectMarketReferencePrice(quote) === null ? null : quote;
+  // 交叉盘口是供应商数据形状错误，必须保留 invalid_response，不能混同为“没有数据”。
+  if (isCrossedMarket(quote)) return { ok: false, reason: "invalid_response" };
+  // 形状完全合法却挑不出参考价（例如只有买价的单边盘口）属于缺数据，报 no_data 而非 invalid_response。
+  return selectMarketReferencePrice(quote) === null
+    ? { ok: false, reason: "no_data" }
+    : { ok: true, quote };
 }
 
 function validTimestamp(timestamp: unknown, now: Date): timestamp is string {
