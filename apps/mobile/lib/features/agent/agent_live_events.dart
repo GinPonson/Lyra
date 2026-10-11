@@ -149,9 +149,13 @@ class AgentLiveEvents {
     if (_disposed || _channel != null) {
       return;
     }
-    final wsUri = Uri.parse(serverUrl).replace(
-      scheme: serverUrl.startsWith('https') ? 'wss' : 'ws',
-      path: '/v1/events',
+    // 事件流必须与 HTTP 调用落在同一个部署前缀上：服务端可能挂在反向代理的
+    // 子路径（如 https://host/lyra），而 replace(path:) 会把整个前缀替换成
+    // /v1/events，使连接永远打不开。这里保留基路径、只追加事件路由。
+    final base = Uri.parse(serverUrl);
+    final wsUri = base.replace(
+      scheme: base.scheme == 'https' ? 'wss' : 'ws',
+      path: '${base.path.replaceFirst(RegExp(r'/+$'), '')}/v1/events',
     );
     // 握手必须携带协议版本头与 Bearer 令牌;服务端在升级前校验两者。
     final channel = channelFactory(wsUri, const <String>[], <String, String>{

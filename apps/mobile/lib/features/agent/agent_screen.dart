@@ -132,13 +132,30 @@ class AgentController extends Notifier<AgentUiState> {
       _live?.dispose();
       _live = null;
     });
-    // 进入 Agent 页时尝试恢复上次活跃会话；失败静默回到创建视图。
-    Future<void>.microtask(_restoreLastSession);
+    // 进入 Agent 页时尝试恢复上次活跃会话；失败由控制器显式进入可重试错误态。
+    // 用 microtask 推迟到 build 返回之后，避免在构建中改写自身状态。
+    unawaited(Future<void>.microtask(_restoreLastSession));
     return const AgentIdle();
   }
 
   /// 读取本地会话 ID 并用服务端权威快照恢复会话视图。
+  ///
+  /// 任何异常都在此收口：本方法是无人 await 的异步入口，异常逃逸会变成
+  /// 未处理异步错误并让界面停在旧状态。协议错误按既有语义处理，其它错误
+  /// （响应形态不匹配、安全存储失败等）显式进入可重试错误态。
   Future<void> _restoreLastSession() async {
+    try {
+      await _restoreLastSessionInternal();
+    } on Object catch (error) {
+      // 本方法由 microtask 触发、无人 await；异常必须在此收口，否则会变成
+      // 未处理异步错误，界面仍停在创建视图且用户看不到失败原因。
+      if (!ref.mounted || state is! AgentIdle) return;
+      state = AgentError(_unexpectedMessage(error));
+    }
+  }
+
+  /// 恢复的实际流程；异常统一由 [_restoreLastSession] 收口处理。
+  Future<void> _restoreLastSessionInternal() async {
     if (state is! AgentIdle) {
       return;
     }
@@ -229,7 +246,7 @@ class AgentController extends Notifier<AgentUiState> {
           return; // 重复事件：忽略。
         }
         if (event.sequence > _lastSequence + 1) {
-          _refreshSnapshot('sequence-gap');
+          unawaited(_refreshSnapshot('sequence-gap'));
           return;
         }
         _lastSequence = event.sequence;
@@ -244,11 +261,11 @@ class AgentController extends Notifier<AgentUiState> {
             event.type == 'message.failed' ||
             event.type == 'session.completed') {
           state = current.copyWith(clearStreamingText: true);
-          _refreshSnapshot('terminal-${event.type}');
+          unawaited(_refreshSnapshot('terminal-${event.type}'));
         }
       case AgentSubscribedFrame(:final mode):
         if (mode == 'snapshot_required') {
-          _refreshSnapshot('subscribed-snapshot');
+          unawaited(_refreshSnapshot('subscribed-snapshot'));
         }
       case AgentErrorFrame():
         state = current.copyWith(
@@ -260,6 +277,9 @@ class AgentController extends Notifier<AgentUiState> {
   }
 
   /// 从服务端重取权威会话快照；事件流只负责提示，快照永远是唯一事实。
+  ///
+  /// 由事件帧触发、无人 await：失败必须在会话内可见，不能逃逸成未处理
+  /// 异步异常；提示型错误不改变回合进行状态，用户仍可继续输入。
   Future<void> _refreshSnapshot(String reason) async {
     final repository = _resolve();
     final current = state;
@@ -286,8 +306,8 @@ class AgentController extends Notifier<AgentUiState> {
       );
       // 权威快照变化后同步工具调用列表。
       unawaited(_refreshToolCalls());
-    } on LyraApiError {
-      // 快照刷新失败保持现有状态；下一帧或下次回合会再触发。
+    } on Object catch (error) {
+      _surfaceSessionError(repository, current.session.id, error);
     }
   }
 
@@ -304,9 +324,9 @@ class AgentController extends Notifier<AgentUiState> {
       if (state is AgentError) {
         state = const AgentIdle();
       }
-    } on LyraApiError catch (error) {
+    } on Object catch (error) {
       if (!ref.mounted || _repository != repository) return;
-      state = AgentError('${error.message}（${error.code}）');
+      state = AgentError(_unexpectedMessage(error));
     }
   }
 
@@ -349,13 +369,18 @@ class AgentController extends Notifier<AgentUiState> {
       if (!ref.mounted || _repository != repository) return;
       _subscribeLive(session.id);
       await _refreshToolCalls();
-    } on LyraApiError catch (error) {
+    } on Object catch (error) {
+      // 覆盖整段创建流程（可用性、创建会话、本机会话 ID 写入）；任何异常都必须
+      // 解除 AgentCreating 锁定并给出可重试的错误态，不能卡在“正在创建…”。
       if (!ref.mounted || _repository != repository) return;
-      state = AgentError('${error.message}（${error.code}）');
+      state = AgentError(_unexpectedMessage(error));
     }
   }
 
-  /// 拉取会话工具调用公开列表；失败不阻塞会话流。
+  /// 拉取会话工具调用公开列表；失败不阻塞会话流，但必须在会话内可见。
+  ///
+  /// 该方法既被 await 也被 unawaited 调用，异常逃逸会在创建/发送流程里
+  /// 变成未处理异步错误，所以在此收口。
   Future<void> _refreshToolCalls() async {
     final repository = _repository;
     final current = state;
@@ -373,8 +398,8 @@ class AgentController extends Notifier<AgentUiState> {
         return;
       }
       state = latest.copyWith(toolCalls: calls);
-    } on LyraApiError {
-      // 工具调用列表是增强信息；拉取失败保持现状。
+    } on Object catch (error) {
+      _surfaceSessionError(repository, current.session.id, error);
     }
   }
 
@@ -388,21 +413,22 @@ class AgentController extends Notifier<AgentUiState> {
         current.session.status != 'idle') {
       return;
     }
-    // 回合窗口重连事件流，保证本回合增量不缺。
-    if (_live == null) {
-      _subscribeLive(current.session.id);
-    } else {
-      _live!.subscribe(
-        sessionId: current.session.id,
-        afterSequence: _lastSequence,
-      );
-    }
-    state = current.copyWith(
-      turnInProgress: true,
-      pendingMessage: content,
-      clearError: true,
-    );
+    // 事件流订阅也在 try 内：订阅失败同样要解除回合锁，不能只停在“回合中”。
     try {
+      // 回合窗口重连事件流，保证本回合增量不缺。
+      if (_live == null) {
+        _subscribeLive(current.session.id);
+      } else {
+        _live!.subscribe(
+          sessionId: current.session.id,
+          afterSequence: _lastSequence,
+        );
+      }
+      state = current.copyWith(
+        turnInProgress: true,
+        pendingMessage: content,
+        clearError: true,
+      );
       final result = await repository.sendTurn(
         sessionId: current.session.id,
         content: content,
@@ -417,20 +443,27 @@ class AgentController extends Notifier<AgentUiState> {
         turnInProgress: false,
         clearPendingMessage: true,
         clearStreamingText: true,
+        // 上一次回合的错误不能留在成功回合的快照上。
+        clearError: true,
       );
       await _refreshToolCalls();
-    } on LyraApiError catch (error) {
+    } on Object catch (error) {
+      // 回合已置为进行中；任何异常（协议错误、响应形态不匹配、解析失败）
+      // 都必须清除该标记，否则输入框会永久禁用且无法重试。
       if (!_isCurrentSession(repository, current.session.id)) return;
       state = current.copyWith(
         turnInProgress: false,
         clearPendingMessage: true,
         clearStreamingText: true,
-        errorMessage: '${error.message}（${error.code}）',
+        errorMessage: _unexpectedMessage(error),
       );
     }
   }
 
-  /// 取消运行中的回合。
+  /// 取消运行中的回合；取消失败保持会话内可见提示。
+  ///
+  /// 取消请求失败时回合可能仍在服务端运行，因此保留 turnInProgress：
+  /// 事件流与快照会给出权威状态，用户也可再次取消。
   Future<void> cancelTurn() async {
     final current = state;
     final repository = _repository;
@@ -447,11 +480,29 @@ class AgentController extends Notifier<AgentUiState> {
         turnInProgress: false,
         clearPendingMessage: true,
         clearStreamingText: true,
+        // 取消成功即回合已结束，之前的回合错误不再适用。
+        clearError: true,
       );
-    } on LyraApiError catch (error) {
+    } on Object catch (error) {
       if (!_isCurrentSession(repository, current.session.id)) return;
-      state = current.copyWith(errorMessage: '${error.message}（${error.code}）');
+      state = current.copyWith(errorMessage: _unexpectedMessage(error));
+      // 取消失败不能靠本地猜测回合状态：重取权威快照决定是否仍在运行。
+      unawaited(_refreshSnapshot('cancel-failed'));
     }
+  }
+
+  /// 在会话内显示非致命错误；会话已切换或销毁时丢弃过期错误。
+  void _surfaceSessionError(
+    AgentRepository repository,
+    String sessionId,
+    Object error,
+  ) {
+    final current = state;
+    if (!_isCurrentSession(repository, sessionId) ||
+        current is! AgentSessionActive) {
+      return;
+    }
+    state = current.copyWith(errorMessage: _unexpectedMessage(error));
   }
 
   bool _isCurrentSession(AgentRepository repository, String sessionId) {
@@ -459,6 +510,15 @@ class AgentController extends Notifier<AgentUiState> {
     final current = state;
     return current is AgentSessionActive && current.session.id == sessionId;
   }
+}
+
+/// 失败原因的可见文案：协议错误保留稳定 code，其它异常按 LyraLoadError 的
+/// 约定暴露原始原因，避免把失败伪装成空状态。
+String _unexpectedMessage(Object error) {
+  if (error is LyraApiError) {
+    return '${error.message}（${error.code}）';
+  }
+  return '响应处理失败：$error';
 }
 
 /// Agent 页 Provider（进入页面时创建，离开销毁）。

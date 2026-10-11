@@ -64,6 +64,25 @@ class _GroupedPositionFixture extends LedgerFixture {
   }
 }
 
+/// 把持仓成本替换为非法形态，验证畸形金额在数据边界失败而不是进入 build。
+class _MalformedPositionFixture extends LedgerFixture {
+  /// 打开后 positions 行的 cost 不再是十进制字符串。
+  bool malformed = true;
+
+  @override
+  Map<String, Object?> payload(String command, Map<String, dynamic> query) {
+    final data = super.payload(command, query);
+    if (malformed && command == 'positions') {
+      final rows = (data['rows'] as List).cast<Map<String, Object?>>();
+      data['rows'] = <Map<String, Object?>>[
+        <String, Object?>{...rows.first, 'cost': <String, Object?>{'x': 1}},
+        ...rows.skip(1),
+      ];
+    }
+    return data;
+  }
+}
+
 /// 可选生成真实 Flutter 渲染截图；普通测试不依赖系统字体或文件输出。
 Future<void> _capture(WidgetTester tester, String name) async {
   if (_reviewDir == null) return;
@@ -504,5 +523,88 @@ void main() {
     });
     expect(read.currencyFor({'accountId': 'b'}), 'EUR');
     expect(read.sections.map((section) => section.currency), ['USD', 'EUR']);
+  });
+
+  test('金额与标识字段在数据边界校验，畸形取值不进入 build', () {
+    for (final row in <Map<String, Object?>>[
+      {'cost': <String, Object?>{'nested': true}},
+      {'cost': 'abc'},
+      {'price': 12.5},
+      {'amount': '1e3'},
+      {'fees': '1.2.3'},
+      {'openPrice': ''},
+      {'closePrice': '--'},
+      {'strike': '1,000'},
+      {'quantity': '很多'},
+      {'underlying': 42},
+      {'symbol': ''},
+      {'symbolKey': '   '},
+      {'check': 7},
+      {'count': 'x'},
+      {'count': 1.5},
+      {'trade': 'invalid'},
+      {'trade': null},
+    ]) {
+      expect(
+        () => LedgerRead.fromJson({
+          'metadata': <String, Object?>{},
+          'data': {
+            'rows': [row],
+          },
+        }),
+        throwsFormatException,
+        reason: '$row 必须在数据边界被拒绝',
+      );
+    }
+  });
+
+  test('extremes 嵌套 trade 记录同样在数据边界校验', () {
+    expect(
+      () => LedgerRead.fromJson({
+        'metadata': <String, Object?>{},
+        'data': {
+          'rows': [
+            {
+              'trade': {'underlying': 'AAPL', 'pnl': 'oops'},
+            },
+          ],
+        },
+      }),
+      throwsFormatException,
+    );
+  });
+
+  testWidgets('畸形明细金额显示可重试错误态而不是红屏', (tester) async {
+    viewport(tester, const Size(390, 844));
+    final fixture = _MalformedPositionFixture();
+    final dependencies = await fixture.dependencies();
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          sessionDependenciesProvider.overrideWithValue(dependencies),
+        ],
+        child: RepaintBoundary(
+          key: _captureKey,
+          child: MaterialApp(
+            debugShowCheckedModeBanner: false,
+            theme: LyraTheme.dark,
+            home: const ReportScreen(view: LedgerView.positions),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // 解析错误在异步边界被捕获，页面进入设计的错误态并给出重试入口。
+    expect(find.text('数据未能加载'), findsOneWidget);
+    expect(find.textContaining('账本字段 cost'), findsOneWidget);
+    expect(find.text('重新加载'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    fixture.malformed = false;
+    await tester.tap(find.text('重新加载'));
+    await tester.pumpAndSettle();
+    expect(find.text('AAPL'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }

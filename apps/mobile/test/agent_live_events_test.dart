@@ -579,6 +579,51 @@ void main() {
     });
   });
 
+  group('AgentLiveEvents 连接地址', () {
+    test('保留服务端部署子路径，只切换协议并追加事件路由', () async {
+      final uris = <Uri>[];
+      WebSocketChannel createChannel(
+        Uri uri,
+        Iterable<String> protocols,
+        Map<String, String> headers,
+      ) {
+        uris.add(uri);
+        return ChannelMock(
+          StreamChannelController<dynamic>(allowForeignErrors: false),
+        );
+      }
+
+      for (final serverUrl in <String>[
+        'https://lyra.example.com/ledger/',
+        'https://lyra.example.com/ledger',
+        'https://lyra.example.com',
+        'http://127.0.0.1:3141',
+      ]) {
+        final live = AgentLiveEvents(
+          serverUrl: serverUrl,
+          accessToken: 'token-1',
+          onFrame: (AgentLiveFrame frame) {},
+          channelFactory: createChannel,
+        );
+        live.subscribe(
+          sessionId: 'a1000000-0000-4000-8000-000000000001',
+          afterSequence: 0,
+        );
+        await pumpEventQueue();
+        live.dispose();
+      }
+
+      // 子路径必须原样保留：HTTP 请求走 https://host/ledger/v1/...，
+      // 事件流若指向 /v1/events 会永远连不上。
+      expect(uris.map((uri) => uri.toString()).toList(), <String>[
+        'wss://lyra.example.com/ledger/v1/events',
+        'wss://lyra.example.com/ledger/v1/events',
+        'wss://lyra.example.com/v1/events',
+        'ws://127.0.0.1:3141/v1/events',
+      ]);
+    });
+  });
+
   group('AgentLiveEvents 重连退避', () {
     test('意外断开按指数退避自动重连并带最新游标', () async {
       final channels = <StreamChannelController<dynamic>>[];

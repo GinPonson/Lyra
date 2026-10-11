@@ -80,10 +80,21 @@ class SessionController extends AsyncNotifier<SessionState> {
       _client?.invalidate();
       _client = null;
     });
-    final snapshot = await withCredentialMutation(
-      dependencies.credentialStore,
-      dependencies.credentialStore.read,
-    );
+    // 安全存储可能不可读（Keystore 主密钥失效、密文损坏）。若让异常留在
+    // build 的 Future 里，总览会停在永远重试的加载错误上，用户没有任何自助
+    // 入口；这里降级为可见的未登录状态，并给出可执行的下一步。
+    final CredentialSnapshot? snapshot;
+    try {
+      snapshot = await withCredentialMutation(
+        dependencies.credentialStore,
+        dependencies.credentialStore.read,
+      );
+    } on Object {
+      return _restored(
+        generation,
+        const SessionSignedOut(message: '本机登录凭据无法读取，请重新登录以恢复。'),
+      );
+    }
     if (!_authActive(generation)) return _publishedState;
     if (snapshot == null) {
       return _restored(generation, const SessionSignedOut());

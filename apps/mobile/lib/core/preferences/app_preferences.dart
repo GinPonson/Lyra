@@ -8,6 +8,7 @@ import '../../app/session.dart';
 import '../../features/system/system_repository.dart'
     show normalizeLyraServerUrl;
 import '../security/credential_store.dart';
+import '../security/secure_storage.dart';
 
 enum StartupAccountMode { rememberLast, all, specific }
 
@@ -210,9 +211,10 @@ class MemoryAppPreferencesStore implements AppPreferencesStore {
   }
 }
 
+/// 本机偏好的安全存储实现；与凭据存储共用 [kLyraSecureStorage] 的加密参数。
 class SecureAppPreferencesStore implements AppPreferencesStore {
   const SecureAppPreferencesStore({FlutterSecureStorage? storage})
-    : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? kLyraSecureStorage;
 
   final FlutterSecureStorage _storage;
   static const storageKey = 'lyra.preferences.v1';

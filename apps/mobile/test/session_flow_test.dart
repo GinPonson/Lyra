@@ -13,6 +13,8 @@ import 'package:lyra_mobile/core/security/credential_store.dart';
 import 'package:lyra_mobile/core/api/lyra_api_error.dart';
 import 'package:lyra_mobile/features/agent/agent_session_store.dart';
 
+import 'support/faulty_stores.dart';
+
 /// 按请求路径返回固定响应的假 HTTP 适配器；不触达真实网络。
 class FakeLyraAdapter implements HttpClientAdapter {
   FakeLyraAdapter(this.handler);
@@ -618,6 +620,37 @@ void main() {
       );
     });
   }
+
+  testWidgets('安全存储不可读时降级为可操作的未登录状态而不是重试死循环', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final store = FaultyCredentialStore(readFails: true);
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          sessionDependenciesProvider.overrideWithValue(
+            SessionDependencies(
+              credentialStore: store,
+              agentSessionStore: MemoryAgentSessionStore(),
+            ),
+          ),
+        ],
+        child: const LyraApp(),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // 读取失败不再留在 build 的 Future 里；用户看到可自助的登录入口与原因。
+    expect(find.text('连接我的账户'), findsOneWidget);
+    await scrollUntilVisible(tester, find.text('登录 Lyra'));
+    expect(find.text('本机登录凭据无法读取，请重新登录以恢复。'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }
 
 const _authenticatedSnapshot = CredentialSnapshot(

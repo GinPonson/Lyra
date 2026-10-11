@@ -9,6 +9,7 @@ import '../accounts/account_repository.dart' show BrokerageAccount;
 import '../accounts/account_workspace.dart';
 import 'ledger_models.dart';
 import 'ledger_repository.dart';
+import 'ledger_view.dart';
 
 /// 跨账号、股票与交易页共享的显式账户范围；不改变既有 AI 会话范围。
 class AccountScopeController extends Notifier<({String id, String label})> {
@@ -174,8 +175,33 @@ class LedgerRead {
   LedgerRead.fromJson(Map<String, Object?> json)
     : metadata = json['metadata'] as Map<String, Object?>,
       data = json['data'] as Map<String, Object?> {
+    _validateMetadata(metadata);
     _validateData(data);
   }
+
+  /// 渲染层按十进制文本解析的字段：协议金额集合，外加持仓/平仓数量。
+  static const Set<String> _decimalRowFields = <String>{
+    ...ledgerAmountFields,
+    'quantity',
+  };
+
+  /// 图形坐标字段；除了十进制形态，还必须能被 finite double 表示。
+  static const List<String> _coordinateFields = <String>[
+    'netPnl',
+    'cumulativePnl',
+    'allocationPct',
+  ];
+
+  /// 参与数值格式化的计数字段（审计记录数）；协议里是 JSON 整数。
+  static const List<String> _rowCountFields = <String>['count'];
+
+  /// 渲染层直接做 `as String`/非空判断的标识字段。
+  static const List<String> _rowTextFields = <String>[
+    'underlying',
+    'symbol',
+    'symbolKey',
+    'check',
+  ];
 
   /// 在异步请求边界校验列表及图形字段；畸形响应进入可重试错误态，不能在 build 中崩溃。
   static void _validateData(Map<String, Object?> data) {
@@ -197,21 +223,74 @@ class LedgerRead {
       if (value is! Map<String, Object?>) {
         throw const FormatException('账本记录格式无效');
       }
-      if (value.containsKey('trade') &&
-          value['trade'] is! Map<String, Object?>) {
+      _validateRow(value);
+      // extremes 等视图以 row['trade'] 作为权威记录；嵌套金额同样要在边界校验。
+      // 出现该键却不是对象（含显式 null）必须失败，否则 build 里的强转会抛错。
+      final trade = value['trade'];
+      if (value.containsKey('trade') && trade is! Map<String, Object?>) {
         throw const FormatException('平仓交易明细格式无效');
       }
-      for (final field in ['netPnl', 'cumulativePnl', 'allocationPct']) {
-        final amount = value[field];
-        if (amount == null) continue;
-        if (amount is! String ||
-            !RegExp(r'^-?\d+(?:\.\d+)?$').hasMatch(amount)) {
-          throw FormatException('账本字段 $field 必须为十进制字符串');
-        }
-        final coordinate = double.tryParse(amount);
-        if (coordinate == null || !coordinate.isFinite) {
-          throw FormatException('账本字段 $field 超出图形展示范围');
-        }
+      if (trade is Map<String, Object?>) _validateRow(trade);
+    }
+  }
+
+  /// 校验渲染层直接消费的字段：金额按十进制文本解析、标识字段直接做
+  /// `as String` 转换、审计记录数参与数值格式化。任一形态不符都会在 build 中
+  /// 抛异常，因此必须在这里（异步边界）失败，让页面进入可重试错误态。
+  static void _validateRow(Map<String, Object?> row) {
+    for (final field in _decimalRowFields) {
+      final value = row[field];
+      if (value == null) continue;
+      if (!isDecimalAmountText(value)) {
+        throw FormatException('账本字段 $field 必须为十进制字符串');
+      }
+    }
+    for (final field in _coordinateFields) {
+      final value = row[field];
+      if (value == null) continue;
+      if (!isDecimalAmountText(value)) {
+        throw FormatException('账本字段 $field 必须为十进制字符串');
+      }
+      // 已确认是十进制文本；非有限值会让 double.parse 在 build 中失败。
+      final coordinate = double.tryParse(value as String);
+      if (coordinate == null || !coordinate.isFinite) {
+        throw FormatException('账本字段 $field 超出图形展示范围');
+      }
+    }
+    for (final field in _rowCountFields) {
+      final value = row[field];
+      if (value == null) continue;
+      if (value is! num || !value.isFinite || value != value.truncate()) {
+        throw FormatException('账本字段 $field 必须为整数');
+      }
+    }
+    for (final field in _rowTextFields) {
+      final value = row[field];
+      // 缺失（null）是合法形态：界面按缺失展示，不接受非字符串的标识值。
+      if (value == null) continue;
+      if (value is! String || value.trim().isEmpty) {
+        throw FormatException('账本字段 $field 必须为非空字符串');
+      }
+    }
+  }
+
+  /// 校验响应元数据：币种分组供 `currencyFor` 在 build 中直接做类型转换，
+  /// 畸形分组同样必须在这里被拒绝。
+  static void _validateMetadata(Map<String, Object?> metadata) {
+    final aggregateCurrency = metadata['aggregateCurrency'];
+    if (aggregateCurrency != null && aggregateCurrency is! String) {
+      throw const FormatException('账本汇总币种格式无效');
+    }
+    final groups = metadata['currencyGroups'];
+    if (groups == null) return;
+    if (groups is! List<Object?>) {
+      throw const FormatException('账本科目分组格式无效');
+    }
+    for (final value in groups) {
+      if (value is! Map<String, Object?> ||
+          value['currency'] is! String ||
+          value['accountIds'] is! List<Object?>) {
+        throw const FormatException('账本科目分组格式无效');
       }
     }
   }

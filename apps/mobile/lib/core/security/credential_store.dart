@@ -1,5 +1,7 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'secure_storage.dart';
+
 // 同一底层凭据存储跨 SessionController 生命周期共用队列。所有生产安全存储
 // 实例操作同一组键，必须全局串行；独立内存存储互不阻塞。
 final _secureCredentialIdentity = Object();
@@ -75,9 +77,12 @@ class CredentialSnapshot {
 }
 
 /// 基于 flutter_secure_storage 的实现；密钥材料交给系统安全存储。
+///
+/// Android 上使用 [kLyraSecureStorage] 的 EncryptedSharedPreferences 参数，
+/// 不沿用插件的历史默认加密方案。
 class SecureCredentialStore implements CredentialStore {
   const SecureCredentialStore({FlutterSecureStorage? storage})
-    : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? kLyraSecureStorage;
 
   final FlutterSecureStorage _storage;
 
