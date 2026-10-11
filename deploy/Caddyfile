@@ -1,4 +1,8 @@
 {
+    # 关闭管理 API（默认监听 localhost:2019）：同网络的其它容器可访问它并改写
+    # 运行中的配置。本部署不使用动态重载，直接关闭最小化暴露面。
+    admin off
+
     # Proxy error logs may contain request URIs even with access logging off.
     # Remove the URI from the default logger so OAuth code/state stay out.
     log default {

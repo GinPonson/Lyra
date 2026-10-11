@@ -46,6 +46,25 @@ async function start(): Promise<void> {
   const packageJson = packageSchema.parse(JSON.parse(
     readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
   ));
+  // 信号处理器必须早于打开数据库注册：迁移是不可逆的 schema 升级，若在
+  // BEGIN…COMMIT 中途被默认动作硬杀，DuckDB 的 schema WAL 可能无法回放
+  // （见 database.ts 的迁移说明）。启动阶段收到信号只记录，待配置校验与
+  // 迁移完成后立即优雅退出，不打断进行中的事务。
+  let pendingSignal: NodeJS.Signals | null = null;
+  let shutdown: ((signal: NodeJS.Signals) => Promise<void>) | null = null;
+  const handleSignal = (signal: NodeJS.Signals): void => {
+    pendingSignal = signal;
+    if (shutdown !== null) {
+      void shutdown(signal);
+    }
+  };
+  process.on("SIGINT", handleSignal);
+  process.on("SIGTERM", handleSignal);
+
+  // 文件系统前提条件同样必须在迁移之前满足：否则一台无法创建暂存目录的
+  // 主机仍会把账本库升级到新 schema，而旧服务已无法再打开它。
+  mkdirSync(environment.LYRA_IMPORT_STAGING_DIR, { recursive: true });
+
   // Validate new integration configuration before any irreversible schema upgrade.
   const loginConfig = loadGoogleLoginConfig(process.env);
   const aiRuntime = createGenkitRuntimeFromEnvironment(process.env);
@@ -66,7 +85,6 @@ async function start(): Promise<void> {
     throw error;
   }
   const registry = createFinancialToolRegistry(database, marketData);
-  mkdirSync(environment.LYRA_IMPORT_STAGING_DIR, { recursive: true });
   const importService = new ImportService({
     database,
     writeCoordinator,
@@ -168,7 +186,7 @@ async function start(): Promise<void> {
   });
 
   let closing = false;
-  const close = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
+  const close = async (signal: NodeJS.Signals): Promise<void> => {
     if (closing) {
       return;
     }
@@ -184,8 +202,12 @@ async function start(): Promise<void> {
       process.exitCode = 1;
     }
   };
-  process.once("SIGINT", () => void close("SIGINT"));
-  process.once("SIGTERM", () => void close("SIGTERM"));
+  shutdown = close;
+  // 启动阶段已收到信号：迁移与装配已完成，这里不再监听端口直接退出。
+  if (pendingSignal !== null) {
+    await close(pendingSignal);
+    return;
+  }
 
   await app.listen({ host: environment.LYRA_HOST, port: environment.LYRA_PORT });
 }

@@ -1,4 +1,6 @@
+import { mkdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 
 import {
   DuckDBConnection,
@@ -7,6 +9,32 @@ import {
 
 import type { DatabaseHealth } from "../../application/index.js";
 import { CURRENT_SCHEMA_VERSION } from "./schema-version.js";
+
+/**
+ * 把 DuckDB 的溢出目录固定到账本文件同级的 `tmp/`。
+ *
+ * DuckDB 默认 `temp_directory` 是相对当前工作目录的 `.tmp`；容器以
+ * `read_only: true` 运行且工作目录为只读的 /app，任何需要溢出的查询
+ * （大文件导入、分析）都会在运行期失败。放在数据库同级目录可同时满足
+ * 只读根文件系统与持久数据卷两种部署形态，且让溢出文件随账本卷一起留存。
+ */
+async function configureTempDirectory(
+  connection: DuckDBConnection,
+  databasePath: string,
+): Promise<void> {
+  // 内存库没有同级目录，也无法从路径推导位置；此时保留 DuckDB 默认行为。
+  if (databasePath.startsWith(":memory:")) {
+    return;
+  }
+  const directory = join(resolve(dirname(databasePath)), "tmp");
+  // SET 不接受参数绑定；路径来自部署配置而非请求，仍按 SQL 字面量规则转义，
+  // 并直接拒绝含引号的路径，避免拼接出意外语句。
+  if (directory.includes("'")) {
+    throw new RangeError("DuckDB 数据目录不能包含单引号");
+  }
+  mkdirSync(directory, { recursive: true });
+  await connection.run(`SET temp_directory = '${directory}'`);
+}
 
 /** 按依赖顺序执行的完整迁移清单。 */
 const MIGRATIONS = [
@@ -100,6 +128,7 @@ export async function openLyraDatabase(databasePath: string): Promise<LyraDataba
   let connection: DuckDBConnection | null = null;
   try {
     connection = await instance.connect();
+    await configureTempDirectory(connection, normalizedPath);
     await applyMigrations(connection);
     return new LyraDatabase(instance, connection);
   } catch (error: unknown) {

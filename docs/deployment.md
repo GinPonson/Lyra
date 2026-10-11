@@ -81,7 +81,7 @@ node deploy/init-env.mjs
 没有其他反向代理占用 80/443 时：
 
 ```bash
-./deploy/compose.sh --profile https up -d --wait --wait-timeout 90
+./deploy/compose.sh --profile https up -d --wait --wait-timeout 300
 ./deploy/compose.sh ps
 ```
 
@@ -104,7 +104,7 @@ node deploy/probe.mjs https://你的域名
 只启动服务：
 
 ```bash
-./deploy/compose.sh up -d --wait --wait-timeout 90 lyra
+./deploy/compose.sh up -d --wait --wait-timeout 300 lyra
 node deploy/probe.mjs http://127.0.0.1:3141
 ```
 
@@ -166,3 +166,13 @@ schema 14 只新增行情选择的持久化，不撤销 schema 13 的有效 OAut
 本次界面切源改动尚未用真实行情 Key 联调，未部署到 VPS，也未重新构建 APK。
 
 部署前只需确定域名、服务器环境和需要使用的兼容模型服务；凭据在服务器本地配置。真实环境联调完成前，现有迁移 PR 继续保持草稿。
+
+## 8. 登录入口的已知安全边界
+
+当前登录流程的**事务绑定的是发起方，而不是在浏览器里完成授权的人**（完整说明见 [Genkit 与 Google 登录的安全边界](genkit-oauth.md#app-登录过程)）。任何能访问登录入口的人都可以自行创建登录事务，把生成好的 Google 授权链接发给所有者，诱导其完成授权后领取所有者的设备凭据。
+
+该问题本轮未修复（需要引入只有人类可传递的共享秘密，属协议与交互改动）。在该改动落地前，运维必须遵守：
+
+- 只使用 App 内「使用 Google 登录」生成的授权页，**不要点击或转发他人提供的 Lyra 授权链接**；
+- 不要把登录入口暴露在不受信任的网络或公开索引中；公网部署应限制来源范围，并优先保证只有所有者本人访问该域名；
+- 发现异常登录时，用「我的 → 确认退出」撤销该设备凭据，并检查服务端日志中的登录事务创建时间。

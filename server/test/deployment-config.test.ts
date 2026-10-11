@@ -111,11 +111,26 @@ async function checkConfiguration(options: {
   }
 }
 
+/**
+ * 成功路径要求配置 CLI 自身不向 stderr 输出任何诊断。
+ *
+ * Node 会为第三方依赖（genkit → compat-oai → openai → node-fetch@2 →
+ * whatwg-url@5 → 内建 punycode）打印 `DEP0040` 之类的运行时警告，这属于
+ * 运行环境噪声而非 CLI 输出，把它算作失败只会让断言随 Node 版本漂移。
+ */
+function cliStderr(stderr: string): string {
+  return stderr
+    .split("\n")
+    .filter((line) => !/^\(node:\d+\)\s/u.test(line) && !/^\(Use `node --trace/u.test(line))
+    .join("\n")
+    .trim();
+}
+
 describe("deployment configuration CLI", () => {
   it("checks a complete deployment in a real child process without database, staging or network side effects", async () => {
     const result = await checkConfiguration({ args: ["--require-ai"] });
     assert.equal(result.code, 0, result.output);
-    assert.equal(result.stderr, "");
+    assert.equal(cliStderr(result.stderr), "");
     assert.match(result.stdout, /\[PASS\] 基础环境与主密钥/u);
     assert.match(result.stdout, /\[PASS\] Google 登录与 owner/u);
     assert.match(result.stdout, /\[PASS\] 公开 HTTPS origin 与 Google 回调/u);
@@ -245,6 +260,25 @@ describe("deployment configuration CLI", () => {
       assert.equal(result.code, 1, "invalid Google callback");
       assert.match(result.stderr, /LYRA_LOGIN_GOOGLE_REDIRECT_URI/u);
     }
+  });
+
+  it("accepts loopback HTTP only when no public origin is configured, matching runtime behaviour", async () => {
+    // 运行时（GoogleLoginClient）允许本机开发使用 loopback HTTP 回调；预检必须
+    // 使用同一判定，否则一个服务端能启动的配置会被预检误判为失败。
+    const loopback = await checkConfiguration({ overrides: {
+      LYRA_PUBLIC_ORIGIN: undefined,
+      LYRA_LOGIN_GOOGLE_REDIRECT_URI: "http://127.0.0.1:3141/v1/auth/google/callback",
+    } });
+    assert.equal(loopback.code, 0, loopback.output);
+    assert.match(loopback.stdout, /\[SKIP\].*LYRA_PUBLIC_ORIGIN/u);
+
+    // 非 loopback 的明文回调仍然必须被拒绝。
+    const remotePlaintext = await checkConfiguration({ overrides: {
+      LYRA_PUBLIC_ORIGIN: undefined,
+      LYRA_LOGIN_GOOGLE_REDIRECT_URI: "http://lyra.ginponson.net/v1/auth/google/callback",
+    } });
+    assert.equal(remotePlaintext.code, 1);
+    assert.match(remotePlaintext.stderr, /LYRA_LOGIN_GOOGLE_REDIRECT_URI/u);
   });
 
   it("provides help and rejects unknown arguments without reflecting their values", async () => {

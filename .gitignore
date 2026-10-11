@@ -21,7 +21,8 @@ uploads/
 .env.*
 !.env.example
 application-gin.yml
-deploy/server.env
+# 通配后缀，避免 `cp server.env server.env.bak` 之类的手工轮换把主密钥带进提交
+deploy/server.env*
 deploy/backups/
 
 # IDE and operating-system files

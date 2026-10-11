@@ -33,6 +33,8 @@ WORKDIR /app/server
 RUN node --input-type=module -e 'import { DuckDBInstance } from "@duckdb/node-api"; const db = await DuckDBInstance.create(":memory:"); const connection = await db.connect(); await connection.run("SELECT 1"); connection.closeSync(); db.closeSync();'
 WORKDIR /app
 EXPOSE 3141
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+# start-period 覆盖首次启动的 schema 迁移；期间的健康检查失败不计入 retries，
+# 否则 `compose up --wait` 会在迁移尚未结束时就把服务判为不健康。
+HEALTHCHECK --interval=15s --timeout=5s --start-period=180s --retries=4 \
     CMD ["node", "server/scripts/healthcheck.mjs"]
 CMD ["/bin/sh", "server/scripts/start-container.sh"]

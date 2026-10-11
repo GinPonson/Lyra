@@ -115,7 +115,10 @@ function checkGoogleLogin(environment: NodeJS.ProcessEnv): boolean {
   }
   const callback = value(environment, "LYRA_LOGIN_GOOGLE_REDIRECT_URI");
   const url = parseUrl(callback);
-  if (url === null || url.protocol !== "https:" || isPlaceholderHostname(url.hostname)
+  // 协议规则（HTTPS，或本机开发允许 loopback HTTP）已由上面的
+  // loadGoogleLoginConfig 统一判定；这里只补充它不检查的规范性：
+  // 占位主机与「origin + 回调路径」的精确形式。
+  if (url === null || isPlaceholderHostname(url.hostname)
     || callback !== `${url.origin}${GOOGLE_LOGIN_CALLBACK_PATH}`) {
     errors.add("LYRA_LOGIN_GOOGLE_REDIRECT_URI");
   }
