@@ -25,6 +25,7 @@
     "genkit": "1.42.0",
     "google-auth-library": "11.2.0",
     "mailparser": "3.9.17",
+    "undici": "8.11.2",
     "zod": "4.5.4"
   },
   "devDependencies": {

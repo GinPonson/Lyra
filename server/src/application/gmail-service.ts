@@ -46,6 +46,35 @@ export interface GmailGoogleOAuthConfig {
   redirectUri: string;
 }
 
+/**
+ * 从环境变量装配 Gmail OAuth 配置。
+ *
+ * 正式服务入口与 Gmail 命令行共用同一判定：client ID 与回调缺一即为未配置，
+ * 返回 null 交由调用方降级；client secret 允许缺失，以兼容不签发 secret 的客户端类型。
+ *
+ * @param environment - 环境变量来源；键缺失或为空白均视为未设置。
+ * @returns 可直接传入 GmailService / GmailSyncService 的配置，未配置时为 null。
+ */
+export function loadGmailGoogleOAuthConfig(
+  environment: {
+    LYRA_GOOGLE_CLIENT_ID?: string | undefined;
+    LYRA_GOOGLE_CLIENT_SECRET?: string | undefined;
+    LYRA_GOOGLE_REDIRECT_URI?: string | undefined;
+  },
+): GmailGoogleOAuthConfig | null {
+  const clientId = environment.LYRA_GOOGLE_CLIENT_ID?.trim() ?? "";
+  const redirectUri = environment.LYRA_GOOGLE_REDIRECT_URI?.trim() ?? "";
+  if (clientId.length === 0 || redirectUri.length === 0) {
+    return null;
+  }
+  const clientSecret = environment.LYRA_GOOGLE_CLIENT_SECRET?.trim() ?? "";
+  return {
+    clientId,
+    ...(clientSecret.length > 0 ? { clientSecret } : {}),
+    redirectUri,
+  };
+}
+
 /** Gmail 连接、映射与授权事务的应用层编排。 */
 export class GmailService {
   readonly #database: LyraDatabase;

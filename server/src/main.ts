@@ -33,7 +33,13 @@ import { registerMarketSettingsRoutes } from "./transport/market-settings-routes
 import { registerImportRoutes } from "./transport/import-routes.js";
 import { registerGmailRoutes } from "./transport/gmail-routes.js";
 import { registerDeviceRoutes } from "./transport/device-routes.js";
-import { ImportService, GmailService, GmailSyncService, DevicePairingService } from "./application/index.js";
+import {
+  ImportService,
+  GmailService,
+  GmailSyncService,
+  DevicePairingService,
+  loadGmailGoogleOAuthConfig,
+} from "./application/index.js";
 import { SecretCipher } from "./infrastructure/security/index.js";
 
 const packageSchema = z.object({
@@ -93,16 +99,7 @@ async function start(): Promise<void> {
   const cipher = new SecretCipher(
     Buffer.from(environment.LYRA_SECRET_MASTER_KEY, "hex"),
   );
-  const googleOAuth = environment.LYRA_GOOGLE_CLIENT_ID.length > 0
-      && environment.LYRA_GOOGLE_REDIRECT_URI.length > 0
-    ? {
-        clientId: environment.LYRA_GOOGLE_CLIENT_ID,
-        ...(environment.LYRA_GOOGLE_CLIENT_SECRET.length > 0
-          ? { clientSecret: environment.LYRA_GOOGLE_CLIENT_SECRET }
-          : {}),
-        redirectUri: environment.LYRA_GOOGLE_REDIRECT_URI,
-      }
-    : null;
+  const googleOAuth = loadGmailGoogleOAuthConfig(environment);
   const gmailService = new GmailService({
     database,
     cipher,

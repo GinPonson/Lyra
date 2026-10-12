@@ -404,10 +404,14 @@ async function postGoogleTokenForm(
     throw new GoogleTokenEndpointFailure(null, true, "Google token request failed", error);
   }
   if (!response.ok) {
+    const oauthError = await readGoogleOAuthErrorCode(response);
     throw new GoogleTokenEndpointFailure(
       response.status,
       response.status === 429 || response.status >= 500,
-      `Google token endpoint returned HTTP ${response.status}`,
+      // 附上 Google 的稳定错误码（如 invalid_grant / redirect_uri_mismatch）：
+      // 它只留在原因链里用于定位，页面仍只看到上层的收敛错误码。
+      `Google token endpoint returned HTTP ${response.status}`
+        + (oauthError === null ? "" : ` (${oauthError})`),
     );
   }
 
@@ -421,6 +425,29 @@ async function postGoogleTokenForm(
     throw new GoogleTokenEndpointFailure(null, false, "Google token response is malformed");
   }
   return payload as Record<string, unknown>;
+}
+
+/**
+ * 读取 Google 错误响应里的 OAuth 错误码。
+ *
+ * 只接受 OAuth 规范定义的短标识（小写字母与下划线），`error_description`
+ * 等自由文本一律丢弃，避免把上游正文带进日志或终端。
+ *
+ * @param response - 非 2xx 的令牌端点响应。
+ * @returns 合法错误码；读取失败或形状不符时为 null。
+ */
+async function readGoogleOAuthErrorCode(response: Response): Promise<string | null> {
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    return null;
+  }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  const error = (payload as Record<string, unknown>).error;
+  return typeof error === "string" && /^[a-z_]{1,60}$/u.test(error) ? error : null;
 }
 
 /** 使用临时 access token 读取身份；未验证邮箱绝不建立连接。 */
