@@ -488,7 +488,7 @@ void main() {
     );
     await tester.pumpAndSettle();
     await _capture(tester, 'welcome-390');
-    expect(find.text('登录 Lyra'), findsOneWidget);
+    expect(find.byKey(const ValueKey('login-screen')), findsOneWidget);
     expect(find.text('使用 Google 登录'), findsOneWidget);
     expect(find.text('使用 Linux.do 登录'), findsOneWidget);
     expect(find.text('使用 GitHub 登录'), findsOneWidget);

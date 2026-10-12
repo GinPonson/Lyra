@@ -225,8 +225,8 @@ void main() {
     await tester.pumpAndSettle();
 
     // 独立登录页展示三种方式；服务端目录决定哪些按钮可用。
-    await scrollUntilVisible(tester, find.text('登录 Lyra'));
-    expect(find.text('登录 Lyra'), findsOneWidget);
+    await scrollUntilVisible(tester, find.text('使用 Google 登录'));
+    expect(find.byKey(const ValueKey('login-screen')), findsOneWidget);
 
     expect(find.widgetWithText(TextField, '服务端地址'), findsNothing);
     expect(find.widgetWithText(TextField, '配对码'), findsNothing);
@@ -674,7 +674,7 @@ void main() {
 
     // 读取失败不再留在 build 的 Future 里；用户看到可自助的登录入口与原因。
     expect(find.byKey(const ValueKey('login-screen')), findsOneWidget);
-    await scrollUntilVisible(tester, find.text('登录 Lyra'));
+    await scrollUntilVisible(tester, find.text('暂时无法恢复登录，请重新登录。'));
     expect(find.text('暂时无法恢复登录，请重新登录。'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
