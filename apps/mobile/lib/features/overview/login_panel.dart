@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -5,7 +7,6 @@ import '../../app/session.dart';
 import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
-import '../../core/design/lyra_icons.dart';
 import '../../core/preferences/app_preferences.dart';
 import '../auth/auth_provider.dart';
 import '../auth/auth_workspace.dart';
@@ -101,6 +102,12 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
   int _attempt = 0;
   String? _message;
   String _progressLabel = '等待授权…';
+  /// 不可用只提示一次：状态行常驻会占位，且用户无法据此判断何时恢复。
+  bool _notifiedUnavailable = false;
+  /// 去掉手动刷新后，服务端瞬时失败需要自行恢复。
+  Timer? _availabilityRetry;
+  int _availabilityRetryAttempt = 0;
+  bool _availabilityRetryExhausted = false;
 
   @override
   void initState() {
@@ -111,6 +118,7 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
   @override
   void dispose() {
     _attempt++;
+    _availabilityRetry?.cancel();
     final owner = _currentOwner;
     if (_submitting && owner != null) _loginOwner.cancel(owner);
     super.dispose();
@@ -174,11 +182,51 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     }
   }
 
-  void _reloadLoginOptions() {
-    setState(() => _message = null);
-    ref.invalidate(appPreferencesProvider);
+  /// 重新读取登录方式目录；不可用时由退避定时器自行调用，无需用户操作。
+  void _refreshLoginOptions() {
     final url = ref.read(currentServerUrlProvider);
     if (url != null) ref.invalidate(authProvidersProvider(url));
+  }
+
+  /// 只提示一次的瞬时提示：不常驻、不带操作按钮。
+  void _notifyUnavailable() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        const SnackBar(
+          key: ValueKey('login-unavailable-notice'),
+          content: Text('登录服务暂时不可用。'),
+          behavior: SnackBarBehavior.floating,
+          duration: Duration(seconds: 4),
+        ),
+      );
+    });
+  }
+
+  /// 退避重查（2/5/10/20/30 秒）；尝试完即停止，避免长期空转。
+  void _scheduleAvailabilityRetry(String? url) {
+    if (url == null || _availabilityRetry != null || _availabilityRetryExhausted) {
+      return;
+    }
+    const delays = [2, 5, 10, 20, 30];
+    if (_availabilityRetryAttempt >= delays.length) {
+      _availabilityRetryExhausted = true;
+      return;
+    }
+    final delay = Duration(seconds: delays[_availabilityRetryAttempt]);
+    _availabilityRetry = Timer(delay, () {
+      _availabilityRetry = null;
+      if (!mounted) return;
+      _availabilityRetryAttempt++;
+      _refreshLoginOptions();
+    });
+  }
+
+  void _cancelAvailabilityRetry() {
+    _availabilityRetry?.cancel();
+    _availabilityRetry = null;
+    _availabilityRetryAttempt = 0;
+    _availabilityRetryExhausted = false;
   }
 
   void _cancel() {
@@ -232,9 +280,26 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     );
     final allUnavailable =
         entries == null || entries.every((item) => !item.available);
-    final needsRetry =
+    // 全部不可用才提示；已登录时不提示登录服务状态。
+    if (!preparing && authenticated == null && allUnavailable) {
+      if (!_notifiedUnavailable) {
+        _notifiedUnavailable = true;
+        _notifyUnavailable();
+      }
+    } else {
+      _notifiedUnavailable = false;
+    }
+    // 自动重查替代原先的手动「重试」：任一方式不可用都尝试自行刷新，
+    // 退避若干次后停止，避免长期空转。
+    final needsRefresh =
         !preparing &&
+        authenticated == null &&
         (allUnavailable || entries.any((item) => !item.available));
+    if (needsRefresh) {
+      _scheduleAvailabilityRetry(url);
+    } else {
+      _cancelAvailabilityRetry();
+    }
     final content = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -267,14 +332,6 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
                         (item) => item.provider == provider && item.available,
                       ) ??
                       false),
-              status: _submitting || preparing
-                  ? null
-                  : entries?.any(
-                          (item) => item.provider == provider && item.available,
-                        ) ==
-                        true
-                  ? null
-                  : '暂不可用',
               onPressed: () => _submit(provider),
             ),
             const SizedBox(height: 12),
@@ -300,21 +357,7 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
               '正在准备登录…',
               textAlign: TextAlign.center,
               style: TextStyle(color: LyraColors.muted, height: 1.6),
-            )
-          else if (needsRetry) ...[
-            if (allUnavailable)
-              const Text(
-                '暂时无法登录，请稍后重试。',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: LyraColors.muted, height: 1.6),
-              ),
-            TextButton.icon(
-              key: const ValueKey('login-reload-providers'),
-              onPressed: busy ? null : _reloadLoginOptions,
-              icon: const Icon(LyraIcons.sync, size: 17),
-              label: const Text('重试'),
             ),
-          ],
         ],
         if (_message != null || sessionMessage != null) ...[
           const SizedBox(height: 16),
@@ -356,12 +399,10 @@ class _ProviderSignInButton extends StatelessWidget {
   const _ProviderSignInButton({
     required this.provider,
     required this.available,
-    required this.status,
     required this.onPressed,
   });
   final AuthProvider provider;
   final bool available;
-  final String? status;
   final VoidCallback onPressed;
 
   @override
@@ -397,20 +438,12 @@ class _ProviderSignInButton extends StatelessWidget {
         Expanded(
           child: Text(
             '使用 ${provider.label} 登录',
-            textAlign: status == null ? TextAlign.center : TextAlign.left,
+            textAlign: TextAlign.center,
           ),
         ),
-        if (status != null) ...[
-          const SizedBox(width: 10),
-          Text(
-            status!,
-            style: const TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w400,
-              color: LyraColors.mutedSoft,
-            ),
-          ),
-        ],
+        // 与左侧图标 + 间距等宽的占位，使文字在整条按钮内真正居中，
+        // 而不是在「图标右侧的剩余空间」里居中。
+        const SizedBox(width: 32),
       ],
     ),
   );

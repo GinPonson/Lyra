@@ -199,7 +199,7 @@ void main() {
     });
   }
 
-  testWidgets('不可用的登录方式禁用并可重试，不暴露配置状态', (tester) async {
+  testWidgets('不可用的登录方式禁用并自动重查，不暴露配置状态', (tester) async {
     final fixture = LoginFixture()..available = {AuthProvider.github};
     await pumpLogin(tester, fixture);
     expect(
@@ -220,19 +220,32 @@ void main() {
           .onPressed,
       isNotNull,
     );
-    expect(find.text('暂不可用'), findsNWidgets(2));
+    // 三种方式样式统一：只有居中的名称文字，不再有右侧状态标签。
+    for (final item in AuthProvider.values) {
+      expect(find.text('使用 ${item.label} 登录'), findsOneWidget);
+    }
+    expect(find.text('暂不可用'), findsNothing);
     expect(fixture.openedUrls, isEmpty);
+    expect(find.byKey(const ValueKey('login-reload-providers')), findsNothing);
     fixture.available = AuthProvider.values.toSet();
-    await tapLogin(
-      tester,
-      find.byKey(const ValueKey('login-reload-providers')),
-    );
+    // 页面不再提供刷新按钮：目录不可用时按退避自行重查并恢复。
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
     expect(
       tester
           .widget<OutlinedButton>(find.byKey(const ValueKey('login-linuxdo')))
           .onPressed,
       isNotNull,
     );
+    // 恢复后三种方式都可点，且依旧没有额外状态文字。
+    for (final item in AuthProvider.values) {
+      expect(
+        tester
+            .widget<OutlinedButton>(find.byKey(ValueKey('login-${item.id}')))
+            .onPressed,
+        isNotNull,
+      );
+    }
     expect(find.text('暂不可用'), findsNothing);
   });
 
@@ -292,7 +305,7 @@ void main() {
       expect(find.byType(TextField), findsNothing);
       expect(find.textContaining('服务端'), findsNothing);
       expect(find.textContaining('http'), findsNothing);
-      expect(find.text('暂时无法登录，请稍后重试。'), findsOneWidget);
+      expect(find.text('登录服务暂时不可用。'), findsOneWidget);
       for (final provider in AuthProvider.values) {
         expect(
           tester
@@ -303,15 +316,15 @@ void main() {
           isNull,
         );
       }
-      await tapLogin(
-        tester,
-        find.byKey(const ValueKey('login-reload-providers')),
-      );
+      // 提示只作为一次性提示出现，页面上不再常驻状态行与刷新按钮。
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+      expect(find.text('登录服务暂时不可用。'), findsNothing);
+      expect(find.byKey(const ValueKey('login-reload-providers')), findsNothing);
       expect(fixture.requests, isEmpty);
       expect(fixture.openedUrls, isEmpty);
     });
   }
-
   testWidgets('等待读取旧地址后才发现登录方式，不短暂请求构建默认后台', (tester) async {
     final fixture = LoginFixture();
     final preferences = _DelayedPreferencesStore();
@@ -334,10 +347,10 @@ void main() {
   });
 
   for (final status in [404, 503]) {
-    testWidgets('登录方式查询 $status 只给出用户提示，重试恢复后可登录', (tester) async {
+    testWidgets('登录方式查询 $status 只给出用户提示，自动重查恢复后可登录', (tester) async {
       final fixture = LoginFixture()..catalogStatus = status;
       await pumpLogin(tester, fixture);
-      expect(find.text('暂时无法登录，请稍后重试。'), findsOneWidget);
+      expect(find.text('登录服务暂时不可用。'), findsOneWidget);
       expect(
         tester
             .widget<OutlinedButton>(find.byKey(const ValueKey('login-google')))
@@ -345,10 +358,9 @@ void main() {
         isNull,
       );
       fixture.catalogStatus = null;
-      await tapLogin(
-        tester,
-        find.byKey(const ValueKey('login-reload-providers')),
-      );
+      // 服务端瞬时失败由页面自行退避重查，用户不需要点任何刷新按钮。
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pumpAndSettle();
       expect(
         tester
             .widget<OutlinedButton>(find.byKey(const ValueKey('login-google')))
