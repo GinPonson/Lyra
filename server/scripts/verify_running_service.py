@@ -10,7 +10,7 @@ complete" 之后，服务仍可能因为数据库不可读、主密钥缺失或�
     cd server
     UV_CACHE_DIR=../.uv-tmp/cache UV_PYTHON_INSTALL_DIR=../.uv-tmp/python \\
       uv run --python 3.12 python scripts/verify_running_service.py \\
-      --base-url http://127.0.0.1:8080 [--device-token "$DEVICE_TOKEN"]
+      --base-url http://127.0.0.1:3141 [--device-token "$DEVICE_TOKEN"]
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def _get(
 def main() -> int:
     """跑完全部启动后检查。"""
     parser = argparse.ArgumentParser(description="验证正在运行的服务")
-    parser.add_argument("--base-url", required=True, help="服务基址，如 http://127.0.0.1:8080")
+    parser.add_argument("--base-url", required=True, help="服务基址，如 http://127.0.0.1:3141")
     parser.add_argument("--device-token", default=None, help="设备访问令牌（可选）")
     args = parser.parse_args()
 

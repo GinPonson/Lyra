@@ -16,7 +16,7 @@
 | 回合取消与重启恢复 | 已完成 | 测试覆盖退出发生于回合启动等待期间、取消持久化与模型完成交错、工具调用取消、迟到输出抑制、重启恢复及重复恢复幂等 |
 | 证券账户创建接口 | 已完成 | 新增已鉴权 `POST /v1/ledger/accounts`；复用领域账户模型、共享写队列和公开脱敏投影；账户、审计与幂等结果同事务，空建账户不增加交易或账本版本；测试覆盖请求重放、并发重复、注销排队和失败回滚 |
 | 首次导入与账户标识一致性 | 已完成 | 真实空库经受控 Google 登录签发设备后，创建账户、上传 CSV、预览、确认并读取持仓/已实现；账户匹配规范化后，交易和哈希沿用数据库原账户键；不同大小写文件名重传仍识别为既有交易。导入解析器版本为 2，财务数据继续沿用既有表与口径 |
-| 服务端完整回归 | 已完成 | **本次独立登录页 / 三提供方**：Node 24.19.0，`npm run check` 干净 TypeScript 构建及 **132 套件 / 400 项**全部通过，0 失败、0 取消、0 跳过。下节保留 2026-10-11 修复轮对历史不可复现统计的纠正及 368 项通过记录 |
+| 服务端完整回归 | 已完成 | **Python 服务端**：HEAD（`ed522c7`）实测 `cd server && uv run --frozen pytest -q` **2307 项通过 / 4 项跳过**，`uv run --frozen ruff check .` 无错误类发现；服务端已由 TypeScript/Fastify 全量迁移到 Python/FastAPI，TS 侧只存在于 git 历史（最后一个 TS 提交 `6887bec`）。下节保留 2026-10-11 修复轮对历史不可复现统计的纠正及 368 项通过记录 |
 | Flutter 登录、单助手与首次账户界面 | 已完成 | 空账户首页与账户选择器提供创建入口；导入保留原文件、创建后继续预览；创建重试、重复账户、预览失败恢复、取消、身份切换和组件卸载均有通过的回归；空库账本版本保持 0，首次财务导入才变为 1 |
 | Flutter 凭据队列与汇总刷新 | 已完成 | 按凭据存储归属排队，所有生产 SecureCredentialStore 实例保持共享队列；独立内存存储互不阻塞，队列失败/空闲后正确释放；登录、刷新、退出及助手会话 ID 保持串行。汇总刷新有身份与请求代次检查，旧成功/失败不能覆盖较新的结果 |
 | Flutter 用户页面与账户管理 | 已完成 | 登录后四个主入口为总览、股票、交易、我的；用户页显示可用的邮箱或昵称与登录方式，提供证券账户列表和新增、偏好、行情、关于和确认退出。未登录进入独立登录页，只选择账号；已移除普通页面的连接配置入口，退出或身份变化清除财务二级路由 |
@@ -35,7 +35,7 @@
 | 真实第三方登录 / 模型 / 行情 / 手机联调 | 待开始 | 本轮未配置真实 Google / LINUX DO / GitHub OAuth 应用和公开回调，也未新增模型 / 行情凭据；外部登录使用受控响应，完整真实系统浏览器往返仍需部署后验收 |
 | GitHub 草稿 PR 交付 | 已完成 | 独立登录页、三种 OAuth、schema15 与后续用户流程精简继续交付至[草稿 PR #1](https://github.com/GinPonson/Lyra/pull/1)；本轮基于 7d72c1c 继续清理其它页面的技术文案并更新截图。真实第三方登录 / 模型 / 行情 / 手机完整联调待验，本轮未合并、部署或构建 APK |
 
-配置模板在 [`server/.env.example`](../server/.env.example)，启动、升级和待验步骤见 [迁移说明](genkit-oauth.md)。界面切源需要更新 App 与服务端；迁移前备份数据库并保留原加密主密钥。v14/v15 保留 v13 的 OAuth 凭据；从 v12 或更早版本升级时，重新登录并新建 Lyra 会话。真实第三方登录 / 模型 / 手机联调完成前，迁移 PR 保持草稿。
+配置模板在 [`deploy/server.env.example`](../deploy/server.env.example)，启动、升级和待验步骤见 [迁移说明](genkit-oauth.md)。界面切源需要更新 App 与服务端；迁移前备份数据库并保留原加密主密钥。v14/v15 保留 v13 的 OAuth 凭据；从 v12 或更早版本升级时，重新登录并新建 Lyra 会话。真实第三方登录 / 模型 / 手机联调完成前，迁移 PR 保持草稿。
 
 ### 其它页面技术文案检查（2026-10-11）
 
@@ -597,6 +597,7 @@ flutter test --no-pub test/market_settings_capture_test.dart \
 | 2026-09-05 | `GRADLE_USER_HOME=/private/tmp/lyra-gradle-home-20260831 flutter build apk --debug` | 通过 | `file_selector_android` 钉回 0.5.1+9 后 Android 构建恢复（52.6s）；修复配对协议头与刷新解析后再次构建成功 |
 | 2026-09-05 | Medium_Phone 模拟器端到端 smoke | 通过 | `com.lyrafinance.lyra_mobile` 安装启动无崩溃；配对真实服务端（127.0.0.1:3141 经 adb reverse）成功并显示空账本权威语境（账本版本 0、已同步）；导入面板经系统文件选择器上传 Schwab CSV，服务端正确返回 `ACCOUNT_MAPPING_REQUIRED` 且 App 显示稳定错误码；Agent 页三供应商入口渲染正常；401 刷新路径暴露的响应解析缺陷已修复并复验配对成功 |
 | 2026-09-01 | `LYRA_PORT=3143 LYRA_DATABASE_PATH=<临时文件> npm start` + loopback smoke | 通过 | 单服务入口完成 v1–v11 迁移并监听本机端口；健康端点返回 200 与 schema 11；`GET /mcp` 明确 405；无凭据与未知凭据的 `tools/list` 均返回 401 稳定 JSON-RPC 错误；SIGTERM 后写队列关闭、进程干净退出 |
+| 2026-10-13 | 文档校对 + `cd server && UV_CACHE_DIR=/tmp/uv-cache uv run --frozen pytest -q tests/test_preflight_script.py`（5 项通过）/ `uv run --frozen pytest -q --collect-only`（2311 项可收集）/ `uv run --frozen ruff check .` | 通过（有边界，见备注） | **文档与构建上下文同步到 Python 服务端现状**：切流运行手册（`server/` 路径、预检七项与 `preflight_cutover.py` 的 `CHECKS` 逐项一致、阶段 3 探针改为 `verify_running_service.py`、阶段 6 回退改为可执行并把 TS 定位到 git 历史 `6887bec`、阶段 7 不再含删除 `server/` 的命令）、`docs/deployment.md`（`python3 deploy/init-env.py`、`verify_running_service.py`、`python:3.12-slim-bookworm`、PyPI 依赖、`lyra`/10001 属主、删除 Node 时代的工具与端点（旧探针脚本、配置检查 CLI、`/mcp`）用法、去掉已不再注入且服务端从不读取的 `LYRA_PUBLIC_ORIGIN` 描述）、`.dockerignore`（放行 `server/pyproject.toml`、`uv.lock`、`src/**`、`scripts/verify_running_service.py`；排除 `server/tests`、`server/.venv`、`__pycache__`）、`README.md`、`server/README.md`、`docs/genkit-oauth.md`。`preflight_cutover.py`：静态检查改项目级 `ruff check .`、接管既有账本改在当前解释器内只读打开夹具（不再 spawn `uv run`）、主密钥检查加加解密往返并对夹具密文只作提示、检查清单提为模块级 `CHECKS` 常量；`test_preflight_script.py` 改为断言清单（名称/条数/函数）而非仅断言函数存在；`verify_running_service.py` 文档串端口 8080 → 3141（无逻辑改动）。**边界**：本环境无 Docker Engine，镜像构建与 `.dockerignore` 的实际过滤未实测；`ruff check .` 当前仍有 1 处错误类发现位于并行修改中的 `server/tests/test_device_repository.py`；`docs/plans/lyra-python-migration-20261012.md`（历史迁移计划，74 处旧目录名）与上方历史条目中的旧脚本引用按历史记录保留，未改写 |
 
 ## 当前环境事项
 

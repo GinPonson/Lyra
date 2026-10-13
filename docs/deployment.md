@@ -2,7 +2,7 @@
 
 本方案运行一个 Lyra 服务进程，以 Docker volume 保存 DuckDB，使用可选的 Caddy 提供 HTTPS。适用于当前 `feat/genkit-oauth` 分支、协议 **2** 和 schema **15**。独立登录页与 Google / Linux.do / GitHub 入口需要构建当前移动端源码；本轮尚未重新打包 Android APK。此前 APK 的版本与验证范围见[进度记录](progress.md)。
 
-配置检查、服务探测和真实联调是三个不同步骤：检查命令不会打开数据库或调用第三方；服务探测读取公开状态，并向已移除的 `/mcp` 发送无 RPC 方法的空对象检查 POST 路由；已启用来源的真实 OAuth 授权、模型工具调用和手机交互需要最后在 App 内验收。
+配置校验、服务探测和真实联调是三个不同步骤：**配置在服务启动时校验**——不完整就直接退出，没有独立的检查命令；服务探测用 `server/scripts/verify_running_service.py` 读取公开状态、协议门与受保护端点的错误形状（它不会登录、建账户、导入文件或请求模型）；已启用来源的真实 OAuth 授权、模型工具调用和手机交互需要最后在 App 内验收。
 
 ## 1. 先准备这些信息
 
@@ -15,9 +15,9 @@
 | GitHub / Linux.do 所有者（启用时） | `LYRA_OWNER_GITHUB_SUBJECT` / `LYRA_OWNER_LINUXDO_SUBJECT` | 自己在该来源的不可变正整数用户 ID；不填用户名、昵称或邮箱 |
 | 模型基址、模型名、API key | 三项 `LYRA_GENKIT_*` | 支持流式 Chat Completions 和 tool calling 的兼容服务 |
 
-主机需要 Docker Engine、**Docker Compose 2.30 或更高版本**；`init-env.mjs` 和 `probe.mjs` 使用 Node.js 22 或更高版本。服务本身运行在 Node 24 Debian 容器中。已有其他反向代理时，可以只启动 Lyra 容器。
+主机需要 Docker Engine、**Docker Compose 2.30 或更高版本**，以及 **`python3`**（只用于运行 `deploy/init-env.py`，它只用标准库、不装依赖）。服务运行在 **`python:3.12-slim-bookworm`** 容器中，依赖由 `uv` 按 `server/uv.lock` 安装。运行探测脚本的机器需要 `uv`（它会自行取用 Python 3.12，见第 4 节）。已有其他反向代理时，可以只启动 Lyra 容器。
 
-构建需要访问锁文件中的 `registry.npmjs.org` 和 `mirrors.cloud.tencent.com`；没有通过修改依赖版本来绕过镜像问题。Dockerfile 在目标架构内安装原生 DuckDB 依赖，并在最终运行层执行一次内存数据库 `SELECT 1` 检查。不要将 Mac 的 `node_modules` 复制到服务器。
+构建需要访问 PyPI（`pypi.org` / `files.pythonhosted.org`）：构建阶段用 `pip` 安装固定版本的 `uv`，再由 `uv sync --frozen` 按 `server/uv.lock` 安装依赖（含按目标架构安装的 DuckDB 轮子）。运行层不再执行内存库 `SELECT 1` 检查——健康检查直接打 `/v1/health`。
 
 使用内置 Caddy 时，让域名的有效 A/AAAA 记录指向 VPS，并开放 TCP 80/443；UDP 443 用于 HTTP/3。Caddy 自动申请和续期证书的条件见[官方 HTTPS 文档](https://caddyserver.com/docs/automatic-https)。
 
@@ -28,14 +28,14 @@
 ```bash
 git clone --branch feat/genkit-oauth https://github.com/GinPonson/Lyra.git
 cd Lyra
-node deploy/init-env.mjs
+python3 deploy/init-env.py
 ```
 
 初始化会创建权限为 `0600` 的 `deploy/.env` 和 `deploy/server.env`，并为**新账本**生成一次 32 字节随机主密钥；已有文件保持原样，不打印密钥。升级已有账本时，将原配置和原 `LYRA_SECRET_MASTER_KEY` 迁入，不能为旧数据换一把新密钥。
 
 在服务器本地用编辑器填好两个文件。不要将真实配置提交到 Git，也不需要把密钥贴进聊天。
 
-`deploy/server.env` 使用 Compose 的 `format: raw`：**一行一个 `KEY=value`，值外面不要加引号，注释单独一行**。美元符号等字符会原样传给服务，避免 API key 被 Compose 变量替换。此格式要求 Compose 2.30+，详见[官方 env_file 说明](https://docs.docker.com/reference/compose-file/services/#format)。它与 `node --env-file=server/.env` 的普通 dotenv 格式分开，不能混用引号规则。
+`deploy/server.env` 使用 Compose 的 `format: raw`：**一行一个 `KEY=value`，值外面不要加引号，注释单独一行**。美元符号等字符会原样传给服务，避免 API key 被 Compose 变量替换。此格式要求 Compose 2.30+，详见[官方 env_file 说明](https://docs.docker.com/reference/compose-file/services/#format)。服务端只读进程环境变量、**不解析 `.env` 文件**，所以不存在第二套 dotenv 格式需要对齐。
 
 ### 启用登录来源
 
@@ -51,13 +51,13 @@ node deploy/init-env.mjs
 
 多种来源访问同一份私有账本，各来源都须显式声明允许的身份。首次成功兑换后，数据库按来源固定 `subject`；相同邮箱或昵称不会自动关联，修改环境变量不能让其他账号接管已经绑定的来源。新增来源声明的是对这份账本的访问权限，当前不是多用户独立账本服务。
 
-修改登录配置后先预检，再重启服务器，在 App 登录页重新检测即可看到来源可用性。配置完整不等于真实凭据已通过提供方验证；关闭来源只阻止新的授权，不代替撤销已经签发的设备会话。
+修改登录配置后重启服务器（配置在启动时校验），再在 App 登录页重新检测即可看到来源可用性。配置完整不等于真实凭据已通过提供方验证；关闭来源只阻止新的授权，不代替撤销已经签发的设备会话。
 
-如果暂时只使用账本，完整删除或注释三项 `LYRA_GENKIT_BASE_URL`、`LYRA_GENKIT_MODEL`、`LYRA_GENKIT_API_KEY`，之后使用不带 `--require-ai` 的检查命令。部分填写或保留占位值会被拒绝。未使用 Gmail 导入时，保持其三项变量为注释，不填写空值。
+如果暂时只使用账本，完整删除或注释三项 `LYRA_GENKIT_BASE_URL`、`LYRA_GENKIT_MODEL`、`LYRA_GENKIT_API_KEY`：三项全空等于未启用模型，服务照常启动。部分填写或保留占位值会在启动时被拒绝。未使用 Gmail 导入时，保持其三项变量为注释，不填写空值。
 
 ### 可选：启用历史或延迟行情
 
-模板默认 `LYRA_MARKET_STOCK_PROVIDERS=none`、`LYRA_MARKET_OPTION_PROVIDERS=none`，推荐保留这两个值。需要行情时，先在服务器填写供应商的完整凭据，执行配置预检并重启；对应来源随后在 App 中变为可选，填写密钥本身不会启用远程读取。
+模板默认 `LYRA_MARKET_STOCK_PROVIDERS=none`、`LYRA_MARKET_OPTION_PROVIDERS=none`，推荐保留这两个值。需要行情时，先在服务器填写供应商的完整凭据并重启（凭据不完整或只填一半会在启动时失败）；对应来源随后在 App 中变为可选，填写密钥本身不会启用远程读取。
 
 之后在 **「我的 → 行情与估值」** 分别为股票和期权选择主来源、可选备用来源或关闭；每次选择都会自动提交，服务端确认后立即对新行情查询生效，日常切源无需重启。等待时显示「正在切换」并防止重复提交，失败时界面恢复最后已确认的选择并提示重试。选择通过 schema 14 引入的配置表持久化在服务端，对同一所有者的全部设备与 Genkit 共用，随数据库备份并在重启后恢复。
 
@@ -65,7 +65,7 @@ node deploy/init-env.mjs
 
 来源环境变量只在数据库尚未保存设置时提供默认值。已有保存记录优先，重启不会用 env 默认顺序覆盖它。保留非 `none` 的旧 env 默认值时，该配置仍需完整有效；移除对应 Key 应同步将旧默认路由清为 `none`，这不会覆盖数据库中的界面选择。已保存来源失去凭据或被移除后，界面会显示不可用状态，允许重新选择或关闭；不会静默替换为新的来源。
 
-密钥、MarketData 模式、预算和超时仍在服务器管理，修改后需重新预检并重启。预检验证来源默认值、模式、请求上限及凭据完整性，输出不含密钥，不验证外部账户权限或剩余额度。密钥不放入 App、Genkit 提示词或请求参数。完整设置契约、时点口径与缓存限制见[行情接入与换源](market-data.md)。
+密钥、MarketData 模式、预算和超时仍在服务器管理，修改后需重启（配置在启动时校验来源默认值、模式、请求上限与凭据完整性；校验输出不含密钥，也不验证外部账户权限或剩余额度）。密钥不放入 App、Genkit 提示词或请求参数。完整设置契约、时点口径与缓存限制见[行情接入与换源](market-data.md)。
 
 容器监听地址、端口、数据目录和公开 origin 由 Compose 固定注入，覆盖 `server.env` 中的同名值：
 
@@ -74,24 +74,22 @@ node deploy/init-env.mjs
 | 监听 | `0.0.0.0:3141` |
 | 数据库 | `/var/lib/lyra/lyra.duckdb` |
 | 上传预览暂存 | `/tmp/lyra-import-staging` |
-| 公开 origin | `https://${LYRA_DOMAIN}` |
+| 公开 origin | **没有这个配置项**：Compose 不再注入 `LYRA_PUBLIC_ORIGIN`，服务端也从不读取它（`Settings` 用 `extra="ignore"`，未知变量被忽略）。公开地址只由反向代理的域名与各来源登记的 HTTPS 回调决定 |
 
-## 3. 构建并先检查配置
+## 3. 构建镜像
 
 ```bash
 ./deploy/compose.sh config --quiet
 ./deploy/compose.sh build lyra
-./deploy/compose.sh run --rm --no-deps lyra \
-  node server/dist/src/cli/check-config.js --require-ai
 ```
-
-检查成功退出码为 `0`，错误为 `1`，参数用法错误为 `2`。检查会复用正式入口的基础配置、三种登录来源、Genkit 和可选行情解析。至少一种登录配置须完整可用，其余来源完全未设置时跳过；部分配置、占位值、缺失的所有者约束、不一致的公开 origin / 任一已启用登录回调及不完整的模型 / 行情配置都会被拒绝。输出只包含检查项及变量名，**不会打开或迁移数据库，也不会验证真实凭据是否有效**。
-
-容器的正常启动入口也会先执行这项检查，通过后才 `exec` 正式服务。不要通过手动运行 `main.js` 来做配置预检，因为它会自动迁移数据库。
 
 `config --quiet` 仅用于语法验证；不要公开粘贴不带 `--quiet` 的完整 Compose 配置，它可能展开密钥。
 
-镜像默认使用 `node:24-bookworm-slim` 与 `caddy:2-alpine`。锁文件固定应用依赖；基础镜像的主版本标签仍会更新。需要固定部署镜像时，在 `deploy/.env` 中将对应镜像变量改成自己验证过的版本或 digest。
+**没有独立的配置检查命令。** 配置在服务启动时校验，顺序是：入口 `lyra-serve` 先构造 `Settings`（`LYRA_DATABASE_PATH`、`LYRA_IMPORT_STAGING_DIR`、`LYRA_SECRET_MASTER_KEY` 的 64 位十六进制形态），再打开并迁移账本，最后由 `create_app` 装配登录来源、Gmail 与模型运行时。任何一项不完整都会在**开始监听之前**直接退出，不会进入"半启动"状态。
+
+登录来源的校验规则（`load_owner_login_providers`）：每组四项（client ID / secret / redirect URI / owner subject）要么**整组未设置**（该来源关闭），要么**整组完整有效**；部分填写会直接让启动失败。redirect URI 必须是固定 HTTPS 回调路径（仅本机开发允许 HTTP），owner subject 必须是正整数用户 ID。**模型与行情配置不完整同样会失败**——让服务带着"看起来启用了但永远用不了"的配置上线是被刻意拒绝的。
+
+因此**不要靠"容器起来了"判断配置正确**：用 `up -d --wait` 的退出码、健康状态与日志判断（见下一节）。镜像默认使用 `python:3.12-slim-bookworm` 与 `caddy:2-alpine`；Python 依赖由 `server/uv.lock` 固定，基础镜像的主版本标签与 `LYRA_UV_VERSION` 仍会随上游更新。需要固定部署镜像时，在 `deploy/.env` 里把 `LYRA_PYTHON_IMAGE` / `LYRA_CADDY_IMAGE` / `LYRA_UV_VERSION` 改成自己验证过的版本或 digest。
 
 ## 4. 启动 HTTPS 服务
 
@@ -102,13 +100,20 @@ node deploy/init-env.mjs
 ./deploy/compose.sh ps
 ```
 
-然后从能访问该域名的机器运行：
+然后从能访问该域名的机器运行探测（需要 `uv`，在仓库的 `server/` 目录下执行）：
 
 ```bash
-node deploy/probe.mjs https://你的域名
+cd server
+UV_CACHE_DIR=../.uv-tmp/cache UV_PYTHON_INSTALL_DIR=../.uv-tmp/python \
+  uv run --python 3.12 python scripts/verify_running_service.py \
+  --base-url https://你的域名 --device-token "$DEVICE_TOKEN"
 ```
 
-探测检查公开协议与 schema、账本健康、无登录访问被拒绝、缺少协议请求头时被拒绝以及 `/mcp` 的 GET / POST 均为 404。它不会登录、建账户、导入文件或请求模型。首次证书签发可能晚于容器进入运行状态；遇到 TLS 连接失败时，核对 DNS 和 Caddy 日志后重试。
+`--base-url` 必填，`--device-token` 可选；不传令牌时会跳过带令牌的三项检查，并明确提示**没有验证过真实账本读取**。
+
+探测逐项验证：`/v1/health` 返回 200 且 `status` 为 `healthy` **或 `degraded`**；`/v1/system/info` 的 `schema_version` 为 15、`protocol_version` 为 2；缺少 `x-lyra-protocol-version` 请求头时受保护端点返回 **426**（而不是 401）；未认证访问受保护端点返回 **401 且错误体是扁平信封**；带令牌读取账本返回 200。它不会登录、建账户、导入文件或请求模型。首次证书签发可能晚于容器进入运行状态；遇到 TLS 连接失败时，核对 DNS 和 Caddy 日志后重试。
+
+（原先的 Node 版探测脚本已随 Node 侧整体删除，它的检查项全部并入这个脚本；`/mcp` 端点更早已移除，脚本不探测它。）
 
 ```bash
 ./deploy/compose.sh logs --tail 100 lyra caddy
@@ -122,7 +127,10 @@ node deploy/probe.mjs https://你的域名
 
 ```bash
 ./deploy/compose.sh up -d --wait --wait-timeout 300 lyra
-node deploy/probe.mjs http://127.0.0.1:3141
+cd server
+UV_CACHE_DIR=../.uv-tmp/cache UV_PYTHON_INSTALL_DIR=../.uv-tmp/python \
+  uv run --python 3.12 python scripts/verify_running_service.py \
+  --base-url http://127.0.0.1:3141
 ```
 
 Compose 将应用端口只发布到 VPS 的 `127.0.0.1:3141`；将现有反向代理指向它。公开 App 地址和每个已启用来源的回调仍使用同一个 HTTPS origin。代理需要保留 `/v1` 路径、Authorization、`X-Lyra-Protocol-Version`、`Idempotency-Key` 和上传头，并支持 `/v1/events` WebSocket。
@@ -132,7 +140,7 @@ Caddy 的 `reverse_proxy` 原生支持 WebSocket，无需额外手写 Upgrade �
 ## 5. 数据、停止和升级
 
 - 只运行 **一个 Lyra writer 进程**；不要用多副本或 PM2 cluster 共享这份 DuckDB。
-- `ledger_data` 挂载整个数据库目录，包括 WAL 和数据库临时文件。运行用户是 `node`；新 volume 从镜像初始化可写目录。导入既有 volume 时，确认数据属于容器 UID/GID `1000:1000`，不要使用 `chmod 777`。
+- `ledger_data` 挂载整个数据库目录，包括 WAL 和数据库临时文件。运行用户是 `lyra`（容器内 UID/GID **10001:10001**）；新建的命名卷按镜像内的属主初始化，所以 `up` 起来即可写。**导入既有 volume 或改用 bind mount 时**，确认数据属于 `10001:10001`（例如 `chown -R 10001:10001 <目录>`），不要使用 `chmod 777`——属主不对时 DuckDB 建不了库、也写不了 WAL，而症状要到首次启动才暴露。
 - `/tmp` 是上限 256 MiB 的临时内存文件系统，用于上传暂存；不是账本备份。服务重启后，尚未确认的预览需要重新选择文件并预览。容器临时目录不会保存历史账本。
 - AI 回合默认上限 120 秒、可配置至 600 秒。Compose 停服宽限设为 **11 分钟**，给最长回合和写队列留出退出时间；空闲服务通常立即停止。升级前先在 App 完成或取消当前回合、处理未确认导入。
 - `stop`、`down` 默认保留命名数据卷；**不要用 `down -v` 作为升级命令**。
@@ -152,11 +160,11 @@ tar -tzf "$backup_file" >/dev/null
 
 备份包含账本目录及数据库中的行情来源选择。`deploy/server.env` 中的原主密钥和供应商凭据需要另外安全保管；数据库副本不能替代密钥。检查备份时服务已停止，不复制一份仍在写入的 DuckDB。当前没有自动备份调度，以上是手动备份操作。
 
-完成备份后更新代码，重新构建并预检，再使用与首次部署相同的 `up -d --wait` 命令更新服务。不要同时启动旧程序和新程序访问该数据卷。
+完成备份后更新代码并重新构建，再用与首次部署相同的 `up -d --wait` 命令更新服务（配置在启动时校验，没有独立的预检命令）。不要同时启动旧程序和新程序访问该数据卷。
 
 schema 14 只新增行情选择的持久化，不撤销 schema 13 的有效 OAuth 设备凭据。schema 15 将所有者绑定扩展为按来源固定 subject，并允许新来源没有邮箱；已有 Google 绑定、有效 OAuth 设备会话、账本及行情选择保留。若从 schema 12 或更早版本升级，则仍会经过 schema 13 的旧匿名配对凭据撤销，需要使用已配置的来源重新登录。
 
-回退需要使用**升级前备份 + 相匹配的旧服务和旧 App**；不能直接拿旧程序打开已经迁移到新 schema 的库。具体迁移规则见 [Genkit 与多来源登录](genkit-oauth.md#7-启动与升级)。
+回退需要使用**升级前备份 + 相匹配的旧服务和旧 App**；不能直接拿旧程序打开已经迁移到新 schema 的库。具体迁移规则见 [Genkit 与多来源登录](genkit-oauth.md#7-启动与升级)。TS → Python 切流的回退（TS 源码只存在于 git 历史、镜像 `lyra-server:local` 无固定 tag/digest）见[切流运行手册](plans/lyra-cutover-runbook-20261013.md)第 6 阶段。
 
 ## 6. 手机上完成真实联调
 
@@ -182,9 +190,9 @@ schema 14 只新增行情选择的持久化，不撤销 schema 13 的有效 OAut
 
 ## 7. 当前验证边界
 
-当前工作环境没有 Docker Engine，因此不能将 Compose/schema 静态校验、Node 本机测试或配置检查当作镜像构建和 VPS 验收。镜像构建、Caddy 真实证书、公开域名、Google / Linux.do / GitHub 真实授权、真实模型及 Android 真机结果应在执行后再更新 [进度记录](progress.md)。
+当前工作环境没有 Docker Engine，因此不能将 Compose/schema 静态校验或本机 Python 测试当作镜像构建和 VPS 验收。镜像构建、Caddy 真实证书、公开域名、Google / Linux.do / GitHub 真实授权、真实模型及 Android 真机结果应在执行后再更新 [进度记录](progress.md)。
 
-本轮独立登录页与多来源登录的服务端 `npm run check` 已通过 **132 套件 / 400 项**，0 失败、0 取消、0 跳过；该结果来自受控身份提供方与本地测试，不代表真实 OAuth 已上线。本轮未部署到 VPS、未重新构建 APK，也未用真实行情 Key 完成联调。
+服务端验证入口是 `cd server && uv run --frozen pytest -q`（全量测试）与 `uv run --frozen ruff check .`（错误类静态检查）；HEAD（`ed522c7`）实测 **2307 项通过 / 4 项跳过**（数字随提交变动，以执行时输出为准）。该结果来自受控身份提供方与本地测试，不代表真实 OAuth 已上线。本轮未部署到 VPS、未重新构建 APK，也未用真实行情 Key 完成联调。
 
 部署前需要确定域名、服务器环境、至少一个登录来源及其所有者 ID，以及按需使用的兼容模型服务；凭据在服务器本地配置。真实环境联调完成前，现有迁移 PR 继续保持草稿。
 

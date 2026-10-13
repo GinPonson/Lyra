@@ -36,7 +36,7 @@ Google、Linux.do 和 GitHub 登录只用于确认 Lyra 用户身份，**不会�
 
 独立登录页固定显示 **Google、Linux.do、GitHub** 三个入口，通过公开的 `GET /v1/auth/providers` 查询当前服务器已启用的方式。未配置的来源保留显示并标为不可用；目录只公开来源名称与可用性，不返回 client secret 或所有者 ID。
 
-部署时至少完整启用一种来源。两份环境模板中的登录组默认均为注释：只取消注释并填写要使用的整组，其他组保持未设置。任何来源部分填写都在数据库迁移前报错；部署预检也拒绝占位值和全部未配置的情况。填写完整仅代表本地配置可用，实际账号与回调仍须浏览器联调。
+部署时至少完整启用一种来源。两份环境模板中的登录组默认均为注释：只取消注释并填写要使用的整组，其他组保持未设置。任何来源部分填写都会在账本迁移前报错；owner 必须是明确配置的正整数用户 ID，回调必须是固定 HTTPS 路径。模板里的 `replace-with-*` 占位值不会被专门识别，务必替换成真实值。填写完整仅代表本地配置可用，实际账号与回调仍须浏览器联调。
 
 ### 回调地址
 
@@ -48,7 +48,7 @@ Google、Linux.do 和 GitHub 登录只用于确认 Lyra 用户身份，**不会�
 | Linux.do | `/v1/auth/linuxdo/callback` | `https://lyra.example.com/v1/auth/linuxdo/callback` |
 | GitHub | `/v1/auth/github/callback` | `https://lyra.example.com/v1/auth/github/callback` |
 
-将示例域名替换为自己的服务域名，协议、域名、端口及路径须完全一致。回调不能含用户名、密码、查询参数或片段；正式环境要求 HTTPS。只允许 `localhost`、`127.0.0.1` 或 IPv6 loopback 在本机开发时使用 HTTP。设置 `LYRA_PUBLIC_ORIGIN` 后，部署预检逐一检查每个已启用来源的回调是否等于该 origin 加对应固定路径，未启用来源跳过。
+将示例域名替换为自己的服务域名，协议、域名、端口及路径须完全一致。回调不能含用户名、密码、查询参数或片段；正式环境要求 HTTPS。只允许 `localhost`、`127.0.0.1` 或 IPv6 loopback 在本机开发时使用 HTTP。服务端启动时会校验每个已启用来源的回调是否符合该来源的固定 HTTPS 路径（部分填写整组失败）；**没有全局 origin 配置项**（不再有 `LYRA_PUBLIC_ORIGIN`，服务端从不读取它），公开地址由反向代理的域名与各自登记的 HTTPS 回调决定。
 
 ### Google
 
@@ -96,7 +96,7 @@ Connect 文档将用户资料中的 `id` 定义为不可变标识。若尚不知
 
 每种来源首次通过配置限制并成功兑换后，数据库固定该 `provider + subject`。之后修改环境变量不能将已经绑定的来源转给另一个账号；其他来源也不能覆盖它。当前没有所有者转移或自助绑定其他人的界面。Google 的已有绑定和设备会话由 schema 15 保留；GitHub / Linux.do 的邮箱允许为空，App 显示对应来源与可用的显示名。
 
-新增或修改 client 配置后，执行部署预检并重启服务器，再在登录页重新检测登录方式。关闭来源阻止该来源继续发起新授权，不应将它视为撤销所有已签发设备凭据的操作；设备退出与凭据撤销另行处理。
+新增或修改 client 配置后重启服务器（配置在启动时校验），再在登录页重新检测登录方式。关闭来源阻止该来源继续发起新授权，不应将它视为撤销所有已签发设备凭据的操作；设备退出与凭据撤销另行处理。
 
 ### App 登录过程
 
@@ -162,27 +162,22 @@ App 为一次创建保留 `Idempotency-Key`，请求响应丢失时可重试并�
 
 行情来源列表由服务端目录提供；未配置来源可见但不可选，已保存来源缺凭据或移除时保留原选择并提示修复。自动提交时显示「正在切换」并暂时禁用选择控件；失败时界面恢复最后已确认的选择并提示重试。请求使用 `expectedRevision` 检查其他设备的修改，冲突返回 `409 / MARKET_SETTINGS_CHANGED`，App 提示重新加载后再选择，不静默覆盖其他设备的修改。设置写操作不进入 Genkit 的只读工具。
 
-模型供应商、密钥和模型名称继续由服务端环境变量管理；行情密钥、MarketData 模式与请求预算也在服务器配置，变更这些内容需要配置预检并重启。推荐行情来源默认环境变量维持 `none`，实际选源通过界面自动提交；env 来源值只在尚无持久记录时作为启动默认。完整行为见[行情接入与换源](market-data.md#4-在界面选择来源)。
+模型供应商、密钥和模型名称继续由服务端环境变量管理；行情密钥、MarketData 模式与请求预算也在服务器配置，变更这些内容需要重启（配置在启动时校验）。推荐行情来源默认环境变量维持 `none`，实际选源通过界面自动提交；env 来源值只在尚无持久记录时作为启动默认。完整行为见[行情接入与换源](market-data.md#4-在界面选择来源)。
 
 ## 7. 启动与升级
 
-VPS 部署可使用已提供的 Dockerfile、Compose 与 Caddy 模板，具体命令见 [服务端部署](deployment.md)。其配置预检不打开数据库；下面保留直接运行 Node 的方式。
+VPS 部署使用仓库里的 `Dockerfile`、`deploy/compose.yaml` 与可选 Caddy 模板，具体命令见 [服务端部署](deployment.md)。
 
-环境变量模板见 [`server/.env.example`](../server/.env.example)。以下命令均从仓库根目录执行：
-
-```bash
-npm ci
-npm run check
-mkdir -p data
-cp server/.env.example server/.env
-```
-
-替换模板值，完整启用至少一组登录配置，配置好 HTTPS 反向代理及相应来源的回调；预检通过后再启动：
+本地直接运行 Python 服务端：需要 Python 3.12+ 与 [uv](https://docs.astral.sh/uv/)。环境变量模板见 [`deploy/server.env.example`](../deploy/server.env.example)（由 `deploy/init-env.py` 生成为 `deploy/server.env`，权限 0600）：
 
 ```bash
-node --env-file=server/.env server/dist/src/cli/check-config.js
-node --env-file=server/.env server/dist/src/main.js
+cd server
+uv run pytest          # 测试
+uv run ruff check .    # 错误类静态检查
+uv run --python 3.12 lyra-serve
 ```
+
+服务端**只读进程环境变量，不解析 `.env` 文件**——先把变量导出（或交给 systemd / Compose 注入）再启动。**没有独立的配置检查命令**：配置在启动时校验，缺少必填项、主密钥形态不对，或至少一组登录配置不完整，都会直接失败退出，不会带着"看起来启用了但永远登不进去"的配置上线。
 
 默认地址是 `127.0.0.1:3141`。反向代理需要转发常规 HTTP 请求并支持 `/v1/events` WebSocket 升级。App 和系统浏览器都必须能够访问回调使用的域名；跨设备测试建议直接使用 HTTPS 测试域名。
 
@@ -190,7 +185,7 @@ node --env-file=server/.env server/dist/src/main.js
 
 1. 停止旧服务，保存一致的数据库备份与原有密钥配置。
 2. 保留原登录配置，按需完整添加 Linux.do / GitHub 组及其所有者 ID；模型配置独立保留。旧 CLI 路径、扩展、工作目录及 MCP 配置不再使用。
-3. 先执行配置预检，通过后启动新版服务，按现有版本自动迁移至 v15。
+3. 先用原主密钥启动新版服务（**不要换密钥**：换掉会让库里已有的 Gmail 密文再也解不开），按现有版本自动迁移至 v15；配置不完整会在启动时直接退出。
 4. 安装包含独立登录页及三种入口的协议 **2** App。从 v12 或更早版本升级时，通过已配置的来源重新登录并新建 Lyra 会话；已有 Google OAuth 绑定与有效设备会话可以继续使用。
 
 v12 保留旧消息和工具审计，记录旧 provider，将旧会话归档，并终结未完成的旧消息/工具记录。v13 新增所有者绑定，并撤销此前匿名配对签发的凭据。v14 新增行情来源设置表，随账本数据库备份；不重复撤销 v13 的 OAuth 凭据，也不改变金融账本版本。
@@ -201,11 +196,11 @@ v15 将所有者绑定扩展为按来源固定 subject，允许 GitHub / Linux.d
 
 ## 8. 验证与当前边界
 
-`npm run check` 执行干净 TypeScript 构建、复制 SQL 迁移，再运行全部服务端测试。构建前清理 `dist`，防止删除的 CLI/MCP 模块及旧测试继续残留在部署产物中。
+服务端验证入口是 `cd server && uv run --frozen pytest -q`（全量测试）与 `uv run --frozen ruff check .`（错误类静态检查）。迁移 SQL 现在是 `server/src/lyra/db/sql/` 下的唯一来源，不再有 TypeScript 构建或 `dist` 清理步骤。
 
 Genkit 集成验证使用 Genkit 的真实工具循环、可控假模型、真实 DuckDB，以及运行在本机的兼容 HTTP/SSE 模型端点；不需要外部模型账号。OAuth 测试替换外部 Google / GitHub / Linux.do 边界，验证状态、来源隔离、所有者规则与真实数据库凭据流程；不能代替真实账号的授权验收。
 
-本轮独立登录页与多来源登录的服务端 `npm run check` 在 Node 24.19.0 上通过 **132 个套件、400 项测试**，0 失败、0 取消、0 跳过，包括新来源配置、身份准入与迁移、登录事务和部署预检；Flutter 当前结果与完整记录见[实现进度](progress.md)。
+独立登录页与多来源登录的服务端 Python 全量测试在 HEAD（`ed522c7`）实测 **2307 项通过 / 4 项跳过**（`cd server && uv run --frozen pytest -q`；数字随提交变动，以执行时输出为准），覆盖新来源配置、身份准入与迁移、登录事务；Flutter 当前结果与完整记录见[实现进度](progress.md)。
 
 首次账户与导入阶段的服务端回归为 **117 个套件、279 项测试通过**，0 失败、0 跳过。该用例从真实空数据库开始，经受控 Google 身份验证后签发设备凭据，创建账户、预览并确认 CSV，最后读取真实持仓与已实现盈亏；大小写不同的文件名重复上传仍不会重复入账。此后的部署和行情改动及最新全量统计见[实现进度](progress.md)。
 

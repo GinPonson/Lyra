@@ -20,7 +20,8 @@ services:
       LYRA_PORT: "3141"
       LYRA_DATABASE_PATH: /var/lib/lyra/lyra.duckdb
       LYRA_IMPORT_STAGING_DIR: /tmp/lyra-import-staging
-      LYRA_PUBLIC_ORIGIN: https://${LYRA_DOMAIN:?Set LYRA_DOMAIN in deploy/.env}
+      # **没有 LYRA_PUBLIC_ORIGIN**：服务端从不读取它（Python 与 TS 运行时都没有引用，
+      # 只有已删除的 check-config CLI 用过）。留着只会让人以为它对回调地址生效。
     ports:
       - "127.0.0.1:3141:3141"
     volumes:

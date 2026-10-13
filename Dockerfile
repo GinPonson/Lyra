@@ -36,7 +36,6 @@ RUN uv sync --frozen --no-dev
 # ---------------------------------------------------------------------------
 FROM ${PYTHON_IMAGE} AS runtime
 
-ARG UV_VERSION
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH" \
@@ -44,8 +43,6 @@ ENV PYTHONUNBUFFERED=1 \
     LYRA_PORT=3141 \
     LYRA_DATABASE_PATH=/var/lib/lyra/lyra.duckdb \
     LYRA_IMPORT_STAGING_DIR=/var/lib/lyra/import-staging
-
-RUN pip install --no-cache-dir "uv==${UV_VERSION}.*"
 
 WORKDIR /app
 COPY --from=build /app/.venv ./.venv

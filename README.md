@@ -1,8 +1,8 @@
 # Lyra
 
-自用资产账本与金融分析 App：Flutter 客户端连接单个 TypeScript / Fastify 服务，DuckDB 保存账本、会话和工具审计。
+自用资产账本与金融分析 App：Flutter 客户端连接单个 **Python / FastAPI** 服务，DuckDB 保存账本、会话和工具审计。
 
-> **服务端正在迁移到 Python/FastAPI。** 目标是把服务端全量换成 Python（Python 接管账本文件与 schema 迁移），**客户端协议保持 2 不变**。新服务在 [`server/`](server/README.md)，进度与验收见[迁移计划](docs/plans/lyra-python-migration-20261012.md)。切换是原子的（DuckDB 单进程锁），在上线前 Flutter 仍连接上面的 TypeScript 服务端。
+> 服务端实现是 [`server/`](server/README.md)（Python 3.12 + FastAPI），账本 schema **15**、客户端协议 **2**。TypeScript/Fastify 版已随迁移整体删除，只存在于 git 历史里；切换与回退步骤见[切流运行手册](docs/plans/lyra-cutover-runbook-20261013.md)。
 
 ## 当前架构
 
@@ -14,27 +14,29 @@
 
 部署、模型配置、三种 OAuth 登录的申请与所有者设置及升级步骤见 **[Genkit 与多来源登录](docs/genkit-oauth.md)**。至少完整配置一种登录来源，其他来源可以整组省略。
 
-VPS 的 Docker Compose、HTTPS 代理、配置预检、备份与手机联调命令见 **[服务端部署](docs/deployment.md)**。容器启动会先检查配置，再打开数据库。
+VPS 的 Docker Compose、HTTPS 代理、备份与手机联调命令见 **[服务端部署](docs/deployment.md)**。容器启动时校验配置，不完整会直接退出，随后才打开并迁移数据库。
 
 行情默认关闭。服务器配置完整凭据后，对应来源会在 App 中变为可选；在界面选择即可自动启用，无需额外保存或重启服务。操作方法、统一契约、参考价与期权乘数规则见 **[行情接入与换源](docs/market-data.md)**。当前显示的是现有持仓按各自报价时点计算的参考估值。
 
 ## 服务端开发
 
-需要 Node.js 22 或更高版本。在仓库根目录执行：
+需要 Python 3.12+ 与 [uv](https://docs.astral.sh/uv/)。在 `server/` 下执行：
 
 ```bash
-npm ci
-npm run check
-mkdir -p data
-cp server/.env.example server/.env
+uv run pytest          # 测试
+uv run ruff check .    # 错误类静态检查
 ```
 
-填好 `server/.env`，取消注释并完整填写至少一组登录配置后，从仓库根目录先预检；检查通过再启动：
+按 [`deploy/server.env.example`](deploy/server.env.example) 提供环境变量
+（`LYRA_DATABASE_PATH`、`LYRA_IMPORT_STAGING_DIR`、`LYRA_SECRET_MASTER_KEY`，以及至少
+一组完整的登录配置），从 `server/` 启动：
 
 ```bash
-node --env-file=server/.env server/dist/src/cli/check-config.js
-node --env-file=server/.env server/dist/src/main.js
+uv run --python 3.12 lyra-serve
 ```
+
+**没有独立的配置检查命令**：配置在启动时校验，不完整或形态不对就直接退出——不会带着
+"看起来启用了但永远登不进去"的配置上线。部署前的构建与启动见[服务端部署](docs/deployment.md)。
 
 默认监听 `127.0.0.1:3141`。正式访问通过 HTTPS 反向代理，代理须支持 `/v1/events` 的 WebSocket 升级。
 

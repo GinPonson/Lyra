@@ -17,16 +17,16 @@ flowchart TD
   D --> F[MarketData 适配器]
 ```
 
-| 层 | 责任 | 主要文件 |
+| 层 | 责任 | 主要文件（Python/FastAPI，见[服务端部署](deployment.md)） |
 | --- | --- | --- |
-| 领域契约 | 标准证券身份、报价、时点、来源、缺失状态 | `server/src/domain/market-data/types.ts` |
-| 设置契约 | 来源目录、主备顺序、设置版本与当前生效来源 | `server/src/domain/market-data/settings.ts` |
-| 选价规则 | 有效买卖中间价 → 最近成交价 → 区间收盘价 | `server/src/domain/market-data/reference-price.ts` |
-| 报价服务 | 路由、缓存、并发合并、请求预算、超时和备用源 | `server/src/application/market-data-service.ts` |
-| 持仓估值 | 账户授权、证券匹配、多空、合约乘数、币种分组 | `server/src/application/market-position-view.ts` |
-| 供应商适配 | 鉴权、端点、供应商代码、字段及错误归一化 | `server/src/infrastructure/market-data/*-provider.ts` |
-| 配置组装 | 注册具体供应商，校验配置并设置缓存和预算 | `server/src/infrastructure/market-data/market-data-runtime.ts` |
-| 设置保存 | 设备鉴权、版本冲突、DuckDB 持久化与热切换 | `server/src/application/market-settings-service.ts`、`server/src/infrastructure/db/market-settings-repository.ts` |
+| 领域契约 | 标准证券身份、报价、时点、来源、缺失状态 | `server/src/lyra/domain/market_data/types.py` |
+| 设置契约 | 来源目录、主备顺序、设置版本与当前生效来源 | `server/src/lyra/domain/market_data/settings.py` |
+| 选价规则 | 有效买卖中间价 → 最近成交价 → 区间收盘价 | `server/src/lyra/domain/market_data/reference_price.py` |
+| 报价服务 | 路由、缓存、并发合并、请求预算、超时和备用源 | `server/src/lyra/application/market_data_service.py`、`server/src/lyra/application/market_budget.py` |
+| 持仓估值 | 账户授权、证券匹配、多空、合约乘数、币种分组 | `server/src/lyra/domain/market_data/valuation.py` |
+| 供应商适配 | 鉴权、端点、供应商代码、字段及错误归一化 | `server/src/lyra/infrastructure/market_data/*_provider.py` |
+| 配置组装 | 注册具体供应商，校验配置并设置缓存和预算 | `server/src/lyra/infrastructure/market_data/runtime.py`、`config.py` |
+| 设置保存 | 设备鉴权、版本冲突、DuckDB 持久化与热切换 | `server/src/lyra/api/market_routes.py`、`server/src/lyra/infrastructure/db/market_settings_repository.py` |
 | 移动端 | 读取标准结果、匹配当前持仓、展示时间与隐私状态 | `apps/mobile/lib/features/market/` |
 
 App 使用已鉴权的 `GET /v1/market/positions?scope=all`，可带 `underlying` 筛选；单账户范围沿用现有 `scope` 规则。重复或非字符串的查询参数返回 `400 / INVALID_ARGUMENT`，不会静默忽略筛选条件后返回未过滤结果。协议头仍为 `X-Lyra-Protocol-Version: 2`。响应复用账本的 `metadata` / `data` 信封，包含账户范围和 `ledgerVersion`，`data.marketData.settingsRevision` 标明本次估值使用的来源设置版本。
@@ -128,13 +128,13 @@ LYRA_MARKETDATA_DAILY_REQUEST_LIMIT=80
 LYRA_MARKET_TIMEOUT_MS=8000
 ```
 
-完整凭据使对应来源在服务端注册、在 App 中变为可选；**填写 Key 本身不会启用远程行情**。这些字段不接受 App 或模型覆盖，密钥不会出现在来源目录、设置响应或 APK 中。新增或修改凭据、模式、预算后，按[部署指南](deployment.md)执行离线预检并重启服务，再回到界面选择。
+完整凭据使对应来源在服务端注册、在 App 中变为可选；**填写 Key 本身不会启用远程行情**。这些字段不接受 App 或模型覆盖，密钥不会出现在来源目录、设置响应或 APK 中。新增或修改凭据、模式、预算后，重启服务（配置在启动时校验，见[部署指南](deployment.md)），再回到界面选择。
 
-`LYRA_MARKET_STOCK_PROVIDERS` 与 `LYRA_MARKET_OPTION_PROVIDERS` 只在数据库还没有保存记录时提供启动默认值，可填 `none`、`alpaca`、`marketdata` 或逗号分隔的主备顺序。模板保留 `none`，便于通过 App 管理。已有持久记录时，环境变量中的来源顺序不会覆盖用户保存的选择。环境默认值仍须通过预检；若旧配置里显式指定了某个源，移除其 Key 时也应将对应默认值改回 `none`，避免留下不完整的启动配置。
+`LYRA_MARKET_STOCK_PROVIDERS` 与 `LYRA_MARKET_OPTION_PROVIDERS` 只在数据库还没有保存记录时提供启动默认值，可填 `none`、`alpaca`、`marketdata` 或逗号分隔的主备顺序。模板保留 `none`，便于通过 App 管理。已有持久记录时，环境变量中的来源顺序不会覆盖用户保存的选择。环境默认值仍须在启动时通过校验；若旧配置里显式指定了某个源，移除其 Key 时也应将对应默认值改回 `none`，避免留下不完整的启动配置。
 
 MarketData 默认显式传 `mode=historical`；即使账户以后升级，也不会因付费账户默认模式改变而悄悄请求实时数据。历史数据的可用时点由提供方及端点决定，不是固定“昨天”或固定延迟 24 小时。尤其期权在周末或节假日可能仍返回更早交易日的数据，页面保留实际时间。
 
-如账户具有延迟模式权限，可设 `LYRA_MARKETDATA_MODE=delayed`，请求随之改为 `mode=delayed`，声明至少延迟 15 分钟。该模式需要相应权限；Lyra 不会因配置模式而取得额外授权。预检只验证配置形状、已选择默认源的凭据完整性及模式 / 请求上限，不验证供应商账户权限或剩余额度。
+如账户具有延迟模式权限，可设 `LYRA_MARKETDATA_MODE=delayed`，请求随之改为 `mode=delayed`，声明至少延迟 15 分钟。该模式需要相应权限；Lyra 不会因配置模式而取得额外授权。启动时的校验只看配置形状、已选择默认源的凭据完整性及模式 / 请求上限，不验证供应商账户权限或剩余额度。
 
 ### 设置 API 与版本
 
@@ -211,10 +211,14 @@ App 每次改变来源选择都会自动调用 PUT，严格请求示例：
 
 ## 7. 增加第三个提供方
 
-1. 在基础设施目录实现 `MarketDataProvider`，完成标准证券到供应商标识的转换、字段 / 单位 / 时间归一化，并将异常映射为固定错误枚举。
-2. 在 `market-data-runtime.ts` 注册工厂、配置名称、凭据校验、支持的资产类型、显示名称、数据模式与缓存 / 请求预算，并加入服务器来源目录；配置预检和两个 env 模板同步更新。
-3. 使用受控 HTTP fixture 验证完整合约匹配、价格单位、时间、缺字段、限流、权限失败及取消；通过公共报价服务验证换源与缓存隔离。
-4. 用部署账户做一次真实请求验收，再在 App 的主来源或备用来源中选择它；App 会自动提交并应用。
+服务端已是 **Python/FastAPI**（`market-data-runtime.ts` 已随 TypeScript 侧删除，见[服务端部署](deployment.md)），当前代码路径是：
+
+1. 在 `server/src/lyra/infrastructure/market_data/` 下实现提供方（参考 `alpaca_provider.py` / `marketdata_provider.py`）：标准证券到供应商标识的转换、字段 / 单位 / 时间归一化，并把异常映射为固定错误枚举。
+2. 在 `.../market_data/config.py` 的 `ProviderId` 与 `PROVIDER_IDS` 加入来源 id，并在 `load_market_data_config` 补凭据解析（拒绝 CR/LF；只填一半凭据算配置错误）。
+3. 在 `.../market_data/runtime.py` 的 `create_market_data_runtime` 注册提供方与其缓存 / 限流策略（缓存 TTL、每分钟与每日请求上限）。凭据齐全的来源随之进入服务端来源目录（`GET /v1/market/...` 返回 `{id, displayName, configured}`，`displayName` 当前等于 id），界面据此展示，**不需要改 Flutter**。
+4. 同步更新 `deploy/server.env.example`。**没有独立的配置预检命令**：未知来源、重复来源、被选中来源缺凭据或凭据含换行，都会在**服务启动时**直接失败。
+5. 在 `server/tests/` 用受控 HTTP fixture 验证完整合约匹配、价格单位、时间、缺字段、限流、权限失败及取消（现有入口：`test_marketdata_provider.py`、`test_market_identifiers.py`、`test_market_runtime.py`、`test_market_data_service.py`、`test_market_http.py`）。
+6. 用部署账户做一次真实请求验收，再在 App 的主来源或备用来源中选择它；App 会自动提交并应用。
 
 来源选择界面读取服务器目录，不在 Flutter 中写死提供方名称和名单。现有报价结构和资产能力能表达新源时，其余业务层无需修改。未来若增加其他市场、外汇或非标准期权乘数，需要明确扩展领域契约；不能把新语义塞入 `feed` 文案或伪装成现有资产。
 

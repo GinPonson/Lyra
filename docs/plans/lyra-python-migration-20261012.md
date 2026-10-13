@@ -4,6 +4,8 @@
 > **日期**：2026-10-12
 > **目标**：把服务端由 TypeScript/Fastify 全量迁移到 **Python 3.12 + FastAPI + Genkit Python + DuckDB**，Python 接管账本文件与 schema 迁移，**Flutter 客户端协议保持版本 2 不变**。
 > **相关**：[边界与迁移设计](lyra-python-analytics-boundary-20261012.md)（决策与硬约束）、[完整方案](lyra-product-technical-design.md)、[服务端部署](../deployment.md)
+>
+> **目录名说明**：本文写作时 Python 服务端在 `server-py/`；M9 已把它改名为 `server/` 并删除 TypeScript 侧（提交 `ed522c7`）。**文中所有 `server-py/` 均应读作 `server/`**；正文按迁移当时原文保留，未逐行改写。
 
 ---
 
