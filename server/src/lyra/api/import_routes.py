@@ -345,7 +345,9 @@ def create_import_router() -> APIRouter:
                     account_id=job.target_account_id,
                     plan=plan,
                     expected_ledger_version=version,
-                    source_reference=job.original_file_name,
+                    # **来源引用用作业 UUID，不是文件名。** 文件名会重复（"Transactions.xlsx"），
+                    # 无法据此回溯到具体哪一次导入；作业 ID 是唯一且可审计的。
+                    source_reference=import_id,
                     idempotency_completion=(
                         IdempotencyCompletion(
                             record_id=idempotency_plan.record.id,

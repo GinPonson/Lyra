@@ -380,3 +380,51 @@ def test_detail_cursor_whose_row_is_gone_is_rejected() -> None:
 
     with pytest.raises(IngestError, match="不属于当前账本快照"):
         _detail(["other"], limit=2, cursor=page.next_cursor)
+
+
+# --------------------------------------------------------------------------
+# 查询级分页（query_cashflow）
+# --------------------------------------------------------------------------
+
+
+def _cashflow_transactions(count: int):
+    """构造 ``count`` 条同日现金类标准交易，序号决定稳定次序。"""
+    from decimal import Decimal
+
+    from lyra.domain.ledger.types import ParsedTransaction
+
+    return tuple(
+        ParsedTransaction(
+            account="TST001", source_type="csv", source_reference="r",
+            record_date="2026-01-05", transaction_date="2026-01-05",
+            action="Credit Interest", raw_symbol=None, description=None,
+            asset_type="cash", underlying=None, expiry=None, strike=None,
+            option_type=None, quantity=None, price=None, fees=None,
+            amount=Decimal("-1.00"), source_hash="src", sequence=index,
+            occurrence=1, business_hash=f"b{index}", transaction_hash=f"h{index}",
+        )
+        for index in range(count)
+    )
+
+
+def test_cashflow_second_page_follows_the_cursor() -> None:
+    """**回归：现金流水翻页必须按游标偏移取行，而不是每页都取最新 limit 条。**
+
+    旧实现用 ``filtered[:limit]``，于是带 cursor 的第二页与第一页完全重复，
+    更早的流水永远看不到。合计与总数仍基于全部筛选行，不随翻页缩小。
+    """
+    from lyra.domain.analytics.queries import CashflowQueryFilters, query_cashflow
+
+    transactions = _cashflow_transactions(5)
+
+    first = query_cashflow(transactions, ALL_SCOPE, CashflowQueryFilters(limit=2))
+    assert [row.txn_hash for row in first.rows] == ["h0", "h1"]
+    assert first.next_cursor is not None
+
+    second = query_cashflow(
+        transactions, ALL_SCOPE, CashflowQueryFilters(limit=2, cursor=first.next_cursor)
+    )
+    assert [row.txn_hash for row in second.rows] == ["h2", "h3"]
+    assert second.total_count == 5
+    assert second.total == "-5.0000"
+    assert second.by_action == {"Credit Interest": "-5.0000"}

@@ -21,7 +21,14 @@ import json
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
-from .genkit_runtime import ModelChunk, ModelStream, ModelToolRequest, ModelUsage
+from .genkit_runtime import (
+    ModelChunk,
+    ModelStream,
+    ModelToolExchange,
+    ModelToolRequest,
+    ModelUsage,
+    group_exchanges_by_turn,
+)
 
 # 一行的最大字节数：防止上游返回超长行把内存吃光。
 MAX_LINE_BYTES = 256 * 1024
@@ -161,13 +168,19 @@ class OpenAiCompatibleStreamProvider:
         self._open_lines = open_lines
 
     def __call__(
-        self, *, content: str, system_context: str, tool_definitions: tuple[Any, ...]
+        self,
+        *,
+        content: str,
+        system_context: str,
+        tool_definitions: tuple[Any, ...],
+        exchanges: tuple[ModelToolExchange, ...] = (),
     ) -> ModelStream:
         """构造一次流式调用。
 
         @param content: 用户输入。
         @param system_context: 系统提示词。
         @param tool_definitions: 可调用工具。
+        @param exchanges: 前几轮已执行的工具调用与结果；为空即首轮。
         @returns 惰性解析的 ``ModelStream``。
         """
         body = {
@@ -178,6 +191,7 @@ class OpenAiCompatibleStreamProvider:
             "messages": [
                 {"role": "system", "content": system_context},
                 {"role": "user", "content": content},
+                *_tool_exchange_messages(exchanges),
             ],
             "tools": [_tool_payload(definition) for definition in tool_definitions],
         }
@@ -205,6 +219,45 @@ def _tool_payload(definition: Any) -> dict[str, Any]:
             "parameters": definition.input_schema,
         },
     }
+
+
+def _tool_exchange_messages(
+    exchanges: tuple[ModelToolExchange, ...],
+) -> list[dict[str, Any]]:
+    """把已执行的工具调用与结果翻译成 OpenAI 兼容的多轮消息。
+
+    同一次模型调用请求的多个工具**合并成一条 assistant 消息**，再逐条给出
+    ``role: tool`` 结果；拆成多条 assistant 消息会让端点因为 ``tool_calls`` 与
+    tool 结果不配对而拒绝整个请求。
+
+    @param exchanges: 按执行顺序排列的回灌记录。
+    @returns 追加到消息列表尾部的消息。
+    """
+    messages: list[dict[str, Any]] = []
+    for round_exchanges in group_exchanges_by_turn(exchanges):
+        messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": exchange.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": exchange.tool_name,
+                        "arguments": json.dumps(exchange.arguments, ensure_ascii=False),
+                    },
+                }
+                for exchange in round_exchanges
+            ],
+        })
+        for exchange in round_exchanges:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": exchange.call_id,
+                # 结果原样回灌：截断或重写会让模型基于被改动过的数据作答。
+                "content": json.dumps(exchange.result, ensure_ascii=False, default=str),
+            })
+    return messages
 
 
 def httpx_open_lines(

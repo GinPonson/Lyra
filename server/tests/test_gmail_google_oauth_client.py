@@ -19,11 +19,6 @@ from lyra.infrastructure.gmail.oauth_transaction import (
     GmailOAuthError,
     create_google_oauth_transaction,
 )
-from lyra.infrastructure.gmail.oauth_transaction import (
-    GMAIL_READONLY_SCOPE as SCOPE_CONST,
-)
-
-GMAIL_READONLY_SCOPE = SCOPE_CONST
 from lyra.infrastructure.gmail.google_oauth_client import (
     GOOGLE_AUTHORIZATION_ENDPOINT,
     GOOGLE_GMAIL_AUTHORIZATION_SCOPES,
@@ -224,8 +219,12 @@ def test_code_challenge_must_be_43_url_safe_characters() -> None:
         _build(transaction=broken)
 
 
-def test_invalid_expiry_is_rejected() -> None:
-    """过期时间不可解析时必须报错，而不是产出一个立即失效的授权地址。"""
+def test_unparseable_expiry_is_rejected() -> None:
+    """过期时间不可解析时必须报错，而不是产出一个立即失效的授权地址。
+
+    **函数名不能叫 ``test_invalid_expiry_is_rejected``**：下面还有一个同名参数化测试
+    （令牌 ``expires_in`` 校验），同名的后定义会把这条整个遮蔽掉——它此前从未运行过。
+    """
     from dataclasses import replace
 
     transaction = _transaction()

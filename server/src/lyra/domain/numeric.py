@@ -72,6 +72,10 @@ _PERCENT_QUANTUM = Decimal("0.01")
 def fixed_text(value: Decimal, places: int) -> str:
     """按 ``toFixed(places)`` 渲染：四舍五入（平局远离零）。
 
+    **结果的符号与原值一致**（decimal.js 的 ``toFixed`` 只在原值为零时省略负号）：
+    ``new Decimal('-0.00001').toFixed(4)`` 是 ``"-0.0000"``，不是 ``"0.0000"``——
+    这个断言此前写反了。与 :func:`percent_text` 的差异见该函数说明。
+
     @param value: 待渲染的数。
     @param places: 小数位数。
     @returns 定点文本。
@@ -81,11 +85,28 @@ def fixed_text(value: Decimal, places: int) -> str:
         raise ValueError("小数位数不能为负")
     quantum = Decimal(1).scaleb(-places)
     quantized = value.quantize(quantum, rounding=ROUND_HALF_UP)
-    if quantized == 0:
-        # **避免 ``-0.0000``**：decimal.js 对结果为 0 的值给出 ``0.0000``，
-        # 而 Python 会保留负号——两者会被客户端当成不同的文本。
-        quantized = abs(quantized)
+    if quantized == 0 and not (value != 0 and value.is_signed()):
+        # **只有在原值本身为零时才去掉负号**：decimal.js 的 toFixed 是
+        # ``x.isNeg() && !x.isZero() ? '-' + str : str``，舍入到零的非零负值仍带负号。
+        quantized = quantized.copy_abs()
     return format(quantized, "f")
+
+
+def fixed_point_text(value: Decimal) -> str:
+    """按 decimal.js ``toFixed()``（无参）渲染：定点、去尾随零、不用指数形式。
+
+    **与 :func:`decimal_text` 的差别只在量级两端**：``|v| < 1e-6`` 或 ``|v| >= 1e21``
+    时 ``toString()`` 改用指数形式，而 ``toFixed()`` 始终给出定点文本。持仓估值与
+    参考价中间价在参考实现里走的正是 ``toFixed()``，用 ``toString()`` 会让极小量级
+    的金额（例如拆股调整后的单价）渲染成 ``1e-7`` 这样的指数文本。
+
+    @param value: 待渲染的精确十进制数。
+    @returns 定点文本。
+    """
+    if value == 0:
+        # decimal.js 对零不补负号（与 :func:`fixed_text` 的判据一致）。
+        return "0"
+    return format(value.normalize(), "f")
 
 
 def percent_text(value: Decimal) -> str:
@@ -93,10 +114,14 @@ def percent_text(value: Decimal) -> str:
 
     **与 :func:`fixed_text` 的舍入模式刻意不同**（见上方说明）。
 
+    **零值不保留负号**：参考实现是 ``toDecimalPlaces(2, ROUND_HALF_EVEN).toFixed(2)``，
+    ``toFixed`` 作用在**已经舍入为零**的 Decimal 上，而 decimal.js 对零不补负号——
+    因此 ``-0.0001`` 渲染为 ``"0.00"``，与 ``fixed_text(-0.0001, 4) == "-0.0000"`` 不同。
+
     @param value: 百分数（已乘 100）。
     @returns 两位小数的定点文本。
     """
     quantized = value.quantize(_PERCENT_QUANTUM, rounding=ROUND_HALF_EVEN)
     if quantized == 0:
-        quantized = abs(quantized)
+        quantized = quantized.copy_abs()
     return format(quantized, "f")

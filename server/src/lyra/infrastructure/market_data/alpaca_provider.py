@@ -34,7 +34,7 @@ from ...domain.market_data.types import (
     MarketTiming,
     StockInstrument,
 )
-from .http import MarketDataFetch, request_market_json
+from .http import MARKET_DATA_TIMEOUT_MILLISECONDS, MarketDataFetch, request_market_json
 from .identifiers import (
     is_record,
     market_timestamp,
@@ -78,6 +78,7 @@ class AlpacaMarketDataProvider:
     @param secret_key: 密钥。
     @param fetch: 传输层。
     @param provider_id: 来源标识。
+    @param timeout_ms: 单次请求超时；由运行时从 ``config.timeout_ms`` 注入。
     """
 
     def __init__(
@@ -87,10 +88,12 @@ class AlpacaMarketDataProvider:
         secret_key: str,
         fetch: MarketDataFetch,
         provider_id: str = "alpaca",
+        timeout_ms: int = MARKET_DATA_TIMEOUT_MILLISECONDS,
     ) -> None:
         self._api_key = api_key.strip()
         self._secret_key = secret_key.strip()
         self._fetch = fetch
+        self._timeout_ms = timeout_ms
         self.id = provider_id
 
     def fetch_quote(self, instrument: MarketInstrument, *, now_ms: int) -> ProviderQuoteResult:
@@ -133,6 +136,8 @@ class AlpacaMarketDataProvider:
                 "APCA-API-SECRET-KEY": self._secret_key,
             },
             fetch=self._fetch,
+            # 服务级超时必须真的传到传输层，否则配置了也不生效（默认 10s 会盖过它）。
+            timeout_ms=self._timeout_ms,
         )
         if not response.ok:
             return QuoteUnavailable(status="unavailable", reason=response.reason)

@@ -27,7 +27,7 @@ from ...domain.market_data.types import (
     MarketTiming,
     StockInstrument,
 )
-from .http import MarketDataFetch, request_market_json
+from .http import MARKET_DATA_TIMEOUT_MILLISECONDS, MarketDataFetch, request_market_json
 from .identifiers import (
     is_record,
     price_point,
@@ -65,6 +65,7 @@ class MarketDataProvider:
     @param timing: 本实例声明的报价时效。
     @param fetch: 传输层。
     @param provider_id: 来源标识。
+    @param timeout_ms: 单次请求超时；由运行时从 ``config.timeout_ms`` 注入。
     """
 
     def __init__(
@@ -74,10 +75,12 @@ class MarketDataProvider:
         timing: MarketTiming,
         fetch: MarketDataFetch,
         provider_id: str = "marketdata",
+        timeout_ms: int = MARKET_DATA_TIMEOUT_MILLISECONDS,
     ) -> None:
         self._api_token = api_token
         self._timing = timing
         self._fetch = fetch
+        self._timeout_ms = timeout_ms
         self.id = provider_id
 
     def fetch_quote(self, instrument: MarketInstrument, *, now_ms: int) -> ProviderQuoteResult:
@@ -104,6 +107,8 @@ class MarketDataProvider:
             url=url,
             headers={"authorization": f"Bearer {self._api_token}"},
             fetch=self._fetch,
+            # 服务级超时必须真的传到传输层，否则配置了也不生效（默认 10s 会盖过它）。
+            timeout_ms=self._timeout_ms,
         )
         if not response.ok:
             return QuoteUnavailable(status="unavailable", reason=response.reason)

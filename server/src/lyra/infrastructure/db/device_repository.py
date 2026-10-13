@@ -16,6 +16,7 @@ from typing import Any
 
 import duckdb
 
+from ...application.app_error import ApplicationError
 from ...application.device_pairing_service import DeviceRepository
 from ...infrastructure.auth.login_provider import LoginIdentity
 from ...security.device_auth import (
@@ -251,17 +252,38 @@ class DuckDbDeviceRepository(DeviceRepository):
         rotation: RotatedDeviceRefreshCredential,
         access_record: DeviceAccessTokenRecord,
     ) -> None:
-        """在同一事务中把旧代标记为 rotated、插入新代并签发访问令牌。"""
-        self._connection.execute(
+        """在同一事务中把旧代标记为 rotated、插入新代并签发访问令牌。
+
+        **UPDATE 必须带状态与代号条件（CAS）**：单写队列只串行化**本进程**的写入，
+        挡不住重放的旧令牌、重新配对的写入或另一个进程。无条件 UPDATE 会让一枚
+        已被轮换/撤销的旧凭据静默换出新的 active 凭据，重用检测随后永远无法触发
+        ——泄漏的整族凭据也就不会被撤销。
+
+        @param rotation: 轮换计划：旧代的新状态与新代记录。
+        @param access_record: 与本次轮换同时签发的访问令牌记录。
+        @raises ApplicationError: CAS 失配（旧代已非 active，或代号已推进）。
+        """
+        # DuckDB 把 UPDATE 的受影响行数作为语句结果返回（一行一列）。
+        changed = self._connection.execute(
             """
             UPDATE device_refresh_credentials
             SET status = ?, last_used_at = CAST(? AS TIMESTAMPTZ),
                 rotated_at = CAST(? AS TIMESTAMPTZ)
             WHERE id = CAST(? AS UUID)
+              AND status = 'active'
+              AND generation = ?
             """,
             [rotation.previous.status, rotation.previous.last_used_at,
-             rotation.previous.rotated_at, rotation.previous.id],
-        )
+             rotation.previous.rotated_at, rotation.previous.id,
+             rotation.previous.generation],
+        ).fetchone()
+        if changed is None or int(changed[0]) != 1:
+            raise ApplicationError(
+                code="DEVICE_CREDENTIAL_REUSED",
+                message="设备刷新凭据已使用或撤销",
+                status_code=401,
+                retryable=False,
+            )
         self.create_refresh_credential(rotation.next)
         self.create_access_token(access_record)
 

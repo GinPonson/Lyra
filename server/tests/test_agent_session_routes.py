@@ -138,12 +138,16 @@ def test_read_session_returns_public_snapshot(client) -> None:
     response = test_client.get(f"/v1/agent/sessions/{SESSION_ID}", headers=_auth(issued))
 
     assert response.status_code == 200
+    # **信封是 ``{"session": ...}``**：客户端读 ``body["session"]``，裸快照会让它
+    # 在解析时抛类型错误（而不是走到这里断言的那些字段）。
     body = response.json()
-    assert body["id"] == SESSION_ID
-    assert body["status"] == "idle"
-    assert body["accountScope"] == {"kind": "all"}
-    assert body["messages"] == []
-    assert "summary" not in body
+    assert set(body) == {"session"}
+    session = body["session"]
+    assert session["id"] == SESSION_ID
+    assert session["status"] == "idle"
+    assert session["accountScope"] == {"kind": "all"}
+    assert session["messages"] == []
+    assert "summary" not in session
 
 
 def test_read_unknown_session_is_not_found(client) -> None:
@@ -163,7 +167,8 @@ def test_tool_calls_start_empty(client) -> None:
         f"/v1/agent/sessions/{SESSION_ID}/tool-calls", headers=_auth(issued)
     ).json()
 
-    assert body == {"rows": [], "count": 0}
+    # **键名是 ``toolCalls``**：客户端只读这个键，缺失会被当成"没有记录"。
+    assert body == {"toolCalls": []}
 
 
 def test_cancel_moves_a_running_session_to_cancelling(client) -> None:
@@ -180,12 +185,12 @@ def test_cancel_moves_a_running_session_to_cancelling(client) -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "cancelling"
+    assert response.json()["session"]["status"] == "cancelling"
 
     stored = test_client.get(
         f"/v1/agent/sessions/{SESSION_ID}", headers=_auth(issued)
     ).json()
-    assert stored["status"] == "cancelling"
+    assert stored["session"]["status"] == "cancelling"
 
 
 def test_cancel_is_rejected_on_an_idle_session(client) -> None:
@@ -226,7 +231,7 @@ def test_close_idle_session(client) -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "closed"
+    assert response.json()["session"]["status"] == "closed"
 
 
 def test_close_is_idempotent(client) -> None:
@@ -237,7 +242,7 @@ def test_close_is_idempotent(client) -> None:
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert second.json()["status"] == "closed"
+    assert second.json()["session"]["status"] == "closed"
 
 
 def test_closed_session_cannot_be_cancelled(client) -> None:
@@ -363,8 +368,8 @@ def test_rejected_message_does_not_advance_the_session(client) -> None:
     body = test_client.get(
         f"/v1/agent/sessions/{SESSION_ID}", headers=_auth(issued)
     ).json()
-    assert body["status"] == "idle"
-    assert body["messages"] == []
+    assert body["session"]["status"] == "idle"
+    assert body["session"]["messages"] == []
 
 
 # --------------------------------------------------------------------------
@@ -403,7 +408,7 @@ def test_create_accepts_the_reference_body_shape(client, configured) -> None:
     )
 
     assert response.status_code == 201
-    assert response.json()["accountScope"] == {"kind": "all"}
+    assert response.json()["session"]["accountScope"] == {"kind": "all"}
 
 
 def test_create_with_an_account_scope_does_not_silently_become_all(client, configured) -> None:
@@ -421,8 +426,8 @@ def test_create_with_an_account_scope_does_not_silently_become_all(client, confi
     )
 
     assert response.status_code == 201
-    assert response.json()["accountScope"] == {"kind": "account", "account": account_id}
-    assert response.json()["accountScope"] != {"kind": "all"}
+    assert response.json()["session"]["accountScope"] == {"kind": "account", "account": account_id}
+    assert response.json()["session"]["accountScope"] != {"kind": "all"}
 
 
 def test_create_rejects_an_account_scope_without_an_account(client) -> None:
@@ -468,7 +473,7 @@ def test_create_ignores_a_client_supplied_as_of(client, configured) -> None:
     )
 
     assert response.status_code == 201
-    assert not response.json()["asOf"].startswith("1999")
+    assert not response.json()["session"]["asOf"].startswith("1999")
 
 
 # --------------------------------------------------------------------------

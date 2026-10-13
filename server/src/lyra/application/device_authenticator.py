@@ -2,8 +2,11 @@
 
 把「读取访问令牌 → 校验 → 更新活动时间」收敛到一处，供所有业务路由复用。
 
-**认证失败一律返回同一个 401**，不区分「令牌不存在」「设备不存在」「令牌已过期」，
-否则未认证的调用方可以通过错误码枚举出哪些令牌曾经存在。
+**读取阶段的失败统一返回 401 且码固定为 ``DEVICE_CREDENTIAL_INVALID``**：
+不区分「令牌不存在」「设备不存在」，否则未认证的调用方可以据此枚举历史令牌。
+**领域层的失败则保留原始错误码**（与参考实现的认证网关一致）：状态码仍是 401，
+但「设备已撤销」「令牌已过期」必须能被 App 区分——压成同一个码会让它分不清
+该重新登录还是刷新令牌。
 """
 
 from __future__ import annotations
@@ -66,9 +69,11 @@ class DeviceAuthenticator:
         try:
             updated = authenticate_device_access_token(device, record, raw_token, now)
         except DeviceAuthError as error:
+            # **保留原始错误码**：把「设备已撤销」与「令牌已过期」都压成
+            # DEVICE_CREDENTIAL_INVALID 会让客户端无法决定是重新登录还是刷新令牌。
             raise ApplicationError(
-                code="DEVICE_CREDENTIAL_INVALID",
-                message="设备访问令牌无效",
+                code=error.code,
+                message=error.message,
                 status_code=401,
                 retryable=False,
             ) from error

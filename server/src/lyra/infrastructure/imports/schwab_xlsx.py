@@ -20,7 +20,9 @@
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 from ...domain.ledger.batch import TransactionBatchInput
 from ...domain.ledger.errors import IngestError
@@ -134,40 +136,58 @@ def _read_transaction_rows(
 
     @raises IngestError: 隐藏行、公式或合并单元格、列数不符。
     """
+    hidden_rows = _hidden_row_numbers(worksheet)
     rows: list[RawTransactionFields] = []
     for row_number, row in enumerate(worksheet.iter_rows(), start=1):
         if row_number <= header_row:
             continue
         cells = list(row)
-        # **逐行读取时 openpyxl 不暴露隐藏标记**（read_only 模式丢弃了行维度信息），
-        # 因此隐藏行的判定在下方通过 worksheet.row_dimensions 尽力完成。
-        if _is_hidden_row(worksheet, row_number):
+        texts = _cell_texts(cells, file_name, worksheet.title, row_number)
+        if not any(text != "" for text in texts):
+            # 空行跳过——**隐藏的空行同样跳过**：参考实现先判空、再判隐藏，
+            # 而 Excel 常常留下被隐藏的空白格式行。
+            continue
+        if row_number in hidden_rows:
             raise IngestError(
                 f"{file_name} 工作表 {worksheet.title} 第{row_number}行: 交易行不可隐藏"
             )
-        texts = _cell_texts(cells, file_name, worksheet.title, row_number)
-        if not any(text != "" for text in texts):
-            # 空行跳过。
-            continue
         rows.append(map_schwab_transaction_row(
             tuple(texts), f"{file_name} 工作表 {worksheet.title} 第{row_number}行"
         ))
     return rows
 
 
-def _is_hidden_row(worksheet: object, row_number: int) -> bool:
-    """判断某行是否被隐藏。
+def _hidden_row_numbers(worksheet: object) -> set[int]:
+    """取出被隐藏的物理行号。
 
-    read_only 模式下 openpyxl 不提供行维度信息，此时无法判定，返回 ``False``
-    （**不猜**：把可见行误报为隐藏会让正常文件无法导入）。
+    read_only 模式丢弃行维度（``worksheet.row_dimensions`` 不可用），因此隐藏行一度
+    完全检测不到。**不改为非 read_only 加载**：上传上限是 512MB，把整本工作簿展开成
+    带样式的 Cell 对象会成倍占用内存，而这里只需要一个行号集合——行 XML 上的
+    ``hidden`` 属性仍在，流式扫一遍该工作表即可，内存 O(1)。
+
+    @returns 被隐藏的行号集合。
     """
-    dimensions = getattr(worksheet, "row_dimensions", None)
-    if dimensions is None:
-        return False
-    try:
-        return bool(dimensions[row_number].hidden)
-    except (KeyError, AttributeError, TypeError):
-        return False
+    reader = getattr(worksheet, "_get_source", None)
+    if reader is None:  # pragma: no cover - 仅在加载模式被改动时走到
+        return {
+            int(number)
+            for number, dimension in getattr(worksheet, "row_dimensions", {}).items()
+            if getattr(dimension, "hidden", False)
+        }
+
+    from xml.etree.ElementTree import iterparse
+
+    hidden: set[int] = set()
+    with reader() as source:
+        for _, element in iterparse(source, events=("start",)):
+            if element.tag.rsplit("}", 1)[-1] != "row":
+                continue
+            row_number = element.get("r")
+            if element.get("hidden") in ("1", "true") and row_number is not None:
+                hidden.add(int(row_number))
+            # 只取属性；立刻释放，避免把整表 XML 留在内存里。
+            element.clear()
+    return hidden
 
 
 def _row_texts(values: tuple) -> list[str]:
@@ -215,7 +235,9 @@ def _cell_to_text(cell: object, file_name: str, sheet_title: str, row_number: in
         # 布尔不是金额也不是文本；当成 "True"/"False" 会污染字段。
         raise IngestError(f"{where}: 单元格类型不支持")
     if isinstance(value, (int, float)):
-        return str(value)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise IngestError(f"{where}: 单元格数值无效")
+        return _js_number_text(value)
     if isinstance(value, datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=UTC)
@@ -224,6 +246,43 @@ def _cell_to_text(cell: object, file_name: str, sheet_title: str, row_number: in
     if isinstance(value, date):
         return f"{value.month:02d}/{value.day:02d}/{value.year}"
     raise IngestError(f"{where}: 单元格类型不支持")
+
+
+def _js_number_text(value: int | float) -> str:
+    """把数值单元格渲染为与 ExcelJS ``cell.text`` 一致的文本。
+
+    ExcelJS 的 ``cell.text`` 对数值就是 JS ``Number.prototype.toString()``
+    （**不套用单元格的数字格式**），它与 Python ``str()`` 有两处会改变业务哈希的差异：
+
+    | 值 | JS | Python ``str()`` |
+    | --- | --- | --- |
+    | ``100.0`` | ``100`` | ``100.0`` |
+    | ``1e16`` | ``10000000000000000`` | ``1e+16`` |
+    | ``1e-7`` | ``1e-7`` | ``1e-07`` |
+
+    小数位取自源文本并进入 ``transaction_hash``，因此这些差异会让同一份文件在迁移
+    前后算出不同的哈希、重复导入时产生重复交易。
+
+    @param value: 单元格数值（非有限值已在上游拒绝）。
+    @returns 与 JS 数值文本一致的十进制文本。
+    """
+    if isinstance(value, int):
+        return str(value)
+    # JS 对整数值的浮点不带 ``.0``；1e21 起改用指数形式。
+    if value == int(value) and abs(value) < 1e21:
+        return str(int(value))
+
+    magnitude = Decimal(repr(value))
+    if Decimal("1e-6") <= abs(magnitude) < Decimal("1e21"):
+        # JS 在 1e-6（含）以上、1e21 以下用定点形式。
+        return format(magnitude, "f")
+
+    sign, digits, exponent = magnitude.normalize().as_tuple()
+    leading = exponent + len(digits) - 1
+    mantissa = str(digits[0])
+    if len(digits) > 1:
+        mantissa += "." + "".join(str(digit) for digit in digits[1:])
+    return f"{'-' if sign else ''}{mantissa}e{'+' if leading >= 0 else '-'}{abs(leading)}"
 
 
 def _is_merged(cell: object) -> bool:

@@ -19,7 +19,9 @@ from lyra.domain.market_data.types import (
 from lyra.infrastructure.market_data.identifiers import (
     price_point,
     provider_instrument,
+    unix_market_timestamp,
     valid_calendar_date,
+    valid_credential,
 )
 
 
@@ -227,3 +229,53 @@ def test_out_of_range_prices_are_rejected(value: float) -> None:
     """负数、非有限值、超出安全整数范围都拒绝。"""
     with pytest.raises(ValueError, match="Invalid market price"):
         price_point(value, "t")
+
+
+# --------------------------------------------------------------------------
+# Unix 秒级时间戳
+# --------------------------------------------------------------------------
+
+NOW_MS = 1_760_000_000_000
+
+
+def test_unix_timestamp_is_rendered_from_seconds() -> None:
+    """合法的 Unix 秒级时间戳渲染为 ISO 文本。"""
+    assert unix_market_timestamp(1_760_000_000, NOW_MS) == "2025-10-09T08:53:20.000Z"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "bad",            # 非数字
+        True,             # 布尔是 int 的子类，但不是合法时间戳
+        1_760_000_000.5,  # 非整数秒
+        -1,               # 负数
+        NOW_MS // 1000 + 3_600,  # 未来
+        2 ** 53,          # 超出 JS 安全整数范围
+    ],
+)
+def test_invalid_unix_timestamps_raise(value: object) -> None:
+    """**无效时间戳必须抛错，而不是伪造成"现在"。**
+
+    退回当前时间会把"来源时点不明的报价"当成刚取到的新鲜报价，让它通过过期判断并
+    被计入 ``complete``；调用方把该异常折叠为 ``invalid_response``。
+    """
+    with pytest.raises(ValueError, match="Invalid Unix market timestamp"):
+        unix_market_timestamp(value, NOW_MS)
+
+
+# --------------------------------------------------------------------------
+# 凭据
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["token", "abc-123_XYZ+/=", "a" * 4096])
+def test_credentials_allow_printable_ascii(value: str) -> None:
+    """可打印 ASCII 凭据通过。"""
+    assert valid_credential(value) is True
+
+
+@pytest.mark.parametrize("value", ["", "   ", "a b", "bad\nvalue", "中", "bad\x00value"])
+def test_credentials_reject_whitespace_and_non_ascii(value: str) -> None:
+    """**空白、控制字符与非 ASCII 都拒绝**（与参考实现的 ``[\\x21-\\x7e]+`` 对齐）。"""
+    assert valid_credential(value) is False

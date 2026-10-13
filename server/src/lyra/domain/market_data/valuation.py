@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from typing import Literal
 
+from ..numeric import fixed_point_text
+
 # 与 TypeScript 侧一致的精度：估值含乘法，精度不足会引入舍入误差。
 _PRECISION = 64
 
@@ -73,8 +75,9 @@ def value_position(
         market_value = quoted_units * factor
         unrealized = (quoted_units - Decimal(cost)) * factor
     return PositionValuation(
-        market_value=_decimal_text(market_value),
-        unrealized_pnl=_decimal_text(unrealized),
+        # 参考实现是 ``.toFixed()``（定点），不是 ``toString()``（极小量级会变指数形式）。
+        market_value=fixed_point_text(market_value),
+        unrealized_pnl=fixed_point_text(unrealized),
         multiplier=multiplier,
     )
 
@@ -128,11 +131,4 @@ def _sum(rows: list[dict], field: str) -> str:
             value = getattr(row["valuation"], field)
             if value is not None:
                 total += Decimal(value)
-    return _decimal_text(total)
-
-
-def _decimal_text(value: Decimal) -> str:
-    """渲染为无指数、去尾随零的十进制文本。"""
-    from ..numeric import decimal_text
-
-    return decimal_text(value)
+    return fixed_point_text(total)

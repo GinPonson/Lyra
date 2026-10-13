@@ -22,10 +22,11 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
-from typing import Any
+from typing import Any, TypeVar
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -33,6 +34,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from ..application.app_error import ApplicationError
 
 REQUEST_ID_HEADER = "x-request-id"
+
+logger = logging.getLogger(__name__)
+
+# 保留传入响应的具体类型（``JSONResponse`` 等），免得调用方的返回类型退化。
+_ResponseT = TypeVar("_ResponseT", bound=Response)
 
 # **禁止缓存的路径。** 这些响应含凭据或供应商密钥配置：
 #
@@ -87,6 +93,26 @@ def _request_id(request: Request) -> str:
     return generated
 
 
+def _finalize_response(request: Request, response: _ResponseT) -> _ResponseT:
+    """为响应补上请求 ID（以及必要的禁止缓存）头。
+
+    **必须逐个响应补，不能只写在中间件的 ``call_next`` 之后**：有两条路径根本走不到
+    那里——协议门 426 在 ``call_next`` 之前就返回，未归类异常的 500 由 Starlette 的
+    ``ServerErrorMiddleware`` 直接下发（异常从内层重新抛出，中间件没有机会处理响应）。
+    只写一处会漏掉这两条，而它们恰恰是用户最需要凭 ID 报障的路径。
+
+    @param request: 当前请求。
+    @param response: 待发出的响应。
+    @returns 同一个响应对象，便于链式返回。
+    """
+    response.headers[REQUEST_ID_HEADER] = _request_id(request)
+    # 含凭据或供应商配置的响应禁止缓存。
+    path = request.url.path
+    if path in _NO_STORE_EXACT or path.startswith(_NO_STORE_PREFIXES):
+        response.headers["cache-control"] = "no-store"
+    return response
+
+
 def error_body(
     request: Request,
     *,
@@ -132,22 +158,17 @@ def install_error_envelope(app: FastAPI) -> None:
         # 需要升级"，那是客户端唯一能据此采取正确动作的信号。
         gate = _client_protocol_gate(request)
         if gate is not None:
-            return gate
+            return _finalize_response(request, gate)
 
         response = await call_next(request)
-        response.headers[REQUEST_ID_HEADER] = request.state.request_id
-        # 含凭据或供应商配置的响应禁止缓存。
-        path = request.url.path
-        if path in _NO_STORE_EXACT or path.startswith(_NO_STORE_PREFIXES):
-            response.headers["cache-control"] = "no-store"
-        return response
+        return _finalize_response(request, response)
 
     @app.exception_handler(ApplicationError)
     async def handle_application_error(
         request: Request, error: ApplicationError
     ) -> JSONResponse:
         """领域错误：状态码、码、可重试性与明细都来自异常本身。"""
-        return JSONResponse(
+        return _finalize_response(request, JSONResponse(
             status_code=error.status_code,
             content=error_body(
                 request,
@@ -156,7 +177,7 @@ def install_error_envelope(app: FastAPI) -> None:
                 details=error.details,
                 retryable=error.retryable,
             ),
-        )
+        ))
 
     @app.exception_handler(StarletteHTTPException)
     async def handle_http_exception(
@@ -178,7 +199,7 @@ def install_error_envelope(app: FastAPI) -> None:
             explicit = detail.get("details")
             if explicit is None and extra:
                 explicit = extra
-            return JSONResponse(
+            return _finalize_response(request, JSONResponse(
                 status_code=error.status_code,
                 content=error_body(
                     request,
@@ -187,15 +208,15 @@ def install_error_envelope(app: FastAPI) -> None:
                     details=explicit,
                     retryable=bool(detail.get("retryable", False)),
                 ),
-            )
-        return JSONResponse(
+            ))
+        return _finalize_response(request, JSONResponse(
             status_code=error.status_code,
             content=error_body(
                 request,
                 code=_fallback_code(error.status_code),
                 message=str(detail),
             ),
-        )
+        ))
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(
@@ -206,7 +227,7 @@ def install_error_envelope(app: FastAPI) -> None:
         参考实现对应 400 ``INVALID_ARGUMENT``；**明细附在 ``details`` 里**，
         便于客户端定位是哪个字段。
         """
-        return JSONResponse(
+        return _finalize_response(request, JSONResponse(
             status_code=400,
             content=error_body(
                 request,
@@ -214,20 +235,29 @@ def install_error_envelope(app: FastAPI) -> None:
                 message="请求参数不符合公开定义",
                 details={"errors": _jsonable_errors(error.errors())},
             ),
-        )
+        ))
 
     @app.exception_handler(Exception)
     async def handle_unexpected(request: Request, error: Exception) -> JSONResponse:
-        """未归类异常：**对外只说发生了内部错误**。
+        """未归类异常：**对外只说发生了内部错误，真实原因进日志**。
 
         异常文本可能包含文件路径、SQL 片段或账户标识，因此不发给客户端。
+        **但它必须留下**：用户拿 ``request_id`` 报障时，日志是唯一能还原现场的记录，
+        只回一个稳定的码而不记录异常，等于让这次故障无法排查。
         """
-        return JSONResponse(
+        logger.error(
+            "未归类异常：request_id=%s error=%s: %s",
+            _request_id(request),
+            type(error).__name__,
+            error,
+            exc_info=error,
+        )
+        return _finalize_response(request, JSONResponse(
             status_code=500,
             content=error_body(
                 request, code=INTERNAL_ERROR_CODE, message=INTERNAL_ERROR_MESSAGE
             ),
-        )
+        ))
 
 
 def _client_protocol_gate(request: Request) -> JSONResponse | None:

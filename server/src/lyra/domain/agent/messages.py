@@ -28,6 +28,31 @@ AuthorizationDecision = Literal["allowed", "denied"]
 
 
 @dataclass(frozen=True)
+class TurnMessage:
+    """一条待落库的回合消息。
+
+    **它是领域层的持久化契约，而不是仓储对象**：``NormalizedAgentMessage`` 只描述
+    "消息是什么"，而写入 ``agent_messages`` 还需要会话归属、序号、供应商与完成时间。
+    把领域对象直接交给消息仓储，结果是每个真实回合在第一次落库时抛
+    ``AttributeError``——领域测试用内存假仓储，所以全绿。
+
+    ``ordinal`` 由编排器给出（登记运行态时已拿到消息列表），而不是在写事务里再查一次
+    ``max(ordinal)``。
+    """
+
+    id: str
+    session_id: str
+    ordinal: int
+    role: AgentMessageRole
+    provider: Literal["genkit", "claude", "pi", "opencode"] | None
+    status: AgentMessageStatus
+    content: str
+    error_code: str | None
+    created_at: str
+    completed_at: str | None = None
+
+
+@dataclass(frozen=True)
 class AgentMessage:
     """一条会话消息。"""
 

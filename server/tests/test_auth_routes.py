@@ -1,27 +1,38 @@
 """认证路由测试。
 
-两条要点：
+三条要点：
 
 1. **`GET /v1/auth/providers` 不要求设备认证**——它本身就是获取认证的入口；
 2. **`POST /v1/devices/tokens` 也不要求访问令牌**——用已过期或已撤销的访问令牌去
-   刷新是行不通的，身份由刷新凭据本身证明。
+   刷新是行不通的，身份由刷新凭据本身证明；
+3. **正文类型收口在路由层**——非字符串字段必须 400，不能穿透到服务层变成 500。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
+from lyra.api.agent_events import EventConnectionRegistry
+from lyra.application.agent_turn_orchestrator import AgentTurnOrchestrator
 from lyra.application.device_pairing_service import DevicePairingService
+from lyra.application.owner_login_service import OwnerLoginService
 from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
-from lyra.infrastructure.auth.login_provider import LoginIdentity
+from lyra.domain.agent.switching import AgentSessionSnapshot
+from lyra.domain.analytics.types import AccountScope
+from lyra.infrastructure.auth.login_provider import (
+    ConfiguredLoginProvider,
+    LoginIdentity,
+)
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
 from lyra.main import create_app
 
@@ -468,3 +479,335 @@ def test_a_malformed_code_verifier_is_not_reported_as_not_configured(client) -> 
 
     assert response.status_code == 401
     assert response.json()["code"] != "AUTH_NOT_CONFIGURED"
+
+
+# --------------------------------------------------------------------------
+# 正文类型收口：非字符串字段必须 400，不能变成 500
+# --------------------------------------------------------------------------
+
+
+def _start_body_without(field: str) -> dict:
+    """构造一份缺少某个字段的登录正文。"""
+    body = dict(VALID_START)
+    del body[field]
+    return body
+
+
+@pytest.mark.parametrize(
+    ("label", "body"),
+    [
+        ("codeChallenge 是数字", {**VALID_START, "codeChallenge": 123}),
+        ("codeChallenge 是数组", {**VALID_START, "codeChallenge": ["x" * 43]}),
+        ("codeChallengeMethod 是数字", {**VALID_START, "codeChallengeMethod": 256}),
+        ("displayName 是数字", {**VALID_START, "displayName": 123}),
+        ("displayName 缺失", _start_body_without("displayName")),
+        ("publicKeyPem 是数字", {**VALID_START, "publicKeyPem": 123}),
+    ],
+)
+def test_a_non_string_start_field_is_a_400_not_a_500(client, label: str, body: dict) -> None:
+    """**非字符串字段必须在路由层被拒**。
+
+    服务层直接对值跑 ``re.fullmatch`` / ``str.strip``；把手写的 dict 原样传下去，
+    一个 ``"codeChallenge": 123`` 就会抛 ``TypeError``，最终对客户端表现为
+    **500 INTERNAL_ERROR**——而这是它自己构造错了请求，应当是 400。
+    """
+    test_client, _ = client
+    response = test_client.post("/v1/auth/github/start", json=body)
+
+    assert response.status_code == 400, f"{label}: {response.status_code}"
+    assert response.json()["code"] == "INVALID_ARGUMENT"
+    # 400 必须带文案：空 message 会让客户端显示一条没有内容的错误。
+    assert response.json()["message"] == "登录参数无效"
+
+
+class _FakeLoginClient:
+    """只提供路由层用得到的动作的来源客户端。"""
+
+    def authorization_url(self, *, state: str, nonce: str, code_challenge: str) -> str:
+        """返回一个固定授权地址；本组测试不解析它。"""
+        return f"https://provider.example/authorize?state={state}"
+
+    def exchange_code(self, **kwargs: Any) -> LoginIdentity:
+        """本组测试不会走到授权码交换。"""
+        raise AssertionError("本组测试不应执行授权码交换")
+
+
+@pytest.fixture()
+def configured_client(client):
+    """在公共夹具之上装配一个 github 来源。
+
+    **必须有已配置的来源**才能验证校验顺序：未配置时服务层会先抛 503，
+    掩盖掉"类型非法应当 400"这条断言。
+    """
+    test_client, issued = client
+    test_client.app.state.login_service = OwnerLoginService(
+        [
+            ConfiguredLoginProvider(
+                id="github",
+                name="GitHub",
+                client=_FakeLoginClient(),
+                assert_owner=lambda identity: None,
+            )
+        ],
+        lambda **kwargs: None,
+    )
+    return test_client, issued
+
+
+@pytest.mark.parametrize(
+    ("label", "body"),
+    [
+        ("loginId 是数组", {"loginId": ["x"], "codeVerifier": "v" * 43}),
+        ("loginId 是数字", {"loginId": 123, "codeVerifier": "v" * 43}),
+        ("loginId 缺失", {"codeVerifier": "v" * 43}),
+        ("codeVerifier 是数字", {"loginId": "11111111-1111-1111-1111-111111111111", "codeVerifier": 43}),
+    ],
+)
+def test_a_non_string_exchange_field_is_a_400_not_a_500(
+    configured_client, label: str, body: dict
+) -> None:
+    """``exchange`` 的非字符串字段同样必须 400。
+
+    ``loginId`` 是数组时服务层会拿它当字典键（``self._attempts.get(["x"])``），
+    未收口时抛 ``TypeError`` → 500。
+    """
+    test_client, _ = configured_client
+    response = test_client.post("/v1/auth/github/exchange", json=body)
+
+    assert response.status_code == 400, f"{label}: {response.status_code}"
+    assert response.json()["code"] == "INVALID_ARGUMENT"
+    assert response.json()["message"] == "登录参数无效"
+
+
+@pytest.mark.parametrize("payload", [{}, {"refreshToken": ""}, {"refreshToken": 5}])
+def test_an_invalid_device_token_body_carries_a_message(client, payload: dict) -> None:
+    """非法刷新正文的 400 必须带文案。
+
+    只有 ``code`` 时错误信封取到空 message，客户端会显示一条空错误提示。
+    """
+    test_client, _ = client
+    body = test_client.post("/v1/devices/tokens", json=payload).json()
+
+    assert body["code"] == "INVALID_ARGUMENT"
+    assert body["message"] == "设备令牌刷新参数无效"
+
+
+# --------------------------------------------------------------------------
+# 单写队列：认证路径必须复用应用级单例
+# --------------------------------------------------------------------------
+
+
+class _RecordingCoordinator(WriteCoordinator):
+    """记录入队次数的协调器替身。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.enqueued = 0
+
+    async def enqueue(self, operation: Any) -> Any:
+        """计数后交给真实实现执行。"""
+        self.enqueued += 1
+        return await super().enqueue(operation)
+
+
+def test_auth_writes_use_the_app_write_coordinator_singleton(client) -> None:
+    """刷新与登出必须走 ``app.state.write_coordinator``。
+
+    **各自 ``new`` 一个协调器等于没有串行化**：健康端点的 ``writeQueue`` 段会与
+    真实认证写入脱节，刷新与登出也可以交错执行。
+    """
+    test_client, issued = client
+    spy = _RecordingCoordinator()
+    test_client.app.state.write_coordinator = spy
+
+    test_client.post("/v1/devices/tokens", json={"refreshToken": issued.refresh_token})
+    assert spy.enqueued == 1
+
+    test_client.post(
+        "/v1/auth/logout", headers={"Authorization": f"Bearer {issued.access_token}"}
+    )
+    assert spy.enqueued == 2
+
+
+# --------------------------------------------------------------------------
+# 兑换响应：必须带 user.email
+# --------------------------------------------------------------------------
+
+
+class _CompletingLoginService:
+    """固定返回一次已完成兑换的登录服务；只用于验证响应组装。"""
+
+    def __init__(self, identity: LoginIdentity) -> None:
+        self._identity = identity
+
+    async def exchange(
+        self, provider_id: str, *, login_id: str, code_verifier: str
+    ) -> dict[str, Any]:
+        """返回一份完整的兑换结果。"""
+        return {
+            "status": "complete",
+            "deviceId": "device-1",
+            "displayName": "Pixel 9",
+            "accessToken": "access",
+            "accessTokenExpiresAt": "2026-10-13T00:10:00.000Z",
+            "refreshToken": "refresh",
+            "refreshTokenExpiresAt": "2026-11-12T00:00:00.000Z",
+            "user": self._identity,
+        }
+
+
+def test_exchange_returns_the_user_email(client) -> None:
+    """``user.email`` 必须出现在响应里。
+
+    客户端把它展示在个人资料页（``user?['email']``）；丢了它 App 会静默显示空邮箱。
+    """
+    test_client, _ = client
+    test_client.app.state.login_service = _CompletingLoginService(
+        LoginIdentity(
+            provider="github", subject="12345", email="owner@example.com", display_name="octocat"
+        )
+    )
+
+    response = test_client.post(
+        "/v1/auth/github/exchange",
+        json={"loginId": "11111111-1111-1111-1111-111111111111", "codeVerifier": "v" * 43},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user"] == {
+        "provider": "github",
+        "subject": "12345",
+        "email": "owner@example.com",
+        "displayName": "octocat",
+    }
+
+
+# --------------------------------------------------------------------------
+# 设备错误码与状态码对齐
+# --------------------------------------------------------------------------
+
+
+def test_a_revoked_device_is_a_403_on_refresh(client) -> None:
+    """``DEVICE_REVOKED`` 是 403（已认证但被拒绝），不能一律压成 401。
+
+    这里只把设备行标成 revoked，保留刷新凭据为 active——正是"设备已撤销但凭据仍在"
+    这一状态让领域层抛出 ``DEVICE_REVOKED``（而不是"凭据已重用"的 401）。
+    """
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    connection.execute(
+        """
+        UPDATE paired_devices
+        SET status = 'revoked', revoked_at = CAST(? AS TIMESTAMPTZ)
+        WHERE id = CAST(? AS UUID)
+        """,
+        ["2026-10-13T12:00:00.000Z", issued.device_id],
+    )
+
+    response = test_client.post(
+        "/v1/devices/tokens", json={"refreshToken": issued.refresh_token}
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "DEVICE_REVOKED"
+
+
+def test_a_revoked_access_token_keeps_its_domain_code(client) -> None:
+    """访问令牌路径保留领域层的错误码：设备已撤销 → ``DEVICE_REVOKED``。
+
+    状态码仍是 401（认证失败），但把「设备已撤销」压成
+    ``DEVICE_CREDENTIAL_INVALID`` 会让 App 分不清该重新登录还是刷新令牌。
+    """
+    test_client, issued = client
+    headers = {"Authorization": f"Bearer {issued.access_token}"}
+    test_client.post("/v1/auth/logout", headers=headers)
+
+    response = test_client.post("/v1/auth/logout", headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "DEVICE_REVOKED"
+
+
+# --------------------------------------------------------------------------
+# 登出的两个副作用：踢掉事件流、终止在跑的回合
+# --------------------------------------------------------------------------
+
+
+class _FakeSocket:
+    """事件连接替身：只实现注册表关心的 ``close``。"""
+
+    def __init__(self) -> None:
+        self.closed: list[tuple[int, str]] = []
+
+    async def close(self, code: int, reason: str) -> None:
+        """记录关闭码与原因。"""
+        self.closed.append((code, reason))
+
+
+def test_logout_closes_the_devices_event_connections(client) -> None:
+    """登出必须踢掉该设备已建立的事件长连接。
+
+    否则"已登出"的设备仍能持续收到 Agent 事件，直到它自己断开连接。
+    """
+    test_client, issued = client
+    registry: EventConnectionRegistry = test_client.app.state.event_connections
+    socket = _FakeSocket()
+    registry.add(issued.device_id, socket)
+
+    test_client.post(
+        "/v1/auth/logout", headers={"Authorization": f"Bearer {issued.access_token}"}
+    )
+
+    # 连接被以 4001 关闭，并从注册表移除（重复登出不会二次关闭）。
+    assert socket.closed == [(4001, "signed out")]
+    assert registry.take_device(issued.device_id) == ()
+
+
+class _CancelableStore:
+    """取消路径所需的最小仓储：会话推进必须"落库"成功。"""
+
+    def __init__(self) -> None:
+        self.saved: list[AgentSessionSnapshot] = []
+
+    def save_session(self, session: AgentSessionSnapshot, *, next_event_sequence: int) -> bool:
+        """记录并接受会话推进。"""
+        self.saved.append(session)
+        return True
+
+
+def test_logout_cancels_the_devices_running_turns(client) -> None:
+    """登出必须终止该设备在跑的回合。
+
+    设备撤销后如果回合继续跑完并把回答落库，"已登出"就只是客户端的本地状态。
+    """
+    test_client, issued = client
+    store = _CancelableStore()
+    orchestrator = AgentTurnOrchestrator(
+        store=store, now=lambda: datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
+    )
+    session_id = "s-logout"
+    orchestrator.register(
+        AgentSessionSnapshot(
+            id=session_id,
+            provider="genkit",
+            status="running",
+            account_scope=AccountScope(kind="all"),
+            ledger_version=1,
+            as_of="2026-10-13T04:00:00.000Z",
+            revision=1,
+            summary=None,
+            messages=(),
+        ),
+        device_id=issued.device_id,
+    )
+    test_client.app.state.agent_orchestrator = orchestrator
+
+    test_client.post(
+        "/v1/auth/logout", headers={"Authorization": f"Bearer {issued.access_token}"}
+    )
+
+    # 回合已被 CAS 推进到 cancelling：再请求取消时它已不在 running，返回 None。
+    assert orchestrator.request_cancel(
+        session_id, now=datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
+    ) is None
+    assert [session.status for session in store.saved] == ["cancelling"]

@@ -201,11 +201,13 @@ def decimal_hash_text(raw: str) -> str | None:
     小数位数取自**清洗后的源文本**，这样 ``$5.00`` 不会被规范化为 ``5``：
     哈希必须对同一次 Schwab 导出的原始书写形式保持稳定。
 
-    与 TypeScript 版的两点刻意对齐：
+    与 TypeScript 版的两点对齐：
 
     1. ``-0.00`` 归一到 ``0.00``（decimal.js 不保留负零）；
-    2. 科学计数法分支**不做猜测性对齐**——它不是已确认的 Schwab 格式，
-       TypeScript 侧同样未做跨语言验证，此处直接给出 Python 的规范文本。
+    2. 科学计数法分支按 decimal.js ``toString()`` 渲染（见
+       :func:`lyra.domain.numeric.decimal_text`）。Python 的 ``str(Decimal)`` 在正指数
+       下会给出 ``1.5E+5``，而 TypeScript 给出 ``150000``——**差异会让同一份文件在
+       迁移前后哈希不同，重复导入时产生重复交易**。
 
     @param raw: 原始单元格文本。
     @returns 哈希文本；空字段返回 ``None``。
@@ -216,7 +218,8 @@ def decimal_hash_text(raw: str) -> str | None:
 
     value = Decimal(normalized)
     if "e" in normalized or "E" in normalized:
-        return str(value)
+        # 复用 decimal.js ``toString()`` 的共享实现，保证与 TypeScript 逐字符一致。
+        return decimal_text(value)
 
     dot_index = normalized.find(".")
     scale = 0 if dot_index < 0 else len(normalized) - dot_index - 1

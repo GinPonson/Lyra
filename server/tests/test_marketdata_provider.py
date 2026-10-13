@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from lyra.domain.market_data.types import (
     MarketPricePoint,
     MarketTiming,
@@ -239,12 +241,34 @@ def test_invalid_status_field_is_rejected() -> None:
     assert result.reason == "invalid_response"
 
 
-def test_missing_timestamp_falls_back_to_now() -> None:
-    """时间戳缺失或离谱时退回当前时间，而不是产出 1970 年的时点。"""
+def test_missing_timestamp_is_rejected_as_invalid_response() -> None:
+    """**时间戳非法时抛错并折叠为 ``invalid_response``，不退回当前时间。**
+
+    退回会把"来源时点不明的报价"伪造成"刚刚取到的新鲜报价"，让它通过过期判断并被
+    计入 ``complete``——错误看起来完全正常。参考实现在这两处都直接抛错。
+    """
     provider, _ = _provider(payload=_ok_payload(updated=["bad"]))
 
     result = provider.fetch_quote(StockInstrument(symbol="INTC"), now_ms=NOW_MS)
 
-    assert isinstance(result, QuoteAvailable)
-    assert result.quote.bid is not None
-    assert result.quote.bid.as_of == "2025-10-09T08:53:20.000Z"
+    assert isinstance(result, QuoteUnavailable)
+    assert result.reason == "invalid_response"
+
+
+@pytest.mark.parametrize(
+    "updated",
+    [
+        -1,                      # 负数
+        NOW_MS // 1000 + 3_600,  # 未来
+        1_760_000_000.5,         # 非整数秒
+        True,                    # 布尔不是数字
+    ],
+)
+def test_invalid_timestamp_values_are_rejected(updated: object) -> None:
+    """负数、未来、非整数与布尔时间戳一律拒绝。"""
+    provider, _ = _provider(payload=_ok_payload(updated=[updated]))
+
+    result = provider.fetch_quote(StockInstrument(symbol="INTC"), now_ms=NOW_MS)
+
+    assert isinstance(result, QuoteUnavailable)
+    assert result.reason == "invalid_response"

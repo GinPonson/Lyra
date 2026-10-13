@@ -24,6 +24,8 @@ from lyra.domain.market_data.types import (
 )
 
 NOW = 1_760_000_000_000
+# 超过默认 7 天时效的报价时点（回归用；默认值见 market_data_service.DEFAULT_MAX_QUOTE_AGE_MS）。
+_STALE_AGE_MS = 8 * 86_400_000
 INSTRUMENT = StockInstrument(symbol="INTC")
 POLICY = MarketProviderPolicy(
     cache_ttl_ms=30_000, max_requests_per_minute=10, max_requests_per_day=None
@@ -147,7 +149,7 @@ def test_stale_primary_does_not_stop_the_fallback() -> None:
 
     一个能给出新鲜报价的备来源胜过只能给出旧报价的主来源。
     """
-    old = _iso(NOW - 60 * 60_000)  # 一小时前的报价，超过默认 15 分钟时效
+    old = _iso(NOW - _STALE_AGE_MS)  # 八天前：超过默认七天时效
 
     catalog = Catalog({
         "primary": ProviderQuote(status="available", quote=_quote(as_of=old)),
@@ -159,9 +161,25 @@ def test_stale_primary_does_not_stop_the_fallback() -> None:
     assert catalog.calls == ["primary", "secondary"]
 
 
+def test_one_hour_old_quote_is_still_available() -> None:
+    """**回归：默认时效是 7 天，不是 15 分钟。**
+
+    15 分钟的默认值会把周内的延迟报价整片判成过期，让本可用的报价降级为 stale，
+    并触发无谓的备来源请求与预算消耗。参考实现的默认值是 ``?? 7 * DAY_MS``。
+    """
+    one_hour_old = _iso(NOW - 60 * 60_000)
+    catalog = Catalog({
+        "primary": ProviderQuote(status="available", quote=_quote(as_of=one_hour_old)),
+    })
+    result = _service(catalog).get_quote(INSTRUMENT)
+
+    assert result.status == "available"
+    assert catalog.calls == ["primary"]
+
+
 def test_returns_stale_when_no_provider_has_a_fresh_quote() -> None:
     """所有来源都只有过期报价时才返回过期结果。"""
-    old = _iso(NOW - 60 * 60_000)
+    old = _iso(NOW - _STALE_AGE_MS)
     catalog = Catalog({
         "primary": ProviderQuote(status="available", quote=_quote(as_of=old)),
         "secondary": _unavailable("provider_unavailable"),
@@ -174,7 +192,7 @@ def test_returns_stale_when_no_provider_has_a_fresh_quote() -> None:
 
 def test_first_stale_result_is_kept() -> None:
     """多个过期结果时保留**第一个**（即最靠前的来源）。"""
-    old = _iso(NOW - 60 * 60_000)
+    old = _iso(NOW - _STALE_AGE_MS)
     catalog = Catalog({
         "primary": ProviderQuote(status="available", quote=_quote(bid="1.0", ask="1.1", as_of=old)),
         "secondary": ProviderQuote(status="available", quote=_quote(bid="2.0", ask="2.1", as_of=old)),
@@ -200,6 +218,26 @@ def test_quote_without_a_reference_price_is_skipped() -> None:
 
     assert result.status == "available"
     assert catalog.calls == ["primary", "secondary"]
+
+
+def test_crossed_market_is_rejected_as_invalid_response() -> None:
+    """**交叉盘口（``ask < bid``）是数据形状错误，不是"没有数据"。**
+
+    参考实现显式把它映射为 ``invalid_response``。若按可用报价放行，它会进入缓存并
+    参与估值——而那个价格在市场上从未存在过。
+    """
+    crossed = ProviderQuote(status="available", quote=_quote(bid="12.4", ask="12.3"))
+    catalog = Catalog({"primary": crossed})
+    service = _service(catalog, route=("primary",))
+
+    result = service.get_quote(INSTRUMENT)
+
+    assert result.status == "unavailable"
+    assert result.issue == "invalid_response"
+    assert result.quote is None
+    # 证券级失败不冷却来源：另一个符号仍然真的打上游。
+    service.get_quote(StockInstrument(symbol="AMD"))
+    assert catalog.calls == ["primary", "primary"]
 
 
 # --------------------------------------------------------------------------

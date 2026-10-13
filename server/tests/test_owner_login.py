@@ -231,7 +231,7 @@ def test_capacity_eviction_prefers_oldest_not_rejecting_newest() -> None:
     若改为对所有人返回 429，未认证攻击者只要占满槽位就能让所有者永久无法登录。
     """
     service = _service()
-    first = service.start("github", _start_payload())
+    service.start("github", _start_payload())  # 最早的事务，应被淘汰
     for _ in range(200):
         latest = service.start("github", _start_payload())
 

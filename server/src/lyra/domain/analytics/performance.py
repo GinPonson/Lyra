@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 from typing import Literal
 
 from ..fifo.types import Lot, RealizedRecord
@@ -76,10 +76,15 @@ def calculate_monthly_performance(
             close_transactions=len({record.close_transaction for record in monthly}),
             wins=wins,
             losses=losses,
-            gross_profit=format(gross_profit.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
-            gross_loss=format(gross_loss.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
-            net_pnl=format(net_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
-            fees=format(fees.quantize(_FEE_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
+            # 参考实现在这些字段上用的是 ``toFixed``（四舍五入），不是银行家舍入。
+            gross_profit=format(
+                gross_profit.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_UP), "f"
+            ),
+            gross_loss=format(
+                gross_loss.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_UP), "f"
+            ),
+            net_pnl=format(net_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_UP), "f"),
+            fees=format(fees.quantize(_FEE_QUANTUM, rounding=ROUND_HALF_UP), "f"),
             win_rate_pct=_ratio_pct(wins, decisive),
             profit_factor=(
                 format(
@@ -97,8 +102,8 @@ def calculate_monthly_performance(
     return MonthlyPerformanceResult(
         rows=tuple(rows),
         months=len(rows),
-        total_pnl=format(total_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
-        total_fees=format(total_fees.quantize(_FEE_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
+        total_pnl=format(total_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_UP), "f"),
+        total_fees=format(total_fees.quantize(_FEE_QUANTUM, rounding=ROUND_HALF_UP), "f"),
         basis="realized_fifo",
     )
 
@@ -227,7 +232,7 @@ def calculate_attribution(
             wins=wins,
             losses=losses,
             win_rate_pct=_ratio_pct(wins, wins + losses),
-            net_pnl=format(net_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
+            net_pnl=format(net_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_UP), "f"),
             absolute_contribution_pct=(
                 None
                 if total_absolute_pnl == 0
@@ -238,7 +243,7 @@ def calculate_attribution(
                     "f",
                 )
             ),
-            fees=format(fees.quantize(_FEE_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
+            fees=format(fees.quantize(_FEE_QUANTUM, rounding=ROUND_HALF_UP), "f"),
         )
         for category, grouped, wins, losses, net_pnl, fees in ordered
     )
@@ -247,7 +252,7 @@ def calculate_attribution(
     return AttributionResult(
         rows=rows,
         groups=len(rows),
-        total_pnl=format(total_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
+        total_pnl=format(total_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_UP), "f"),
         basis="realized_fifo",
     )
 

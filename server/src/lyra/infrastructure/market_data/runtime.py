@@ -70,7 +70,8 @@ def create_market_data_runtime(
 
     if config.alpaca_api_key is not None and config.alpaca_secret_key is not None:
         alpaca = AlpacaMarketDataProvider(
-            api_key=config.alpaca_api_key, secret_key=config.alpaca_secret_key, fetch=fetch
+            api_key=config.alpaca_api_key, secret_key=config.alpaca_secret_key,
+            fetch=fetch, timeout_ms=config.timeout_ms,
         )
         providers[alpaca.id] = alpaca.fetch_quote
         policies[alpaca.id] = MarketProviderPolicy(
@@ -87,7 +88,8 @@ def create_market_data_runtime(
             delay_minutes=None if historical else MARKETDATA_DELAY_MINUTES,
         )
         marketdata = MarketDataProvider(
-            api_token=config.marketdata_api_token, timing=timing, fetch=fetch
+            api_token=config.marketdata_api_token, timing=timing, fetch=fetch,
+            timeout_ms=config.timeout_ms,
         )
         providers[marketdata.id] = marketdata.fetch_quote
         policies[marketdata.id] = MarketProviderPolicy(

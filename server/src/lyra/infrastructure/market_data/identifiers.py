@@ -30,10 +30,15 @@ from ...domain.market_data.types import (
 # OCC 行使价：最多 5 位整数部分，整体最多 8 位千分位（即 99999.999）。
 MAX_OCC_STRIKE_THOUSANDTHS = 99_999_999
 
+# 与 JavaScript ``Number.MAX_SAFE_INTEGER`` 一致：供应商时间戳必须是安全整数秒。
+_MAX_SAFE_INTEGER = 9_007_199_254_740_991
+
 _STOCK_SYMBOL = re.compile(r"^[A-Z][A-Z0-9]{0,9}(?:[.-][A-Z0-9]{1,2})?$")
 _UNDERLYING = re.compile(r"^[A-Z]{1,6}$")
 _STRIKE = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d{1,3})?$")
 _OPTION_EXPIRY = re.compile(r"^20\d{2}-\d{2}-\d{2}$")
+# 参考实现：``/^[\x21-\x7e]+$/``——只允许可打印 ASCII，空白与非 ASCII 都不行。
+_CREDENTIAL = re.compile(r"^[\x21-\x7e]+$")
 
 
 @dataclass(frozen=True)
@@ -170,34 +175,37 @@ def _decimal_text(value: float) -> str:
 def unix_market_timestamp(value: object, now: int) -> str:
     """把供应商的 Unix 秒级时间戳渲染为 ISO 文本。
 
-    **无效或明显离谱的时间戳退回当前时间**，而不是产出一个 1970 年或 55000 年的
-    时点——那会让"报价是否过期"的判断彻底失效。
+    **无效、非安全整数、负数或未来的时间戳一律抛错**，而不是退回当前时间：退回会把
+    "来源时点不明的报价"伪造成"刚刚取到的新鲜报价"，让它通过过期判断并被计入
+    ``complete``——错误看起来完全正常。调用方（行情适配器）已把该异常折叠为
+    ``invalid_response``。
 
     @param value: 供应商返回值。
     @param now: 当前毫秒时间戳。
     @returns ISO UTC 文本。
+    @raises ValueError: 值不是安全整数秒、为负，或换算后晚于当前时刻。
     """
-
-    if isinstance(value, bool) or not isinstance(value, int):
-        return _iso_ms(now)
-    # **任何未来时间戳都不可信**：供应商的时钟快一点就会把"报价时间"推到未来，
-    # 让"是否过期"的判断反向失效。
-    if value < 0 or value * 1000 > now:
-        return _iso_ms(now)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value > _MAX_SAFE_INTEGER
+        or value < 0
+        or value * 1000 > now
+    ):
+        raise ValueError("Invalid Unix market timestamp")
     return _iso_ms(value * 1000)
 
 
 def valid_credential(value: str) -> bool:
-    """判断凭据是否可用（非空且无控制字符）。
+    """判断凭据是否可用。
 
-    控制字符会破坏 HTTP 头，而请求头的解析失败通常表现为"认证失败"——掩盖真正原因。
+    只允许 **0x21–0x7e 的可打印 ASCII**（与参考实现的正则逐字符对齐）：空白字符会
+    破坏 HTTP 头的解析，非 ASCII 会在编码层失败——两者通常都表现为"认证失败"，
+    掩盖真正原因；长度也不再有单独的宽松上限。
     """
     if not isinstance(value, str):
         return False
-    stripped = value.strip()
-    if stripped == "" or len(stripped) > 4096:
-        return False
-    return not any(ord(character) < 0x20 or ord(character) == 0x7F for character in stripped)
+    return _CREDENTIAL.fullmatch(value) is not None
 
 
 def _iso_ms(milliseconds: int) -> str:

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Union
+from typing import Any, Literal, Union
 
 from .events import AgentEvent, AgentEventSequencer
 from .switching import AgentSessionSnapshot
@@ -28,6 +28,9 @@ from .turn import (
     complete_agent_turn,
     fail_agent_turn,
 )
+
+AgentToolAuthorizationDecision = Literal["allowed", "denied"]
+AgentToolCallStatus = Literal["started", "completed", "failed", "cancelled", "rejected"]
 
 
 @dataclass(frozen=True)
@@ -72,8 +75,60 @@ class TurnSettled:
     """回合结束信号。"""
 
 
+@dataclass(frozen=True)
+class ToolStarted:
+    """一次**已获授权**的工具调用开始。
+
+    ``message_id`` 指向**已落库的用户消息**：``agent_tool_calls`` 对消息有外键，
+    而助手消息要到回合结束才落库；因此工具事件的 ``messageId`` 与文本增量事件不同，
+    这是刻意的。拒绝的调用不发本信号——它从未开始。
+
+    @param arguments_summary: 有界的参数摘要；原始参数不得进入事件与审计。
+    """
+
+    message_id: str
+    call_id: str
+    ordinal: int
+    tool_name: str
+    authorization_decision: AgentToolAuthorizationDecision
+    status: AgentToolCallStatus
+    arguments_summary: dict[str, Any]
+    result_summary: dict[str, Any] | None
+    duration_ms: int | None
+    error_code: str | None
+    ledger_version: int
+
+
+@dataclass(frozen=True)
+class ToolCompleted:
+    """一次工具调用的终态（成功、失败或策略拒绝）。
+
+    ``status`` 与数据库 CHECK 同域；``rejected`` 只能配 ``denied``，其余终态只能配
+    ``allowed``——否则编排器会写出一条自相矛盾的审计记录。
+    """
+
+    message_id: str
+    call_id: str
+    ordinal: int
+    tool_name: str
+    authorization_decision: AgentToolAuthorizationDecision
+    status: AgentToolCallStatus
+    arguments_summary: dict[str, Any]
+    result_summary: dict[str, Any] | None
+    duration_ms: int | None
+    error_code: str | None
+    ledger_version: int
+
+
 AgentTurnStreamSignal = Union[
-    MessageDelta, ReasoningDelta, MessageSnapshot, UsageUpdated, MessageFailed, TurnSettled
+    MessageDelta,
+    ReasoningDelta,
+    MessageSnapshot,
+    UsageUpdated,
+    MessageFailed,
+    ToolStarted,
+    ToolCompleted,
+    TurnSettled,
 ]
 
 
@@ -155,6 +210,8 @@ def apply_agent_turn_stream_signal(
     current = state
     event_type: str | None = None
     payload: dict[str, object] = {}
+    # 工具事件挂靠用户消息，其余事件挂靠本回合的助手消息。
+    event_message_id: str | None = None
 
     if isinstance(signal, MessageDelta):
         _reject_after_terminal(current, "文本")
@@ -196,6 +253,10 @@ def apply_agent_turn_stream_signal(
             raise ValueError("Agent 流收到冲突的失败终态")
         current = replace(current, failure_outcome=signal.outcome)
 
+    elif isinstance(signal, (ToolStarted, ToolCompleted)):
+        event_type, payload = _tool_event(signal)
+        event_message_id = signal.message_id
+
     else:  # TurnSettled
         current = replace(current, settled=True)
 
@@ -204,7 +265,7 @@ def apply_agent_turn_stream_signal(
 
     event = AgentEventSequencer(current.session_id, current.last_event_sequence).next(
         event_type=event_type,  # type: ignore[arg-type]
-        message_id=current.message_id,
+        message_id=event_message_id or current.message_id,
         occurred_at=resolved_at,
         payload={
             **payload,
@@ -215,6 +276,36 @@ def apply_agent_turn_stream_signal(
     return AgentTurnStreamUpdate(
         state=replace(current, last_event_sequence=event.sequence), event=event
     )
+
+
+def _tool_event(signal: ToolStarted | ToolCompleted) -> tuple[str, dict[str, object]]:
+    """把工具信号翻译为客户端事件类型与负载。
+
+    **事件里不放参数与结果摘要**：事件会实时推给客户端并被重连缓冲回放，而摘要属于
+    审计面。需要审计的一方读 ``agent_tool_calls``，那里才有完整记录。
+
+    @returns 事件类型与负载。
+    @raises ValueError: 调用标识为空，或终态的授权判定与状态互相矛盾。
+    """
+    call_id = _require_text(signal.call_id, "Agent 工具调用 ID")
+    tool_name = _require_text(signal.tool_name, "Agent 工具名")
+    _require_text(signal.message_id, "Agent 工具调用所属消息 ID")
+    if isinstance(signal, ToolStarted):
+        if signal.status != "started" or signal.authorization_decision != "allowed":
+            raise ValueError("Agent 工具开始信号只能是已授权的 started")
+        return "tool.started", {"tool_call_id": call_id, "tool_name": tool_name}
+    if signal.status == "started":
+        raise ValueError("Agent 工具完成信号不能用 started 状态")
+    if (signal.authorization_decision == "denied") != (signal.status == "rejected"):
+        # 与数据库 CHECK 同义：拒绝的调用只能来自 denied，反之亦然。
+        raise ValueError("Agent 工具调用终态与授权判定不一致")
+    return "tool.completed", {
+        "tool_call_id": call_id,
+        "tool_name": tool_name,
+        "outcome": signal.status,
+        "duration_ms": signal.duration_ms,
+        "error_code": signal.error_code,
+    }
 
 
 def finalize_agent_turn_stream(

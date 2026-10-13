@@ -134,7 +134,8 @@ def calculate_holding_period(
             wins=wins,
             losses=losses,
             average_holding_days=format(average_holding_days, "f"),
-            net_pnl=format(net_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN), "f"),
+            # 参考实现是 ``netPnl.toFixed(4)``（HALF_UP），不是 Python 默认的银行家舍入。
+            net_pnl=format(net_pnl.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_UP), "f"),
             average_lot_pnl=format(average_lot_pnl, "f"),
             win_rate_pct=_ratio_pct(wins, wins + losses),
         ))
@@ -288,7 +289,10 @@ def calculate_option_stress(
     rows = tuple(
         OptionStressRow(
             underlying=underlying,
-            contracts=format(group.contracts.quantize(_CONTRACT_QUANTUM), "f"),
+            # 参考实现是 ``toFixed(6)``（HALF_UP），不是 Python 默认的银行家舍入。
+            contracts=format(
+                group.contracts.quantize(_CONTRACT_QUANTUM, rounding=ROUND_HALF_UP), "f"
+            ),
             premium_at_risk=format(premium, "f"),
             nearest_expiry=group.nearest_expiry,
             farthest_expiry=group.farthest_expiry,
@@ -303,7 +307,9 @@ def calculate_option_stress(
 
     return OptionStressResult(
         rows=rows,
-        long_option_contracts=format(total_contracts.quantize(_CONTRACT_QUANTUM), "f"),
+        long_option_contracts=format(
+            total_contracts.quantize(_CONTRACT_QUANTUM, rounding=ROUND_HALF_UP), "f"
+        ),
         all_long_options_loss_if_zero=format(-total, "f"),
         top_three_loss_if_zero=format(-top_three, "f"),
         basis="maximum_paid_premium_loss_no_market_data",

@@ -1,17 +1,15 @@
 """交易流水、已实现明细与现金流水查询。
 
-镜像 TypeScript 版 ``queries.ts`` 的**默认查询路径**：过滤、排序、页长限制
-与合计口径。
+镜像 TypeScript 版 ``queries.ts`` 的查询路径：过滤、排序、**游标分页**与合计口径。
 
-**本阶段未实现游标分页。** TypeScript 侧的 ``nextCursor`` 是不透明游标，属于
-接口层契约；它的具体编码会在 M4（只读 REST API）按协议 2 的既有形状一并确定。
-此处不实现，也不返回占位值——返回一个"看起来能翻页"的假游标比没有更危险。
+游标本身是不透明定位符，编码与校验见 :mod:`.cursor`；本模块只负责按页取行与
+按**全部筛选结果**（而非当前页）汇总，两者口径不同，混用会让翻页时合计"缩水"。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 
 from ..fifo.types import RealizedRecord
 from ..numeric import fixed_text
@@ -38,8 +36,6 @@ from .types import (
 # 默认页长与上限，与现有实现一致。
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 200
-
-_AMOUNT_QUANTUM = Decimal("0.0001")
 
 
 @dataclass(frozen=True)
@@ -273,7 +269,9 @@ def query_cashflow(
             amount=transaction.amount,
             txn_hash=transaction.transaction_hash,
         )
-        for transaction in filtered[:limit]
+        # **必须遍历 ``page.rows`` 而不是 ``filtered[:limit]``**：后者会忽略游标偏移，
+        # 于是每一页都重新返回最新的 limit 条，旧流水永远看不到。
+        for transaction in page.rows
     )
 
     by_action: dict[str, Decimal] = {}
@@ -359,26 +357,3 @@ def _fixed_four(value: Decimal) -> str:
     """委托共享实现（见 :func:`lyra.domain.numeric.fixed_text`）。"""
     return fixed_text(value, 4)
 
-
-def _fixed_four_legacy(value: Decimal) -> str:
-    """按四位小数渲染金额，**舍入方式与 decimal.js 的 ``toFixed`` 一致**。
-
-    ``toFixed`` 是"四舍五入（平局远离零）"，**不是银行家舍入**：
-
-    | 值 | ``toFixed(4)`` | ``ROUND_HALF_EVEN`` |
-    | --- | --- | --- |
-    | ``1.23445`` | ``1.2345`` | ``1.2344`` |
-    | ``0.00005`` | ``0.0001`` | ``0.0000`` |
-
-    差异只出现在**恰好落在中点**的值上，而账本金额恰好落到第 5 位为 5 并不罕见
-    （费用按比例分摊时尤其常见）。Python 的 ``ROUND_HALF_UP`` 语义正是"远离零"。
-
-    @param value: 待渲染的金额。
-    @returns 四位小数的定点文本。
-    """
-    quantized = value.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_UP)
-    if quantized == 0:
-        # **避免 ``-0.0000``**：decimal.js 的 ``toFixed`` 对结果为 0 的值给出
-        # ``0.0000``，而 Python 会保留负号。两者会被客户端当成不同的数值文本。
-        quantized = abs(quantized)
-    return format(quantized, "f")

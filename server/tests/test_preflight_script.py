@@ -2,10 +2,11 @@
 
 **一个永远通过的检查等于没有检查。** 本文件固定两件使预检可信的事：
 
-1. 每一项都**真的被接进主流程**——否则它会在某次重构中被静默丢掉，而预检照样打印
-   "全部通过"；
-2. **判别力已被验证过**：注入模式版本不一致会让 `模式版本一致` 失败（实测：
-   Python=14 / TS=15 时报未通过）。这里用一条不跑全量测试的等价断言守住这个性质。
+1. 每一项都**真的被接进主流程的 `CHECKS` 清单**——否则它会在某次重构中被静默丢掉，
+   而预检照样打印"全部通过"。断言指向清单本身（名称集合 + 条目数 + 函数），而不是
+   "模块里有这个函数"：后者在有人把某一项从清单里删掉时仍然通过；
+2. **判别力**：模式版本与协议版本检查都会打印它们实际比的值——只报"通过/未通过"
+   看不出它比了什么，失败时也无法定位。
 """
 
 from __future__ import annotations
@@ -28,14 +29,26 @@ def _load():
 
 
 def test_every_documented_check_is_wired_in() -> None:
-    """**每一项检查都必须出现在主流程里。**
+    """**每一项检查都必须出现在主流程的 `CHECKS` 清单里。**
 
-    预检的价值在于"每一项要么通过要么不通过"。若某一项没被接进 `main` 的清单，它会
-    静默消失，而输出仍然是"全部通过"——那比没有这项检查更危险。
+    预检的价值在于"每一项要么通过要么不通过"。若某一项没被接进主流程，它会静默消失，
+    而输出仍然是"全部通过"——那比没有这项检查更危险。
+
+    **断言的是清单本身**：只断言"模块里有 check_* 函数"时，把某一项从清单里删掉，
+    测试照样通过——那正是这条测试想拦住的事。
     """
     module = _load()
-    # 依据脚本文档里列出的七项。
-    expected = {
+
+    expected_names = {
+        "Python 全量测试",
+        "错误类静态检查",
+        "接管既有账本",
+        "模式版本自洽",
+        "协议版本为 2",
+        "路由契约",
+        "LYRA_SECRET_MASTER_KEY 形态",
+    }
+    expected_functions = {
         "check_full_test_suite",
         "check_static_checks",
         "check_can_take_over_an_existing_ledger",
@@ -45,8 +58,10 @@ def test_every_documented_check_is_wired_in() -> None:
         "check_encrypted_secret_master_key",
     }
 
-    for name in expected:
-        assert hasattr(module, name), f"缺少检查函数 {name}"
+    # 条数也要断言：名称集合相等只能证明"没有多也没有少"，防不住清单里出现两条同名项。
+    assert len(module.CHECKS) == len(expected_functions)
+    assert {name for name, _ in module.CHECKS} == expected_names
+    assert {run.__name__ for _, run in module.CHECKS} == expected_functions
 
 
 def test_the_schema_version_check_reports_both_numbers() -> None:

@@ -375,7 +375,10 @@ def realized_row_key(record: Any) -> str:
 def cashflow_row_key(row: Any) -> str:
     """现金流水行键——直接用交易哈希（与参考实现一致）。
 
-    @param row: 现金流明细行。
+    **入参是标准交易 ``ParsedTransaction``，不是投影后的 ``CashflowRow``**：
+    分页发生在投影之前，参考实现同样取 ``transaction.transactionHash``。
+
+    @param row: 现金流水对应的标准交易。
     @returns 交易哈希。
     """
-    return row.txn_hash
+    return row.transaction_hash

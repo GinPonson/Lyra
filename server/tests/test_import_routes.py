@@ -452,6 +452,14 @@ def test_commit_end_to_end_writes_the_ledger(client) -> None:
     ).fetchone()
     assert status is not None
     assert status[0] in {"committed", "committing"}
+    # **账本版本的来源引用是作业 UUID，不是文件名。**
+    # 文件名会重复（"Transactions.xlsx"），无法据此回溯到具体哪一次导入。
+    source = connection.execute(
+        "SELECT reason, source_reference FROM ledger_versions ORDER BY version DESC LIMIT 1"
+    ).fetchone()
+    assert source is not None
+    assert source[0] == "file_import"
+    assert source[1] == import_id
     # 暂存必须清理，不把账本数据留在磁盘上。
     staging = Path(test_client.app.state.settings.lyra_import_staging_dir)
     assert list(staging.iterdir()) == []

@@ -189,7 +189,6 @@ def test_event_envelope_fields_match_the_reference() -> None:
     ``occurredAt`` / ``payload``。客户端按这些名字取值，**改名不会报错，只会读到
     ``undefined``**。
     """
-    from lyra.api.agent_events import _event_payload
     from lyra.domain.agent.events import AgentEvent
 
     event = AgentEvent(
@@ -208,9 +207,8 @@ def test_event_envelope_fields_match_the_reference() -> None:
 
 def test_the_event_frame_wraps_the_envelope_under_event() -> None:
     """事件帧把信封放在 ``event`` 键下，而不是平铺。"""
-    frames = _frame_keys()
-
     # 帧的外层键由路由构造；这里断言契约本身在测试里可见。
+    assert _frame_keys() == _EVENT_FRAME_OUTER_KEYS
     assert "event" in _EVENT_FRAME_OUTER_KEYS
 
 
@@ -244,3 +242,74 @@ def test_error_frame_uses_the_invalid_argument_code(wired) -> None:
     assert set(frame) == {"type", "code", "message"}
     assert frame["type"] == "error"
     assert frame["code"] == "INVALID_ARGUMENT"
+
+
+# --------------------------------------------------------------------------
+# 登出必须终止已建立的事件流
+# --------------------------------------------------------------------------
+
+
+def test_a_connected_socket_is_registered_under_its_device(wired) -> None:
+    """连接按**设备**登记：登出要能据此精确踢掉该设备的连接。
+
+    这里只断言"真实连接确实登记在它的设备下"（``take_device`` 取到 1 个）；
+    关闭动作本身由下面的替身单测覆盖。
+    """
+    application, issued, _ = wired
+    registry = application.state.event_connections
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client, client.websocket_connect(
+        "/v1/events", headers={"Authorization": f"Bearer {issued.access_token}"}
+    ) as socket:
+        socket.send_text(json.dumps({
+            "type": "subscribe", "sessionId": SESSION_ID, "afterSequence": 0
+        }))
+        socket.receive_json()
+        assert len(registry.take_device(issued.device_id)) == 1
+
+    # 连接已被取走；重复登出是幂等的（不会二次关闭）。
+    assert registry.take_device(issued.device_id) == ()
+
+
+def test_closing_one_device_leaves_other_devices_alone() -> None:
+    """只关目标设备的连接：踢错设备等于把别人的对话打断。"""
+    from lyra.api.agent_events import EventConnectionRegistry, _close_quietly
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.closed: list[tuple[int, str]] = []
+
+        async def close(self, code: int, reason: str) -> None:
+            self.closed.append((code, reason))
+
+    registry = EventConnectionRegistry()
+    mine, other = FakeSocket(), FakeSocket()
+    registry.add("device-1", mine)
+    registry.add("device-2", other)
+
+    async def sign_out() -> None:
+        for websocket in registry.take_device("device-1"):
+            await _close_quietly(websocket, 4001, "signed out")
+
+    asyncio.run(sign_out())
+    assert mine.closed == [(4001, "signed out")]
+    assert other.closed == [], "关掉了不属于该设备的连接"
+
+
+def test_closing_a_device_socket_sends_the_unauthorized_close_code() -> None:
+    """关闭码必须是 4001：客户端据此区分"登录失效"与"网络断了"。"""
+    from lyra.api.agent_events import EventConnectionRegistry, UNAUTHORIZED_CLOSE_CODE
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.closed: list[tuple[int, str]] = []
+
+        async def close(self, code: int, reason: str) -> None:
+            self.closed.append((code, reason))
+
+    registry = EventConnectionRegistry()
+    socket = FakeSocket()
+    registry.add("device-1", socket)
+
+    assert UNAUTHORIZED_CLOSE_CODE == 4001
+    assert registry.take_device("device-1") == (socket,)

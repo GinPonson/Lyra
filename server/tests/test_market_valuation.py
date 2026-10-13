@@ -49,6 +49,21 @@ def test_long_stock_valuation() -> None:
     assert valuation.multiplier == "1"
 
 
+def test_tiny_market_value_is_rendered_in_fixed_point() -> None:
+    """**估值金额用 ``toFixed()`` 口径，极小量级不得变成指数形式。**
+
+    参考价 ``1e-7`` × 数量 1 的市值是 ``0.0000001``；若按 ``toString()`` 渲染会写成
+    ``1e-7``，与参考实现和客户端契约都不同。
+    """
+    valuation = value_position(
+        quantity="1", cost="0", reference_price="0.0000001",
+        asset_type="stock", direction="long",
+    )
+
+    assert valuation.market_value == "0.0000001"
+    assert valuation.unrealized_pnl == "0.0000001"
+
+
 def test_short_position_is_negative() -> None:
     """**空头持仓的市值是负的。**
 

@@ -26,18 +26,25 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+from uuid import uuid4
 
 from ..domain.agent.events import AgentEvent, AgentEventResume
+from ..domain.agent.lifecycle import AgentSessionStateError, transition_agent_session
+from ..domain.agent.messages import AgentMessageStatus, AgentToolCall, TurnMessage
 from ..domain.agent.switching import AgentSessionSnapshot
+from ..domain.agent.tool_call import AgentToolContext
 from ..domain.agent.turn import (
     AgentTurnCompletionPlan,
     AgentTurnFailurePlan,
     AgentTurnStartPlan,
+    fail_agent_turn,
     start_agent_turn,
 )
 from ..domain.agent.turn_stream import (
     AgentTurnStreamSignal,
+    ToolCompleted,
+    ToolStarted,
     TurnSettled,
     apply_agent_turn_stream_signal,
     create_agent_turn_stream_state,
@@ -54,13 +61,22 @@ class AgentTurnExecutor(Protocol):
 
     实现方负责与具体模型协议打交道；编排器只消费规范化信号，**不解释供应商协议**。
 
-    ``session`` 会被传入：系统提示词需要账户范围与账本版本，而这两项属于会话状态，
-    不属于调用参数。
+    ``session`` 与 ``context`` 会被传入：系统提示词需要账户范围与账本版本，工具授权
+    边界需要会话绑定，而这些都属于服务端状态，**不属于模型可控参数**。
+
+    ``emit`` 是逐信号回调而不是"返回一个列表"：回合的增量必须能在产生时就落库与推送，
+    攒完再返回会让流式在真实路径上消失，并让整个事件循环在模型调用期间停摆。
     """
 
     def run(
-        self, *, session: AgentSessionSnapshot, message_id: str, content: str
-    ) -> Iterable[AgentTurnStreamSignal]: ...
+        self,
+        *,
+        session: AgentSessionSnapshot,
+        content: str,
+        context: AgentToolContext,
+        emit: Callable[[AgentTurnStreamSignal], None],
+    ) -> None: ...
+
 
 
 class AgentTurnStore(Protocol):
@@ -70,7 +86,21 @@ class AgentTurnStore(Protocol):
         self, session: AgentSessionSnapshot, *, next_event_sequence: int
     ) -> bool: ...
 
-    def append_message(self, message: Any) -> None: ...
+    def save_turn_start(
+        self,
+        session: AgentSessionSnapshot,
+        message: TurnMessage,
+        *,
+        next_event_sequence: int,
+    ) -> bool: ...
+
+    def append_turn_message(self, message: TurnMessage) -> None: ...
+
+    def append_tool_call(self, call: AgentToolCall) -> None: ...
+
+    def complete_tool_call(self, call: AgentToolCall) -> bool: ...
+
+    def session_status(self, session_id: str) -> str | None: ...
 
 
 @dataclass
@@ -88,6 +118,12 @@ class _Runtime:
     session: AgentSessionSnapshot
     buffer: AgentEventBuffer
     last_event_sequence: int = 0
+    #: 发起会话的设备；登出/撤销时据此终止该设备的在跑回合。
+    device_id: str | None = None
+    #: 下一条消息的序号；由已落库消息数推出，避免与既有行冲突。
+    next_ordinal: int = 1
+    #: 本回合的起始时间；工具审计的 ``startedAt`` 用它，而不是"信号到达时间"。
+    started_at: datetime | None = None
 
 
 class AgentTurnOrchestrator:
@@ -110,16 +146,39 @@ class AgentTurnOrchestrator:
         self._on_event = on_event
         self._runtimes: dict[str, _Runtime] = {}
 
-    def register(self, session: AgentSessionSnapshot, *, last_event_sequence: int = 0) -> None:
+    def register(
+        self,
+        session: AgentSessionSnapshot,
+        *,
+        last_event_sequence: int = 0,
+        device_id: str | None = None,
+        next_ordinal: int = 1,
+    ) -> None:
         """登记一个会话的内存运行态。
+
+        **已登记的会话就地更新，不重建运行态。** 重建会连带换掉事件缓冲，而 WebSocket
+        的订阅挂在缓冲上——每发一条消息都会静默丢掉客户端刚建立的订阅，实时事件永远
+        送不到（这曾是真实缺陷）。
 
         @param session: 会话快照。
         @param last_event_sequence: 已持久化的事件序号。
+        @param device_id: 发起会话的设备 ID。
+        @param next_ordinal: 下一条消息的序号。
         """
+        existing = self._runtimes.get(session.id)
+        if existing is not None:
+            existing.session = session
+            existing.last_event_sequence = last_event_sequence
+            if device_id is not None:
+                existing.device_id = device_id
+            existing.next_ordinal = max(existing.next_ordinal, next_ordinal)
+            return
         self._runtimes[session.id] = _Runtime(
             session=session,
             buffer=AgentEventBuffer(session.id, self._on_event),
             last_event_sequence=last_event_sequence,
+            device_id=device_id,
+            next_ordinal=next_ordinal,
         )
 
     def runtime(self, session_id: str) -> AgentSessionSnapshot | None:
@@ -162,6 +221,49 @@ class AgentTurnOrchestrator:
         if runtime is not None:
             runtime.buffer.unsubscribe(handle)
 
+    def request_cancel(self, session_id: str, *, now: datetime) -> AgentSessionSnapshot | None:
+        """请求取消一个在跑的回合。
+
+        **取消必须落库**：只有 ``cancelling`` 这个持久化状态能活过进程重启，也被
+        编排器在收口时读取（见 :meth:`_cancellation_requested`）。同时按领域规则做
+        CAS——会话不是 ``running`` 时返回 ``None``，由调用方决定报什么错。
+
+        @param session_id: 会话 ID。
+        @param now: 服务端时钟。
+        @returns 推进后的快照；会话未登记或不在 ``running`` 时返回 ``None``。
+        """
+        runtime = self._runtimes.get(session_id)
+        if runtime is None or runtime.session.status != "running":
+            return None
+        try:
+            cancelling = transition_agent_session(runtime.session, "cancelling")
+        except AgentSessionStateError:
+            return None
+        if not self._store.save_session(
+            cancelling, next_event_sequence=runtime.last_event_sequence
+        ):
+            return None
+        runtime.session = cancelling
+        return cancelling
+
+    def cancel_device_turns(self, device_id: str, *, now: datetime) -> tuple[str, ...]:
+        """请求取消某设备所有在跑的回合。
+
+        **退出登录必须能终止该设备的行为**：设备撤销后如果回合继续在服务端跑完并落库，
+        "已登出"就只是本地状态，服务端仍然替它产生并保存了回答。
+
+        @param device_id: 已撤销的设备 ID。
+        @param now: 服务端时钟。
+        @returns 被请求取消的会话 ID。
+        """
+        cancelled: list[str] = []
+        for session_id, runtime in list(self._runtimes.items()):
+            if runtime.device_id != device_id or runtime.session.status != "running":
+                continue
+            if self.request_cancel(session_id, now=now) is not None:
+                cancelled.append(session_id)
+        return tuple(cancelled)
+
     def run_turn(
         self, *, session_id: str, executor: AgentTurnExecutor, content: str
     ) -> AgentTurnRunResult:
@@ -176,16 +278,35 @@ class AgentTurnOrchestrator:
         """
         runtime = self._runtime_for(session_id)
         started_at = _iso(self._now())
-        message_id = f"{session_id}:assistant:{runtime.last_event_sequence + 1}"
+        runtime.started_at = self._now()
+        # **助手消息 ID 必须是 UUID**：``agent_messages.id`` 是 UUID 列，写入时
+        # ``CAST(? AS UUID)``；拼出来的 ``"<session>:assistant:N"`` 会让插入直接失败。
+        # 它同时是客户端看到的 ``messageId``，也必须符合公开的 UUID 约定。
+        message_id = str(uuid4())
 
-        # 1) 先把 running 快照、用户消息与事件落库——不能先启动模型。
+        # 1) 先把 running 快照、用户消息与事件**原子地**落库——不能先启动模型。
+        #
+        # 会话快照与用户消息必须在同一事务里：分散成两条语句时，后一条失败会留下
+        # "会话已 running、却没有用户消息"的半写状态，而 ``send_message`` 只在
+        # ``idle`` 才受理，``DELETE`` 又不允许 running→closed——会话会永久卡住，
+        # 只能手工改库。
         start: AgentTurnStartPlan = start_agent_turn(
-            session=runtime.session, message_id=_user_message_id(runtime),
+            session=runtime.session, message_id=str(uuid4()),
             content=content, started_at=started_at,
             last_event_sequence=runtime.last_event_sequence,
         )
-        self._advance(runtime, start.session, start.event)
-        self._store.append_message(start.user_message)
+        user_message = _turn_message(
+            runtime, start.user_message, role="user", status="completed",
+            completed_at=started_at,
+        )
+        if not self._store.save_turn_start(
+            start.session, user_message, next_event_sequence=start.event.sequence
+        ):
+            raise ValueError("Agent 会话状态已被并发修改，请重试")
+        runtime.session = start.session
+        runtime.next_ordinal = user_message.ordinal + 1
+        runtime.last_event_sequence = start.event.sequence
+        runtime.buffer.append(start.event)
 
         # 2) 建立流状态（必须已 running）。
         stream = create_agent_turn_stream_state(
@@ -195,9 +316,40 @@ class AgentTurnOrchestrator:
         events: list[AgentEvent] = [start.event]
 
         # 3) 消费执行器信号。
-        for signal in executor.run(
-            session=runtime.session, message_id=message_id, content=content
-        ):
+        #
+        # **逐信号处理而不是先把信号收进列表**：收完再处理会让流式在真实路径上消失，
+        # 也会让"取消"只能等模型全部返回之后才有机会生效。
+        tool_ordinal = 0
+
+        def consume(signal: AgentTurnStreamSignal) -> None:
+            nonlocal stream, tool_ordinal
+            # **工具审计与事件同时落库**：``tool.started`` / ``tool.completed`` 事件
+            # 只是实时通知，审计行才是事后可查的记录。两个写在一起，客户端看到的
+            # 与本轮结束后查到的才是同一批调用。
+            if isinstance(signal, ToolStarted):
+                tool_ordinal += 1
+                self._store.append_tool_call(_tool_call(
+                    runtime, signal, ordinal=tool_ordinal, status="started",
+                    result_summary=None, completed_at=None, session_id=runtime.session.id,
+                ))
+            elif isinstance(signal, ToolCompleted):
+                if signal.status == "rejected":
+                    # **被拒绝的调用从未 started**：仓储的 ``complete_tool_call`` 只更新
+                    # ``status='started'`` 的行，用它去收口一条不存在的行会静默丢掉这次
+                    # 尝试——而"模型试过什么"恰恰是审计最需要留下的一条。因此这里直接
+                    # 插入终态行，而不是先插 started 再更新。
+                    tool_ordinal += 1
+                    self._store.append_tool_call(_tool_call(
+                        runtime, signal, ordinal=tool_ordinal,
+                        status=signal.status, result_summary=signal.result_summary,
+                        completed_at=_iso(self._now()), session_id=runtime.session.id,
+                    ))
+                else:
+                    self._store.complete_tool_call(_tool_call(
+                        runtime, signal, ordinal=tool_ordinal,
+                        status=signal.status, result_summary=signal.result_summary,
+                        completed_at=_iso(self._now()), session_id=runtime.session.id,
+                    ))
             update = apply_agent_turn_stream_signal(
                 state=stream, session=runtime.session, signal=signal,
                 occurred_at=_iso(self._now()),
@@ -205,6 +357,15 @@ class AgentTurnOrchestrator:
             stream = update.state
             if update.event is not None:
                 events.append(self._record(runtime, update.event))
+
+        executor.run(
+            session=runtime.session, content=content,
+            # ``user_message_id`` 必须一起注入：工具审计行有
+            # ``(session_id, message_id) → agent_messages`` 的外键，而助手消息要到
+            # 回合末才落库，能安全引用的只有刚写好的用户消息。
+            context=_turn_context(runtime, user_message_id=user_message.id),
+            emit=consume,
+        )
         if not stream.settled:
             # 执行器没有显式收口。这里**只补一个 settled**，让 finalize 按已有事实判定：
             # 有权威快照且非空 → 成功；否则 → 失败。
@@ -219,9 +380,20 @@ class AgentTurnOrchestrator:
 
         # 4) 生成终态计划并落库。
         runtime.last_event_sequence = stream.last_event_sequence
-        plan = finalize_agent_turn_stream(
-            state=stream, session=runtime.session, finished_at=_iso(self._now())
-        )
+        if self._cancellation_requested(runtime):
+            # **用户已经点了"停止"**：按 ``cancelled`` 收口，而不是把模型跑完的结果
+            # 记成一次成功。判断依据是**持久化状态**（``cancelling``），不是进程内的
+            # 标志位——重启后进程内状态会丢，而取消意图必须活过重启。
+            plan = fail_agent_turn(
+                session=runtime.session, message_id=message_id, outcome="cancelled",
+                partial_content=stream.visible_content,
+                finished_at=_iso(self._now()),
+                last_event_sequence=runtime.last_event_sequence,
+            )
+        else:
+            plan = finalize_agent_turn_stream(
+                state=stream, session=runtime.session, finished_at=_iso(self._now())
+            )
         self._apply_final_plan(runtime, plan, message_id)
         events.append(self._record(runtime, plan.event))
         return AgentTurnRunResult(snapshot=runtime.session, events=tuple(events))
@@ -238,19 +410,13 @@ class AgentTurnOrchestrator:
             raise KeyError(f"Agent 会话未登记: {session_id}")
         return runtime
 
-    def _advance(
-        self, runtime: _Runtime, session: AgentSessionSnapshot, event: AgentEvent
-    ) -> None:
-        """持久化状态变迁并推送事件。
+    def _cancellation_requested(self, runtime: _Runtime) -> bool:
+        """会话是否已被请求取消。
 
-        **事件在持久化之后才推送**：反过来会让客户端收到数据库中还不存在的事件，
-        此时断线重连会找不到它。
+        **读库而不是读内存标志**：取消请求可能来自另一个线程（同步路由跑在线程池里）
+        或另一次进程生命周期，只有 ``cancelling`` 这个持久化状态是可信来源。
         """
-        if not self._store.save_session(session, next_event_sequence=event.sequence):
-            raise ValueError("Agent 会话状态已被并发修改，请重试")
-        runtime.session = session
-        runtime.last_event_sequence = event.sequence
-        runtime.buffer.append(event)
+        return self._store.session_status(runtime.session.id) == "cancelling"
 
     def _record(self, runtime: _Runtime, event: AgentEvent) -> AgentEvent:
         """把一个已生成的事件写入缓冲并推进序号。"""
@@ -269,17 +435,109 @@ class AgentTurnOrchestrator:
             raise ValueError("Agent 会话状态已被并发修改，请重试")
         runtime.session = plan.session
         if plan.assistant_message is not None:
-            self._store.append_message(plan.assistant_message)
+            # 终态消息的 ``status`` 与用户可见的部分内容都由领域层决定；这里只补
+            # 持久化需要的归属、序号、供应商与完成时间。
+            self._store.append_turn_message(_turn_message(
+                runtime, plan.assistant_message, role="assistant",
+                status=_terminal_status(plan),
+                completed_at=plan.assistant_message.created_at,
+                message_id=message_id,
+            ))
+            runtime.next_ordinal += 1
         _ = message_id
 
 
-def _user_message_id(runtime: _Runtime) -> str:
-    """生成用户消息 ID。
+def _terminal_status(plan: AgentTurnCompletionPlan | AgentTurnFailurePlan) -> AgentMessageStatus:
+    """助手消息的持久终态。
 
-    真实实现由客户端提供消息 ID；编排器只在无客户端 ID 时兜底生成，避免同一回合
-    因重试写出两条用户消息。
+    成功是 ``completed``；失败/取消沿用领域层给出的 ``status``（``failed`` /
+    ``cancelled``）——它是客户端的唯一依据。
     """
-    return f"{runtime.session.id}:user:{runtime.last_event_sequence + 1}"
+    if isinstance(plan, AgentTurnCompletionPlan):
+        return "completed"
+    status = plan.assistant_message.status if plan.assistant_message is not None else None
+    return "cancelled" if status == "cancelled" else "failed"
+
+
+def _turn_message(
+    runtime: _Runtime,
+    message: Any,
+    *,
+    role: str,
+    status: AgentMessageStatus,
+    completed_at: str | None,
+    message_id: str | None = None,
+) -> TurnMessage:
+    """把领域消息补成可落库的回合消息。
+
+    **序号由运行态给出**，不由数据层推导：判定 ``ordinal`` 需要在写事务里查一次
+    ``max(ordinal)``，而运行态在登记时已经拿过消息列表。
+    """
+    return TurnMessage(
+        id=message_id or message.id,
+        session_id=runtime.session.id,
+        ordinal=runtime.next_ordinal,
+        role=role,
+        provider=runtime.session.provider,
+        status=status,
+        content=message.content,
+        error_code=message.error_code if isinstance(message.error_code, str) else None,
+        created_at=message.created_at,
+        completed_at=completed_at,
+    )
+
+
+def _turn_context(runtime: _Runtime, *, user_message_id: str) -> AgentToolContext:
+    """服务端注入的回合上下文。
+
+    **它不是模型可控参数**：账户范围、账本版本与数据截止时间都来自会话，模型只能
+    在其中活动，不能自己指定——否则一句提示词注入就能把查询扩到全部账户。
+
+    ``user_message_id`` 一并给出，是因为工具审计行有
+    ``(session_id, message_id) → agent_messages`` 的外键，而助手消息要到回合末
+    才落库；能安全引用的只有刚写好的用户消息。
+    """
+    return AgentToolContext(
+        session_id=runtime.session.id,
+        # 未登记设备时用空串：该字段只用于归属与排查，不是授权依据。
+        device_id=runtime.device_id or "",
+        user_message_id=user_message_id,
+        account_scope=runtime.session.account_scope,
+        ledger_version=runtime.session.ledger_version,
+        as_of=runtime.session.as_of,
+    )
+
+
+def _tool_call(
+    runtime: _Runtime,
+    signal: ToolStarted | ToolCompleted,
+    *,
+    ordinal: int,
+    status: str,
+    result_summary: Any,
+    completed_at: str | None,
+    session_id: str,
+) -> AgentToolCall:
+    """把工具信号映射为审计行。
+
+    摘要来自信号（已由领域层净化过）：原始参数与第三方响应**不得**进入审计表。
+    """
+    return AgentToolCall(
+        id=signal.call_id,
+        session_id=session_id,
+        message_id=signal.message_id,
+        ordinal=ordinal,
+        tool_name=signal.tool_name,
+        authorization_decision=signal.authorization_decision,
+        status=status,  # type: ignore[arg-type]
+        arguments_summary=dict(signal.arguments_summary),
+        result_summary=None if result_summary is None else dict(result_summary),
+        ledger_version=signal.ledger_version,
+        duration_ms=signal.duration_ms,
+        error_code=signal.error_code,
+        started_at=_iso(runtime.started_at),
+        completed_at=completed_at,
+    )
 
 
 def _iso(value: datetime) -> str:

@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from lyra.infrastructure.agents.openai_compatible_stream import (
@@ -277,3 +279,48 @@ def test_provider_does_not_set_max_tokens_or_retries() -> None:
     list(stream.chunks())
 
     assert "max_tokens" not in captured["body"]
+
+
+def test_provider_replays_tool_calls_and_results() -> None:
+    """工具结果按 OpenAI 兼容格式回灌：一条 assistant 工具消息 + 逐条 tool 结果。
+
+    同一次模型调用请求的多个工具必须落在**同一条** assistant 消息里；拆开会因为
+    ``tool_calls`` 与结果不配对而被端点拒绝。
+    """
+    from lyra.infrastructure.agents.genkit_runtime import ModelToolExchange
+
+    captured: dict = {}
+
+    def open_lines(url, headers, body, timeout):
+        captured["body"] = body
+        return iter([_delta("[DONE]")])
+
+    provider = OpenAiCompatibleStreamProvider(_Config(), open_lines)
+    stream = provider(
+        content="这个月赚了多少",
+        system_context="系统提示",
+        tool_definitions=(_Definition(),),
+        exchanges=(
+            ModelToolExchange(0, "c-1", "summary", {}, {"count": 1}),
+            ModelToolExchange(0, "c-2", "positions", {"underlying": "INTC"}, {"count": 2}),
+            ModelToolExchange(1, "c-3", "trades", {}, {"count": 3}),
+        ),
+    )
+    list(stream.chunks())
+
+    messages = captured["body"]["messages"]
+    assert [message["role"] for message in messages] == [
+        "system", "user", "assistant", "tool", "tool", "assistant", "tool"
+    ]
+    first = messages[2]
+    assert first["content"] is None
+    assert [call["id"] for call in first["tool_calls"]] == ["c-1", "c-2"]
+    assert first["tool_calls"][0]["function"]["name"] == "summary"
+    assert json.loads(first["tool_calls"][1]["function"]["arguments"]) == {
+        "underlying": "INTC"
+    }
+    # 结果必须原样回灌，不能被审计摘要替换。
+    assert json.loads(messages[3]["content"]) == {"count": 1}
+    assert messages[3]["tool_call_id"] == "c-1"
+    assert json.loads(messages[4]["content"]) == {"count": 2}
+    assert messages[5]["tool_calls"][0]["id"] == "c-3"

@@ -14,10 +14,15 @@
 都去写账本，交易被导入两次。CAS 是唯一能挡住这件事的地方——授权校验只能证明
 "这个令牌曾经有效"，不能证明"它还没被用过"。
 
-**第 3 步与第 4 步不在同一事务**：两者之间崩溃会留下 `committing` 且账本未写入的
-作业。这是刻意的——`committing → failed` 是合法转换，运维可以据此排查并让用户
-重新预览；反之若把状态也放进账本事务，崩溃后作业会停在 `preview_ready`，而账本
-可能已经写了，重试就会重复导入，且**没有任何痕迹**。
+**第 3 步与第 4 步不在同一事务**：把状态 CAS 也搬进账本事务，需要本模块反过来接管
+``import_files`` 终态写入，并按 DuckDB 的外键顺序把它排在 ``transactions`` 插入之前
+（父行一旦被引用就不能再更新）——那是结构性改动，涉及服务与仓储的接口契约。
+
+因此当前保留既定分层，但**补上了恢复路径**：进入提交前，处于 ``committing`` 且
+**账本确认未写入**的作业会被判回 ``preview_ready`` 后正常重试；否则那个作业既不能提交
+（状态已不是 ``preview_ready``）也不能取消，用户被迫重新上传。账本已写入但状态仍停在
+``committing`` 的极端情形不做自动回退：那需要按导入作业 UUID 找到账本版本再补记终态，
+留待运维核对。
 """
 
 from __future__ import annotations
@@ -84,6 +89,14 @@ def commit_import_job(
     job = store.load_import_job(import_id)
     if job is None:
         raise ValueError(f"导入作业不存在: {import_id}")
+
+    # **崩溃恢复要先于授权校验。** CAS 与账本事务之间的窗口里崩溃会留下 committing
+    # 且账本未写入的作业，而授权校验看到 committing 会直接判 409——那个作业就再也
+    # 无法提交，用户只能重新上传。只有仓储确认账本未写入时才会真正回退。
+    if job.status == "committing" and store.recover_stale_committing(import_id, now):
+        recovered = store.load_import_job(import_id)
+        if recovered is not None:
+            job = recovered
 
     assert_import_preview_authorized(
         record=preview_record,

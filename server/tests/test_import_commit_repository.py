@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -18,9 +19,11 @@ import pytest
 
 from lyra.application.app_error import ApplicationError
 from lyra.application.import_commit import ImportCommitPreview, build_import_commit_plan
+from lyra.application.import_job import PersistedImportJobRecord
 from lyra.db.connection import open_lyra_database
 from lyra.domain.ledger.types import ParsedTransaction
 from lyra.infrastructure.db.import_commit_repository import DuckDbImportCommitRepository
+from lyra.infrastructure.db.import_job_repository import DuckDbImportJobRepository
 
 ACCOUNT_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_ACCOUNT_ID = "22222222-2222-2222-2222-222222222222"
@@ -195,13 +198,83 @@ def test_unchanged_plan_does_not_create_a_ledger_version(wired) -> None:
 
 
 def test_account_mismatch_is_rejected_before_any_write(wired) -> None:
-    """账户 ID 与计划账户键不一致时必须直接报错，不进入事务。"""
+    """账户 ID 与计划账户键不一致时必须直接报 409，不进入事务。"""
     repository, connection = wired
     plan = build_import_commit_plan(_preview(_txn("a")), ())
 
-    with pytest.raises(ValueError, match="不匹配"):
+    with pytest.raises(ApplicationError) as raised:
         _commit(repository, plan, account_id=OTHER_ACCOUNT_ID)
+    assert raised.value.code == "ACCOUNT_MAPPING_REQUIRED"
+    assert raised.value.status_code == 409
     assert _count(connection, "transactions") == 0
+
+
+def test_archived_account_is_rejected(wired) -> None:
+    """**归档账户不得再接收新交易。**
+
+    归档账户已从会计范围里消失，写进去的交易会被所有查询忽略——用户看到"导入成功"
+    却查不到任何数据。参考实现在同一处同时校验 ``status = 'active'``。
+    """
+    repository, connection = wired
+    connection.execute(
+        "UPDATE accounts SET status = 'archived' WHERE id = CAST(? AS UUID)",
+        [ACCOUNT_ID],
+    )
+    plan = build_import_commit_plan(_preview(_txn("a")), ())
+
+    with pytest.raises(ApplicationError) as raised:
+        _commit(repository, plan)
+
+    assert raised.value.code == "ACCOUNT_MAPPING_REQUIRED"
+    assert raised.value.status_code == 409
+    assert _count(connection, "transactions") == 0
+
+
+# --------------------------------------------------------------------------
+# 崩溃恢复：committing 且账本未写入
+# --------------------------------------------------------------------------
+
+
+JOB_ID = "33333333-3333-3333-3333-333333333333"
+NOW = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
+
+
+def _job(*, status: str) -> PersistedImportJobRecord:
+    """构造一条指向第一个账户的导入作业。"""
+    return PersistedImportJobRecord(
+        id=JOB_ID, file_hash=_h("file"), original_file_name="ledger.csv", file_type="csv",
+        file_size_bytes=1024, parser_version="2", status=status,  # type: ignore[arg-type]
+        target_account_id=ACCOUNT_ID, preview_token_hash=_h("token"),
+        preview_ledger_version=None, total_rows=1, inserted_rows=1, skipped_rows=0,
+        error_code=None, error_summary=None, committed_ledger_version=None,
+        created_at="2026-10-12T08:00:00.000Z", updated_at="2026-10-12T08:30:00.000Z",
+    )
+
+
+def test_recover_stale_committing_rolls_back_without_a_ledger_version(wired) -> None:
+    """**崩溃恢复**：CAS 与账本事务之间崩溃留下的 committing 作业必须能判回重试。"""
+    _, connection = wired
+    jobs = DuckDbImportJobRepository(connection)
+    jobs.create_import_job(_job(status="committing"))
+
+    assert jobs.recover_stale_committing(JOB_ID, NOW) is True
+    job = jobs.load_import_job(JOB_ID)
+    assert job is not None and job.status == "preview_ready"
+
+
+def test_recover_stale_committing_leaves_a_written_ledger_alone(wired) -> None:
+    """**账本已写入时不回退**：回退会让同一个令牌再提交一次、把交易导入两次。"""
+    _, connection = wired
+    jobs = DuckDbImportJobRepository(connection)
+    jobs.create_import_job(_job(status="committing"))
+    connection.execute(
+        "INSERT INTO ledger_versions (reason, source_reference) VALUES ('file_import', ?)",
+        [JOB_ID],
+    )
+
+    assert jobs.recover_stale_committing(JOB_ID, NOW) is False
+    job = jobs.load_import_job(JOB_ID)
+    assert job is not None and job.status == "committing"
 
 
 # --------------------------------------------------------------------------

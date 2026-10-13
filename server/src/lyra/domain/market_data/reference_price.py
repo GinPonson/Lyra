@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from typing import Literal
 
+from ..numeric import fixed_point_text
 from .types import MarketQuote
 
 ReferenceBasis = Literal["mid", "last", "close"]
@@ -55,7 +56,8 @@ def select_market_reference_price(quote: MarketQuote) -> MarketReferencePrice | 
             context.prec = _PRICE_PRECISION
             mid = (Decimal(bid.value) + Decimal(ask.value)) / 2
         return MarketReferencePrice(
-            value=_decimal_text(mid), as_of=bid.as_of, basis="mid"
+            # 参考实现是 ``.toFixed()``（定点、去尾随零），不是 ``toString()``。
+            value=fixed_point_text(mid), as_of=bid.as_of, basis="mid"
         )
 
     for basis, point in (("last", quote.last), ("close", quote.close)):
@@ -84,10 +86,3 @@ def _greater_than_zero(value: str) -> bool:
         return Decimal(value) > 0
     except Exception:  # noqa: BLE001 - 非法文本不构成可用价格
         return False
-
-
-def _decimal_text(value: Decimal) -> str:
-    """渲染为无指数、去尾随零的十进制文本。"""
-    from ..numeric import decimal_text
-
-    return decimal_text(value)

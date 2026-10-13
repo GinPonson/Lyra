@@ -38,17 +38,33 @@ class FakeStore:
         self.messages: list[Any] = []
         self.saved: list[AgentSessionSnapshot] = []
         self.reject_save = reject_save
+        #: 会话的持久化状态；编排器据此判断"取消是否已被请求"。
+        self.status = "idle"
+        #: 事件推送顺序由外部注入的列表记录（见 test_events_are_pushed_after_persistence）。
+        self.order: list[str] = []
 
     def save_session(self, session: AgentSessionSnapshot, *, next_event_sequence: int) -> bool:
         if self.reject_save:
             return False
         self.calls.append("save")
         self.saved.append(session)
+        self.status = session.status
         return True
 
-    def append_message(self, message: Any) -> None:
+    def save_turn_start(self, session, message, *, next_event_sequence: int) -> bool:
+        """一个事务里的"会话 + 用户消息"；顺序约束在这里被观察。"""
+        self.order.append("persist")
+        if not self.save_session(session, next_event_sequence=next_event_sequence):
+            return False
+        self.messages.append(message)
+        return True
+
+    def append_turn_message(self, message: Any) -> None:
         self.calls.append("message")
         self.messages.append(message)
+
+    def session_status(self, session_id: str) -> str | None:
+        return self.status
 
 
 class FakeExecutor:
@@ -58,12 +74,14 @@ class FakeExecutor:
         self._signals = signals
         self.calls: list[dict[str, Any]] = []
 
-    def run(self, *, session, message_id: str, content: str):
-        # ``session`` 会被传入：系统提示词需要账户范围与账本版本。
+    def run(self, *, session, content: str, context, emit):
+        # ``session`` 与 ``context`` 都会被传入：前者供系统提示词，后者是服务端注入的
+        # 授权上下文（账户范围、账本版本、数据截止时间）。
         self.calls.append({
-            "session_id": session.id, "message_id": message_id, "content": content
+            "session_id": session.id, "content": content, "context": context,
         })
-        return list(self._signals)
+        for signal in self._signals:
+            emit(signal)
 
 
 def _session(status: str = "idle") -> AgentSessionSnapshot:
@@ -150,17 +168,11 @@ def test_persist_happens_before_execution() -> None:
     order: list[str] = []
 
     class TracingExecutor(FakeExecutor):
-        def run(self, *, session, message_id: str, content: str):
+        def run(self, *, session, content: str, context, emit):
             order.append("execute")
-            return super().run(session=session, message_id=message_id, content=content)
+            super().run(session=session, content=content, context=context, emit=emit)
 
-    original_save = store.save_session
-
-    def tracing_save(session, *, next_event_sequence):
-        order.append("persist")
-        return original_save(session, next_event_sequence=next_event_sequence)
-
-    store.save_session = tracing_save  # type: ignore[method-assign]
+    store.order = order
 
     orchestrator.run_turn(session_id="s-1", executor=TracingExecutor(SUCCESS), content="x")
 
@@ -171,13 +183,7 @@ def test_events_are_pushed_after_persistence() -> None:
     """**事件在持久化之后才推送**。"""
     order: list[str] = []
     store = FakeStore()
-    original_save = store.save_session
-
-    def tracing_save(session, *, next_event_sequence):
-        order.append("persist")
-        return original_save(session, next_event_sequence=next_event_sequence)
-
-    store.save_session = tracing_save  # type: ignore[method-assign]
+    store.order = order
     orchestrator = _orchestrator(store=store, on_event=lambda event: order.append("push"))
 
     orchestrator.run_turn(session_id="s-1", executor=FakeExecutor(SUCCESS), content="x")

@@ -66,6 +66,10 @@ class FakeStore:
         self.job = replace(self.job, status=next_status)
         return True
 
+    def recover_stale_committing(self, job_id: str, now: datetime) -> bool:
+        """默认认为账本已写入，不回退。"""
+        return False
+
 
 def _issued_token():
     """签发令牌并返回 (记录, 明文)。"""
@@ -333,3 +337,62 @@ def test_null_baseline_means_empty_ledger_not_missing() -> None:
     )
 
     assert seen == [0], "空账本基准版本应为 0"
+
+
+# --------------------------------------------------------------------------
+# 崩溃恢复：CAS 与账本事务之间的窗口
+# --------------------------------------------------------------------------
+
+
+class _RecoveringStore(FakeStore):
+    """模拟仓储在"账本未写入"时把 committing 判回 preview_ready。"""
+
+    def __init__(self, job) -> None:
+        super().__init__(job)
+        self.recover_calls: list[str] = []
+
+    def recover_stale_committing(self, job_id: str, now: datetime) -> bool:
+        self.recover_calls.append(job_id)
+        if self.job is None or self.job.status != "committing":
+            return False
+        self.job = replace(self.job, status="preview_ready")
+        return True
+
+
+def test_a_crash_between_cas_and_ledger_is_recovered() -> None:
+    """**崩溃恢复**：committing 且账本未写入的作业判回 preview_ready 后正常提交。
+
+    没有这条路径，作业会永远卡在 committing：既不能提交（状态已不是 preview_ready）
+    也不能取消（committing 不在可取消集合里），用户只能重新上传。
+    """
+    store = _RecoveringStore(_job(status="committing"))
+    record, token = _issued_token()
+
+    result = commit_import_job(
+        store=store, import_id=IMPORT_ID, preview_record=record,
+        preview_fingerprint=FINGERPRINT, token=token, plan=_plan(), now=NOW,
+        commit_ledger=_ok,
+    )
+
+    assert store.recover_calls == [IMPORT_ID]
+    assert result.ledger_version == 4
+    assert store.cas_calls == [
+        ("preview_ready", "committing"),
+        ("committing", "committed"),
+    ]
+
+
+def test_a_committing_job_with_a_written_ledger_is_not_rolled_back() -> None:
+    """**账本已写入时不得回退**：回退会让同一个令牌再提交一次，重复导入。"""
+    store = FakeStore(_job(status="committing"))
+    record, token = _issued_token()
+
+    with pytest.raises(ApplicationError) as raised:
+        commit_import_job(
+            store=store, import_id=IMPORT_ID, preview_record=record,
+            preview_fingerprint=FINGERPRINT, token=token, plan=_plan(), now=NOW,
+            commit_ledger=_ok,
+        )
+
+    assert raised.value.code == "IMPORT_PREVIEW_STALE"
+    assert store.cas_calls == []

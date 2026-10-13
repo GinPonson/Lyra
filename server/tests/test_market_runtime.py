@@ -160,3 +160,32 @@ def test_marketdata_timing_follows_the_mode() -> None:
         assert expected in captured["url"], mode
         # 清掉缓存以免影响下一轮。
         runtime.service._cache.clear()
+
+
+def test_configured_timeout_reaches_the_transport() -> None:
+    """**服务级超时必须真的传到 provider。**
+
+    以前 ``config.timeout_ms`` 只存进运行时 dataclass，两个 provider 调用传输层时都
+    不传超时——传输层于是退回自己的默认值（10s），配置形同虚设。
+    """
+    from lyra.domain.market_data.types import StockInstrument
+
+    seen: list[float] = []
+
+    def fetch(url, *, headers, timeout):
+        seen.append(timeout)
+        raise RuntimeError("传输失败：这里只关心超时参数")
+
+    config = load_market_data_config({
+        "LYRA_MARKET_STOCK_PROVIDERS": "marketdata,alpaca",
+        "LYRA_MARKET_TIMEOUT_MS": "7500",
+        **ALPACA_CREDS, **MARKETDATA_CREDS,
+    })
+    runtime = create_market_data_runtime(
+        config, fetch=fetch, now=lambda: 1_760_000_000_000
+    )
+
+    runtime.service.get_quote(StockInstrument(symbol="INTC"))
+
+    # 两个来源都拿到了配置值（秒）。
+    assert seen == [7.5, 7.5]

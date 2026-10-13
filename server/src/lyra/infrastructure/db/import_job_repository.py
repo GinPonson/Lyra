@@ -148,6 +148,39 @@ class DuckDbImportJobRepository:
         ).fetchone()
         return row is not None
 
+    def recover_stale_committing(self, job_id: str, now: datetime) -> bool:
+        """把"崩在 CAS 与账本事务之间"的作业判回 ``preview_ready``。
+
+        ``preview_ready → committing`` 的 CAS 与账本写入**不在同一个事务**（见
+        :mod:`lyra.application.import_commit_service`），两者之间崩溃会留下
+        ``committing`` 且账本未写入的作业：它既不能提交（状态已不是
+        ``preview_ready``）也不能取消（``committing`` 不在可取消集合里），用户只能
+        重新上传——即使原始文件仍在暂存区。
+
+        **只有确认账本没有被写过才回退。** 账本版本以导入作业 UUID 作为
+        ``source_reference``，因此存在对应版本行就说明数据已经落库；此时回退会让同一个
+        令牌再次提交、把同一批交易导入两次。这种情况返回 ``False``，由调用方报冲突，
+        由运维核对。
+
+        @param job_id: 作业 ID。
+        @param now: 更新时间。
+        @returns 是否确实回退了一次。
+        """
+        row = self._connection.execute(
+            """
+            UPDATE import_files
+            SET status = 'preview_ready', updated_at = CAST(? AS TIMESTAMPTZ)
+            WHERE id = CAST(? AS UUID) AND status = 'committing'
+              AND NOT EXISTS (
+                SELECT 1 FROM ledger_versions
+                WHERE reason = 'file_import' AND source_reference = ?
+              )
+            RETURNING id
+            """,
+            [_iso(now), job_id, job_id],
+        ).fetchone()
+        return row is not None
+
     def record_preview(
         self,
         job_id: str,

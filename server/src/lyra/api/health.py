@@ -50,7 +50,7 @@ def create_health_router(
     database: LyraDatabase,
     write_coordinator_provider: Any = None,
     gmail_connections: Any = None,
-    agent_configured: Any = None,
+    agent_availability: Any = None,
 ) -> APIRouter:
     """构造健康路由。
 
@@ -60,7 +60,8 @@ def create_health_router(
     @param database: 已打开的账本连接。
     @param write_coordinator_provider: 返回写队列协调器的可调用对象；``None`` 表示未装配该段。
     @param gmail_connections: 返回 Gmail 连接列表的可调用对象。
-    @param agent_configured: 返回模型提供方是否已配置的可调用对象。
+    @param agent_availability: 返回 Agent 可用性快照的可调用对象；返回 ``None`` 表示
+        运行时缺席（不知道是否可用）。``None`` 参数表示未装配该段。
     @returns 挂载 ``GET /v1/health`` 的路由器。
     """
     router = APIRouter()
@@ -112,8 +113,8 @@ def create_health_router(
 
 
         agent_status = "unknown"
-        if agent_configured is not None:
-            configured = bool(agent_configured())
+        if agent_availability is not None:
+            availability = agent_availability()
             # **运行时缺席时状态是 ``unknown``，不是 ``degraded``。**
             #
             # 参考实现里 ``agentAvailability === null``（没有运行时）映射为 ``unknown``：
@@ -121,12 +122,26 @@ def create_health_router(
             # 是不同的信息。
             #
             # 但两者都会让整体变成 ``degraded``——因为判定是 `status !== "available"`。
-            agent_status = "unknown" if not configured else "available"
+            if availability is None:
+                available_providers = 0
+                unavailable_providers = 0
+            else:
+                # **计数由真实 provider 列表推导**，不是"配置了就算 1 个可用"。
+                #
+                # 参考实现的可用性快照里**总有** provider 条目（未配置时那一条是
+                # ``unavailable``）。写死 ``1 if configured else 0`` 会把"提供方不可用"
+                # 报成 ``available``+0 个不可用，让排查者看不到真正的原因。
+                providers = tuple(availability.providers)
+                available_providers = sum(
+                    1 for provider in providers if provider.get("status") == "available"
+                )
+                unavailable_providers = len(providers) - available_providers
+                agent_status = "degraded" if unavailable_providers > 0 else "available"
             snapshot["agents"] = {
                 "status": agent_status,
-                # 运行时缺席时两个计数都是 0：没有提供方，就谈不上"不可用的提供方"。
-                "availableProviders": 1 if configured else 0,
-                "unavailableProviders": 0,
+                # 没有提供方时两个计数都是 0：谈不上"不可用的提供方"。
+                "availableProviders": available_providers,
+                "unavailableProviders": unavailable_providers,
             }
 
         service_unavailable = (

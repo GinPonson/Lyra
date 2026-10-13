@@ -87,9 +87,13 @@ def create_agent_events_router() -> APIRouter:
         await websocket.accept()
         authenticator = websocket.app.state.authenticator
         token = _bearer_token(websocket.headers.get("authorization"))
-        if token is None or not _authorized(authenticator, token):
+        device = _authenticated_device(authenticator, token) if token else None
+        if device is None:
             await websocket.close(code=UNAUTHORIZED_CLOSE_CODE, reason="unauthorized")
             return
+
+        connections = websocket.app.state.event_connections
+        connections.add(device.id, websocket)
 
         orchestrator = websocket.app.state.agent_orchestrator
         handle: int | None = None
@@ -98,10 +102,19 @@ def create_agent_events_router() -> APIRouter:
         def push(event: Any) -> None:
             """把事件推给客户端。
 
+            **推送前重新认证**：长连接不能沿用建立时的结果，否则设备被撤销后，只要
+            客户端不再发帧，就能一直收到该账号的 Agent 事件（其中含账本增量）。
+            参考实现同样在每次推送前认证。
+
             推送是同步回调，因此把发送排进事件循环；失败即认为连接已不可用。
             """
             import asyncio
 
+            if not _authorized(authenticator, token):
+                asyncio.ensure_future(_close_quietly(
+                    websocket, UNAUTHORIZED_CLOSE_CODE, "signed out"
+                ))
+                return
             asyncio.ensure_future(_safe_send(websocket, {
                 "type": "event",
                 "event": {
@@ -163,8 +176,43 @@ def create_agent_events_router() -> APIRouter:
         finally:
             if handle is not None and subscribed_session is not None:
                 orchestrator.unsubscribe(subscribed_session, handle)
+            connections.discard(websocket)
 
     return router
+
+
+class EventConnectionRegistry:
+    """设备 → 活动事件连接的注册表。
+
+    **存在的理由**：退出登录除了撤销设备，还必须**踢掉该设备已经建立的事件流**——
+    否则"已登出"的设备仍能持续收到 Agent 事件，直到它自己断开连接。
+    """
+
+    def __init__(self) -> None:
+        self._by_device: dict[str, set[Any]] = {}
+
+    def add(self, device_id: str, websocket: Any) -> None:
+        """登记一个连接。"""
+        self._by_device.setdefault(device_id, set()).add(websocket)
+
+    def discard(self, websocket: Any) -> None:
+        """移除一个连接；连接已不在时静默返回。"""
+        for sockets in self._by_device.values():
+            sockets.discard(websocket)
+        for device_id in [key for key, value in self._by_device.items() if not value]:
+            del self._by_device[device_id]
+
+    def take_device(self, device_id: str) -> tuple[Any, ...]:
+        """取出并移除某设备的全部连接。
+
+        **只做"取走"，不负责关闭**：关闭是异步操作，而调用方（登出路由）是
+        ``async def``——由它 ``await`` 才能真正关掉。注册表自己在同步上下文里
+        排任务的话，既不保证连接被关掉，也会丢掉失败信息。
+
+        @param device_id: 设备 ID。
+        @returns 该设备的连接（已从注册表移除）。
+        """
+        return tuple(self._by_device.pop(device_id, ()))
 
 
 def _bearer_token(header: str | None) -> str | None:
@@ -173,6 +221,18 @@ def _bearer_token(header: str | None) -> str | None:
         return None
     token = header[len("Bearer ") :]
     return token or None
+
+
+def _authenticated_device(authenticator: Any, token: str) -> Any | None:
+    """认证令牌并返回设备；失败返回 ``None``。"""
+    from ..application.app_error import ApplicationError
+
+    try:
+        return authenticator.authenticate(token)
+    except ApplicationError:
+        return None
+    except Exception:  # noqa: BLE001 - 认证实现异常同样视为未认证
+        return None
 
 
 def _authorized(authenticator: Any, token: str) -> bool:
@@ -206,6 +266,14 @@ def _event_payload(event: Any) -> dict[str, Any]:
         "occurredAt": event.occurred_at,
         "payload": dict(event.payload),
     }
+
+
+async def _close_quietly(websocket: WebSocket, code: int, reason: str) -> None:
+    """关闭连接；已经关闭或出错时静默忽略。"""
+    try:
+        await websocket.close(code=code, reason=reason)
+    except Exception:  # noqa: BLE001 - 连接已断开
+        return
 
 
 async def _safe_send(websocket: WebSocket, payload: dict[str, Any]) -> None:

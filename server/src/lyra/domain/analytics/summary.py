@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 
 from ..fifo.types import FifoReplayResult
 from ..ledger.types import ParsedTransaction
@@ -72,7 +72,7 @@ def calculate_account_summary(
         total_fees=format(
             _sum_decimals([
                 transaction.fees for transaction in scoped_transactions
-            ]).quantize(Decimal("0.000001"), rounding=ROUND_HALF_EVEN),
+            ]).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP),
             "f",
         ),
         dividends=_format_amount(_sum_transaction_amounts([

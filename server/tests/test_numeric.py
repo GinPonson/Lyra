@@ -134,19 +134,44 @@ def test_percentages_use_bankers_rounding() -> None:
     # 若误用四舍五入，1.005 会变成 1.01 —— 两者在报表对账时会被发现。
 
 
-def test_fixed_text_never_renders_negative_zero() -> None:
-    """**负数舍入到零时不带负号。**
+def test_zero_rendering_follows_decimal_js() -> None:
+    """**零的负号行为必须逐条对齐 decimal.js**（此前这里写反了）。
 
-    ``format(Decimal("-0.00001").quantize(...), "f")`` 会给出 ``-0.0000``，
-    而 decimal.js 给出 ``0.0000``——两者会被客户端当成不同的文本。
+    decimal.js 的 ``toFixed`` 是 ``x.isNeg() && !x.isZero() ? '-' + str : str``：
+
+    - ``new Decimal("-0.00001").toFixed(4)`` → ``"-0.0000"``（实测），原值非零，保留符号；
+    - ``new Decimal("-0").toFixed(4)`` → ``"0.0000"``，原值本身是零，不补符号。
+
+    百分比不同：参考实现是 ``toDecimalPlaces(2, HALF_EVEN).toFixed(2)``，``toFixed``
+    作用在**已经舍入为零**的 Decimal 上，因此负的极小值渲染为 ``"0.00"``。
     """
-    from lyra.domain.numeric import fixed_text
+    from lyra.domain.numeric import fixed_text, percent_text
 
-    from lyra.domain.numeric import percent_text
-
-    assert fixed_text(Decimal("-0.00001"), 4) == "0.0000"
+    assert fixed_text(Decimal("-0.00001"), 4) == "-0.0000"
+    assert fixed_text(Decimal("-1.23001"), 2) == "-1.23"
     assert fixed_text(Decimal("-0.0"), 4) == "0.0000"
+    assert fixed_text(Decimal("0.00001"), 4) == "0.0000"
     assert percent_text(Decimal("-0.001")) == "0.00"
+
+
+def test_fixed_point_text_stays_out_of_exponent_notation() -> None:
+    """**``fixed_point_text`` 对应 decimal.js 的无参 ``toFixed()``：始终定点。**
+
+    ``toString()`` 在 ``|v| < 1e-6`` 或 ``>= 1e21`` 时改用指数形式，而持仓估值与
+    参考价中间价在参考实现里用的是 ``toFixed()``——用错会让极小量级的金额渲染成
+    ``1e-7`` 这样的文本。
+    """
+    from lyra.domain.numeric import decimal_text, fixed_point_text
+
+    assert fixed_point_text(Decimal("1.5")) == "1.5"
+    assert fixed_point_text(Decimal("1.500")) == "1.5"
+    assert fixed_point_text(Decimal("1E+2")) == "100"
+    assert fixed_point_text(Decimal("1e-7")) == "0.0000001"
+    assert fixed_point_text(Decimal("0.00")) == "0"
+    assert fixed_point_text(Decimal("-1e-7")) == "-0.0000001"
+
+    # 两者刻意不同：toString 会切到指数形式。
+    assert decimal_text(Decimal("1e-7")) == "1e-7"
 
 
 def test_fixed_text_rejects_a_negative_place_count() -> None:

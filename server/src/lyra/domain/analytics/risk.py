@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 
+from ..numeric import percent_text
 from ..fifo.types import Lot, RealizedRecord
 from .dates import (
     days_between,
@@ -35,7 +36,6 @@ RISK_BUCKET_ORDER: tuple[OptionRiskBucket, ...] = (
 )
 
 _AMOUNT_QUANTUM = Decimal("0.0001")
-_PCT_QUANTUM = Decimal("0.01")
 _PREMIUM_QUANTUM = Decimal("0.01")
 _CONTRACT_QUANTUM = Decimal("0.000001")
 
@@ -185,11 +185,16 @@ def calculate_option_risk(
         OptionRiskRow(
             bucket=bucket,
             positions=item.positions,
-            contracts=format(item.contracts.quantize(_CONTRACT_QUANTUM), "f"),
+            # ``toFixed(6)`` 是四舍五入（HALF_UP），不是 Python 的默认银行家舍入。
+            contracts=format(item.contracts.quantize(_CONTRACT_QUANTUM, rounding=ROUND_HALF_UP), "f"),
             long_positions=item.long_positions,
             short_positions=item.short_positions,
-            long_contracts=format(item.long_contracts.quantize(_CONTRACT_QUANTUM), "f"),
-            short_contracts=format(item.short_contracts.quantize(_CONTRACT_QUANTUM), "f"),
+            long_contracts=format(
+                item.long_contracts.quantize(_CONTRACT_QUANTUM, rounding=ROUND_HALF_UP), "f"
+            ),
+            short_contracts=format(
+                item.short_contracts.quantize(_CONTRACT_QUANTUM, rounding=ROUND_HALF_UP), "f"
+            ),
             long_premium_paid=format(item.long_premium_paid, "f"),
             short_premium_received=format(item.short_premium_received, "f"),
             long_premium_pct=_share_pct(item.long_premium_paid, total_long_paid),
@@ -238,14 +243,19 @@ def _risk_bucket(days_remaining: int) -> OptionRiskBucket:
 
 
 def _share_pct(part: Decimal, total: Decimal) -> str | None:
-    """计算占比；合计为零时返回 ``None`` 而不是 0，避免把"无数据"说成"占比为零"。"""
+    """计算占比；合计为零时返回 ``None`` 而不是 0，避免把"无数据"说成"占比为零"。
+
+    委托共享实现：参考实现是 ``toDecimalPlaces(2, HALF_EVEN).toFixed(2)``，此前这里
+    另写了一份裸 ``quantize``，两处对"舍入到零的负值"给出不同文本。
+    """
     if total == 0:
         return None
-    return format(
-        (part * 100 / total).quantize(_PCT_QUANTUM, rounding=ROUND_HALF_EVEN), "f"
-    )
+    return percent_text(part * 100 / total)
 
 
 def _amount_text(value: Decimal) -> str:
-    """按既有 schema 的四位小数渲染金额。"""
-    return format(value.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN), "f")
+    """按既有 schema 的四位小数渲染金额。
+
+    参考实现在回撤曲线上用的是 ``toFixed(4)``（四舍五入），不是银行家舍入。
+    """
+    return format(value.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_UP), "f")

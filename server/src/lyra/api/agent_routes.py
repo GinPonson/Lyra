@@ -154,12 +154,19 @@ def create_agent_router() -> APIRouter:
         )
         if scope.kind == "account":
             # 会话里的账户是 UUID；不存在的 UUID 会让后续账本查询静默返回空。
+            # **只接受 active 账户**：归档账户能建会话的话，后续每次工具调用都会
+            # 静默返回空账本，用户看到"没有数据"而不是"账户已归档"。
             exists = connection.execute(
-                "SELECT 1 FROM accounts WHERE id = CAST(? AS UUID)", [account_id]
+                "SELECT 1 FROM accounts WHERE id = CAST(? AS UUID) AND status = 'active'",
+                [account_id],
             ).fetchone()
             if exists is None:
                 raise HTTPException(
-                    status_code=400, detail={"code": "INVALID_ARGUMENT"}
+                    status_code=400,
+                    detail={
+                        "code": "INVALID_ARGUMENT",
+                        "message": "账户不存在或已归档",
+                    },
                 )
 
         now = datetime.now(UTC)
@@ -185,7 +192,12 @@ def create_agent_router() -> APIRouter:
         DuckDbAgentSessionRepository(connection).create_session(
             snapshot, device_id=request.state.device.id, now=now
         )
-        return project_agent_session(snapshot)
+        # **创建后立即登记运行态**：否则"建会话 → 订阅事件"的标准时序里，第一次订阅
+        # 必然拿到 snapshot_required（运行态不存在），而参考实现此时会返回空事件列表。
+        request.app.state.agent_orchestrator.register(
+            snapshot, device_id=request.state.device.id
+        )
+        return {"session": project_agent_session(snapshot)}
 
     def _require_session_id(session_id: str) -> None:
         """校验路径里的会话 ID 是 UUID。
@@ -214,14 +226,17 @@ def create_agent_router() -> APIRouter:
         if row is None:
             raise HTTPException(status_code=404, detail={"code": "AGENT_SESSION_NOT_FOUND"})
         messages = AgentMessageRepository(connection).load_messages(session_id)
-        return project_agent_session(_rebuild(row, messages))
+        return {"session": project_agent_session(_rebuild(row, messages))}
 
     @router.get("/v1/agent/sessions/{session_id}/tool-calls")
     def read_tool_calls(session_id: str, request: Request) -> Any:
         """读取会话的工具调用审计记录。"""
         connection = request.app.state.database.connection
         calls = AgentMessageRepository(connection).load_tool_calls(session_id)
-        return {"rows": list(calls), "count": len(calls)}
+        # **信封键必须是 ``toolCalls``**：客户端读的是这个键（缺失时静默显示为空），
+        # 而参考实现同样返回 ``{toolCalls: [...]}``。返回裸列表或 ``rows`` 会让
+        # 审计页面永远空白且不报错。
+        return {"toolCalls": [dict(call) for call in calls]}
 
     @router.post("/v1/agent/sessions/{session_id}/cancel")
     def cancel_session(session_id: str, request: Request) -> Any:
@@ -231,7 +246,10 @@ def create_agent_router() -> APIRouter:
         表示"请求已受理、尚未停止"，不应据此认为回合已经结束。
         """
         _require_session_id(session_id)
-        return _transition(request, session_id, "cancelling")
+        result = _transition(request, session_id, "cancelling")
+        # **取消意图由持久化状态表达**：编排器在收口前读 ``cancelling`` 决定按
+        # ``cancelled`` 还是成功落库，因此这里不需要（也不能）依赖进程内标志。
+        return result
 
     @router.post("/v1/agent/sessions/{session_id}/messages")
     async def send_message(session_id: str, request: Request) -> Any:
@@ -284,7 +302,12 @@ def create_agent_router() -> APIRouter:
         messages = AgentMessageRepository(connection).load_messages(session_id)
         from ..application.agent_turn_orchestrator import REGISTRY_UNAVAILABLE
         orchestrator.register(
-            _rebuild(row, messages), last_event_sequence=row.last_event_sequence
+            _rebuild(row, messages),
+            last_event_sequence=row.last_event_sequence,
+            device_id=row.device_id,
+            # 两条消息（用户 + 助手）接着既有行排下去：序号由运行态给出，
+            # 避免在同一事务里再查一次 max(ordinal)。
+            next_ordinal=len(messages) + 1,
         )
         try:
             result = orchestrator.run_turn(
@@ -338,7 +361,7 @@ def _transition(request: Request, session_id: str, target: str) -> Any:
         ) from error
     if next_session is snapshot:
         # 幂等重放：已是目标状态，无需写库。
-        return project_agent_session(snapshot)
+        return {"session": project_agent_session(snapshot)}
     if not repository.update_status(
         session_id, row.status, target, datetime.now(UTC)  # type: ignore[arg-type]
     ):
@@ -346,7 +369,7 @@ def _transition(request: Request, session_id: str, target: str) -> Any:
             status_code=409, detail={"code": "AGENT_SESSION_STATE_CONFLICT"}
         )
     messages = AgentMessageRepository(connection).load_messages(session_id)
-    return project_agent_session(_rebuild(row, messages, status=target))
+    return {"session": project_agent_session(_rebuild(row, messages, status=target))}
 
 
 def _project_event(event: Any) -> dict[str, Any]:

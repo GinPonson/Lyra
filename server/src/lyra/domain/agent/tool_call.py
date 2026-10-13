@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass
 from typing import Any, Literal
+
+from ..analytics.types import AccountScope
 
 AgentToolSummary = dict[str, str | int | float | bool | None]
 AgentToolRejectionReason = Literal[
@@ -50,6 +53,33 @@ class AgentToolPolicyError(Exception):
     """工具调用违反安全策略。"""
 
     code = "AGENT_TOOL_FORBIDDEN"
+
+
+@dataclass(frozen=True)
+class AgentToolContext:
+    """服务端为一次 Agent 工具调用注入的不可变口径。
+
+    **它不是模型可控参数。** 账户范围、账本版本与截止时间只来自会话快照；把它们
+    放进工具的公开 schema 就等于让模型自己声明授权范围——会话绑定单账户时，一次
+    不传范围字段的调用会静默升级为"全部账户"。
+
+    @param session_id: 所属会话。
+    @param device_id: 发起会话的设备；工具调用因此可归属到一次可撤销的登录。
+    @param user_message_id: 工具调用挂靠的**已落库**消息 ID。``agent_tool_calls``
+        对 ``agent_messages`` 有外键，而助手消息要到回合结束才落库，所以工具调用
+        只能绑定本轮的用户消息。
+    @param account_scope: 会话授权范围。``account`` 是账户 **UUID**——不是账本用的
+        脱敏账户键，两者类型相同，混用不会报错、只会返回空账本。
+    @param ledger_version: 权威数据基线版本。
+    @param as_of: 数据截止时间（会话存储的 ISO 时间戳）。
+    """
+
+    session_id: str
+    device_id: str
+    user_message_id: str
+    account_scope: AccountScope
+    ledger_version: int
+    as_of: str
 
 
 def normalize_summary(summary: dict[str, Any], label: str) -> AgentToolSummary:

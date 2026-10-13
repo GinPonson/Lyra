@@ -40,6 +40,21 @@ from .write_coordinator import WriteCoordinator
 ACCESS_TOKEN_TTL_MILLISECONDS = 15 * 60 * 1000
 REFRESH_TOKEN_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1000
 
+# 设备错误码与 HTTP 状态的显式映射，逐项对齐参考实现的 transport 映射表。
+#
+# **不能一律压成 401**：``DEVICE_REVOKED`` 是 403（已认证但被拒绝），公钥类错误是
+# 400（请求本身非法）。客户端按码分支，状态码错了会让它走错分支。
+_DEVICE_STATUS_CODES: dict[str, int] = {
+    "PAIRING_CODE_INVALID": 400,
+    "PAIRING_CODE_EXPIRED": 410,
+    "PAIRING_CODE_USED": 409,
+    "DEVICE_PUBLIC_KEY_INVALID": 400,
+    "DEVICE_CREDENTIAL_INVALID": 401,
+    "DEVICE_CREDENTIAL_EXPIRED": 401,
+    "DEVICE_CREDENTIAL_REUSED": 401,
+    "DEVICE_REVOKED": 403,
+}
+
 
 class DeviceRepository(Protocol):
     """设备会话所需的持久化操作。
@@ -257,9 +272,16 @@ class DevicePairingService:
             self._repository.apply_family_revocation(plan)
 
     def _device_error(self, error: DeviceAuthError) -> ApplicationError:
-        """把设备领域错误映射为应用错误。"""
+        """把设备领域错误映射为应用错误。
+
+        @param error: 领域层抛出的设备错误。
+        @returns 与参考实现 transport 映射表一致的应用错误（状态码按码查表）。
+        """
         return ApplicationError(
-            code=error.code, message=error.message, status_code=401, retryable=False
+            code=error.code,
+            message=error.message,
+            status_code=_DEVICE_STATUS_CODES.get(error.code, 401),
+            retryable=False,
         )
 
     def _credential_invalid(self) -> ApplicationError:

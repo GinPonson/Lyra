@@ -39,7 +39,12 @@ class ImportJobStore:
         expected_status: ImportJobStatus,
         next_status: ImportJobStatus,
         now: datetime,
+        committed_ledger_version: int | None = None,
     ) -> bool: ...
+
+    def recover_stale_committing(self, job_id: str, now: datetime) -> bool:
+        """把崩溃留下的 ``committing`` 作业判回 ``preview_ready``；已写入账本时返回 ``False``。"""
+        ...
 
 
 def cancel_import_job(store: ImportJobStore, job_id: str, now: datetime) -> PublicImportJob:

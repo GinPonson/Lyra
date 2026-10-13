@@ -24,6 +24,7 @@ from typing import Literal
 
 from ..domain.market_data.reference_price import (
     MarketReferencePrice,
+    is_crossed_market,
     select_market_reference_price,
 )
 from ..domain.market_data.types import (
@@ -72,8 +73,12 @@ class _CacheEntry:
     expires_at: int
 
 
-DEFAULT_MAX_QUOTE_AGE_MS = 15 * 60_000
-DEFAULT_MAX_CACHE_ENTRIES = 512
+# **7 天，不是 15 分钟。** 参考实现的默认值是 ``?? 7 * DAY_MS``，两侧装配点都没有
+# 覆盖它；15 分钟会把"周内的延迟报价"整片判成过期，进而让本可用的报价降级为 stale、
+# 触发无谓的备来源请求与预算消耗。
+DEFAULT_MAX_QUOTE_AGE_MS = 7 * 86_400_000
+# 参考实现的默认值是 ``?? 1_000``；512 会在长会话里更早淘汰仍然新鲜的报价。
+DEFAULT_MAX_CACHE_ENTRIES = 1_000
 
 
 class MarketDataService:
@@ -198,6 +203,15 @@ class MarketDataService:
                 result = ProviderQuote(status="unavailable", reason="provider_unavailable")
 
         completed = self._now()
+        # **交叉盘口（``ask < bid``）是供应商数据形状错误，必须折叠为 invalid_response。**
+        # 若放行，它会作为"可用报价"进入缓存并参与估值——而那个价格在市场上从未存在过。
+        # 参考实现在报价归一化的成功分支之前拦截该情形。
+        if (
+            result.status == "available"
+            and result.quote is not None
+            and is_crossed_market(result.quote)
+        ):
+            result = ProviderQuote(status="unavailable", reason="invalid_response")
         if result.status == "available" and result.quote is not None:
             entry = _CacheEntry(
                 quote=result.quote, issue=None,

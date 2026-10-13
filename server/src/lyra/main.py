@@ -12,12 +12,13 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI
 
-from .api.agent_events import create_agent_events_router
+from .api.agent_events import EventConnectionRegistry, create_agent_events_router
 from .api.agent_routes import create_agent_router
 from .api.auth_routes import build_owner_login_service, create_auth_router
 from .api.error_envelope import install_error_envelope
 from .api.gmail_routes import create_gmail_router
 from .api.health import create_health_router
+from .application.agent_availability import create_agent_availability_snapshot
 from .application.write_coordinator import WriteCoordinator
 from .infrastructure.db.gmail_connection_repository import load_gmail_connections
 from .api.import_routes import create_import_router
@@ -29,18 +30,26 @@ from .db.connection import LyraDatabase, open_lyra_database
 
 
 async def _authorize_owner_device(
-    *, identity: object, public_key_pem: str, display_name: str, database: object
+    *,
+    identity: object,
+    public_key_pem: str,
+    display_name: str,
+    database: object,
+    write_coordinator: object,
 ) -> object:
     """登录成功后的设备签发。
 
     **异步**：签发走单写队列，而队列用 ``asyncio.Lock`` 串行化。
+
+    ``write_coordinator`` 由调用方注入**应用级单例**：每个调用点各自
+    ``new WriteCoordinator()`` 会拿到各自实例的锁，等于没有队列——健康端点报告的
+    队列状态也会与实际写入脱节。
     """
     from .application.device_pairing_service import DevicePairingService
-    from .application.write_coordinator import WriteCoordinator
     from .infrastructure.db.device_repository import DuckDbDeviceRepository
 
     service = DevicePairingService(
-        DuckDbDeviceRepository(database.connection), WriteCoordinator()
+        DuckDbDeviceRepository(database.connection), write_coordinator
     )
     issued = await service.authorize_owner_device(
         identity=identity, display_name=display_name, public_key_pem=public_key_pem
@@ -73,18 +82,26 @@ def create_app(settings: Settings, database: LyraDatabase) -> FastAPI:
     )
     # **统一错误信封与请求 ID 必须在挂载路由之前装配。**
     install_error_envelope(app)
-    # **健康快照需要三段来源**：写队列、Gmail 连接、Agent 配置状态。
+    # **健康快照需要三段来源**：写队列、Gmail 连接、Agent 可用性。
     # 用 lambda 延迟取值——这些状态在下方才装配，且 Gmail 连接是每请求读取的。
+    #
+    # Agent 段传**真实可用性快照**而不是布尔：运行时的可用性由 provider 列表表达
+    # （未配置时那条是 ``unavailable``），健康端点据此推导计数与状态。
     app.include_router(create_health_router(
         database,
         write_coordinator_provider=lambda: app.state.write_coordinator,
         gmail_connections=lambda: load_gmail_connections(database.connection),
-        agent_configured=lambda: app.state.agent_executor is not None,
+        agent_availability=lambda: create_agent_availability_snapshot(
+            configured=app.state.agent_executor is not None,
+            checked_at=datetime.now(UTC),
+        ),
     ))
     app.include_router(create_system_router(database))
     app.include_router(create_ledger_router())
     app.include_router(create_import_router())
     app.include_router(create_agent_router())
+    # 事件连接的注册表：登出时据此踢掉该设备已经建立的事件流。
+    app.state.event_connections = EventConnectionRegistry()
     app.include_router(create_agent_events_router())
     app.include_router(create_market_router())
     # 登录服务：按环境装配。部分配置会在启动时抛错——让服务带着"看起来启用了
@@ -93,7 +110,13 @@ def create_app(settings: Settings, database: LyraDatabase) -> FastAPI:
     # 设备签发用例指向尚未接线的 `exchange` 路径，见 auth_routes 的模块文档。
     app.state.login_service = build_owner_login_service(
         os.environ,
-        lambda **kwargs: _authorize_owner_device(database=database, **kwargs),
+        lambda **kwargs: _authorize_owner_device(
+            database=database,
+            # lambda 体在**请求期**求值，晚于下方 `app.state.write_coordinator` 的赋值，
+            # 因此这里取到的就是那个单例。
+            write_coordinator=app.state.write_coordinator,
+            **kwargs,
+        ),
     )
     app.state.login_provider_ids = frozenset(
         provider.id for provider in app.state.login_service._providers

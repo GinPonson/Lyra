@@ -7,8 +7,14 @@
 账本（只有新交易没有对应批次，会让后续分析算出错误持仓）。
 
 一处非直觉的 DuckDB 约束：**不允许更新已被外键引用的父行**，即使主键不变。
-因此当本次提交需要写 ``import_files`` 终态时，必须在 ``transactions`` 引用它之前写。
-本模块当前不接管导入作业表，该顺序约束在接入作业表时适用。
+实测代价：只要 ``transactions.import_file_id`` 指向某次导入作业，之后对该作业行的
+任何更新（包括写 ``status='committed'`` 或清空预览摘要）都会抛
+``ConstraintException: ... is still referenced by a foreign key``。
+
+因此本模块要接管 ``import_files`` 终态写入时，**必须把它排在 ``transactions`` 插入
+之前，并且与账本写入处于同一个事务**——这正是 ``preview_ready → committing`` 的 CAS
+也应当搬进来的原因（当前 CAS 仍在应用层、事务之外，见
+:mod:`lyra.application.import_commit_service` 的说明与恢复路径）。
 """
 
 from __future__ import annotations
@@ -82,12 +88,12 @@ class DuckDbImportCommitRepository:
         @param account_id: 目标账户的内部 UUID。
         @param plan: 事务外已算好的提交计划。
         @param expected_ledger_version: 预览时读到的账本版本。
-        @param source_reference: 记入账本版本的来源引用。
+        @param source_reference: 记入账本版本的来源引用（导入作业 UUID）。
         @param idempotency_completion: 幂等记录的收口信息；``None`` 表示本次请求
             未携带幂等键。
         @returns 是否变更与新账本版本。
-        @raises ApplicationError: 账本版本已变化（409），必须重新生成预览。
-        @raises ValueError: 账户 ID 与计划中的账户键不匹配。
+        @raises ApplicationError: 账本版本已变化（409）或账户不可用（409），
+            必须重新生成预览。
         """
         self._assert_account_matches(account_id, plan.account)
         self._connection.execute("BEGIN TRANSACTION")
@@ -192,18 +198,23 @@ class DuckDbImportCommitRepository:
         )
 
     def _assert_account_matches(self, account_id: str, legacy_key: str) -> None:
-        """确认账户 ID 与计划中的账户键指向同一账户。
+        """确认账户 ID 仍指向计划中的账户，且**账户处于 active**。
 
-        @raises ValueError: 不存在该账户，或两者不匹配。
+        归档账户不得再接收新交易：它已经从会计范围里消失，写入的数据会被所有查询
+        忽略——用户看到"导入成功"却查不到任何交易。
+
+        @raises ApplicationError: 账户不存在、键不匹配或已归档（409）。
         """
         row = self._connection.execute(
-            "SELECT legacy_account_key FROM accounts WHERE id = CAST(? AS UUID)",
+            "SELECT legacy_account_key, status FROM accounts WHERE id = CAST(? AS UUID)",
             [account_id],
         ).fetchone()
-        if row is None or row[0] != legacy_key:
-            actual = None if row is None else row[0]
-            raise ValueError(
-                f"账户 ID 与计划账户不匹配: expected={legacy_key} actual={actual}"
+        if row is None or row[0] != legacy_key or row[1] != "active":
+            raise ApplicationError(
+                code="ACCOUNT_MAPPING_REQUIRED",
+                message="导入目标账户已变化，请重新确认账户映射",
+                status_code=409,
+                retryable=False,
             )
 
     def _current_ledger_version(self) -> int:
@@ -233,7 +244,12 @@ class DuckDbImportCommitRepository:
     def _insert_transaction(
         self, transaction: ParsedTransaction, account_id: str, ledger_version: int
     ) -> None:
-        """插入一条标准交易。"""
+        """插入一条标准交易。
+
+        **``import_file_id`` 目前写 NULL**（见模块 docstring）：一旦交易引用了
+        ``import_files``，后续对该作业行的任何更新都会被 DuckDB 的外键限制拒绝；
+        要让这一列有值，必须先把作业终态写入搬进本事务、并排在交易插入之前。
+        """
         self._connection.execute(
             """
             INSERT INTO transactions (

@@ -324,3 +324,104 @@ def test_stream_state_mismatch_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="不匹配"):
         _apply(_state(), MessageDelta(delta="x"), session=other)
+
+
+# --------------------------------------------------------------------------
+# 工具事件
+# --------------------------------------------------------------------------
+
+
+def _tool_started(**overrides):
+    """一条已授权的工具开始信号。"""
+    from lyra.domain.agent.turn_stream import ToolStarted
+
+    fields = {
+        "message_id": "u-1", "call_id": "c-1", "ordinal": 1, "tool_name": "summary",
+        "authorization_decision": "allowed", "status": "started",
+        "arguments_summary": {"account": "TST001"}, "result_summary": None,
+        "duration_ms": None, "error_code": None, "ledger_version": 3,
+    }
+    fields.update(overrides)
+    return ToolStarted(**fields)
+
+
+def _tool_completed(**overrides):
+    """一条工具终态信号。"""
+    from lyra.domain.agent.turn_stream import ToolCompleted
+
+    fields = {
+        "message_id": "u-1", "call_id": "c-1", "ordinal": 1, "tool_name": "summary",
+        "authorization_decision": "allowed", "status": "completed",
+        "arguments_summary": {"account": "TST001"}, "result_summary": {"count": 1},
+        "duration_ms": 12, "error_code": None, "ledger_version": 3,
+    }
+    fields.update(overrides)
+    return ToolCompleted(**fields)
+
+
+def test_tool_started_maps_to_a_tool_started_event() -> None:
+    """工具开始映射为 ``tool.started``，序号继续推进。"""
+    update = _apply(_state(), _tool_started())
+
+    assert update.event is not None
+    assert update.event.type == "tool.started"
+    assert update.event.sequence == 1
+    assert update.event.payload["tool_call_id"] == "c-1"
+    assert update.event.payload["tool_name"] == "summary"
+    assert update.state.last_event_sequence == 1
+    # 工具调用挂靠已落库的用户消息，而不是本回合的助手消息。
+    assert update.event.message_id == "u-1"
+    assert update.event.payload["ledger_version"] == 3
+
+
+def test_tool_events_do_not_carry_arguments_or_results() -> None:
+    """**事件里没有参数与结果摘要**——它们属于审计面，事件会被重连缓冲回放。"""
+    update = _apply(_state(), _tool_completed())
+
+    assert update.event is not None
+    assert "TST001" not in str(update.event.payload)
+    assert update.event.payload["outcome"] == "completed"
+    assert update.event.payload["duration_ms"] == 12
+    assert update.event.payload["error_code"] is None
+
+
+def test_tool_rejection_maps_to_a_completed_event_only() -> None:
+    """被拒的调用只发 ``tool.completed``：它从未开始，不该有 started 事件。"""
+    update = _apply(_state(), _tool_completed(
+        authorization_decision="denied", status="rejected",
+        result_summary=None, duration_ms=0, error_code="AGENT_TOOL_FORBIDDEN",
+    ))
+
+    assert update.event is not None
+    assert update.event.type == "tool.completed"
+    assert update.event.payload["outcome"] == "rejected"
+    assert update.event.payload["error_code"] == "AGENT_TOOL_FORBIDDEN"
+
+
+def test_tool_events_do_not_settle_or_change_content() -> None:
+    """工具事件不改变可见内容，也不收口——否则回合会在工具调用处被截断。"""
+    update = _apply(_state(), _tool_started())
+
+    assert update.state.settled is False
+    assert update.state.visible_content == ""
+    assert update.state.has_authoritative_snapshot is False
+
+
+def test_inconsistent_tool_terminal_state_is_rejected() -> None:
+    """终态与授权判定必须自洽（与数据库 CHECK 同义）。"""
+    with pytest.raises(ValueError, match="不一致"):
+        _apply(_state(), _tool_completed(authorization_decision="denied", status="completed"))
+    with pytest.raises(ValueError, match="不一致"):
+        _apply(_state(), _tool_completed(authorization_decision="allowed", status="rejected"))
+
+
+def test_tool_completed_cannot_be_started() -> None:
+    """完成信号不能用 started——否则编排器会写出一条永远不结束的审计记录。"""
+    with pytest.raises(ValueError, match="started"):
+        _apply(_state(), _tool_completed(status="started"))
+
+
+def test_tool_started_requires_an_allowed_decision() -> None:
+    """开始信号只能是已授权的 started。"""
+    with pytest.raises(ValueError, match="已授权"):
+        _apply(_state(), _tool_started(authorization_decision="denied"))

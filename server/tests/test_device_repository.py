@@ -18,12 +18,23 @@ from pathlib import Path
 import pytest
 
 from lyra.application.app_error import ApplicationError
-from lyra.application.device_pairing_service import DevicePairingService
+from lyra.application.device_pairing_service import (
+    ACCESS_TOKEN_TTL_MILLISECONDS,
+    REFRESH_TOKEN_TTL_MILLISECONDS,
+    DevicePairingHttpResponse,
+    DevicePairingService,
+)
 from lyra.application.write_coordinator import WriteCoordinator
 from lyra.db.connection import open_lyra_database
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
-from lyra.security.device_auth import hash_opaque_credential
+from lyra.security.device_auth import (
+    DeviceAccessTokenRecord,
+    RotatedDeviceRefreshCredential,
+    hash_opaque_credential,
+    issue_device_access_token,
+    rotate_device_refresh_credential,
+)
 
 KEYS = json.loads(
     (Path(__file__).parent / "fixtures" / "device-keys.json").read_text(encoding="utf-8")
@@ -199,21 +210,21 @@ def test_revoke_device_marks_rows_in_database(wired) -> None:
 def test_revoke_is_idempotent_in_database(wired) -> None:
     """重复撤销保留首次撤销时间（``coalesce``）。"""
     service, connection = wired
-    issued = _authorize(service)
-    asyncio.run(service.revoke_device(issued.device_id))
-    first = connection.execute("SELECT revoked_at FROM paired_devices").fetchone()
+    device_id = _authorize(service).device_id
+    asyncio.run(service.revoke_device(device_id))
+    revoked_at = connection.execute("SELECT revoked_at FROM paired_devices").fetchone()
 
-    asyncio.run(service.revoke_device(issued.device_id))
+    asyncio.run(service.revoke_device(device_id))
     second = connection.execute("SELECT revoked_at FROM paired_devices").fetchone()
 
-    assert first is not None and second is not None
-    assert first[0] == second[0]
+    assert revoked_at is not None and second is not None
+    assert revoked_at[0] == second[0], "重复撤销覆盖了首次撤销时间"
 
 
 def test_rollback_leaves_no_partial_credentials(wired) -> None:
     """事务失败必须整体回滚，不留下半提交的凭据。"""
     service, connection = wired
-    issued = _authorize(service)
+    _authorize(service)  # 先造出一族凭据；随后注入的失败必须把它们一起回滚
     before = _count(connection, "device_refresh_credentials")
 
     class Exploding(DuckDbDeviceRepository):
@@ -250,3 +261,125 @@ def test_clock_timezone_is_utc(wired) -> None:
     offset = paired_at.astimezone(UTC).utcoffset()
     assert offset is not None
     assert offset.total_seconds() == 0
+
+
+# --------------------------------------------------------------------------
+# 轮换的 CAS：条件与受影响行数都必须校验
+# --------------------------------------------------------------------------
+
+
+def _rotation_plan(
+    repository: DuckDbDeviceRepository, issued: DevicePairingHttpResponse
+) -> tuple[RotatedDeviceRefreshCredential, DeviceAccessTokenRecord]:
+    """为一次刷新构造轮换计划与访问令牌记录（尚未落库）。"""
+    record = repository.load_refresh_credential(hash_opaque_credential(issued.refresh_token))
+    assert record is not None
+    device = repository.load_paired_device_auth(issued.device_id)
+    assert device is not None
+    now = datetime.now(UTC)
+    rotation = rotate_device_refresh_credential(
+        device, record, issued.refresh_token, now, REFRESH_TOKEN_TTL_MILLISECONDS
+    )
+    access = issue_device_access_token(device, now, ACCESS_TOKEN_TTL_MILLISECONDS)
+    return rotation, access.record
+
+
+def test_rotation_refuses_a_credential_that_is_no_longer_active(wired) -> None:
+    """**轮换的 UPDATE 必须带 CAS**：计划生成后该代被抢先轮换时要报"重用"。
+
+    无条件 UPDATE 会让一枚已被用过的旧凭据静默换出新的 active 凭据，重用检测随后
+    永远不触发——泄漏的整族凭据也就不会被撤销。失配还必须整体回滚：不得插入新代
+    与新的访问令牌。
+    """
+    service, connection = wired
+    issued = _authorize(service)
+    repository = DuckDbDeviceRepository(connection)
+    rotation, access_record = _rotation_plan(repository, issued)
+
+    # 模拟并发写入者抢先提交：这一代已不再是 active。
+    connection.execute(
+        """
+        UPDATE device_refresh_credentials
+        SET status = 'rotated', rotated_at = CAST(? AS TIMESTAMPTZ)
+        WHERE id = CAST(? AS UUID)
+        """,
+        ["2026-10-13T12:00:00.000Z", rotation.previous.id],
+    )
+
+    with pytest.raises(ApplicationError) as raised:
+        with repository.transaction():
+            repository.rotate_refresh_credential(rotation, access_record)  # type: ignore[arg-type]
+    assert raised.value.code == "DEVICE_CREDENTIAL_REUSED"
+    assert raised.value.status_code == 401
+
+    assert _count(connection, "device_refresh_credentials") == 1
+    assert _count(connection, "device_access_tokens") == 1
+
+
+def test_rotation_refuses_a_stale_generation(wired) -> None:
+    """代号条件同样必须参与 CAS：只比对 id 会让"代号已推进"的旧计划照样通过。
+
+    这里保持该代 active、只推进代号，单独检验 ``generation`` 谓词。
+    """
+    service, connection = wired
+    issued = _authorize(service)
+    repository = DuckDbDeviceRepository(connection)
+    rotation, access_record = _rotation_plan(repository, issued)
+
+    connection.execute(
+        """
+        UPDATE device_refresh_credentials
+        SET generation = generation + 1
+        WHERE id = CAST(? AS UUID)
+        """,
+        [rotation.previous.id],
+    )
+
+    with pytest.raises(ApplicationError) as raised:
+        with repository.transaction():
+            repository.rotate_refresh_credential(rotation, access_record)  # type: ignore[arg-type]
+    assert raised.value.code == "DEVICE_CREDENTIAL_REUSED"
+
+    assert _count(connection, "device_refresh_credentials") == 1
+    assert _count(connection, "device_access_tokens") == 1
+
+
+def test_concurrent_rotation_is_reported_as_reuse(wired) -> None:
+    """并发轮换（读与写之间被抢先）必须报重用，而不是再签发一枚 active 凭据。
+
+    **单写队列只串行化本进程的写入**，挡不住重放与其它写入者；这正是 CAS 存在的原因。
+    这里用真实仓储加一次"抢先提交"来构造该窗口。
+    """
+    _, connection = wired
+
+    class Racing(DuckDbDeviceRepository):
+        """在轮换落库前先替"另一个写入者"提交：该代已不再 active。"""
+
+        def __init__(self, connection) -> None:  # type: ignore[no-untyped-def]
+            super().__init__(connection)
+            self.raced = False
+
+        def rotate_refresh_credential(self, rotation, access_record):  # type: ignore[no-untyped-def]
+            if not self.raced:
+                self.raced = True
+                self._connection.execute(
+                    """
+                    UPDATE device_refresh_credentials
+                    SET status = 'rotated', rotated_at = CAST(? AS TIMESTAMPTZ)
+                    WHERE id = CAST(? AS UUID)
+                    """,
+                    ["2026-10-13T12:00:00.000Z", rotation.previous.id],
+                )
+            super().rotate_refresh_credential(rotation, access_record)
+
+    service = DevicePairingService(Racing(connection), WriteCoordinator())
+    issued = _authorize(service)
+
+    with pytest.raises(ApplicationError) as raised:
+        asyncio.run(service.refresh_tokens(refresh_token=issued.refresh_token))
+
+    assert raised.value.code == "DEVICE_CREDENTIAL_REUSED"
+    assert raised.value.status_code == 401
+    # 事务回滚：既没有新代，也没有新的访问令牌。
+    assert _count(connection, "device_refresh_credentials") == 1
+    assert _count(connection, "device_access_tokens") == 1

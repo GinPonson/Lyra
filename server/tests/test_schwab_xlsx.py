@@ -162,6 +162,29 @@ def test_hidden_transaction_sheet_is_rejected() -> None:
         _parse(_content(workbook))
 
 
+def test_hidden_transaction_row_is_rejected() -> None:
+    """**交易行不可隐藏**（read_only 模式曾让这条判定完全失效）。"""
+    workbook = _workbook()
+    sheet = _transaction_sheet(workbook)
+    sheet.row_dimensions[2].hidden = True
+
+    with pytest.raises(IngestError, match="交易行不可隐藏"):
+        _parse(_content(workbook))
+
+
+def test_hidden_empty_row_is_skipped_not_rejected() -> None:
+    """**隐藏的空行跳过**（参考实现先判空、再判隐藏）。
+
+    Excel 常留下被隐藏的空白格式行；把这类行当"隐藏交易行"拒绝会让正常文件无法导入。
+    """
+    workbook = _workbook()
+    sheet = _transaction_sheet(workbook)
+    sheet.cell(row=3, column=1).value = None  # 撑出第三行，但没有内容
+    sheet.row_dimensions[3].hidden = True
+
+    assert len(_parse(_content(workbook)).rows) == 1
+
+
 def test_multiple_candidates_are_ambiguous() -> None:
     """**多个候选取歧义**，并列出全部候选工作表名。"""
     workbook = _workbook()
@@ -229,6 +252,40 @@ def test_boolean_cells_are_rejected() -> None:
 
     with pytest.raises(IngestError, match="单元格类型不支持"):
         _parse(_content(workbook))
+
+
+def test_integral_float_cell_renders_without_a_trailing_decimal() -> None:
+    """**数值单元格按 ExcelJS ``cell.text``（JS 数值文本）渲染。**
+
+    浮点 ``100.0`` 在 ExcelJS 里是 ``100``，而 Python ``str(100.0)`` 是 ``100.0``。
+    小数位取自源文本并进入业务哈希，差异会让同一份文件在迁移前后算出不同的
+    ``transaction_hash``、重复导入时产生重复交易。
+    """
+    workbook = _workbook()
+    sheet = _transaction_sheet(workbook)
+    sheet["E2"] = 100.0
+
+    assert _parse(_content(workbook)).rows[0].quantity == "100"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0, "0"),
+        (100, "100"),
+        (100.0, "100"),           # Python str() 会给 "100.0"
+        (-0.0, "0"),              # JS 的 -0 渲染为 "0"
+        (40.5, "40.5"),
+        (1e16, "10000000000000000"),  # Python str() 会给 "1e+16"
+        (1e-7, "1e-7"),           # Python str() 会给 "1e-07"
+        (1.5e21, "1.5e+21"),
+    ],
+)
+def test_js_number_text_matches_javascript(value, expected: str) -> None:
+    """数值文本的边界与 JS ``Number.prototype.toString()`` 一致。"""
+    from lyra.infrastructure.imports.schwab_xlsx import _js_number_text
+
+    assert _js_number_text(value) == expected
 
 
 def test_blank_trailing_cells_are_read_as_empty_strings() -> None:
