@@ -1,0 +1,26 @@
+{
+  "producedBy": "typescript",
+  "cases": [
+    {
+      "name": "rsa",
+      "inputPem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlZaQCoYRRniVvoG3Vq12\nlTQm4jDmXQous+eh9jWEhA+myvBp+Hsd98O12yPSGbmi3PjinweoV+Gq0DblO1E7\nUQtcohy8plkEqX4GH1Xlw8AJD4DXU9NdE9kG8KvfYzT0pKV8cA/X2MDH9Pb5GZa+\nAIuWcL5jsZdgJtcOBM9KA/lpOwvahkLVIx5/nOydu8tpFeflt2XxMgHLRW5BxY9c\nVQncXqgn3Gw7ap7noE7TpuIMrRbW0F5gZKF9r34ky4+DL4cpjKeVyJIc3FaUz6sr\ncWRorYzLTWJRQkJb7+sfI6iE9eA055C7r7nS8B9NdqN4IoJEcklSxJ8yg4uymZ5P\nJQIDAQAB\n-----END PUBLIC KEY-----\n",
+      "normalizedPem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlZaQCoYRRniVvoG3Vq12\nlTQm4jDmXQous+eh9jWEhA+myvBp+Hsd98O12yPSGbmi3PjinweoV+Gq0DblO1E7\nUQtcohy8plkEqX4GH1Xlw8AJD4DXU9NdE9kG8KvfYzT0pKV8cA/X2MDH9Pb5GZa+\nAIuWcL5jsZdgJtcOBM9KA/lpOwvahkLVIx5/nOydu8tpFeflt2XxMgHLRW5BxY9c\nVQncXqgn3Gw7ap7noE7TpuIMrRbW0F5gZKF9r34ky4+DL4cpjKeVyJIc3FaUz6sr\ncWRorYzLTWJRQkJb7+sfI6iE9eA055C7r7nS8B9NdqN4IoJEcklSxJ8yg4uymZ5P\nJQIDAQAB\n-----END PUBLIC KEY-----\n",
+      "fingerprint": "0fb8346e75a9e45b02b059b96b05eee543627d1d148a67eb011e69134aa3f30c",
+      "algorithm": "rsa"
+    },
+    {
+      "name": "ec",
+      "inputPem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhomPNLqXxw/MFHJByoParD7lrMUZ\nKASAdjmqeMa5Tx3vU/i6blG4q8Pcu+OUAoRSwNKU3F9RzHZsiN38xPUGtA==\n-----END PUBLIC KEY-----\n",
+      "normalizedPem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhomPNLqXxw/MFHJByoParD7lrMUZ\nKASAdjmqeMa5Tx3vU/i6blG4q8Pcu+OUAoRSwNKU3F9RzHZsiN38xPUGtA==\n-----END PUBLIC KEY-----\n",
+      "fingerprint": "d664005233de0e808b4d94ef30e55ecca4c6d2857880fb4f76927e5353481746",
+      "algorithm": "ec"
+    },
+    {
+      "name": "ed25519",
+      "inputPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA7lvdRTmVXGU/z0KXl+0UvZE8FrL1r/wgTYzm/ZaCgkk=\n-----END PUBLIC KEY-----\n",
+      "normalizedPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA7lvdRTmVXGU/z0KXl+0UvZE8FrL1r/wgTYzm/ZaCgkk=\n-----END PUBLIC KEY-----\n",
+      "fingerprint": "f8aa6474a7340971547ae03636b85a18a8d31533586fed47d453ed0253b8e75a",
+      "algorithm": "ed25519"
+    }
+  ]
+}

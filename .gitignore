@@ -1,7 +1,8 @@
-# Node.js / TypeScript build output
-node_modules/
-dist/
-coverage/
+# Python 字节码
+# **必须忽略**：不同 Python 版本与平台产出的 .pyc 不同，提交它们会造成大量假变更，
+# 还会把构建路径写进仓库。
+__pycache__/
+*.py[cod]
 
 # Flutter / Dart generated output
 .dart_tool/
@@ -15,6 +16,19 @@ data/
 uploads/
 *.duckdb
 *.duckdb.wal
+
+# **例外：测试夹具必须进仓库。**
+#
+# `*.duckdb` 会连它一起忽略，而它是"Python 能打开既有 schema 15 库"的唯一证据——
+# 不进仓库的话，别人克隆后那条测试会失败（且失败原因看起来像环境问题）。
+# 该夹具无任何账户/交易/设备数据，因此可以安全提交。
+!server/tests/fixtures/*.duckdb
+
+# uv 的缓存、解释器与虚拟环境落点（见各脚本的 UV_* 变量）。
+.uv-tmp/
+
+# 服务端虚拟环境
+server/.venv/
 
 # Local secrets and machine-specific configuration
 .env

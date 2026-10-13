@@ -1,0 +1,197 @@
+{
+  "note": "路由契约（签入）。迁移前与 TypeScript 版逐项对账为 47 个 (方法, 路径) 对 + 1 个 WebSocket，此清单即那份对账结果。路径参数统一归一化为 {}——参数名两侧各有命名 习惯，不是契约的一部分，路径形状才是。新增或删除路由时必须同时改这里。",
+  "pairs": [
+    {
+      "method": "DELETE",
+      "path": "/v1/agent/sessions/{}"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/google/connections/{}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/agent/sessions/{}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/agent/sessions/{}/tool-calls"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/agents"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/analytics/allocation"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/analytics/attribution"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/analytics/drawdown"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/analytics/extremes"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/analytics/holding-period"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/analytics/monthly"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/analytics/risk"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/analytics/streaks"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/analytics/stress"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/auth/providers"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/auth/{}/callback"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/google/connections"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/google/connections/{}/mappings"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/health"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/imports/{}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/ledger/accounts"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/ledger/audit"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/ledger/cashflow"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/ledger/expiring"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/ledger/positions"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/ledger/realized"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/ledger/summary"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/ledger/trades"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/market/positions"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/market/settings"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/system/info"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/agent/sessions"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/agent/sessions/{}/cancel"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/agent/sessions/{}/messages"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/logout"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/{}/exchange"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/{}/start"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/devices/tokens"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/google/authorization-transactions"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/google/authorization-transactions/{}/complete"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/google/connections/{}/sync"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/imports/preview"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/imports/{}/cancel"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/imports/{}/commit"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/ledger/accounts"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/google/connections/{}/mappings/{}"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/market/settings"
+    },
+    {
+      "method": "WS",
+      "path": "/v1/events"
+    }
+  ]
+}

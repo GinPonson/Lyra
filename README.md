@@ -2,6 +2,8 @@
 
 自用资产账本与金融分析 App：Flutter 客户端连接单个 TypeScript / Fastify 服务，DuckDB 保存账本、会话和工具审计。
 
+> **服务端正在迁移到 Python/FastAPI。** 目标是把服务端全量换成 Python（Python 接管账本文件与 schema 迁移），**客户端协议保持 2 不变**。新服务在 [`server/`](server/README.md)，进度与验收见[迁移计划](docs/plans/lyra-python-migration-20261012.md)。切换是原子的（DuckDB 单进程锁），在上线前 Flutter 仍连接上面的 TypeScript 服务端。
+
 ## 当前架构
 
 - **一个 Lyra 助手**：Genkit 负责模型调用与工具循环，调用服务端 18 个只读金融工具，包括 17 个账本工具和独立的行情参考估值工具。
