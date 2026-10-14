@@ -3,10 +3,16 @@
 路径与 TypeScript 侧逐条对齐（``/v1/ledger/*`` 与 ``/v1/analytics/*``），
 协议版本仍为 2。
 
-**当前响应形状**：领域对象直接序列化（字段名与分析层一致）。这与 oracle 的
-CLI 输出一致，但**尚未**套上 TypeScript 工具运行时的公开投影（camelCase 字段
-名与按币种分组的信封）。在切流之前必须补齐该投影层，否则 Flutter 会看到字段名
-差异——这一步记录在迁移计划的 M4 待办中。
+**响应形状**：``{"metadata": {...}, "data": {...}}``，与参考实现逐字段一致。
+
+``metadata`` 携带**服务端权威生成**的语境：账户范围、解析出的账户 ID、按币种
+分组、账本版本、数据截止时间与获取时间。客户端用它判断"这份数据是什么时候、
+在什么范围下算出来的"；让客户端自己拼这些字段，等于让它用请求参数覆盖服务端
+事实。
+
+**这一层曾整体缺失**：早期实现直接返回领域对象，于是 Flutter 解析
+``json["metadata"]`` 时拿到 ``null``，总览恒显示"数据未能加载"——服务端 200、
+客户端报错，而当时的测试只校验路径与状态码，看不见响应形状。
 """
 
 from __future__ import annotations
@@ -107,6 +113,55 @@ def create_ledger_router() -> APIRouter:
     def _scope(request: Request, scope: str | None) -> AccountScope:
         return _resolved_scope(request, scope)
 
+    def _resolved(request: Request, scope: str | None) -> tuple[Any, AccountScope]:
+        """一次请求内**只解析一次**快照与账户范围。
+
+        元数据里的账户范围、账户 ID 与按币种分组必须与本次查询用的是同一份事实；
+        各自重算会让两者在并发写入下出现分歧（元数据说 A 币种、数据是 B 币种）。
+        """
+        cached = getattr(request.state, "ledger_resolution", None)
+        if cached is None:
+            resolved = _resolved_scope(request, scope)
+            cached = (_snapshot(request, scope), resolved)
+            request.state.ledger_resolution = cached
+        return cached
+
+    def _envelope(request: Request, scope: str | None, data: Any) -> Any:
+        """把查询结果包成 ``{metadata, data}``。
+
+        @param data: 已投影（camelCase）的查询结果。
+        @returns 可直接序列化的公开响应。
+        """
+        snapshot, resolved = _resolved(request, scope)
+        connection = request.app.state.database.connection
+        row = connection.execute(
+            "SELECT coalesce(max(version), 0) FROM ledger_versions"
+        ).fetchone()
+        ledger_version = int(row[0]) if row else 0
+        fetched_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        by_currency: dict[str, list[str]] = {}
+        for account in snapshot.accounts:
+            by_currency.setdefault(account.base_currency, []).append(account.id)
+        metadata = {
+            "accountScope": (
+                {"kind": "all"} if resolved.kind == "all"
+                else {"kind": "account", "account": resolved.account}
+            ),
+            "accountIds": [account.id for account in snapshot.accounts],
+            "currencyGroups": [
+                {"currency": currency, "accountIds": ids}
+                for currency, ids in sorted(by_currency.items())
+            ],
+            "aggregateCurrency": (
+                next(iter(by_currency)) if len(by_currency) == 1 else None
+            ),
+            "ledgerVersion": ledger_version,
+            # 数据截止时间与获取时间都由服务端时钟给出：客户端不得用请求参数覆盖。
+            "asOf": fetched_at,
+            "fetchedAt": fetched_at,
+        }
+        return to_jsonable({"metadata": metadata, "data": data})
+
     @router.post("/v1/ledger/accounts", status_code=201)
     async def create_account_route(
         request: Request,
@@ -167,8 +222,13 @@ def create_ledger_router() -> APIRouter:
         return {"account": public}
 
     @router.get("/v1/ledger/accounts")
-    def read_accounts(request: Request) -> Any:
-        """当前设备的活跃与已归档账户；**不暴露券商账户的完整标识**。"""
+    def read_accounts(request: Request, scope: str | None = Query(default=None)) -> Any:
+        """当前设备的活跃与已归档账户；**不暴露券商账户的完整标识**。
+
+        ``scope`` 与其它账本端点同义：账户清单本身不受范围过滤，但**元数据里的范围
+        必须来自同一个显式参数**——省略它会让"查全部账户"变成隐式默认，而本项目的
+        既定方向是"忘记带参数就报错，而不是给全部数据"。
+        """
         connection = request.app.state.database.connection
         rows = connection.execute(
             """
@@ -187,13 +247,14 @@ def create_ledger_router() -> APIRouter:
             for row in rows
         ]
         projected = project_account_list(accounts)
-        return to_jsonable({"rows": projected, "count": len(projected)})
+        return _envelope(request, scope, {"rows": projected, "count": len(projected)})
 
     @router.get("/v1/ledger/summary")
     def read_summary(request: Request, scope: str | None = Query(default=None)) -> Any:
         """账户总览；返回按币种分组的信封。"""
-        return to_jsonable(handle_currency_grouped(
-            "summary", _snapshot(request, scope), _scope(request, scope), {}
+        snapshot, resolved = _resolved(request, scope)
+        return _envelope(request, scope, handle_currency_grouped(
+            "summary", snapshot, resolved, {}
         ))
 
     @router.get("/v1/ledger/positions")
@@ -203,10 +264,10 @@ def create_ledger_router() -> APIRouter:
         underlying: str | None = Query(default=None),
     ) -> Any:
         """当前持仓。"""
-        snapshot = _snapshot(request, scope)
-        rows = aggregate_positions(snapshot.open_lots, _scope(request, scope), underlying)
+        snapshot, resolved = _resolved(request, scope)
+        rows = aggregate_positions(snapshot.open_lots, resolved, underlying)
         projected = project_positions(rows, account_id_map(snapshot.accounts))
-        return to_jsonable({
+        return _envelope(request, scope, {
             "rows": projected,
             "count": len(projected),
             "basis": "historical_cost_not_market_value",
@@ -220,10 +281,10 @@ def create_ledger_router() -> APIRouter:
         days: int = Query(default=DEFAULT_EXPIRING_DAYS),
     ) -> Any:
         """到期窗口内的未平期权；``as_of`` 必填，避免结果随服务器日期漂移。"""
-        snapshot = _snapshot(request, scope)
-        positions = aggregate_positions(snapshot.open_lots, _scope(request, scope))
+        snapshot, resolved = _resolved(request, scope)
+        positions = aggregate_positions(snapshot.open_lots, resolved)
         result = analyze_expiring_positions(positions, as_of, days)
-        return to_jsonable(project_expiring(result, account_id_map(snapshot.accounts)))
+        return _envelope(request, scope, project_expiring(result, account_id_map(snapshot.accounts)))
 
     @router.get("/v1/ledger/trades")
     def read_trades(
@@ -236,15 +297,15 @@ def create_ledger_router() -> APIRouter:
         ``cursor`` 是上一次响应里的 ``nextCursor`` 原样回传。**无效游标报 400 而不是
         回退到第一页**——回退会让客户端把"游标坏了"当成"数据到头了"。
         """
-        snapshot = _snapshot(request, scope)
+        snapshot, resolved = _resolved(request, scope)
         try:
             result = query_trades(
-                snapshot.transactions, _scope(request, scope),
+                snapshot.transactions, resolved,
                 TradeQueryFilters(cursor=cursor),
             )
         except IngestError as error:
             raise _invalid_cursor(error) from error
-        return to_jsonable(project_trade_query(
+        return _envelope(request, scope, project_trade_query(
             result,
             account_id_map(snapshot.accounts),
             {t.transaction_hash: t for t in snapshot.transactions},
@@ -257,10 +318,10 @@ def create_ledger_router() -> APIRouter:
         cursor: str | None = Query(default=None),
     ) -> Any:
         """已实现明细；隐藏开平仓交易哈希。"""
-        snapshot = _snapshot(request, scope)
+        snapshot, resolved = _resolved(request, scope)
         fifo = replay_fifo(snapshot.transactions)
-        return to_jsonable(project_realized_query(
-            query_realized(fifo.realized_records, _scope(request, scope)),
+        return _envelope(request, scope, project_realized_query(
+            query_realized(fifo.realized_records, resolved),
             account_id_map(snapshot.accounts),
         ))
 
@@ -271,9 +332,9 @@ def create_ledger_router() -> APIRouter:
         cursor: str | None = Query(default=None),
     ) -> Any:
         """现金流水；附分动作合计。"""
-        snapshot = _snapshot(request, scope)
-        return to_jsonable(project_cashflow_query(
-            query_cashflow(snapshot.transactions, _scope(request, scope)),
+        snapshot, resolved = _resolved(request, scope)
+        return _envelope(request, scope, project_cashflow_query(
+            query_cashflow(snapshot.transactions, resolved),
             account_id_map(snapshot.accounts),
             {t.transaction_hash: t for t in snapshot.transactions},
         ))
@@ -281,19 +342,19 @@ def create_ledger_router() -> APIRouter:
     @router.get("/v1/ledger/audit")
     def read_audit(request: Request, scope: str | None = Query(default=None)) -> Any:
         """账本一致性审计（只读）。"""
-        snapshot = _snapshot(request, scope)
+        snapshot, resolved = _resolved(request, scope)
         fifo = replay_fifo(snapshot.transactions)
-        return to_jsonable(project_ledger_audit(
-            audit_ledger(snapshot.transactions, fifo, _scope(request, scope))
+        return _envelope(request, scope, project_ledger_audit(
+            audit_ledger(snapshot.transactions, fifo, resolved)
         ))
 
     @router.get("/v1/analytics/monthly")
     def read_monthly(request: Request, scope: str | None = Query(default=None)) -> Any:
         """月度绩效；返回按币种分组的信封。"""
-        return to_jsonable(handle_currency_grouped(
-            "monthly", _snapshot(request, scope), _scope(request, scope), {}
-        ))
-
+        snapshot, resolved = _resolved(request, scope)
+        return _envelope(request, scope, handle_currency_grouped(
+                "monthly", snapshot, resolved, {}
+            ))
 
     @router.get("/v1/analytics/allocation")
     def read_allocation(
@@ -302,10 +363,10 @@ def create_ledger_router() -> APIRouter:
         group_by: str = Query(default="underlying"),
     ) -> Any:
         """历史成本配置。"""
-        return to_jsonable(handle_currency_grouped(
-            "allocation", _snapshot(request, scope), _scope(request, scope), {"groupBy": group_by}
-        ))
-
+        snapshot, resolved = _resolved(request, scope)
+        return _envelope(request, scope, handle_currency_grouped(
+                "allocation", snapshot, resolved, {"groupBy": group_by}
+            ))
 
     @router.get("/v1/analytics/attribution")
     def read_attribution(
@@ -314,18 +375,18 @@ def create_ledger_router() -> APIRouter:
         group_by: str = Query(default="underlying"),
     ) -> Any:
         """已实现损益归因。"""
-        return to_jsonable(handle_currency_grouped(
-            "attribution", _snapshot(request, scope), _scope(request, scope), {"groupBy": group_by}
-        ))
-
+        snapshot, resolved = _resolved(request, scope)
+        return _envelope(request, scope, handle_currency_grouped(
+                "attribution", snapshot, resolved, {"groupBy": group_by}
+            ))
 
     @router.get("/v1/analytics/drawdown")
     def read_drawdown(request: Request, scope: str | None = Query(default=None)) -> Any:
         """日度回撤；返回按币种分组的信封。"""
-        return to_jsonable(handle_currency_grouped(
-            "drawdown", _snapshot(request, scope), _scope(request, scope), {}
-        ))
-
+        snapshot, resolved = _resolved(request, scope)
+        return _envelope(request, scope, handle_currency_grouped(
+                "drawdown", snapshot, resolved, {}
+            ))
 
     @router.get("/v1/analytics/risk")
     def read_risk(
@@ -334,7 +395,7 @@ def create_ledger_router() -> APIRouter:
         as_of: str = Query(...),
     ) -> Any:
         """期权风险桶；``as_of`` 必填。"""
-        snapshot = _snapshot(request, scope)
+        snapshot, resolved = _resolved(request, scope)
 
         def calculate(subset: Any) -> dict[str, Any]:
             # **这里刻意传全部而不是解析后的范围。**
@@ -346,17 +407,17 @@ def create_ledger_router() -> APIRouter:
                 calculate_option_risk(subset.open_lots, AccountScope(kind="all"), as_of)
             )
 
-        return to_jsonable(project_currency_grouped(
-            group_by_currency(snapshot, _scope(request, scope), calculate)
+        return _envelope(request, scope, project_currency_grouped(
+            group_by_currency(snapshot, resolved, calculate)
         ))
 
     @router.get("/v1/analytics/holding-period")
     def read_holding_period(request: Request, scope: str | None = Query(default=None)) -> Any:
         """持有期汇总。"""
-        return to_jsonable(handle_currency_grouped(
-            "holding-period", _snapshot(request, scope), _scope(request, scope), {}
-        ))
-
+        snapshot, resolved = _resolved(request, scope)
+        return _envelope(request, scope, handle_currency_grouped(
+                "holding-period", snapshot, resolved, {}
+            ))
 
     @router.get("/v1/analytics/extremes")
     def read_extremes(
@@ -365,27 +426,28 @@ def create_ledger_router() -> APIRouter:
         limit: int = Query(default=DEFAULT_EXTREMES_LIMIT),
     ) -> Any:
         """最佳与最差交易。"""
-        snapshot = _snapshot(request, scope)
+        snapshot, resolved = _resolved(request, scope)
         fifo = replay_fifo(snapshot.transactions)
-        return to_jsonable(project_extreme_trades(
-            calculate_extreme_trades(fifo.realized_records, _scope(request, scope), limit),
+        return _envelope(request, scope, project_extreme_trades(
+            calculate_extreme_trades(fifo.realized_records, resolved, limit),
             account_id_map(snapshot.accounts),
         ))
 
     @router.get("/v1/analytics/streaks")
     def read_streaks(request: Request, scope: str | None = Query(default=None)) -> Any:
         """最长连续盈利与亏损。"""
-        return to_jsonable(handle_currency_grouped(
-            "streaks", _snapshot(request, scope), _scope(request, scope), {}
-        ))
-
+        snapshot, resolved = _resolved(request, scope)
+        return _envelope(request, scope, handle_currency_grouped(
+                "streaks", snapshot, resolved, {}
+            ))
 
     @router.get("/v1/analytics/stress")
     def read_stress(request: Request, scope: str | None = Query(default=None)) -> Any:
         """长期权权利金归零压力。"""
-        return to_jsonable(handle_currency_grouped(
-            "stress", _snapshot(request, scope), _scope(request, scope), {}
-        ))
+        snapshot, resolved = _resolved(request, scope)
+        return _envelope(request, scope, handle_currency_grouped(
+                "stress", snapshot, resolved, {}
+            ))
 
     return router
 

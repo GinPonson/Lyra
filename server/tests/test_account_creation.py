@@ -232,7 +232,8 @@ def test_the_account_appears_in_the_list(client) -> None:
     created = _create(test_client, issued, _VALID).json()["account"]
 
     listed = test_client.get(
-        "/v1/ledger/accounts", headers=_auth(issued)
+        "/v1/ledger/accounts", headers=_auth(issued), params={"scope": "all"}
     ).json()
 
-    assert created["id"] in [row["id"] for row in listed["rows"]]
+    # 列表也在 ``{metadata, data}`` 信封里；账户清单本身不受范围过滤。
+    assert created["id"] in [row["id"] for row in listed["data"]["rows"]]

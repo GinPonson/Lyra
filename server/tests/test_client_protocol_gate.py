@@ -67,6 +67,7 @@ def test_missing_protocol_header_is_426_not_401(application) -> None:
     with TestClient(app) as client:
         response = client.get(
             "/v1/ledger/accounts",
+            params={"scope": "all"},
             headers={"Authorization": f"Bearer {issued.access_token}"},
         )
 
@@ -110,6 +111,7 @@ def test_a_supported_version_passes(application) -> None:
     with TestClient(app, headers=CLIENT_PROTOCOL_HEADERS) as client:
         response = client.get(
             "/v1/ledger/accounts",
+            params={"scope": "all"},
             headers={"Authorization": f"Bearer {issued.access_token}"},
         )
 

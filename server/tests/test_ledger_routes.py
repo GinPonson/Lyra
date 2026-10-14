@@ -106,11 +106,23 @@ def _auth(issued) -> dict[str, str]:
     }
 
 
+def _data(body: dict) -> dict:
+    """取出 ``{metadata, data}`` 信封里的数据段。
+
+    **这层信封是协议的一部分**：元数据携带服务端权威的账户范围、账本版本与时间，
+    客户端从 ``body["data"]`` 读结果。早期实现直接返回数据段，Flutter 解析
+    ``body["metadata"]`` 拿到 ``null``，总览恒显示"数据未能加载"。
+    """
+    assert set(body) == {"metadata", "data"}, f"响应缺少信封: {sorted(body)}"
+    return body["data"]
+
+
 def _summary_data(body: dict) -> dict:
     """取出总览信封里的第一个币种分组数据。"""
-    assert body["aggregateCurrency"] == "USD"
-    assert len(body["groups"]) == 1
-    return body["groups"][0]["data"]
+    data = _data(body)
+    assert data["aggregateCurrency"] == "USD"
+    assert len(data["groups"]) == 1
+    return data["groups"][0]["data"]
 
 
 def test_rejects_missing_token(client) -> None:
@@ -162,7 +174,7 @@ def test_amounts_are_decimal_strings_not_floats(client) -> None:
 def test_positions_endpoint_shape(client) -> None:
     """持仓端点返回 rows/count 信封。"""
     test_client, issued = client
-    body = test_client.get("/v1/ledger/positions", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/ledger/positions", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["count"] == 0
     assert body["rows"] == []
@@ -171,7 +183,7 @@ def test_positions_endpoint_shape(client) -> None:
 def test_realized_endpoint_returns_decimal_strings(client) -> None:
     """已实现明细的金额同样是字符串。"""
     test_client, issued = client
-    body = test_client.get("/v1/ledger/realized", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/ledger/realized", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["count"] == 1
     assert isinstance(body["totalPnl"], str)
@@ -187,7 +199,7 @@ def test_realized_endpoint_returns_decimal_strings(client) -> None:
 def test_drawdown_endpoint_uses_currency_envelope(client) -> None:
     """回撤端点返回币种信封，且公开字段为 camelCase。"""
     test_client, issued = client
-    body = test_client.get("/v1/analytics/drawdown", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/analytics/drawdown", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["aggregateCurrency"] == "USD"
     assert len(body["groups"]) == 1
@@ -287,7 +299,7 @@ def test_position_projection_redacts_account_and_uses_camel_case(client) -> None
         [ACCOUNT_ID, _h("txn-1")],
     )
 
-    body = test_client.get("/v1/ledger/positions", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/ledger/positions", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["count"] == 1
     assert body["basis"] == "historical_cost_not_market_value"
@@ -306,10 +318,10 @@ def test_position_projection_redacts_account_and_uses_camel_case(client) -> None
 def test_expiring_projection_uses_camel_case(client) -> None:
     """到期端点的统计字段同样是 camelCase。"""
     test_client, issued = client
-    body = test_client.get(
+    body = _data(test_client.get(
         "/v1/ledger/expiring", headers=_auth(issued),
         params={"as_of": "2026-09-01", "scope": "all"},
-    ).json()
+    ).json())
 
     assert set(body) == {"rows", "count", "asOf", "cutoff", "expired", "expiresToday", "upcoming"}
     assert body["asOf"] == "2026-09-01"
@@ -330,9 +342,12 @@ _ENVELOPE_CASES = [
 def test_analytics_endpoints_return_currency_envelope(client, path: str, public_field: str) -> None:
     """这些命令都返回币种信封，且 data 是 camelCase 公开字段。"""
     test_client, issued = client
-    body = test_client.get(
+    envelope = test_client.get(
         path, headers=_auth(issued), params={"scope": "all"}
     ).json()
+    # 外层信封是 {metadata, data}；币种分组在 data 里。
+    assert set(envelope) == {"metadata", "data"}, path
+    body = envelope["data"]
 
     assert set(body) == {"aggregateCurrency", "groups"}, path
     assert body["aggregateCurrency"] == "USD", path
@@ -351,10 +366,10 @@ def test_risk_endpoint_requires_as_of_and_returns_envelope(client) -> None:
         "/v1/analytics/risk", headers=_auth(issued), params={"scope": "all"}
     ).status_code == 400
 
-    body = test_client.get(
+    body = _data(test_client.get(
         "/v1/analytics/risk", headers=_auth(issued),
         params={"as_of": "2026-09-01", "scope": "all"},
-    ).json()
+    ).json())
     assert body["aggregateCurrency"] == "USD"
     data = body["groups"][0]["data"]
     assert data["asOf"] == "2026-09-01"
@@ -369,9 +384,9 @@ def test_envelope_data_has_no_snake_case_keys(client) -> None:
     """
     test_client, issued = client
     for path, _ in _ENVELOPE_CASES:
-        data = test_client.get(
+        data = _data(test_client.get(
             path, headers=_auth(issued), params={"scope": "all"}
-        ).json()["groups"][0]["data"]
+        ).json())["groups"][0]["data"]
         for key in data:
             # **``request_id`` 是唯一允许的 snake_case 键**：它是日志关联标识而非领域
             # 字段，参考实现也用这个名字（见 `api-error.ts` 的 `createResponse`）。
@@ -384,7 +399,7 @@ def test_envelope_data_has_no_snake_case_keys(client) -> None:
 def test_trades_projection_hides_hashes_and_uses_camel_case(client) -> None:
     """交易投影必须隐藏哈希与来源引用，并把 symbol 取自 raw_symbol。"""
     test_client, issued = client
-    body = test_client.get("/v1/ledger/trades", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/ledger/trades", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["count"] == 2
     # 查询按交易日期倒序，因此首行是卖出。
@@ -420,7 +435,7 @@ def test_cashflow_projection_includes_action_totals(client) -> None:
         [ACCOUNT_ID, _h("source"), _h("business-3"), _h("txn-3")],
     )
 
-    body = test_client.get("/v1/ledger/cashflow", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/ledger/cashflow", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["count"] == 1
     assert isinstance(body["total"], str)
@@ -433,7 +448,7 @@ def test_cashflow_projection_includes_action_totals(client) -> None:
 def test_cashflow_is_empty_without_cash_transactions(client) -> None:
     """没有现金类交易时返回空结果，而不是把买卖也算进来。"""
     test_client, issued = client
-    body = test_client.get("/v1/ledger/cashflow", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/ledger/cashflow", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["count"] == 0
     assert body["rows"] == []
@@ -458,9 +473,9 @@ def test_pagination_fields_are_truthful_not_fabricated(client) -> None:
     test_client, issued = client
 
     for path in ("/v1/ledger/trades", "/v1/ledger/realized", "/v1/ledger/cashflow"):
-        body = test_client.get(
+        body = _data(test_client.get(
             path, headers=_auth(issued), params={"scope": "all"}
-        ).json()
+        ).json())
 
         # 夹具数据不足一页，因此必须是 null，而不是被截断出来的游标。
         assert body["nextCursor"] is None, f"{path} 伪造了 nextCursor"
@@ -477,7 +492,7 @@ def test_pagination_fields_are_truthful_not_fabricated(client) -> None:
 def test_audit_projection_is_camel_case(client) -> None:
     """审计报告为 camelCase，且不含旧账户键。"""
     test_client, issued = client
-    body = test_client.get("/v1/ledger/audit", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/ledger/audit", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["readOnly"] is True
     assert body["transactionCount"] == 2
@@ -493,7 +508,7 @@ def test_audit_projection_is_camel_case(client) -> None:
 def test_extremes_projection_hides_hashes_and_redacts_account(client) -> None:
     """极值交易只公开业务字段，账户脱敏为 UUID，且不含交易哈希。"""
     test_client, issued = client
-    body = test_client.get("/v1/analytics/extremes", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/analytics/extremes", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["perSide"] == 10
     assert body["basis"]
@@ -557,7 +572,7 @@ def test_no_read_endpoint_leaks_snake_case_keys(client) -> None:
 def test_accounts_endpoint_exposes_public_fields(client) -> None:
     """账户端点返回 camelCase 字段，且不暴露券商完整标识。"""
     test_client, issued = client
-    body = test_client.get("/v1/ledger/accounts", headers=_auth(issued), params={"scope": "all"}).json()
+    body = _data(test_client.get("/v1/ledger/accounts", headers=_auth(issued), params={"scope": "all"}).json())
 
     assert body["count"] == 1
     row = body["rows"][0]
@@ -615,9 +630,9 @@ def test_a_cursor_from_a_different_scope_is_rejected(client) -> None:
 def test_no_cursor_means_the_first_page(client) -> None:
     """不带游标即第一页。"""
     test_client, issued = client
-    body = test_client.get(
+    body = _data(test_client.get(
         "/v1/ledger/trades", headers=_auth(issued), params={"scope": "all"}
-    ).json()
+    ).json())
 
     assert body["count"] >= 0
     # 夹具数据不足一页，因此没有下一页。
