@@ -148,6 +148,7 @@ def test_market_positions_uses_account_id_not_the_legacy_key() -> None:
     projected = project_market_positions(
         [{
             "account": "TST001", "symbol_key": "INTC", "asset_type": "stock",
+            "currency": "USD", "instrument_key": "US:stock:INTC",
             "underlying": "INTC", "expiry": None, "strike": None, "option_type": None,
             "direction": "long", "quantity": "10", "cost": "400",
             "first_open_date": "2026-01-05",
@@ -155,7 +156,10 @@ def test_market_positions_uses_account_id_not_the_legacy_key() -> None:
                 "marketValue": None, "unrealizedPnl": None,
                 "multiplier": "1", "basis": "reference_price_excluding_fees",
             },
-            "quote": None,
+            "quote": {
+                "status": "unavailable", "quote": None, "referencePrice": None,
+                "issue": "not_configured", "cached": False,
+            },
         }],
         None,
         {"TST001": "11111111-1111-1111-1111-111111111111"},

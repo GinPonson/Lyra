@@ -7,18 +7,12 @@
 | ``POST /v1/imports/preview`` | ✅ |
 | ``GET /v1/imports/{importId}`` | ✅ |
 | ``POST /v1/imports/{importId}/cancel`` | ✅ |
-| ``POST /v1/imports/{importId}/commit`` | ✅ **未接幂等键**（见下） |
+| ``POST /v1/imports/{importId}/commit`` | ✅ |
 
 预览请求体是**原始字节**（``application/octet-stream``），文件名走
 ``x-lyra-file-name`` 头——与 TypeScript 侧一致，不使用 multipart。
-
-**一处仍未闭合的差异**：参考实现的提交路由会读取 ``Idempotency-Key`` 头，并把
-"读记录 → 决策 → 登记 → 收口/释放"编排进提交路径（§143）。本模块尚未接入，
-因此同一份文件重复提交会**真的执行两次提交**，而不是返回同一个作业。
-
-幂等的**决策函数与仓储均已就绪**（``application/idempotent_mutation.py``、
-``infrastructure/db/mutation_idempotency_repository.py``），缺的只是这里的编排。
-**它是当前唯一未闭合的协议行为差异**，已在计划文档 §143.7 列出实现步骤。
+预览响应与 Flutter ``ImportPreviewView.fromJson`` 对齐：根对象携带 ``importId`` 与
+一次性 ``confirmToken``，统计与账户信息位于 ``preview`` 对象中。
 """
 
 from __future__ import annotations
@@ -103,7 +97,7 @@ def create_import_router() -> APIRouter:
         @param request: 请求对象。
         @param x_lyra_file_name: 原始文件名。
         @param account_id: 可选的显式账户 UUID。
-        @returns 预览结果与一次性预览令牌。
+        @returns Flutter 可解析的预览结果与一次性确认令牌。
         @raises HTTPException: 上传不合法、格式未实现或无法唯一绑定账户。
         """
         if (
@@ -197,8 +191,7 @@ def create_import_router() -> APIRouter:
             import_id=import_id,
             account_id=resolved.account_id,
             base_ledger_version=base_version,
-            token=issued.token,
-            expires_at=issued.record.expires_at,
+            confirm_token=issued.token,
         )
 
     @router.get("/v1/imports/{import_id}")

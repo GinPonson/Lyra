@@ -31,11 +31,13 @@ from ..domain.market_data.settings import (
     effective_routes,
     normalize_routes,
 )
+from ..infrastructure.db.account_lookup import resolve_legacy_account_key
+from ..infrastructure.db.ledger_repository import DuckDbLedgerRepository
 from ..infrastructure.db.market_settings_repository import (
     load_market_settings,
     persist_market_settings,
 )
-from .dependencies import require_device, to_jsonable
+from .dependencies import parse_scope_query, require_device, to_jsonable
 
 
 def create_market_router() -> APIRouter:
@@ -55,8 +57,14 @@ def create_market_router() -> APIRouter:
         routes = stored.routes if stored is not None else (
             runtime.default_routes if runtime is not None else normalize_routes(None)
         )
+        revision = 0 if stored is None else stored.revision
+        if runtime is not None:
+            # 读取时同步持久化状态，避免服务重启或外部更新后继续按旧路由报价。
+            current = runtime.initialize_settings(routes, revision)
+            routes = current.routes
+            revision = current.revision
         return _settings_payload(
-            revision=0 if stored is None else stored.revision,
+            revision=revision,
             routes=routes,
             configured=configured,
             providers=_provider_options(runtime),
@@ -121,13 +129,20 @@ def create_market_router() -> APIRouter:
             ) from error
 
         runtime = request.app.state.market_runtime
-        if runtime is not None:
-            # **热切换**：设置保存后立刻生效，不需要重启。
-            runtime.service.set_routes(routes)
         stored = load_market_settings(connection)
+        active_routes = routes
+        active_revision = revision
+        if runtime is not None:
+            # **热切换**：写入后的持久化版本立即生效；并发较新的版本优先。
+            current = runtime.initialize_settings(
+                routes if stored is None else stored.routes,
+                revision if stored is None else stored.revision,
+            )
+            active_routes = current.routes
+            active_revision = current.revision
         return _settings_payload(
-            revision=revision,
-            routes=routes,
+            revision=active_revision,
+            routes=active_routes,
             configured=frozenset(runtime.provider_ids) if runtime is not None else frozenset(),
             providers=_provider_options(runtime),
             updated_at=None if stored is None else stored.updated_at,
@@ -136,33 +151,130 @@ def create_market_router() -> APIRouter:
     @router.get("/v1/market/positions")
     def read_market_positions(
         request: Request,
-        account: str | None = None,
+        scope: str | None = None,
         underlying: str | None = None,
     ) -> Any:
-        """当前持仓的参考估值。
+        """按显式账户范围读取持仓参考估值。
 
         **行情不可用不影响本端点的可用性**：行情只有可用时才附加到行上，
         账本数据照常返回。
         """
         connection = request.app.state.database.connection
-        scope = AccountScope(kind="all") if not account else AccountScope(
-            kind="account", account=account
+        public_scope = parse_scope_query(scope)
+        # 账本、修订号和路由必须来自同一数据库读快照；显式事务同时阻止共享连接被
+        # 其它请求插入写操作。行情 I/O 在提交后进行，避免网络延迟占住数据库锁。
+        connection.execute("BEGIN TRANSACTION")
+        try:
+            resolved_scope = _resolve_market_scope(connection, public_scope)
+            snapshot = DuckDbLedgerRepository(connection).load_snapshot(resolved_scope)
+            stored = load_market_settings(connection)
+            version_row = connection.execute(
+                "SELECT coalesce(max(version), 0) FROM ledger_versions"
+            ).fetchone()
+            ledger_version = int(version_row[0]) if version_row else 0
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+
+        runtime = request.app.state.market_runtime
+        market_settings = None
+        if runtime is not None:
+            routes = stored.routes if stored is not None else runtime.default_routes
+            revision = 0 if stored is None else stored.revision
+            market_settings = runtime.initialize_settings(routes, revision)
+        data = handle_market_positions(
+            connection,
+            resolved_scope,
+            runtime,
+            underlying,
+            snapshot=snapshot,
+            market_settings=market_settings,
         )
-        return to_jsonable(handle_market_positions(
-            connection, scope, request.app.state.market_runtime, underlying
-        ))
+        return _market_positions_envelope(
+            public_scope, snapshot, data, ledger_version
+        )
 
     return router
 
 
 def _provider_options(runtime: Any) -> list[dict[str, Any]]:
-    """可选来源列表。"""
+    """投影真实来源目录，保留未配置来源的不可用状态。"""
     if runtime is None:
         return []
     return [
-        {"id": provider_id, "displayName": provider_id, "configured": True}
-        for provider_id in runtime.provider_ids
+        {
+            "id": provider.id,
+            "displayName": provider.display_name,
+            "assetTypes": list(provider.asset_types),
+            "configured": provider.configured,
+            "timing": {
+                "kind": provider.timing_kind,
+                "delayMinutes": provider.delay_minutes,
+            },
+            "cacheTtlSeconds": provider.cache_ttl_seconds,
+        }
+        for provider in runtime.provider_options
     ]
+
+
+def _resolve_market_scope(connection: Any, scope: AccountScope) -> AccountScope:
+    """把公开账户 UUID 映射到账本查询使用的 legacy key。
+
+    @param connection: 当前数据库连接。
+    @param scope: 已由 parse_scope_query 校验的公开账户范围。
+    @returns 账本查询范围。
+    @raises HTTPException: UUID 对应账户不存在时返回 404。
+    """
+    if scope.kind == "all":
+        return scope
+    key = resolve_legacy_account_key(connection, scope.account or "")
+    if key is None:
+        raise HTTPException(status_code=404, detail={"code": "ACCOUNT_NOT_FOUND"})
+    return AccountScope(kind="account", account=key)
+
+
+def _market_positions_envelope(
+    scope: AccountScope,
+    snapshot: Any,
+    data: dict[str, Any],
+    ledger_version: int,
+) -> dict[str, Any]:
+    """为行情持仓数据添加与账本查询一致的 metadata/data 信封。
+
+    @param scope: 公开 UUID 范围；不含账本内部 legacy key。
+    @param snapshot: 本次数据使用的账本快照。
+    @param data: 共享持仓估值处理器返回的数据部分。
+    @param ledger_version: 与快照在同一只读事务中捕获的账本版本。
+    @returns 可直接序列化的公开响应。
+    """
+    fetched_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+    accounts_by_currency: dict[str, list[str]] = {}
+    for account in snapshot.accounts:
+        accounts_by_currency.setdefault(account.base_currency, []).append(account.id)
+    metadata = {
+        "accountScope": (
+            {"kind": "all"}
+            if scope.kind == "all"
+            else {"kind": "account", "account": scope.account}
+        ),
+        "accountIds": [account.id for account in snapshot.accounts],
+        "currencyGroups": [
+            {"currency": currency, "accountIds": ids}
+            for currency, ids in sorted(accounts_by_currency.items())
+        ],
+        "aggregateCurrency": (
+            next(iter(accounts_by_currency))
+            if len(accounts_by_currency) == 1
+            else None
+        ),
+        "ledgerVersion": ledger_version,
+        "asOf": fetched_at,
+        "fetchedAt": fetched_at,
+    }
+    return to_jsonable({"metadata": metadata, "data": data})
 
 
 def _settings_payload(

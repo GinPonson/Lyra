@@ -44,6 +44,8 @@ from ..domain.analytics.audit import audit_ledger
 from ..domain.analytics.currency_groups import group_by_currency
 from ..domain.analytics.positions import aggregate_positions, analyze_expiring_positions
 from ..domain.analytics.queries import (
+    CashflowQueryFilters,
+    RealizedQueryFilters,
     TradeQueryFilters,
     query_cashflow,
     query_realized,
@@ -320,8 +322,14 @@ def create_ledger_router() -> APIRouter:
         """已实现明细；隐藏开平仓交易哈希。"""
         snapshot, resolved = _resolved(request, scope)
         fifo = replay_fifo(snapshot.transactions)
+        try:
+            result = query_realized(
+                fifo.realized_records, resolved, RealizedQueryFilters(cursor=cursor)
+            )
+        except IngestError as error:
+            raise _invalid_cursor(error) from error
         return _envelope(request, scope, project_realized_query(
-            query_realized(fifo.realized_records, resolved),
+            result,
             account_id_map(snapshot.accounts),
         ))
 
@@ -333,8 +341,14 @@ def create_ledger_router() -> APIRouter:
     ) -> Any:
         """现金流水；附分动作合计。"""
         snapshot, resolved = _resolved(request, scope)
+        try:
+            result = query_cashflow(
+                snapshot.transactions, resolved, CashflowQueryFilters(cursor=cursor)
+            )
+        except IngestError as error:
+            raise _invalid_cursor(error) from error
         return _envelope(request, scope, project_cashflow_query(
-            query_cashflow(snapshot.transactions, resolved),
+            result,
             account_id_map(snapshot.accounts),
             {t.transaction_hash: t for t in snapshot.transactions},
         ))

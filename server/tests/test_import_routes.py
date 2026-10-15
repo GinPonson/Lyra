@@ -268,7 +268,7 @@ def test_preview_requires_file_name_header(client) -> None:
 
 
 def test_preview_accepts_upload_and_returns_token(client, tmp_path) -> None:
-    """合法上传返回预览与一次性令牌，并落一个 preview_ready 作业。"""
+    """合法上传返回 Flutter 可解析的预览契约，并落一个 preview_ready 作业。"""
     connection = None
     test_client, issued = client
     response = _preview(client)
@@ -277,15 +277,21 @@ def test_preview_accepts_upload_and_returns_token(client, tmp_path) -> None:
     assert response.status_code == 201
     body = response.json()
     assert body["importId"]
-    assert body["accountId"] == ACCOUNT_ID
-    assert body["fileName"] == CSV_NAME
-    assert body["totalRows"] == 1
-    assert body["insertableRows"] == 1
-    assert body["existingRows"] == 0
-    assert body["baseLedgerVersion"] == 0
-    assert body["byAction"] == {"Buy": 1}
-    assert body["firstTransactionDate"] == "2026-01-05"
-    assert body["previewToken"]
+    assert set(body) == {"importId", "confirmToken", "preview"}
+    assert body["confirmToken"]
+    assert "previewToken" not in body
+    preview = body["preview"]
+    assert set(preview) == {
+        "fileName", "accountId", "baseLedgerVersion", "totalRows",
+        "insertableRows", "existingRows", "byAction",
+    }
+    assert preview["accountId"] == ACCOUNT_ID
+    assert preview["fileName"] == CSV_NAME
+    assert preview["totalRows"] == 1
+    assert preview["insertableRows"] == 1
+    assert preview["existingRows"] == 0
+    assert preview["baseLedgerVersion"] == 0
+    assert preview["byAction"] == {"Buy": 1}
 
     # 作业必须已经进入 preview_ready，且只存令牌哈希。
     connection = test_client.app.state.database.connection
@@ -295,7 +301,7 @@ def test_preview_accepts_upload_and_returns_token(client, tmp_path) -> None:
     ).fetchone()
     assert row is not None
     assert row[0] == "preview_ready"
-    assert row[1] != body["previewToken"], "数据库里存了明文令牌"
+    assert row[1] != body["confirmToken"], "数据库里存了明文令牌"
     assert len(row[1]) == 64
     # 空账本用 NULL 表示基准 0：该列引用 ledger_versions，没有 version 0 的行。
     assert row[2] is None
@@ -306,13 +312,25 @@ def test_preview_never_leaks_the_fingerprint(client) -> None:
     body = _preview(client).json()
     assert "previewFingerprint" not in body
     assert "preview_fingerprint" not in body
+    assert "previewFingerprint" not in body["preview"]
+    assert "preview_fingerprint" not in body["preview"]
 
 
 def test_preview_has_no_snake_case_keys(client) -> None:
     """预览响应同样不得出现 snake_case 字段。"""
     body = _preview(client).json()
-    for key in body:
-        assert "_" not in key, f"预览响应泄漏 snake_case 字段: {key}"
+
+    def assert_camel_case(value: object) -> None:
+        """递归验证预览的根对象与嵌套统计仅公开 camelCase 键。"""
+        if isinstance(value, dict):
+            for key, child in value.items():
+                assert "_" not in key, f"预览响应泄漏 snake_case 字段: {key}"
+                assert_camel_case(child)
+        elif isinstance(value, list):
+            for child in value:
+                assert_camel_case(child)
+
+    assert_camel_case(body)
 
 
 def test_preview_requires_account_mapping_when_unknown(client) -> None:
@@ -336,7 +354,7 @@ def test_preview_accepts_a_real_xlsx(client) -> None:
 
     # **201**（与参考实现一致）。
     assert response.status_code == 201
-    assert response.json()["totalRows"] == 1
+    assert response.json()["preview"]["totalRows"] == 1
 
 
 def test_preview_reports_a_corrupt_xlsx_as_validation_failure(client) -> None:
@@ -404,7 +422,7 @@ def _commit(client, import_id: str, token: str, extra_headers: dict | None = Non
 def _flow(client, *, name: str = CSV_NAME):
     """走一遍预览，返回 (importId, token)。"""
     body = _preview(client, name=name).json()
-    return body["importId"], body["previewToken"]
+    return body["importId"], body["confirmToken"]
 
 
 def test_commit_requires_authentication(client) -> None:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from threading import Lock, RLock
 from typing import Literal
 
 from ..domain.market_data.reference_price import (
@@ -109,6 +110,10 @@ class MarketDataService:
         self._max_quote_age_ms = max_quote_age_ms
         self._max_cache_entries = max_cache_entries
         self._cache: dict[str, _CacheEntry] = {}
+        # 网络调用可并行；共享缓存、路由与预算则通过状态锁读写。
+        self._state_lock = RLock()
+        # 同一来源与合约只允许一个刷新请求；固定条带数避免锁表随符号数增长。
+        self._instrument_locks = tuple(Lock() for _ in range(64))
         self._budgets: dict[str, ProviderBudget] = {
             provider_id: ProviderBudget() for provider_id in providers
         }
@@ -119,7 +124,11 @@ class MarketDataService:
         **不清空缓存**：缓存键里带来源 id，因此切换后旧来源的条目不会被新来源误用；
         清空反而会让切换立刻打出一批上游请求。
         """
-        self._routes = dict(routes)
+        with self._state_lock:
+            self._routes = {
+                asset_type: tuple(routes.get(asset_type, ()))
+                for asset_type in ("stock", "option")
+            }
 
     def get_quote(self, instrument: MarketInstrument) -> MarketQuoteLookup:
         """按资产类型的路由读取报价。
@@ -128,7 +137,9 @@ class MarketDataService:
         @returns 读取结果；**永不抛异常**（网络失败是数据状态）。
         """
         asset_type = "stock" if isinstance(instrument, StockInstrument) else "option"
-        return self.read_quote(instrument, self._routes.get(asset_type, ()))
+        with self._state_lock:
+            route = self._routes.get(asset_type, ())
+        return self.read_quote(instrument, route)
 
     def read_quote(
         self, instrument: MarketInstrument, route: tuple[str, ...]
@@ -142,16 +153,13 @@ class MarketDataService:
         issue: MarketQuoteIssue = "not_configured"
         stale: MarketQuoteLookup | None = None
         identifier = market_instrument_key(instrument)
-        now = self._now()
 
         for provider_id in route:
             if provider_id not in self._providers:
                 # 路由指向未装配的来源：跳过而不是崩溃。
                 continue
             key = f"{provider_id}\u0000{identifier}"
-            existing = self._cache.get(key)
-            cached = existing is not None and existing.expires_at > now
-            entry = existing if cached else self._refresh(provider_id, instrument, key, existing)
+            entry, cached = self._entry_for(provider_id, instrument, key)
 
             issue = entry.issue or "no_data"
             if entry.quote is None:
@@ -159,6 +167,7 @@ class MarketDataService:
             reference = select_market_reference_price(entry.quote)
             if reference is None:
                 continue
+            now = self._now()
             too_old = now - _parse_millis(reference.as_of) > self._max_quote_age_ms
             result = MarketQuoteLookup(
                 # 有 issue 说明这次刷新失败，只是用了缓存里的旧报价 → stale。
@@ -187,58 +196,84 @@ class MarketDataService:
         provider_id: str,
         instrument: MarketInstrument,
         key: str,
-        previous: _CacheEntry | None,
-    ) -> _CacheEntry:
-        """向上游取一次报价并写入缓存。"""
+    ) -> tuple[_CacheEntry, bool]:
+        """刷新单一缓存键，并返回报价是否来自已有缓存。"""
+        stripe = self._instrument_locks[hash(key) % len(self._instrument_locks)]
+        with stripe:
+            now = self._now()
+            with self._state_lock:
+                existing = self._cache.get(key)
+                if existing is not None and existing.expires_at > now:
+                    self._cache.pop(key)
+                    self._cache[key] = existing
+                    return existing, True
+                previous = existing
+                policy = self._policies[provider_id]
+                budget = self._budgets[provider_id]
+                denied = budget.consume(policy, now)
+
+            if denied is not None:
+                result = ProviderQuote(status="unavailable", reason=denied)
+            else:
+                try:
+                    result = self._providers[provider_id](instrument, now_ms=now)
+                except Exception:  # noqa: BLE001 - 供应商实现异常折叠为来源不可用
+                    result = ProviderQuote(
+                        status="unavailable", reason="provider_unavailable"
+                    )
+
+            completed = self._now()
+            # 交叉盘口是供应商数据形状错误，不能让它进入估值缓存。
+            if (
+                result.status == "available"
+                and result.quote is not None
+                and is_crossed_market(result.quote)
+            ):
+                result = ProviderQuote(status="unavailable", reason="invalid_response")
+            if result.status == "available" and result.quote is not None:
+                entry = _CacheEntry(
+                    quote=result.quote, issue=None,
+                    expires_at=completed + policy.cache_ttl_ms,
+                )
+                from_cache = False
+            else:
+                reason: MarketQuoteIssue = result.reason or "provider_unavailable"
+                cooldown = cooldown_ms(reason)
+                # 预算状态也会被不同合约并发访问，冷却写入与额度消费共用状态锁。
+                with self._state_lock:
+                    if denied is None and should_block_provider(reason):
+                        budget.block(completed + cooldown, reason)
+                entry = _CacheEntry(
+                    # 保留上一次报价作为过期回退，并明确标记它来自缓存。
+                    quote=None if previous is None else previous.quote,
+                    issue=reason,
+                    expires_at=completed + cooldown,
+                )
+                from_cache = previous is not None and previous.quote is not None
+
+            with self._state_lock:
+                self._cache.pop(key, None)
+                self._cache[key] = entry
+                # 有界缓存按最近使用顺序淘汰。
+                while len(self._cache) > self._max_cache_entries:
+                    oldest = next(iter(self._cache), None)
+                    if oldest is None:
+                        break
+                    del self._cache[oldest]
+            return entry, from_cache
+
+    def _entry_for(
+        self, provider_id: str, instrument: MarketInstrument, key: str
+    ) -> tuple[_CacheEntry, bool]:
+        """读取未过期缓存，或按合约互斥刷新后返回结果。"""
         now = self._now()
-        policy = self._policies[provider_id]
-        budget = self._budgets[provider_id]
-        denied = budget.consume(policy, now)
-        if denied is not None:
-            result = ProviderQuote(status="unavailable", reason=denied)
-        else:
-            try:
-                result = self._providers[provider_id](instrument, now_ms=now)
-            except Exception:  # noqa: BLE001 - 供应商实现异常折萐为来源不可用
-                result = ProviderQuote(status="unavailable", reason="provider_unavailable")
-
-        completed = self._now()
-        # **交叉盘口（``ask < bid``）是供应商数据形状错误，必须折叠为 invalid_response。**
-        # 若放行，它会作为"可用报价"进入缓存并参与估值——而那个价格在市场上从未存在过。
-        # 参考实现在报价归一化的成功分支之前拦截该情形。
-        if (
-            result.status == "available"
-            and result.quote is not None
-            and is_crossed_market(result.quote)
-        ):
-            result = ProviderQuote(status="unavailable", reason="invalid_response")
-        if result.status == "available" and result.quote is not None:
-            entry = _CacheEntry(
-                quote=result.quote, issue=None,
-                expires_at=completed + policy.cache_ttl_ms,
-            )
-        else:
-            reason: MarketQuoteIssue = result.reason or "provider_unavailable"
-            cooldown = cooldown_ms(reason)
-            # **只有来源级失败才冷却来源**：一个坏符号不该让同来源的其他符号一起失败。
-            if denied is None and should_block_provider(reason):
-                budget.block(completed + cooldown, reason)
-            entry = _CacheEntry(
-                # 保留上一次的报价作为过期回退。
-                quote=None if previous is None else previous.quote,
-                issue=reason,
-                expires_at=completed + cooldown,
-            )
-
-        self._cache.pop(key, None)
-        self._cache[key] = entry
-        # 有界缓存：淘汰最旧条目。
-        while len(self._cache) > self._max_cache_entries:
-            oldest = next(iter(self._cache), None)
-            if oldest is None:
-                break
-            del self._cache[oldest]
-        return entry
+        with self._state_lock:
+            existing = self._cache.get(key)
+            if existing is not None and existing.expires_at > now:
+                self._cache.pop(key)
+                self._cache[key] = existing
+                return existing, True
+        return self._refresh(provider_id, instrument, key)
 
 
 def _parse_millis(value: str) -> int:

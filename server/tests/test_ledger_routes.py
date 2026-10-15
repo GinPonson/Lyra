@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,65 @@ def _seed_ledger(connection) -> None:
             """,
             [ACCOUNT_ID, date, date, action, price, amount, _h("source"), index,
              _h(f"business-{index}"), _h(f"txn-{index}")],
+        )
+
+
+def _insert_realized_rows(connection, count: int) -> None:
+    """写入确定性股票往返交易，供 HTTP 游标测试跨过默认 50 行页长。"""
+    source_hash = _h("pagination-realized-source")
+    first_open_date = date(2026, 2, 1)
+    for index in range(count):
+        open_date = first_open_date + timedelta(days=index * 2)
+        close_date = open_date + timedelta(days=1)
+        for offset, action, transaction_date, price, amount in (
+            (0, "Buy", open_date, "10.00", "-10.0000"),
+            (1, "Sell", close_date, "11.00", "11.0000"),
+        ):
+            sequence = index * 2 + offset + 1
+            connection.execute(
+                """
+                INSERT INTO transactions
+                    (account_id, record_date, transaction_date, action, raw_symbol,
+                     description, asset_type, underlying, quantity, price, amount,
+                     source_type, source_reference, source_hash, sequence, occurrence,
+                     business_hash, transaction_hash, parser_version, ledger_version)
+                VALUES (CAST(? AS UUID), CAST(? AS DATE), CAST(? AS DATE), ?, 'MSFT',
+                        'MICROSOFT CORP', 'stock', 'MSFT', CAST('1' AS DECIMAL(18,6)),
+                        CAST(? AS DECIMAL(18,6)), CAST(? AS DECIMAL(18,4)), 'csv',
+                        'pagination-realized.csv', ?, ?, 1, ?, ?, 2, 1)
+                """,
+                [
+                    ACCOUNT_ID, transaction_date.isoformat(), transaction_date.isoformat(),
+                    action, price, amount, source_hash, sequence,
+                    _h(f"pagination-realized-business-{sequence}"),
+                    _h(f"pagination-realized-transaction-{sequence}"),
+                ],
+            )
+
+
+def _insert_cashflow_rows(connection, count: int) -> None:
+    """写入金额各异的股息行，便于同时核对分页与全量合计。"""
+    source_hash = _h("pagination-cashflow-source")
+    first_date = date(2026, 6, 1)
+    for index in range(count):
+        transaction_date = first_date + timedelta(days=index)
+        amount = str(index + 1)
+        connection.execute(
+            """
+            INSERT INTO transactions
+                (account_id, record_date, transaction_date, action, description, asset_type,
+                 amount, source_type, source_reference, source_hash, sequence, occurrence,
+                 business_hash, transaction_hash, parser_version, ledger_version)
+            VALUES (CAST(? AS UUID), CAST(? AS DATE), CAST(? AS DATE), 'Qualified Dividend',
+                    'PAGINATION DIVIDEND', 'cash', CAST(? AS DECIMAL(18,4)), 'csv',
+                    'pagination-cashflow.csv', ?, ?, 1, ?, ?, 2, 1)
+            """,
+            [
+                ACCOUNT_ID, transaction_date.isoformat(), transaction_date.isoformat(), amount,
+                source_hash, index + 1,
+                _h(f"pagination-cashflow-business-{index}"),
+                _h(f"pagination-cashflow-transaction-{index}"),
+            ],
         )
 
 
@@ -455,6 +515,67 @@ def test_cashflow_is_empty_without_cash_transactions(client) -> None:
     assert body["byAction"] == {}
 
 
+def test_realized_cursor_paginates_http_results_and_keeps_full_totals(client) -> None:
+    """已实现 HTTP 第二页不重复，并继续返回筛选结果的全量合计。"""
+    test_client, issued = client
+    _insert_realized_rows(test_client.app.state.database.connection, 50)
+    headers = _auth(issued)
+
+    first = _data(test_client.get(
+        "/v1/ledger/realized", headers=headers, params={"scope": "all"}
+    ).json())
+    second = _data(test_client.get(
+        "/v1/ledger/realized", headers=headers,
+        params={"scope": "all", "cursor": first["nextCursor"]},
+    ).json())
+
+    first_keys = {
+        (row["symbolKey"], row["openDate"], row["closeDate"])
+        for row in first["rows"]
+    }
+    second_keys = {
+        (row["symbolKey"], row["openDate"], row["closeDate"])
+        for row in second["rows"]
+    }
+    assert first["count"] == 50
+    assert second["count"] == 1
+    assert first_keys.isdisjoint(second_keys)
+    assert first["totalCount"] == second["totalCount"] == 51
+    assert first["totalPnl"] == second["totalPnl"] == "250.0000"
+
+
+def test_cashflow_cursor_paginates_http_results_and_keeps_full_totals(client) -> None:
+    """现金流 HTTP 第二页不重复，金额与分动作合计仍按全部筛选行计算。"""
+    test_client, issued = client
+    _insert_cashflow_rows(test_client.app.state.database.connection, 51)
+    headers = _auth(issued)
+
+    first = _data(test_client.get(
+        "/v1/ledger/cashflow", headers=headers, params={"scope": "all"}
+    ).json())
+    second = _data(test_client.get(
+        "/v1/ledger/cashflow", headers=headers,
+        params={"scope": "all", "cursor": first["nextCursor"]},
+    ).json())
+
+    first_keys = {
+        (row["transactionDate"], row["amount"])
+        for row in first["rows"]
+    }
+    second_keys = {
+        (row["transactionDate"], row["amount"])
+        for row in second["rows"]
+    }
+    assert first["count"] == 50
+    assert second["count"] == 1
+    assert first_keys.isdisjoint(second_keys)
+    assert first["totalCount"] == second["totalCount"] == 51
+    assert first["total"] == second["total"] == "1326.0000"
+    assert first["byAction"] == second["byAction"] == {
+        "Qualified Dividend": "1326.0000"
+    }
+
+
 def test_pagination_fields_are_truthful_not_fabricated(client) -> None:
     """分页字段**必须是真的**，不能伪造。
 
@@ -593,13 +714,16 @@ def test_an_invalid_cursor_is_a_400_not_a_silent_first_page(client) -> None:
     而实际上只看了第一页。这比报错危险得多，因为它**不报错**。
     """
     test_client, issued = client
-    response = test_client.get(
-        "/v1/ledger/trades", headers=_auth(issued),
-        params={"scope": "all", "cursor": "not-a-valid-cursor!"},
-    )
+    for path in (
+        "/v1/ledger/trades", "/v1/ledger/realized", "/v1/ledger/cashflow",
+    ):
+        response = test_client.get(
+            path, headers=_auth(issued),
+            params={"scope": "all", "cursor": "not-a-valid-cursor!"},
+        )
 
-    assert response.status_code == 400
-    assert response.json()["code"] == "INVALID_CURSOR"
+        assert response.status_code == 400, path
+        assert response.json()["code"] == "INVALID_CURSOR", path
 
 
 def test_a_cursor_from_a_different_scope_is_rejected(client) -> None:

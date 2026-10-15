@@ -167,12 +167,20 @@ def create_app(settings: Settings, database: LyraDatabase) -> FastAPI:
     from .infrastructure.market_data.config import load_market_data_config
     from .infrastructure.market_data.httpx_fetch import httpx_market_fetch
     from .infrastructure.market_data.runtime import create_market_data_runtime
+    from .infrastructure.db.market_settings_repository import load_market_settings
 
     app.state.market_runtime = create_market_data_runtime(
         load_market_data_config(os.environ),
         fetch=httpx_market_fetch,
         now=lambda: int(datetime.now(UTC).timestamp() * 1000),
     )
+    stored_market_settings = load_market_settings(database.connection)
+    if stored_market_settings is not None:
+        # 持久化设置优先于启动默认值；应用开始服务前就恢复，保证 HTTP 与 Agent
+        # 工具第一次读行情时使用同一组已保存的路由和 revision。
+        app.state.market_runtime.initialize_settings(
+            stored_market_settings.routes, stored_market_settings.revision
+        )
     app.state.agent_executor = create_executor_from_environment(
         connection=database.connection,
         environment=os.environ,

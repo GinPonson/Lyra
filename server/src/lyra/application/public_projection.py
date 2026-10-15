@@ -541,37 +541,33 @@ def project_import_preview(
     import_id: str,
     account_id: str,
     base_ledger_version: int,
-    token: str,
-    expires_at: str,
+    confirm_token: str,
 ) -> dict[str, Any]:
     """把导入预览投影为 camelCase 公开响应。
 
-    ``previewToken`` 是**唯一一次**返回的明文确认令牌；服务端只存其哈希。
-    预览指纹本身不外发——它是服务端提交校验用的内部凭据。
+    响应按 Flutter ``ImportPreviewView.fromJson`` 的契约组织：作业 ID 与一次性
+    ``confirmToken`` 位于根对象，文件统计位于 ``preview``。服务端只保存令牌哈希，
+    预览指纹本身不外发——它是提交校验用的内部凭据。
 
     @param preview: 领域层预览结果。
     @param import_id: 已创建的作业 ID。
     @param account_id: 已绑定的账户 UUID。
     @param base_ledger_version: 预览时的账本基准版本。
-    @param token: 明文确认令牌。
-    @param expires_at: 令牌过期时间。
-    @returns camelCase 字段的公开字典。
+    @param confirm_token: 唯一一次返回的明文确认令牌。
+    @returns 包含作业 ID、确认令牌与嵌套预览统计的公开字典。
     """
     return {
         "importId": import_id,
-        "accountId": account_id,
-        "baseLedgerVersion": base_ledger_version,
-        "fileName": preview.file_name,
-        "fileHash": preview.file_hash,
-        "parserVersion": preview.parser_version,
-        "totalRows": preview.total_rows,
-        "insertableRows": preview.insertable_rows,
-        "existingRows": preview.existing_rows,
-        "byAction": dict(preview.by_action),
-        "firstTransactionDate": preview.first_transaction_date,
-        "lastTransactionDate": preview.last_transaction_date,
-        "previewToken": token,
-        "previewExpiresAt": expires_at,
+        "confirmToken": confirm_token,
+        "preview": {
+            "fileName": preview.file_name,
+            "accountId": account_id,
+            "baseLedgerVersion": base_ledger_version,
+            "totalRows": preview.total_rows,
+            "insertableRows": preview.insertable_rows,
+            "existingRows": preview.existing_rows,
+            "byAction": dict(preview.by_action),
+        },
     }
 
 
@@ -654,7 +650,10 @@ def project_agent_session(session: Any) -> dict[str, Any]:
 
 
 def project_market_positions(
-    rows: list[Any], market_runtime: Any, account_ids: dict[str, str]
+    rows: list[Any],
+    market_runtime: Any,
+    account_ids: dict[str, str],
+    market_settings: Any = None,
 ) -> dict[str, Any]:
     """把持仓估值行投影为公开响应。
 
@@ -671,13 +670,21 @@ def project_market_positions(
     @param rows: 已算好估值的持仓行（snake_case）。
     @param market_runtime: 行情运行时；用于填充来源状态。
     @param account_ids: 账户键到 UUID 的映射。
+    @param market_settings: 本次读取固定使用的路由与 revision 快照。
     @returns camelCase 的公开响应。
     @raises KeyError: 账户不在范围内——宁可失败也不泄漏未授权账户。
     """
+    from ..domain.market_data.valuation import (
+        PositionValuation,
+        aggregate_currency_group,
+    )
+
     projected = [
         {
             "accountId": account_ids[row["account"]],
             "symbolKey": row["symbol_key"],
+            "currency": row["currency"],
+            "instrumentKey": row["instrument_key"],
             "assetType": row["asset_type"],
             "underlying": row["underlying"],
             "expiry": row["expiry"],
@@ -693,6 +700,36 @@ def project_market_positions(
         for row in rows
     ]
     priced = [row for row in projected if row["valuation"]["marketValue"] is not None]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in projected:
+        quote = row["quote"]
+        reference = quote["referencePrice"]
+        valuation = row["valuation"]
+        groups.setdefault(row["currency"], []).append({
+            "accountId": row["accountId"],
+            "valuation": PositionValuation(
+                market_value=valuation["marketValue"],
+                unrealized_pnl=valuation["unrealizedPnl"],
+                multiplier=valuation["multiplier"],
+            ),
+            "available": quote["status"] == "available",
+            "as_of": None if reference is None else reference["asOf"],
+        })
+    currency_groups = []
+    for currency in sorted(groups):
+        group_rows = groups[currency]
+        total = aggregate_currency_group(group_rows)
+        currency_groups.append({
+            "currency": currency,
+            "accountIds": sorted({row["accountId"] for row in group_rows}),
+            "positions": total.positions,
+            "pricedPositions": total.priced_positions,
+            "complete": total.complete,
+            "marketValue": total.market_value,
+            "unrealizedPnl": total.unrealized_pnl,
+            "asOfFrom": total.as_of_from,
+            "asOfTo": total.as_of_to,
+        })
     return {
         "rows": projected,
         "count": len(projected),
@@ -704,21 +741,45 @@ def project_market_positions(
             for row in projected
         ),
         "basis": "current_positions_at_quote_times_excluding_fees",
-        "marketData": _market_status(market_runtime),
+        "marketData": _market_status(market_runtime, market_settings),
+        "currencyGroups": currency_groups,
     }
 
 
-def _market_status(market_runtime: Any) -> dict[str, Any]:
-    """行情来源状态。"""
+def _market_status(market_runtime: Any, market_settings: Any = None) -> dict[str, Any]:
+    """投影本次请求采用的行情路由、修订号与已知来源状态。"""
     if market_runtime is None:
-        return {"routes": {"stock": [], "option": []}, "providers": []}
+        return {
+            "enabled": False,
+            "routes": {"stock": [], "option": []},
+            "providers": [],
+            "settingsRevision": 0,
+        }
+    snapshot = market_settings or market_runtime.settings_snapshot()
+    routes = snapshot.routes
+    configured = frozenset(market_runtime.provider_ids)
+    from ..domain.market_data.settings import effective_routes
+
+    effective = effective_routes(routes, configured)
     return {
+        "enabled": any(effective.values()),
         "routes": {
             asset_type: list(providers)
-            for asset_type, providers in market_runtime.default_routes.items()
+            for asset_type, providers in routes.items()
         },
         "providers": [
-            {"id": provider_id, "configured": True}
-            for provider_id in market_runtime.provider_ids
+            {
+                "id": provider.id,
+                "displayName": provider.display_name,
+                "assetTypes": list(provider.asset_types),
+                "configured": provider.configured,
+                "timing": {
+                    "kind": provider.timing_kind,
+                    "delayMinutes": provider.delay_minutes,
+                },
+                "cacheTtlSeconds": provider.cache_ttl_seconds,
+            }
+            for provider in market_runtime.provider_options
         ],
+        "settingsRevision": snapshot.revision,
     }

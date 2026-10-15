@@ -32,6 +32,48 @@ def test_no_credentials_means_no_providers() -> None:
 
     assert runtime.provider_ids == ()
     assert runtime.default_routes == {"stock": (), "option": ()}
+    assert [source.id for source in runtime.provider_options] == ["alpaca", "marketdata"]
+    assert all(source.configured is False for source in runtime.provider_options)
+
+
+def test_provider_catalog_reports_real_timing_and_cache_settings() -> None:
+    """设置目录完整列出来源，并反映实际凭据、时效与缓存策略。"""
+    runtime = _runtime(
+        LYRA_MARKETDATA_MODE="delayed",
+        **ALPACA_CREDS,
+        **MARKETDATA_CREDS,
+    )
+    providers = {source.id: source for source in runtime.provider_options}
+
+    assert providers["alpaca"].configured is True
+    assert providers["alpaca"].asset_types == ("stock", "option")
+    assert providers["alpaca"].timing_kind == "delayed"
+    assert providers["alpaca"].delay_minutes == 16
+    assert providers["alpaca"].cache_ttl_seconds == 900
+    assert providers["marketdata"].configured is True
+    assert providers["marketdata"].asset_types == ("stock", "option")
+    assert providers["marketdata"].timing_kind == "delayed"
+    assert providers["marketdata"].delay_minutes == 15
+    assert providers["marketdata"].cache_ttl_seconds == 900
+
+
+def test_persisted_routes_initialize_runtime_without_revision_rollback() -> None:
+    """数据库设置覆盖启动默认值，较旧读取不能回退运行时修订号。"""
+    from lyra.domain.market_data.types import StockInstrument
+
+    runtime = _runtime()
+
+    initialized = runtime.initialize_settings(
+        {"stock": ("marketdata",), "option": ("alpaca",)}, 4
+    )
+    stale_read = runtime.initialize_settings(
+        {"stock": (), "option": ()}, 3
+    )
+
+    assert initialized.revision == 4
+    assert stale_read == initialized
+    assert runtime.settings_snapshot() == initialized
+    assert runtime.service.get_quote(StockInstrument(symbol="INTC")).issue == "not_configured"
 
 
 def test_providers_are_registered_by_credentials_not_routes() -> None:
@@ -189,3 +231,76 @@ def test_configured_timeout_reaches_the_transport() -> None:
 
     # 两个来源都拿到了配置值（秒）。
     assert seen == [7.5, 7.5]
+
+
+def test_concurrent_reads_share_one_refresh_and_one_budget_charge() -> None:
+    """并发读取同一合约时只刷新一次，不重复消耗来源预算。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import UTC, datetime
+    from threading import Event
+
+    from lyra.application.market_budget import MarketProviderPolicy
+    from lyra.application.market_data_service import MarketDataService, ProviderQuote
+    from lyra.domain.market_data.types import (
+        MarketPricePoint,
+        MarketQuote,
+        MarketTiming,
+        StockInstrument,
+    )
+
+    now = 1_800_000_000_000
+    as_of = (
+        datetime.fromtimestamp(now / 1000, tz=UTC)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+    entered_provider = Event()
+    release_provider = Event()
+    calls: list[int] = []
+
+    def provider(instrument, *, now_ms):
+        calls.append(now_ms)
+        entered_provider.set()
+        assert release_provider.wait(timeout=2)
+        return ProviderQuote(
+            status="available",
+            quote=MarketQuote(
+                instrument_key="US:stock:INTC",
+                provider_id="fixture",
+                feed="deterministic fixture",
+                currency="USD",
+                bid=MarketPricePoint(value="10", as_of=as_of),
+                ask=MarketPricePoint(value="10.2", as_of=as_of),
+                last=None,
+                close=None,
+                timing=MarketTiming(kind="delayed", delay_minutes=15),
+                fetched_at=as_of,
+            ),
+        )
+
+    service = MarketDataService(
+        providers={"fixture": provider},
+        routes={"stock": ("fixture",), "option": ()},
+        policies={
+            "fixture": MarketProviderPolicy(
+                cache_ttl_ms=900_000,
+                max_requests_per_minute=1,
+                max_requests_per_day=None,
+            )
+        },
+        now=lambda: now,
+    )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        reads = [
+            executor.submit(service.get_quote, StockInstrument(symbol="INTC"))
+            for _ in range(8)
+        ]
+        assert entered_provider.wait(timeout=2)
+        release_provider.set()
+        results = [read.result(timeout=2) for read in reads]
+
+    assert len(calls) == 1
+    assert len(service._budgets["fixture"].minute_calls) == 1
+    assert all(result.status == "available" for result in results)
+    assert sum(result.cached for result in results) == 7

@@ -19,10 +19,12 @@ historical 的 TTL 是 24 小时：**收盘价在当天不会变**，15 分钟�
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import RLock
 
 from ...application.market_budget import MarketProviderPolicy
 from ...application.market_data_service import MarketDataService, ProviderQuote
+from ...domain.market_data.settings import MarketProviderOption, MarketRoutes
 from ...domain.market_data.types import MarketTiming
 from .alpaca_provider import AlpacaMarketDataProvider
 from .config import MarketDataConfig
@@ -38,14 +40,67 @@ MARKETDATA_DELAY_MINUTES = 15
 
 
 @dataclass(frozen=True)
+class MarketDataRuntimeSettings:
+    """一次一致读取的已生效路由与持久化修订号。"""
+
+    routes: MarketRoutes
+    revision: int
+
+
+@dataclass
 class MarketDataRuntime:
-    """装配好的行情运行时。"""
+    """装配好的行情运行时及其当前持久化设置。"""
 
     service: MarketDataService
-    # 可选来源 id（已配置凭据的），供界面展示。
+    # 可选来源 id（凭据齐全的），供运行时选路与限流使用。
     provider_ids: tuple[str, ...]
+    # 启动配置路由；数据库中有保存值时由 initialize_settings 覆盖。
     default_routes: dict[str, tuple[str, ...]]
     timeout_ms: int
+    # 来源目录包含已知但未配置的来源，供设置页显示其真实不可用状态。
+    provider_options: tuple[MarketProviderOption, ...]
+    _routes: dict[str, tuple[str, ...]] = field(init=False, repr=False)
+    _settings_revision: int = field(default=0, init=False, repr=False)
+    _settings_lock: RLock = field(default_factory=RLock, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """以启动配置路由初始化服务状态。"""
+        self.default_routes = _copy_routes(self.default_routes)
+        self._routes = _copy_routes(self.default_routes)
+
+    def initialize_settings(
+        self, routes: MarketRoutes, revision: int
+    ) -> MarketDataRuntimeSettings:
+        """用数据库保存的路由与修订号初始化或更新运行时。
+
+        @param routes: 已校验的持久化路由。
+        @param revision: 与路由同一行的修订号。
+        @returns 当前实际生效的路由快照；较旧的并发读取不会覆盖较新修订。
+        @raises ValueError: 修订号为负数。
+        """
+        if (
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 0
+        ):
+            raise ValueError("行情设置 revision 不能为负数")
+        resolved = _copy_routes(routes)
+        with self._settings_lock:
+            # 请求可能先读到旧设置、后于新保存请求到达此处；只允许修订号向前推进。
+            if revision >= self._settings_revision:
+                self.service.set_routes(resolved)
+                self._routes = resolved
+                self._settings_revision = revision
+            return MarketDataRuntimeSettings(
+                routes=_copy_routes(self._routes), revision=self._settings_revision
+            )
+
+    def settings_snapshot(self) -> MarketDataRuntimeSettings:
+        """返回路由和修订号一致的当前快照。"""
+        with self._settings_lock:
+            return MarketDataRuntimeSettings(
+                routes=_copy_routes(self._routes), revision=self._settings_revision
+            )
 
 
 def create_market_data_runtime(
@@ -107,6 +162,32 @@ def create_market_data_runtime(
         "stock": config.stock_providers,
         "option": config.option_providers,
     }
+    provider_options = (
+        MarketProviderOption(
+            id="alpaca",
+            display_name="Alpaca",
+            asset_types=("stock", "option"),
+            configured="alpaca" in providers,
+            timing_kind="delayed",
+            delay_minutes=16,
+            cache_ttl_seconds=ALPACA_CACHE_TTL_MS // 1000,
+        ),
+        MarketProviderOption(
+            id="marketdata",
+            display_name="MarketData.app",
+            asset_types=("stock", "option"),
+            configured="marketdata" in providers,
+            timing_kind="end_of_day" if config.marketdata_mode == "historical" else "delayed",
+            delay_minutes=(
+                None if config.marketdata_mode == "historical" else MARKETDATA_DELAY_MINUTES
+            ),
+            cache_ttl_seconds=(
+                MARKETDATA_HISTORICAL_CACHE_TTL_MS
+                if config.marketdata_mode == "historical"
+                else MARKETDATA_DELAYED_CACHE_TTL_MS
+            ) // 1000,
+        ),
+    )
     service = MarketDataService(
         providers=providers,
         routes=routes,
@@ -119,4 +200,13 @@ def create_market_data_runtime(
         provider_ids=tuple(providers),
         default_routes=routes,
         timeout_ms=config.timeout_ms,
+        provider_options=provider_options,
     )
+
+
+def _copy_routes(routes: MarketRoutes) -> dict[str, tuple[str, ...]]:
+    """复制两个资产类别的路由，避免调用方修改运行时快照。"""
+    return {
+        "stock": tuple(routes.get("stock", ())),
+        "option": tuple(routes.get("option", ())),
+    }

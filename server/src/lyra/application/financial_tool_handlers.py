@@ -286,6 +286,9 @@ def handle_market_positions(
     scope: AccountScope,
     market_runtime: Any,
     underlying: str | None = None,
+    *,
+    snapshot: Any = None,
+    market_settings: Any = None,
 ) -> dict[str, Any]:
     """当前持仓的参考估值。
 
@@ -298,40 +301,64 @@ def handle_market_positions(
     @param scope: 账户范围。
     @param market_runtime: 行情运行时；``None`` 表示未装配。
     @param underlying: 仅看某个标的。
+    @param snapshot: 调用方已读取的账本快照；路由封装与数据共用同一快照。
+    @param market_settings: 本次读取固定采用的路由与 revision 快照。
     @returns 含 rows / count / pricedCount / complete / basis / marketData 的字典。
     """
     from ..domain.market_data.valuation import value_position
     from ..infrastructure.db.ledger_repository import DuckDbLedgerRepository
     from .public_projection import account_id_map, project_market_positions
 
-    snapshot = DuckDbLedgerRepository(connection).load_snapshot(scope)
+    if snapshot is None:
+        snapshot = DuckDbLedgerRepository(connection).load_snapshot(scope)
     positions = aggregate_positions(snapshot.open_lots, scope, underlying)
+    account_currencies = {
+        account.legacy_account_key: account.base_currency
+        for account in snapshot.accounts
+    }
+    settings_snapshot = market_settings
+    if market_runtime is not None and settings_snapshot is None:
+        settings_snapshot = market_runtime.settings_snapshot()
 
     rows: list[dict[str, Any]] = []
     for position in positions:
         instrument = _instrument_for(position)
         if market_runtime is None or instrument is None:
-            valuation = value_position(
-                quantity=str(position.qty), cost=str(position.cost),
-                reference_price=None,
-                asset_type="option" if position.asset_type == "option" else "stock",
-                direction=position.direction,
-            )
             lookup = None
         else:
-            lookup = market_runtime.service.get_quote(instrument)
-            reference = (
-                None if lookup.reference_price is None else lookup.reference_price.value
+            asset_route = settings_snapshot.routes.get(
+                "stock" if position.asset_type == "stock" else "option", ()
             )
-            valuation = value_position(
-                quantity=str(position.qty), cost=str(position.cost),
-                reference_price=reference,
-                asset_type="option" if position.asset_type == "option" else "stock",
-                direction=position.direction,
-            )
+            lookup = market_runtime.service.read_quote(instrument, asset_route)
+        reference = (
+            None if lookup is None or lookup.reference_price is None
+            else lookup.reference_price.value
+        )
+        valuation = value_position(
+            quantity=str(position.qty), cost=str(position.cost),
+            reference_price=reference,
+            asset_type="option" if position.asset_type == "option" else "stock",
+            direction=position.direction,
+        )
+        quote = None if lookup is None else lookup.quote
+        reference_price = None if lookup is None else lookup.reference_price
+        issue = (
+            "unsupported_instrument" if instrument is None
+            else "not_configured" if market_runtime is None
+            else None if lookup is None else lookup.issue
+        )
+        currency = (
+            quote.currency if quote is not None
+            else instrument.currency if instrument is not None
+            else account_currencies[position.account]
+        )
         rows.append({
             "account": position.account,
             "symbol_key": position.symbol_key,
+            "currency": currency,
+            "instrument_key": (
+                None if instrument is None else _instrument_key(instrument)
+            ),
             "asset_type": position.asset_type,
             "underlying": position.underlying,
             "expiry": position.expiry,
@@ -348,20 +375,28 @@ def handle_market_positions(
                 "basis": valuation.basis,
             },
             "quote": (
-                None if lookup is None
-                else {
-                    "status": lookup.status,
-                    "issue": lookup.issue,
-                    "asOf": (
-                        None if lookup.reference_price is None
-                        else lookup.reference_price.as_of
+                {
+                    "status": "unavailable" if lookup is None else lookup.status,
+                    "quote": None if quote is None else _quote_payload(quote),
+                    "referencePrice": (
+                        None if reference_price is None
+                        else {
+                            "value": reference_price.value,
+                            "asOf": reference_price.as_of,
+                            "basis": reference_price.basis,
+                        }
                     ),
+                    "issue": issue,
+                    "cached": False if lookup is None else lookup.cached,
                 }
             ),
         })
 
     return project_market_positions(
-        rows, market_runtime, account_id_map(snapshot.accounts)
+        rows,
+        market_runtime,
+        account_id_map(snapshot.accounts),
+        settings_snapshot,
     )
 
 
@@ -373,12 +408,17 @@ def _instrument_for(position: Any) -> Any:
     from ..domain.market_data.types import OptionInstrument, StockInstrument
 
     if position.asset_type == "stock":
-        if not isinstance(position.underlying, str):
+        if (
+            not isinstance(position.underlying, str)
+            or position.underlying.strip() == ""
+        ):
             return None
         return StockInstrument(symbol=position.underlying)
     if (
         not isinstance(position.underlying, str)
+        or position.underlying.strip() == ""
         or not isinstance(position.expiry, str)
+        or position.expiry.strip() == ""
         or position.strike is None
         or position.option_type not in ("C", "P")
     ):
@@ -389,17 +429,37 @@ def _instrument_for(position: Any) -> Any:
     )
 
 
-def _market_status(market_runtime: Any) -> dict[str, Any]:
-    """行情来源状态。"""
-    if market_runtime is None:
-        return {"routes": {"stock": [], "option": []}, "providers": []}
+def _instrument_key(instrument: Any) -> str:
+    """返回领域合约的供应商无关标识。"""
+    from ..domain.market_data.types import market_instrument_key
+
+    return market_instrument_key(instrument)
+
+
+def _quote_payload(quote: Any) -> dict[str, Any]:
+    """把领域报价转换为移动端的 camelCase 结构。
+
+    @param quote: 领域行情报价。
+    @returns 包含价格点、时效、来源及获取时间的公开报价。
+    """
+    def point(value: Any) -> dict[str, str] | None:
+        """投影可空价格点。"""
+        if value is None:
+            return None
+        return {"value": value.value, "asOf": value.as_of}
+
     return {
-        "routes": {
-            asset_type: list(providers)
-            for asset_type, providers in market_runtime.default_routes.items()
+        "instrumentKey": quote.instrument_key,
+        "providerId": quote.provider_id,
+        "feed": quote.feed,
+        "currency": quote.currency,
+        "bid": point(quote.bid),
+        "ask": point(quote.ask),
+        "last": point(quote.last),
+        "close": point(quote.close),
+        "timing": {
+            "kind": quote.timing.kind,
+            "delayMinutes": quote.timing.delay_minutes,
         },
-        "providers": [
-            {"id": provider_id, "configured": True}
-            for provider_id in market_runtime.provider_ids
-        ],
+        "fetchedAt": quote.fetched_at,
     }
