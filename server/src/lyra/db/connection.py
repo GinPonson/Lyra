@@ -16,6 +16,7 @@ from typing import Literal, TypedDict
 import duckdb
 
 from .migrations import apply_migrations
+from .serialized_connection import SerializedDuckDBConnection
 
 
 class DatabaseHealthAvailable(TypedDict):
@@ -45,7 +46,9 @@ class LyraDatabase:
     """单进程共用的 DuckDB 连接；仅由 :func:`open_lyra_database` 在迁移成功后创建。"""
 
     def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
-        self.connection = connection
+        # 仓储会长期捕获 database.connection；包装必须在此处一次创建并一直复用，
+        # 才能让所有请求共享同一把连接锁。
+        self.connection = SerializedDuckDBConnection(connection)
         self._closed = False
 
     def read_health(self) -> DatabaseHealth:
