@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -98,35 +99,31 @@ def create_agent_events_router() -> APIRouter:
         orchestrator = websocket.app.state.agent_orchestrator
         handle: int | None = None
         subscribed_session: str | None = None
+        loop = asyncio.get_running_loop()
+        pending_events: asyncio.Queue[tuple[int, Any]] = asyncio.Queue()
+        send_lock = asyncio.Lock()
+        subscription_generation = 0
 
-        def push(event: Any) -> None:
-            """把事件推给客户端。
+        async def send_events() -> None:
+            """按到达顺序推送事件；每次发送前在所属事件循环重新认证。"""
+            while True:
+                generation, event = await pending_events.get()
+                async with send_lock:
+                    # 重新订阅可能已重放这些事件；旧订阅排队中的帧不再发送。
+                    if generation != subscription_generation:
+                        continue
+                    if not _authorized(authenticator, token):
+                        await _close_quietly(websocket, UNAUTHORIZED_CLOSE_CODE, "signed out")
+                        return
+                    await _safe_send(websocket, {
+                        "type": "event", "event": _event_payload(event),
+                    })
 
-            **推送前重新认证**：长连接不能沿用建立时的结果，否则设备被撤销后，只要
-            客户端不再发帧，就能一直收到该账号的 Agent 事件（其中含账本增量）。
-            参考实现同样在每次推送前认证。
+        def push(event: Any, generation: int) -> None:
+            """把工作线程中的事件送回连接所属循环，避免在线程池中创建异步任务。"""
+            loop.call_soon_threadsafe(pending_events.put_nowait, (generation, event))
 
-            推送是同步回调，因此把发送排进事件循环；失败即认为连接已不可用。
-            """
-            import asyncio
-
-            if not _authorized(authenticator, token):
-                asyncio.ensure_future(_close_quietly(
-                    websocket, UNAUTHORIZED_CLOSE_CODE, "signed out"
-                ))
-                return
-            asyncio.ensure_future(_safe_send(websocket, {
-                "type": "event",
-                "event": {
-                    "type": event.type,
-                    "sessionId": event.session_id,
-                    "messageId": event.message_id,
-                    "sequence": event.sequence,
-                    "occurredAt": event.occurred_at,
-                    "payload": dict(event.payload),
-                },
-            }))
-
+        sender = asyncio.create_task(send_events())
         try:
             while True:
                 raw = await websocket.receive_text()
@@ -144,38 +141,50 @@ def create_agent_events_router() -> APIRouter:
                         "message": "WebSocket 订阅帧无效",
                     })
                     continue
-                resume = orchestrator.resume_events(
-                    message.session_id, after_sequence=message.after_sequence
-                ) if _registered(orchestrator, message.session_id) else None
-                if resume is None:
-                    await websocket.send_json({
-                        "type": "subscribed",
-                        "mode": "snapshot_required",
-                        "reason": "SESSION_NOT_RESUMED",
-                    })
-                    continue
-                # 重复订阅替换旧订阅，避免同一事件被推送多次。
-                if handle is not None and subscribed_session is not None:
-                    orchestrator.unsubscribe(subscribed_session, handle)
-                handle = orchestrator.subscribe(message.session_id, push)
-                subscribed_session = message.session_id
-                if resume.mode == "events":
-                    await websocket.send_json({
-                        "type": "subscribed",
-                        "mode": "events",
-                        "events": [_event_payload(event) for event in resume.events],
-                    })
-                else:
-                    await websocket.send_json({
-                        "type": "subscribed",
-                        "mode": "snapshot_required",
-                        "reason": resume.reason,
-                    })
+                # 订阅确认帧必须先于新订阅的实时事件发送。
+                async with send_lock:
+                    # 旧订阅先移除，重放快照和新订阅在同一临界区建立，避免线程间事件缺口。
+                    if handle is not None and subscribed_session is not None:
+                        orchestrator.unsubscribe(subscribed_session, handle)
+                    handle = None
+                    subscribed_session = None
+                    subscription_generation += 1
+                    subscription = orchestrator.subscribe_with_resume(
+                        message.session_id,
+                        lambda event, generation=subscription_generation: push(event, generation),
+                        after_sequence=message.after_sequence,
+                    )
+                    if subscription is None:
+                        await websocket.send_json({
+                            "type": "subscribed",
+                            "mode": "snapshot_required",
+                            "reason": "SESSION_NOT_RESUMED",
+                        })
+                        continue
+                    handle, resume = subscription
+                    subscribed_session = message.session_id
+                    if resume.mode == "events":
+                        await websocket.send_json({
+                            "type": "subscribed",
+                            "mode": "events",
+                            "events": [_event_payload(event) for event in resume.events],
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "subscribed",
+                            "mode": "snapshot_required",
+                            "reason": resume.reason,
+                        })
         except WebSocketDisconnect:
             pass
         finally:
             if handle is not None and subscribed_session is not None:
                 orchestrator.unsubscribe(subscribed_session, handle)
+            sender.cancel()
+            try:
+                await sender
+            except asyncio.CancelledError:
+                pass
             connections.discard(websocket)
 
     return router
@@ -245,14 +254,6 @@ def _authorized(authenticator: Any, token: str) -> bool:
     except ApplicationError:
         return False
     except Exception:  # noqa: BLE001 - 认证实现异常同样视为未认证
-        return False
-
-
-def _registered(orchestrator: Any, session_id: str) -> bool:
-    """会话是否已登记运行态。"""
-    try:
-        return orchestrator.runtime(session_id) is not None
-    except Exception:  # noqa: BLE001
         return False
 
 

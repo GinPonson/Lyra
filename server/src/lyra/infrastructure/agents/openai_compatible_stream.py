@@ -21,6 +21,7 @@ import json
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+from ...domain.agent.switching import NormalizedAgentMessage
 from .genkit_runtime import (
     ModelChunk,
     ModelStream,
@@ -173,6 +174,7 @@ class OpenAiCompatibleStreamProvider:
         content: str,
         system_context: str,
         tool_definitions: tuple[Any, ...],
+        history: tuple[NormalizedAgentMessage, ...] = (),
         exchanges: tuple[ModelToolExchange, ...] = (),
     ) -> ModelStream:
         """构造一次流式调用。
@@ -180,6 +182,7 @@ class OpenAiCompatibleStreamProvider:
         @param content: 用户输入。
         @param system_context: 系统提示词。
         @param tool_definitions: 可调用工具。
+        @param history: 当前用户消息之前的历史 user/assistant 消息。
         @param exchanges: 前几轮已执行的工具调用与结果；为空即首轮。
         @returns 惰性解析的 ``ModelStream``。
         """
@@ -190,6 +193,10 @@ class OpenAiCompatibleStreamProvider:
             "stream_options": {"include_usage": True},
             "messages": [
                 {"role": "system", "content": system_context},
+                *[
+                    {"role": message.role, "content": message.content}
+                    for message in history
+                ],
                 {"role": "user", "content": content},
                 *_tool_exchange_messages(exchanges),
             ],

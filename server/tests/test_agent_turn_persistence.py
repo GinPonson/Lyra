@@ -448,3 +448,74 @@ def test_the_real_executor_completes_a_turn_through_the_orchestrator(tmp_path: P
         assert messages[1][0] == "assistant" and messages[1][2] == "净收益 200"
     finally:
         database.close()
+
+
+def test_real_store_history_excludes_the_current_user_message(wired) -> None:
+    """连续两轮真实仓储请求带入旧对话，且不把本轮 user 重复发送给模型。"""
+    from lyra.application.agent_config import GenkitConfig
+    from lyra.infrastructure.agents.genkit_runtime import GenkitTurnExecutor
+
+    class FinalStream:
+        """不调用工具、直接返回固定最终文本的模型流。"""
+
+        def __init__(self, answer: str) -> None:
+            self._answer = answer
+
+        def chunks(self):
+            return [ModelChunk(text=self._answer)]
+
+        def tool_requests(self):
+            return ()
+
+        def usage(self):
+            return None
+
+        def final_text(self):
+            return self._answer
+
+    class CapturingProvider:
+        """记录每轮传给模型的历史，并返回不同的固定答案。"""
+
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            return FinalStream(f"回答 {len(self.calls)}")
+
+    test_client, issued, _, database = wired
+    provider = CapturingProvider()
+    test_client.app.state.agent_executor = GenkitTurnExecutor(
+        config=GenkitConfig(
+            base_url="http://127.0.0.1:9/v1", model="test", api_key="test-key",
+            turn_timeout_ms=1_000, max_turns=2,
+        ),
+        tool_definitions=(),
+        stream_provider=provider,
+    )
+
+    for _ in range(2):
+        response = test_client.post(
+            f"/v1/agent/sessions/{SESSION_ID}/messages",
+            headers=_auth(issued), json={"content": "重复内容"},
+        )
+        assert response.status_code == 200, response.text
+
+    rows = database.connection.execute(
+        "SELECT id, role, content FROM agent_messages "
+        "WHERE session_id = CAST(? AS UUID) ORDER BY ordinal",
+        [SESSION_ID],
+    ).fetchall()
+    assert [(row[1], row[2]) for row in rows] == [
+        ("user", "重复内容"),
+        ("assistant", "回答 1"),
+        ("user", "重复内容"),
+        ("assistant", "回答 2"),
+    ]
+    assert provider.calls[0]["history"] == ()
+    history = provider.calls[1]["history"]
+    assert [(message.id, message.role, message.content) for message in history] == [
+        (str(rows[0][0]), "user", "重复内容"),
+        (str(rows[1][0]), "assistant", "回答 1"),
+    ]
+    assert all(message.id != str(rows[2][0]) for message in history)

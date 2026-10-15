@@ -266,6 +266,38 @@ def test_provider_builds_the_request() -> None:
     assert captured["timeout"] == 30.0
 
 
+def test_provider_places_history_after_system_and_before_current_user() -> None:
+    """请求体按 system、历史对话、本轮 user 的顺序保留原角色与内容。"""
+    from lyra.domain.agent.switching import NormalizedAgentMessage
+
+    captured: dict = {}
+
+    def open_lines(url, headers, body, timeout):
+        captured["body"] = body
+        return iter([_delta("[DONE]")])
+
+    history = (
+        NormalizedAgentMessage(
+            id="old-user", role="user", content="旧问题", created_at="t1"
+        ),
+        NormalizedAgentMessage(
+            id="old-assistant", role="assistant", content="旧回答", created_at="t2"
+        ),
+    )
+    provider = OpenAiCompatibleStreamProvider(_Config(), open_lines)
+    stream = provider(
+        content="新问题", system_context="服务端系统提示", tool_definitions=(), history=history
+    )
+    list(stream.chunks())
+
+    assert captured["body"]["messages"] == [
+        {"role": "system", "content": "服务端系统提示"},
+        {"role": "user", "content": "旧问题"},
+        {"role": "assistant", "content": "旧回答"},
+        {"role": "user", "content": "新问题"},
+    ]
+
+
 def test_provider_does_not_set_max_tokens_or_retries() -> None:
     """不设 max_tokens，也不自动重试。"""
     captured: dict = {}

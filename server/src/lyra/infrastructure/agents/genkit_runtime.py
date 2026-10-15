@@ -34,10 +34,12 @@ from dataclasses import dataclass
 from itertools import count, groupby
 from typing import Any, Protocol
 
+from ...application.agent_turn_orchestrator import AgentTurnCancelled
 from ...application.agent_config import DEFAULT_MAX_TURNS
 from ...application.app_error import ApplicationError
 from ...application.financial_tool_validation import is_valid_financial_tool_arguments
 from ...application.financial_tools import FINANCIAL_TOOL_NAMES
+from ...domain.agent.switching import NormalizedAgentMessage
 from ...domain.agent.tool_call import (
     AgentToolContext,
     authorize_tool_call,
@@ -112,7 +114,7 @@ class ModelStream(Protocol):
     def final_text(self) -> str: ...
 
 
-# 流提供者：接收用户输入、系统上下文、工具定义与已回灌的工具结果，返回一次模型调用。
+# 流提供者：接收系统上下文、对话历史、本轮用户输入、工具定义与工具回灌，返回一次模型调用。
 StreamProvider = Callable[..., ModelStream]
 # 工具执行器：接收模型请求与本次调用的审计 ID，返回回灌给模型的结果。
 # 审计信号由执行器自己发出——只有它知道授权判定、耗时与稳定错误码。
@@ -127,6 +129,7 @@ def run_agent_turn_stream(
     stream_provider: StreamProvider,
     execute_tool: ToolExecutor,
     emit: Callable[[AgentTurnStreamSignal], None],
+    history: tuple[NormalizedAgentMessage, ...] = (),
     max_turns: int = DEFAULT_MAX_TURNS,
 ) -> None:
     """执行一次回合并把输出翻译成规范化信号。
@@ -140,6 +143,7 @@ def run_agent_turn_stream(
     @param stream_provider: 模型流提供者。
     @param execute_tool: 工具执行器；返回值会被回灌给模型。
     @param emit: 信号接收器。
+    @param history: 当前用户消息之外的历史 user/assistant 消息，按对话顺序排列。
     @param max_turns: 允许的模型调用次数上限。
     """
     try:
@@ -150,6 +154,7 @@ def run_agent_turn_stream(
             stream = stream_provider(
                 content=content,
                 system_context=system_context,
+                history=history,
                 tool_definitions=tool_definitions,
                 exchanges=tuple(exchanges),
             )
@@ -186,6 +191,9 @@ def run_agent_turn_stream(
             emit(UsageUpdated(total_tokens=total_tokens, total_cost=None))
 
         emit(MessageSnapshot(content=final_text, stop_reason="end_turn"))
+    except AgentTurnCancelled:
+        # 取消由编排器按持久化状态生成终态；不能把它改写成普通模型失败。
+        raise
     except Exception:  # noqa: BLE001 - 统一折叠为失败终态，细节只进日志
         emit(MessageFailed(outcome="failed"))
     finally:
@@ -464,6 +472,13 @@ class GenkitTurnExecutor:
                 available_tools=tuple(
                     definition.name for definition in self._tools
                 ),
+            ),
+            # 起始快照已经包含本轮 user 消息；用持久消息 ID 精确排除它，避免重复，
+            # 同时保留相同文本的旧问题。system/tool 记录不作为对话历史传给模型。
+            history=tuple(
+                message for message in session.messages
+                if message.id != context.user_message_id
+                and message.role in ("user", "assistant")
             ),
             tool_definitions=self._tools,
             stream_provider=self._stream_provider,

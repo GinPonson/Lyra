@@ -323,6 +323,83 @@ def test_exchange_rounds_group_tool_calls_for_replay() -> None:
     ]
 
 
+def test_executor_reuses_only_prior_conversation_history_for_each_tool_cycle() -> None:
+    """工具循环每次请求都带同一份历史，且不混入本轮或系统/工具数据。"""
+    from dataclasses import replace
+
+    from lyra.domain.agent.switching import NormalizedAgentMessage
+
+    prior_user = NormalizedAgentMessage(
+        id="prior-user", role="user", content="重复问题", created_at="t1"
+    )
+    prior_assistant = NormalizedAgentMessage(
+        id="prior-assistant", role="assistant", content="上一轮回答", created_at="t2"
+    )
+    session = replace(
+        _fake_session(),
+        messages=(
+            prior_user,
+            prior_assistant,
+            NormalizedAgentMessage(
+                id="old-system", role="system", content="旧系统内容", created_at="t3"
+            ),
+            NormalizedAgentMessage(
+                id="old-tool", role="tool", content="旧工具数据", created_at="t4"
+            ),
+            NormalizedAgentMessage(
+                id="u-1", role="user", content="重复问题", created_at="t5"
+            ),
+        ),
+    )
+    definition = _EchoDefinition()
+    provider = ScriptedProvider([
+        FakeStream(
+            tools=[ModelToolRequest(name="summary", arguments={"value": 3})]
+        ),
+        FakeStream(chunks=[ModelChunk(text="回答")], final="回答"),
+    ])
+    executor = _executor(definition, provider, max_turns=2)
+    signals: list = []
+
+    executor.run(
+        session=session, content="重复问题", context=_tool_context(), emit=signals.append
+    )
+
+    expected_history = (prior_user, prior_assistant)
+    assert [call["history"] for call in provider.calls] == [
+        expected_history, expected_history
+    ]
+    assert all(message.id != "u-1" for call in provider.calls for message in call["history"])
+    assert definition.calls == [({"value": 3}, _tool_context())]
+
+
+def test_cancellation_propagates_and_still_settles() -> None:
+    """已取消回合向编排器透传异常，同时仍发出 TurnSettled。"""
+    from lyra.application.agent_turn_orchestrator import AgentTurnCancelled
+
+    signals: list = []
+
+    def emit(signal) -> None:
+        """模拟编排器在消费文本增量时发现已持久化的取消状态。"""
+        if isinstance(signal, MessageDelta):
+            raise AgentTurnCancelled()
+        signals.append(signal)
+
+    with pytest.raises(AgentTurnCancelled):
+        run_agent_turn_stream(
+            content="问题",
+            system_context="系统提示",
+            tool_definitions=(),
+            stream_provider=lambda **_: FakeStream(
+                chunks=[ModelChunk(text="部分答案")], final="部分答案"
+            ),
+            execute_tool=lambda request, call_id: None,
+            emit=emit,
+        )
+
+    assert signals == [TurnSettled()]
+
+
 def snapshots(signals: list) -> list:
     """取出权威快照信号。"""
     return [signal for signal in signals if isinstance(signal, MessageSnapshot)]

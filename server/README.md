@@ -37,6 +37,11 @@ uv run python -m lyra.main
 `uv run python -m lyra.main` 等价。默认监听 `127.0.0.1:3141`，与 TypeScript 版一致。
 配置缺失、主密钥形态不对、数据库打不开或迁移失败时，`run()` 直接退出，不进入"半启动"。
 
+服务保持单进程运行。同步路由与 Agent 工作线程共享受保护的 DuckDB 连接：执行查询与
+取出结果在同一临界区内完成，显式事务从 `BEGIN` 到 `COMMIT` / `ROLLBACK` 独占连接，
+事务内不得跨线程或 `await`。Agent 的模型流在线程池执行，WebSocket 发送仍在事件循环；
+取消先持久化为 `cancelling`，随后在下一个模型信号或回合结束时收口。
+
 ## 目录
 
 ```text
@@ -47,6 +52,7 @@ src/lyra/
 ├── db/
 │   ├── migrations.py 15 条迁移清单与执行语义
 │   ├── connection.py 打开账本、溢出目录、健康探测
+│   ├── serialized_connection.py 共享连接、独立查询结果与事务互斥
 │   └── sql/          迁移 SQL（**唯一来源**）
 ├── api/              health / system / 认证 / 账本 / 导入 / 行情 / Agent / Gmail 路由
 ├── application/      用例编排（导入、配对、行情设置、Agent 回合等）

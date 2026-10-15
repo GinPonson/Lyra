@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
 
 from ..application.agent_availability import create_agent_availability_snapshot
 from ..application.public_projection import project_agent_session
@@ -246,10 +247,13 @@ def create_agent_router() -> APIRouter:
         表示"请求已受理、尚未停止"，不应据此认为回合已经结束。
         """
         _require_session_id(session_id)
-        result = _transition(request, session_id, "cancelling")
-        # **取消意图由持久化状态表达**：编排器在收口前读 ``cancelling`` 决定按
-        # ``cancelled`` 还是成功落库，因此这里不需要（也不能）依赖进程内标志。
-        return result
+        snapshot = request.app.state.agent_orchestrator.request_cancel(
+            session_id, now=datetime.now(UTC)
+        )
+        if snapshot is not None:
+            return {"session": project_agent_session(snapshot)}
+        # 尚无内存运行态的持久化会话也必须按同一状态机校验。
+        return _transition(request, session_id, "cancelling")
 
     @router.post("/v1/agent/sessions/{session_id}/messages")
     async def send_message(session_id: str, request: Request) -> Any:
@@ -301,16 +305,17 @@ def create_agent_router() -> APIRouter:
         orchestrator = request.app.state.agent_orchestrator
         messages = AgentMessageRepository(connection).load_messages(session_id)
         from ..application.agent_turn_orchestrator import REGISTRY_UNAVAILABLE
-        orchestrator.register(
-            _rebuild(row, messages),
-            last_event_sequence=row.last_event_sequence,
-            device_id=row.device_id,
-            # 两条消息（用户 + 助手）接着既有行排下去：序号由运行态给出，
-            # 避免在同一事务里再查一次 max(ordinal)。
-            next_ordinal=len(messages) + 1,
-        )
         try:
-            result = orchestrator.run_turn(
+            orchestrator.register(
+                _rebuild(row, messages),
+                last_event_sequence=row.last_event_sequence,
+                device_id=row.device_id,
+                # 用户与助手消息接着既有行排列，运行态在开始回合时原子推进序号。
+                next_ordinal=len(messages) + 1,
+            )
+            # 同步模型流必须在线程池执行，事件循环才能及时发送 WebSocket 与受理取消。
+            result = await run_in_threadpool(
+                orchestrator.run_turn,
                 session_id=session_id, executor=executor, content=content
             )
         except ValueError as error:
