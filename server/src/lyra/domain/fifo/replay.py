@@ -175,10 +175,18 @@ def _close_position(
         f"{transaction.transaction_date} {transaction.action} "
         f"{_display_symbol(transaction.raw_symbol)}"
     )
-    if not book or not any(lot.direction == direction for lot in book):
+    directional_book = [
+        lot for lot in book
+        if lot.direction == direction and lot.remaining_quantity > 0
+    ]
+    if not directional_book:
         raise FifoError(f"{where}: 没有可平的 {direction} 持仓")
 
-    consumed = _consume(book, transaction.quantity, where)
+    # 一个账户与标的可能同时持有多空两组批次；可用量与 FIFO 顺序都必须只看
+    # 本次 Action 指定的方向，不能让一侧的超额平仓消耗另一侧的批次。
+    consumed = _consume(directional_book, transaction.quantity, where)
+    # _consume 操作方向筛选后的队列；同步清掉原账本中已耗尽的 Lot，保留相反方向。
+    book[:] = [lot for lot in book if lot.remaining_quantity > 0]
     close_fees_total = transaction.fees if transaction.fees is not None else Decimal(0)
     close_fees_allocated = Decimal(0)
     multiplier = 100 if transaction.asset_type == "option" else 1
