@@ -25,6 +25,7 @@ from ...application.gmail_service import (
 from ...application.gmail_sync_service import (
     GmailSyncDependencies,
 )
+from ...application.gmail_user_scope import assert_gmail_user_active
 from ...infrastructure.db.gmail_connection_repository import (
     create_gmail_account_mapping_row,
     create_gmail_connection_row,
@@ -48,11 +49,23 @@ from .google_oauth_client import (
 )
 from .http_transport import build_form_getter, build_json_getter
 
+# 单次同步的有界扫描/增量上限。
+#
+# 值必须存在且为正：Gmail 查询不带 ``maxResults`` 会把邮箱全部历史拉下来（既慢又贵），
+# 而 ``search_query`` 会拒绝非正数。当前没有对应的配置字段（``config.py`` 不在本次
+# 改造范围），因此先固定为模块常量；需要按部署调整时应由主代理在 ``config.py`` 增加
+# 设置项并从这里读取，而不是把数字散落到调用点。
+DEFAULT_GMAIL_MAXIMUM_MESSAGES = 500
+
 
 def build_gmail_service(
     *, connection: duckdb.DuckDBPyConnection, environment: object, cipher: SecretCipher
 ) -> GmailService:
     """装配 Gmail 服务。
+
+    **返回值是未绑定用户的服务**：路由必须经 ``service.for_user(user_id)`` 取得绑定
+    当前用户的视图后再调用。未绑定视图在真实依赖上调用业务方法会因缺少 ``user_id``
+    直接报错，不会退回全库语义。
 
     @param connection: 数据库连接。
     @param environment: 环境变量映射。
@@ -73,7 +86,12 @@ def build_gmail_service(
 
 
 class _Dependencies:
-    """服务所需外部动作的真实实现。"""
+    """服务所需外部动作的真实实现。
+
+    **每个与数据库相关的方法首参都是 ``user_id``**，由
+    :class:`lyra.application.gmail_service._UserScopedGmailDependencies` 注入；
+    这样仓储调用不可能漏掉用户范围。
+    """
 
     def __init__(self, *, connection, cipher, now, post_form, get_json) -> None:
         self._connection = connection
@@ -97,40 +115,44 @@ class _Dependencies:
             now=self.now(), **kwargs,
         )
 
-    def create_connection(self, record) -> None:
-        """插入连接行。"""
-        create_gmail_connection_row(self._connection, record)
+    def create_connection(self, user_id: str, record) -> None:
+        """插入属于该用户的连接行。"""
+        create_gmail_connection_row(self._connection, user_id, record)
 
-    def list_connections(self) -> tuple:
-        """列出连接。"""
-        return load_gmail_connections(self._connection)
+    def list_connections(self, user_id: str) -> tuple:
+        """列出该用户的连接。"""
+        return load_gmail_connections(self._connection, user_id)
 
-    def load_connection(self, connection_id: str):
-        """读取一条连接。"""
-        return load_gmail_connection(self._connection, connection_id)
+    def load_connection(self, user_id: str, connection_id: str):
+        """读取一条属于该用户的连接。"""
+        return load_gmail_connection(self._connection, user_id, connection_id)
 
-    def save_connection(self, record, *, expected_updated_at: str, **overrides) -> None:
-        """保存连接状态（带 CAS）。"""
+    def save_connection(
+        self, user_id: str, record, *, expected_updated_at: str, **overrides
+    ) -> None:
+        """保存该用户的连接状态（带 CAS）。"""
         save_gmail_connection_row(
-            self._connection, _with_overrides(record, overrides),
+            self._connection, user_id, _with_overrides(record, overrides),
             expected_updated_at=expected_updated_at,
         )
 
-    def list_mappings(self, connection_id: str) -> tuple:
-        """列出某连接的映射。"""
-        return load_gmail_account_mappings(self._connection, connection_id)
+    def list_mappings(self, user_id: str, connection_id: str) -> tuple:
+        """列出该用户某连接的映射。"""
+        return load_gmail_account_mappings(self._connection, user_id, connection_id)
 
-    def load_mapping(self, mapping_id: str):
-        """读取一条映射。"""
-        return load_gmail_account_mapping(self._connection, mapping_id)
+    def load_mapping(self, user_id: str, mapping_id: str):
+        """读取一条属于该用户的映射。"""
+        return load_gmail_account_mapping(self._connection, user_id, mapping_id)
 
-    def list_accounts(self) -> tuple:
-        """列出全部账户。"""
+    def list_accounts(self, user_id: str) -> tuple:
+        """列出该用户的账本账户。"""
         rows = self._connection.execute(
             """
             SELECT CAST(id AS VARCHAR), legacy_account_key, masked_suffix, status
-            FROM accounts ORDER BY masked_suffix, id
-            """
+            FROM accounts WHERE user_id = CAST(? AS UUID)
+            ORDER BY masked_suffix, id
+            """,
+            [user_id],
         ).fetchall()
         return tuple(
             AccountRecord(
@@ -142,12 +164,14 @@ class _Dependencies:
 
     def plan_mapping_update(self, **kwargs):
         """规划一次映射改绑。"""
-        return plan_gmail_account_mapping_update(accounts=self.list_accounts(), **kwargs)
+        return plan_gmail_account_mapping_update(**kwargs)
 
-    def update_mapping(self, *, mapping_id, expected_account_id, next_account_id, at) -> None:
-        """执行改绑（旧账户 ID 做 CAS）。"""
+    def update_mapping(
+        self, user_id: str, *, mapping_id, expected_account_id, next_account_id, at
+    ) -> None:
+        """执行改绑（旧账户 ID 做 CAS），并确认目标账户属于该用户。"""
         update_gmail_account_mapping_row(
-            self._connection, mapping_id=mapping_id,
+            self._connection, user_id, mapping_id=mapping_id,
             expected_account_id=expected_account_id,
             next_account_id=next_account_id, at=at,
         )
@@ -156,6 +180,21 @@ class _Dependencies:
         """向 Google 撤销授权。"""
         revoke_gmail_connection_authorization(
             connection, self.cipher, post_form=self._post_form
+        )
+
+    def build_sync_dependencies(self, user_id: str) -> GmailSyncDependencies:
+        """构造绑定该用户的同步依赖集合。
+
+        同步依赖里的每一次数据库读写都带 ``user_id``：连接读取、账户候选、映射读写、
+        账本版本与消息归档。因此"同步携带用户"不是靠某个参数传到最深处，而是**依赖
+        集合本身属于一个用户**。
+
+        @param user_id: 当前用户的 UUID 文本。
+        @returns 同步编排所需的动作集合。
+        """
+        return build_gmail_sync_dependencies(
+            connection=self._connection, cipher=self.cipher,
+            maximum_messages=DEFAULT_GMAIL_MAXIMUM_MESSAGES, user_id=user_id,
         )
 
 
@@ -173,27 +212,58 @@ class _SyncDependencies:
 
     **有界扫描必须先取 profile。** profile 给出本次扫描起点的 history 基线；
     不先取它，扫描期间新增的消息就没有游标可以覆盖，会永久丢失。
+
+    **整个依赖集合属于一个用户**（``user_id``）：连接、账户、映射、账本版本与消息
+    归档的每一次读写都带用户范围，"同步携带 user_id"因此不依赖调用点自觉传参。
+
+    @param connection: 数据库连接。
+    @param cipher: 凭据加密器。
+    @param maximum_messages: 单次同步的消息上限。
+    @param user_id: 当前用户的 UUID 文本；**必填**。
     """
 
-    def __init__(self, *, connection, cipher, maximum_messages) -> None:
+    def __init__(
+        self, *, connection, cipher, maximum_messages, user_id
+    ) -> None:
         self._connection = connection
         self._cipher = cipher
         self._maximum_messages = maximum_messages
+        self._user_id = user_id
         self._post_form = build_form_getter()
         self._get_json = build_json_getter()
+        # 由 ``load_connection`` 填入：有界扫描要用它校验 profile 属于同一个邮箱。
+        self._expected_email: str | None = None
 
     def now(self):
         """服务端可信时间。"""
         return datetime.now(UTC)
 
     def load_connection(self, connection_id: str):
-        """读取连接。"""
-        return load_gmail_connection(self._connection, connection_id)
+        """读取**当前用户的**连接，并确认用户仍然活动。
+
+        **活动状态在这里查**：``sync_gmail_connection`` 的第一件事就是读取连接，
+        因此停用一旦提交，本次同步在拉取任何消息之前就被拒绝（403），既不会继续调用
+        Google，也不会写回状态（计划 §4.4：排队任务实际开始执行时必须拒绝）。
+
+        @raises ApplicationError: 用户已停用（403）。
+        """
+        assert_gmail_user_active(self._connection, self._user_id)
+        row = load_gmail_connection(self._connection, self._user_id, connection_id)
+        if row is not None:
+            # 有界扫描的 profile 校验基准；读不到连接时同步层会立刻报 404，
+            # 因此这里不会用空基准去跳过邮箱校验。
+            self._expected_email = row.google_email
+        return row
 
     def save_connection(self, record, *, expected_updated_at: str, **overrides) -> None:
-        """保存连接状态（带 CAS）。"""
+        """保存当前用户的连接状态（带 CAS）。
+
+        **写回前再确认一次活动状态**：长流程期间被停用后，同步不得把游标或状态写回
+        （"不得继续拉取或写回消息"）。
+        """
+        assert_gmail_user_active(self._connection, self._user_id)
         save_gmail_connection_row(
-            self._connection, _with_overrides(record, overrides),
+            self._connection, self._user_id, _with_overrides(record, overrides),
             expected_updated_at=expected_updated_at,
         )
 
@@ -201,12 +271,15 @@ class _SyncDependencies:
         """刷新 access token。"""
         from ...application.gmail_sync_errors import refresh_with_connection
 
+        # 刷新令牌是同步里第一次触达 Google 的动作：停用后不得发出。
+        assert_gmail_user_active(self._connection, self._user_id)
         return refresh_with_connection(
             connection, cipher=self._cipher, post_form=self._post_form, now=self.now
         )
 
     def fetch_incremental(self, access_token, start_history_id, maximum):
         """拉取增量消息。"""
+        assert_gmail_user_active(self._connection, self._user_id)
         return fetch_incremental_gmail_full_records_for(
             access_token, start_history_id, maximum, get_json=self._get_json
         )
@@ -216,8 +289,16 @@ class _SyncDependencies:
 
         **profile 先于消息列表**：它给出本次扫描的 history 基线，扫描期间新增的消息
         才能被后续增量覆盖。
+
+        **profile 必须与本次连接的邮箱一致**：``load_connection`` 已经填好基准；
+        基准缺失说明调用顺序被改坏了（同步层会先读连接），此时**明确失败**而不是
+        跳过校验——否则一个错配的 access token 能把别人邮箱的邮件写进本次连接。
         """
-        from ...domain.gmail.search_query import build_schwab_econfirm_search
+        # **路径必须是同包的 ``.search_query``**：原先是 ``...domain.gmail.search_query``，
+        # 而 ``build_schwab_econfirm_search`` 一直只存在于 ``infrastructure/gmail/``。
+        # 那行在 ``GmailService.sync`` 实现之前是死代码（同步根本没有生产入口），
+        # 一旦首次同步可走，它就会抛 ``ModuleNotFoundError`` → 500。
+        from .search_query import build_schwab_econfirm_search
         from .google_gmail_client import (
             fetch_bounded_gmail_message_ids,
             fetch_full_gmail_records,
@@ -225,7 +306,9 @@ class _SyncDependencies:
             request_gmail_json,
         )
 
-        # **profile 先于消息列表**：它给出本次扫描的 history 基线。
+        assert_gmail_user_active(self._connection, self._user_id)
+        if self._expected_email is None:
+            raise RuntimeError("Gmail 有界扫描缺少连接邮箱基准，必须先读取连接")
         profile = parse_gmail_profile(
             request_gmail_json(
                 GMAIL_PROFILE_ENDPOINT, access_token, get_json=self._get_json
@@ -254,15 +337,18 @@ class _SyncDependencies:
 
         deps = GmailMessageProcessingDependencies(
             parse_records=lambda record: parse_gmail_full_input(record, source_name="Gmail 同步"),
+            # 账户候选与映射都限定在当前用户内：跨用户账户不可能被解析成映射目标，
+            # 因此"跨归属映射"在解析阶段就无从产生，写入阶段还有仓储层的原子校验。
             load_accounts=self._load_accounts,
             load_mappings=lambda: load_gmail_account_mappings(
-                self._connection, connection.id
+                self._connection, self._user_id, connection.id
             ),
             resolve_mapping=lambda **kwargs: resolve_gmail_account_mapping(
                 connection_id=connection.id, **kwargs
             ),
             create_mapping=lambda plan: create_gmail_account_mapping_row(
-                self._connection, connection_id=plan.connection_id,
+                self._connection, self._user_id,
+                connection_id=plan.connection_id,
                 account_suffix=plan.account_suffix, account_id=plan.account_id,
                 at=self.now(),
             ),
@@ -275,12 +361,14 @@ class _SyncDependencies:
         return summary.to_dict()
 
     def _load_accounts(self) -> tuple:
-        """读取全部账户。"""
+        """读取**当前用户的**账本账户。"""
         rows = self._connection.execute(
             """
             SELECT CAST(id AS VARCHAR), legacy_account_key, masked_suffix, status
-            FROM accounts ORDER BY masked_suffix, id
-            """
+            FROM accounts WHERE user_id = CAST(? AS UUID)
+            ORDER BY masked_suffix, id
+            """,
+            [self._user_id],
         ).fetchall()
         return tuple(
             AccountRecord(
@@ -304,7 +392,8 @@ class _SyncDependencies:
                 synced_at=self.now(), error_code=error_code,
             )
             persist_unsuccessful_gmail_message(
-                self._connection, metadata, synced_at=_iso(self.now())
+                self._connection, self._user_id, metadata,
+                synced_at=_iso(self.now()),
             )
 
         return persist
@@ -323,9 +412,9 @@ class _SyncDependencies:
 
 
         def import_message(message, trades, mapping):
-            ledger_version = _current_ledger_version(self._connection)
+            ledger_version = _current_ledger_version(self._connection, self._user_id)
             existing = load_existing_gmail_message_state(
-                self._connection, connection.id, message.message_id
+                self._connection, self._user_id, connection.id, message.message_id
             )
             plan = build_gmail_message_import_plan(
                 connection_id=connection.id, thread_id=None, message=message,
@@ -336,13 +425,13 @@ class _SyncDependencies:
                 base_ledger_version=ledger_version,
                 existing_message=existing,
                 existing_account_transactions=_account_transactions(
-                    self._connection, mapping.legacy_account_key
+                    self._connection, self._user_id, mapping.legacy_account_key
                 ),
             )
             if plan.kind == "already_imported":
                 return "already_imported"
             persist_gmail_message_import(
-                self._connection, plan=plan,
+                self._connection, user_id=self._user_id, plan=plan,
                 expected_ledger_version=ledger_version,
                 synced_at=_iso(self.now()),
             )
@@ -368,17 +457,23 @@ def _iso(value: datetime) -> str:
 
 
 def build_gmail_sync_dependencies(
-    *, connection: duckdb.DuckDBPyConnection, cipher: SecretCipher, maximum_messages: int
+    *,
+    connection: duckdb.DuckDBPyConnection,
+    cipher: SecretCipher,
+    maximum_messages: int,
+    user_id: str,
 ) -> GmailSyncDependencies:
     """装配同步编排所需的动作集合。
 
     @param connection: 数据库连接。
     @param cipher: 凭据加密器。
     @param maximum_messages: 单次同步的消息上限。
+    @param user_id: 当前用户的 UUID 文本；**必填**，所有回调都限定在该用户内。
     @returns 依赖集合。
     """
     deps = _SyncDependencies(
-        connection=connection, cipher=cipher, maximum_messages=maximum_messages
+        connection=connection, cipher=cipher,
+        maximum_messages=maximum_messages, user_id=user_id,
     )
     return GmailSyncDependencies(
         load_connection=deps.load_connection,
@@ -445,10 +540,17 @@ class _ReadyRecords:
         self.completion_history_id = completion_history_id
 
 
-def _current_ledger_version(connection: duckdb.DuckDBPyConnection) -> int:
-    """读取当前账本版本；空账本为 0。"""
+def _current_ledger_version(connection: duckdb.DuckDBPyConnection, user_id: str) -> int:
+    """读取**当前用户**的账本版本；该用户的空账本为 0。
+
+    契约 §3.3 把「用户当前账本版本」显式定义为 ``max(version) WHERE user_id = ?``，
+    ``ledger_version_seq`` 仍是全局序列（号码不连续）。**禁止**改回全局
+    ``max(version)``：那会让 B 的导入把 A 的基准版本推高，A 拿着旧版本提交时被判
+    ``LEDGER_VERSION_CONFLICT``——A 的同步被 B 的写入"隔空"作废。
+    """
     row = connection.execute(
-        "SELECT coalesce(max(version), 0) FROM ledger_versions"
+        "SELECT coalesce(max(version), 0) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [user_id],
     ).fetchone()
     return 0 if row is None else int(row[0])
 
@@ -464,7 +566,9 @@ def _parser_version() -> str:
     return PARSER_VERSION
 
 
-def _account_transactions(connection: duckdb.DuckDBPyConnection, legacy_key: str) -> tuple:
+def _account_transactions(
+    connection: duckdb.DuckDBPyConnection, user_id: str, legacy_key: str
+) -> tuple:
     """读取目标账户的现有标准交易。
 
     传给导入计划做去重与 FIFO 重算的依据。
@@ -472,11 +576,14 @@ def _account_transactions(connection: duckdb.DuckDBPyConnection, legacy_key: str
     **复用已有的账本快照读取**，而不是另写一份查询——两份查询在字段或排序上稍有差异
     就会让导入计划基于不同的交易集合做判断。注意分析层的 ``AccountScope.account``
     用的是**legacy 账户键**（不是 UUID）。
+
+    仓储在构造时绑定 ``user_id``：账户键已改为用户内唯一，不带用户范围的快照会把
+    另一个用户的同键账户交易混进本次去重与 FIFO。
     """
     from ...domain.analytics.types import AccountScope
     from ..db.ledger_repository import DuckDbLedgerRepository
 
-    snapshot = DuckDbLedgerRepository(connection).load_snapshot(
+    snapshot = DuckDbLedgerRepository(connection, user_id=user_id).load_snapshot(
         AccountScope(kind="account", account=legacy_key)
     )
     # 快照按范围过滤，但显式再筛一次：仓储若过滤失效，多出的交易会污染去重与 FIFO。

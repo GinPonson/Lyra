@@ -20,6 +20,7 @@ const _snapshot = CredentialSnapshot(
   deviceId: 'profile-device',
   accessToken: 'profile-access',
   refreshToken: 'profile-refresh',
+  userId: 'profile-user',
   authMethod: 'google',
   userEmail: 'owner@example.com',
   googleSubject: 'profile-owner',
@@ -87,10 +88,15 @@ class _ProfileFixture extends LedgerFixture {
             return _json({
               'status': 'complete',
               'user': {
-                'provider': 'google',
-                'subject': 'new-owner',
-                'email': 'new@example.com',
+                'userId': 'new-owner-user',
                 'displayName': 'New user',
+                'status': 'active',
+                'role': 'member',
+                'identity': {
+                  'provider': 'google',
+                  'subject': 'new-owner',
+                  'email': 'new@example.com',
+                },
               },
               'deviceId': 'new-device',
               'displayName': 'Lyra Mobile',
@@ -111,10 +117,10 @@ class _ProfileFixture extends LedgerFixture {
             expectSync(options.headers['authorization'], isNull);
             return _json({
               'server_version': '1.2.3',
-              'protocol_version': 2,
-              'min_supported_protocol_version': 2,
-              'max_supported_protocol_version': 2,
-              'schema_version': 4,
+              'protocol_version': 3,
+              'min_supported_protocol_version': 3,
+              'max_supported_protocol_version': 3,
+              'schema_version': 16,
             });
           }
           if (path == '/v1/health') return _json({'status': 'healthy'});
@@ -235,6 +241,7 @@ Future<void> _replaceIdentity(
       deviceId: 'different-device',
       accessToken: 'different-access',
       refreshToken: 'different-refresh',
+      userId: 'different-user',
       authMethod: 'google',
       userEmail: 'different@example.com',
       googleSubject: 'different-owner',

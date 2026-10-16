@@ -14,13 +14,15 @@ from fastapi import FastAPI
 
 from .api.agent_events import EventConnectionRegistry, create_agent_events_router
 from .api.agent_routes import create_agent_router
-from .api.auth_routes import build_owner_login_service, create_auth_router
+from .api.auth_routes import build_login_service, create_auth_router
 from .api.error_envelope import install_error_envelope
 from .api.gmail_routes import create_gmail_router
 from .api.health import create_health_router
 from .application.agent_availability import create_agent_availability_snapshot
 from .application.write_coordinator import WriteCoordinator
-from .infrastructure.db.gmail_connection_repository import load_gmail_connections
+from .infrastructure.db.gmail_connection_repository import (
+    count_gmail_connections_needing_attention,
+)
 from .api.import_routes import create_import_router
 from .api.ledger_routes import build_authenticator, create_ledger_router
 from .api.market_routes import create_market_router
@@ -29,7 +31,7 @@ from .config import Settings
 from .db.connection import LyraDatabase, open_lyra_database
 
 
-async def _authorize_owner_device(
+async def _authorize_user_device(
     *,
     identity: object,
     public_key_pem: str,
@@ -37,21 +39,28 @@ async def _authorize_owner_device(
     database: object,
     write_coordinator: object,
 ) -> object:
-    """登录成功后的设备签发。
+    """登录成功后的用户解析与设备签发。
 
     **异步**：签发走单写队列，而队列用 ``asyncio.Lock`` 串行化。
 
     ``write_coordinator`` 由调用方注入**应用级单例**：每个调用点各自
     ``new WriteCoordinator()`` 会拿到各自实例的锁，等于没有队列——健康端点报告的
     队列状态也会与实际写入脱节。
+
+    ``user`` 与 ``identity`` 一并返回而不是只返回设备字段：登录响应必须给出与
+    ``GET /v1/me`` 同形的 ``user`` 对象（见 P0 契约 §3.9），而它只能来自本次解析出
+    的用户与身份。缺这两个 key 会让 ``auth_routes`` 的兑换路径 KeyError。
     """
     from .application.device_pairing_service import DevicePairingService
     from .infrastructure.db.device_repository import DuckDbDeviceRepository
+    from .infrastructure.db.user_repository import UserRepository
 
     service = DevicePairingService(
-        DuckDbDeviceRepository(database.connection), write_coordinator
+        DuckDbDeviceRepository(database.connection),
+        write_coordinator,
+        UserRepository(database.connection),
     )
-    issued = await service.authorize_owner_device(
+    issued = await service.authorize_user_device(
         identity=identity, display_name=display_name, public_key_pem=public_key_pem
     )
     return {
@@ -61,6 +70,8 @@ async def _authorize_owner_device(
         "accessTokenExpiresAt": issued.access_token_expires_at,
         "refreshToken": issued.refresh_token,
         "refreshTokenExpiresAt": issued.refresh_token_expires_at,
+        "user": issued.user,
+        "identity": issued.identity,
     }
 
 
@@ -90,7 +101,11 @@ def create_app(settings: Settings, database: LyraDatabase) -> FastAPI:
     app.include_router(create_health_router(
         database,
         write_coordinator_provider=lambda: app.state.write_coordinator,
-        gmail_connections=lambda: load_gmail_connections(database.connection),
+        # Gmail 段传**部署级聚合数**而不是连接列表：多用户下连接数是用户活动信息，
+        # 公开健康响应不得暴露（计划 §4.4）。健康端点只据此推导 available/degraded。
+        gmail_attention_provider=lambda: count_gmail_connections_needing_attention(
+            database.connection
+        ),
         agent_availability=lambda: create_agent_availability_snapshot(
             configured=app.state.agent_executor is not None,
             checked_at=datetime.now(UTC),
@@ -108,9 +123,9 @@ def create_app(settings: Settings, database: LyraDatabase) -> FastAPI:
     # 但永远登不进去"的配置上线是最糟的选择。
     #
     # 设备签发用例指向尚未接线的 `exchange` 路径，见 auth_routes 的模块文档。
-    app.state.login_service = build_owner_login_service(
+    app.state.login_service = build_login_service(
         os.environ,
-        lambda **kwargs: _authorize_owner_device(
+        lambda **kwargs: _authorize_user_device(
             database=database,
             # lambda 体在**请求期**求值，晚于下方 `app.state.write_coordinator` 的赋值，
             # 因此这里取到的就是那个单例。
@@ -118,9 +133,11 @@ def create_app(settings: Settings, database: LyraDatabase) -> FastAPI:
             **kwargs,
         ),
     )
-    app.state.login_provider_ids = frozenset(
-        provider.id for provider in app.state.login_service._providers
-    )
+    # ``_providers`` 是 ``dict[provider_id, ConfiguredLoginProvider]``，因此**迭代它得到的是
+    # 字符串 key**。原先写成 ``provider.id for provider in ...`` 会对字符串取 ``.id`` 抛
+    # ``AttributeError``——这个 bug 一直潜伏，只因为没有来源被配置时空字典让循环体不执行；
+    # **任何配齐一组 OAuth 凭据的真实部署都会在启动时直接崩**。
+    app.state.login_provider_ids = frozenset(app.state.login_service._providers)
     app.include_router(create_auth_router())
     # Gmail 服务：仓储 + 加密器 + OAuth 客户端 + Gmail 客户端的装配。
     #
@@ -167,20 +184,21 @@ def create_app(settings: Settings, database: LyraDatabase) -> FastAPI:
     from .infrastructure.market_data.config import load_market_data_config
     from .infrastructure.market_data.httpx_fetch import httpx_market_fetch
     from .infrastructure.market_data.runtime import create_market_data_runtime
-    from .infrastructure.db.market_settings_repository import load_market_settings
 
     app.state.market_runtime = create_market_data_runtime(
         load_market_data_config(os.environ),
         fetch=httpx_market_fetch,
         now=lambda: int(datetime.now(UTC).timestamp() * 1000),
     )
-    stored_market_settings = load_market_settings(database.connection)
-    if stored_market_settings is not None:
-        # 持久化设置优先于启动默认值；应用开始服务前就恢复，保证 HTTP 与 Agent
-        # 工具第一次读行情时使用同一组已保存的路由和 revision。
-        app.state.market_runtime.initialize_settings(
-            stored_market_settings.routes, stored_market_settings.revision
-        )
+    # **启动期不再装载任何"已保存的行情设置"。**
+    #
+    # 那行代码把某一个用户的设置装成全局运行时偏好，多用户下等于让启动时读取的那
+    # 一个用户覆盖所有人的来源选择（计划 §4.4「禁止每个请求覆盖同一 runtime 的
+    # 全局路由」）。现在每次请求按自己的 user_id 从库里读快照，运行时不再保存
+    # 当前路由与修订号——见 P0 契约 §3.12。
+    #
+    # 这里保留的 `market_runtime` 仍携带**启动默认路由**与共享的报价服务：供应商
+    # 凭据、公开报价缓存与供应商预算保持部署级共享，不随用户划分。
     app.state.agent_executor = create_executor_from_environment(
         connection=database.connection,
         environment=os.environ,

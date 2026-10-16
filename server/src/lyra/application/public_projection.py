@@ -16,6 +16,7 @@ from typing import Any
 from ..domain.analytics.currency_groups import CurrencyGroupedResult
 from ..domain.analytics.types import AccountSummary
 from ..domain.numeric import decimal_text
+from .app_error import ApplicationError
 
 
 def project_summary(summary: AccountSummary) -> dict[str, Any]:
@@ -747,7 +748,12 @@ def project_market_positions(
 
 
 def _market_status(market_runtime: Any, market_settings: Any = None) -> dict[str, Any]:
-    """投影本次请求采用的行情路由、修订号与已知来源状态。"""
+    """投影本次请求采用的行情路由、修订号与已知来源状态。
+
+    @param market_runtime: 行情运行时；``None`` 表示未装配。
+    @param market_settings: 本次请求已按用户读取的设置快照。
+    @raises ApplicationError: 装了运行时却没有给出设置快照。
+    """
     if market_runtime is None:
         return {
             "enabled": False,
@@ -755,8 +761,18 @@ def _market_status(market_runtime: Any, market_settings: Any = None) -> dict[str
             "providers": [],
             "settingsRevision": 0,
         }
-    snapshot = market_settings or market_runtime.settings_snapshot()
-    routes = snapshot.routes
+    if market_settings is None:
+        # **这里不能再自己去读设置**：快照按用户读取，而本函数只有运行时、没有用户
+        # 身份与连接。原先的 `settings_snapshot()` 无参调用在多用户下要么直接报错，
+        # 要么退化成"读某个全局当前值"——后者会让 A 看到 B 的来源。因此改为要求调用方
+        # 显式传入它已经按用户取好的快照，缺失即明确失败。
+        raise ApplicationError(
+            code="MARKET_SETTINGS_SNAPSHOT_REQUIRED",
+            message="行情状态投影缺少设置快照",
+            status_code=500,
+            retryable=False,
+        )
+    routes = market_settings.routes
     configured = frozenset(market_runtime.provider_ids)
     from ..domain.market_data.settings import effective_routes
 
@@ -781,5 +797,5 @@ def _market_status(market_runtime: Any, market_settings: Any = None) -> dict[str
             }
             for provider in market_runtime.provider_options
         ],
-        "settingsRevision": snapshot.revision,
+        "settingsRevision": market_settings.revision,
     }

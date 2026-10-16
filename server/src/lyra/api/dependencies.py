@@ -17,6 +17,7 @@ from fastapi import Header, HTTPException, Request
 
 from ..application.app_error import ApplicationError
 from ..domain.analytics.types import AccountScope
+from ..security.auth_context import AuthContext
 
 
 def to_jsonable(value: Any) -> Any:
@@ -36,28 +37,57 @@ def to_jsonable(value: Any) -> Any:
     return value
 
 
-def require_device(request: Request, authorization: str | None = Header(default=None)) -> Any:
-    """FastAPI 依赖：校验 `Authorization: Bearer` 并返回已认证设备。
+def require_user(request: Request, authorization: str | None = Header(default=None)) -> AuthContext:
+    """FastAPI 依赖：校验 ``Authorization: Bearer`` 并返回已认证的用户上下文。
+
+    **返回的是用户上下文，不是设备**。多用户下设备只用于凭据撤销与审计，数据归属
+    一律由 ``AuthContext.user_id`` 决定；把设备当成「访问主体」会让归属判定分叉
+    （P0 契约 §3.8）。
+
+    认证器已经完成了「令牌有效 → 设备未撤销 → 用户仍活动」三步；这里只负责取出
+    令牌与转换错误信封，不再重复校验。
 
     @param request: 请求对象，用于取出应用持有的认证器。
     @param authorization: 授权头原文。
-    @returns 已认证设备的安全状态。
-    @raises HTTPException: 缺少或非法令牌，统一返回 401。
+    @returns 已认证请求的用户上下文。
+    @raises HTTPException: 令牌缺失或非法（401）、用户已停用（403）。
     """
     if authorization is None or not authorization.startswith("Bearer ") or len(authorization) <= 7:
         raise HTTPException(status_code=401, detail={"code": "DEVICE_CREDENTIAL_INVALID", "message": "设备访问令牌无效"})
     token = authorization[len("Bearer ") :]
     authenticator = request.app.state.authenticator
     try:
-        device = authenticator.authenticate(token)
+        auth = authenticator.authenticate(token)
     except ApplicationError as error:
         raise HTTPException(
             status_code=error.status_code, detail={"code": error.code, "message": error.message}
         ) from error
     # 也挂到 request.state：路由处理器常常需要设备身份（例如写 agent_sessions.device_id），
     # 而依赖的返回值只能被声明了该依赖的函数参数接收。
-    request.state.device = device
-    return device
+    request.state.auth = auth
+    return auth
+
+
+def require_admin(request: Request, authorization: str | None = Header(default=None)) -> AuthContext:
+    """FastAPI 依赖：在 :func:`require_user` 之上再要求管理员角色。
+
+    直接复用 :func:`require_user`，因此**停用用户的 403 先于角色判定**——否则一个
+    被停用的管理员会在管理接口上得到「权限不足」这种误导性的结论。
+
+    @param request: 请求对象，用于取出应用持有的认证器。
+    @param authorization: 授权头原文。
+    @returns 已认证的管理员上下文。
+    @raises HTTPException: 未认证（401）、用户已停用（403）、非管理员（403）。
+    """
+    auth = require_user(request, authorization)
+    if auth.role != "admin":
+        # 非管理员与「不存在该接口」不可区分不是目标；这里给出明确的 403，
+        # 但**不透露**任何其他用户的信息。
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "ADMIN_REQUIRED", "message": "该操作仅限管理员"},
+        )
+    return auth
 
 
 def account_scope_of(value: str | None) -> AccountScope:

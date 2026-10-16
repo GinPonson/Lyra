@@ -8,7 +8,10 @@
 - **签名与时效由官方库验证**（``google-auth``），它负责拉取 Google JWKS 并校验
   `iss` / `aud` / `exp`；
 - **本模块只做官方库不覆盖的边界校验**：`nonce` 绑定、`email_verified`、
-  账户状态与 owner 准入。
+  账户状态与 ID token 声明的完整性。
+
+**这里不做任何准入判断**：多用户改造后没有 owner 白名单，首次登录一律自动注册，
+是否需要放行由上层按 `(provider, subject)` 解析出的用户状态决定（见 P0 契约 §3.8）。
 
 **不得用 JSON 解码替代官方验签入口**——那等于接受任何人伪造的身份令牌。
 """
@@ -43,13 +46,16 @@ _LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
 
 @dataclass(frozen=True)
 class GoogleLoginConfig:
-    """登录与 Gmail 离线授权使用不同配置；登录**不申请** Gmail 或 offline 权限。"""
+    """登录与 Gmail 离线授权使用不同配置；登录**不申请** Gmail 或 offline 权限。
+
+    **不含 owner 白名单**：多用户下登录来源的可用性只看 OAuth 凭据是否齐备，
+    谁可以登录由 ``(provider, subject)`` 的用户解析决定（自动注册），而不是由部署
+    配置里的一份 subject 名单决定。首个管理员改由离线入口显式创建（契约 §3.10）。
+    """
 
     client_id: str
     client_secret: str
     redirect_uri: str
-    owner_email: str | None
-    owner_subject: str | None
 
 
 @dataclass(frozen=True)
@@ -68,15 +74,13 @@ def load_google_login_config(
     """从环境读取并校验 Google 登录配置。
 
     @param env: 环境变量映射。
-    @returns 已校验配置；五项全空时返回 ``None``（来源未启用）。
-    @raises ValueError: 部分配置、缺少 owner 或取值非法。
+    @returns 已校验配置；三项凭据全空时返回 ``None``（来源未启用）。
+    @raises ValueError: 部分配置或取值非法。
     """
     names = (
         "LYRA_LOGIN_GOOGLE_CLIENT_ID",
         "LYRA_LOGIN_GOOGLE_CLIENT_SECRET",
         "LYRA_LOGIN_GOOGLE_REDIRECT_URI",
-        "LYRA_OWNER_EMAIL",
-        "LYRA_OWNER_GOOGLE_SUBJECT",
     )
     if all((env.get(name) or "").strip() == "" for name in names):
         return None
@@ -91,8 +95,6 @@ def load_google_login_config(
         client_id=required("LYRA_LOGIN_GOOGLE_CLIENT_ID"),
         client_secret=required("LYRA_LOGIN_GOOGLE_CLIENT_SECRET"),
         redirect_uri=required("LYRA_LOGIN_GOOGLE_REDIRECT_URI"),
-        owner_email=(env.get("LYRA_OWNER_EMAIL") or "").strip().lower() or None,
-        owner_subject=(env.get("LYRA_OWNER_GOOGLE_SUBJECT") or "").strip() or None,
     )
     validate_google_login_config(config)
     return config
@@ -101,7 +103,7 @@ def load_google_login_config(
 def validate_google_login_config(config: GoogleLoginConfig) -> None:
     """校验 Google 登录配置。
 
-    @raises ValueError: 凭据、回调地址或 owner 不合法。
+    @raises ValueError: 凭据或回调地址不合法。
     """
     if not config.client_id.strip() or not config.client_secret.strip():
         raise ValueError("Google 登录必须配置 Web OAuth client ID 与 client secret")
@@ -123,13 +125,6 @@ def validate_google_login_config(config: GoogleLoginConfig) -> None:
             f"Google 登录回调必须为固定 HTTPS {GOOGLE_LOGIN_CALLBACK_PATH} 地址"
             "（仅本机开发允许 HTTP）"
         )
-
-    if config.owner_email is None and config.owner_subject is None:
-        raise ValueError("必须配置 LYRA_OWNER_EMAIL 或 LYRA_OWNER_GOOGLE_SUBJECT，Lyra 不开放注册")
-    if config.owner_email is not None and not _EMAIL.fullmatch(config.owner_email):
-        raise ValueError("LYRA_OWNER_EMAIL 格式无效")
-    if config.owner_subject is not None and not _SUBJECT.fullmatch(config.owner_subject):
-        raise ValueError("LYRA_OWNER_GOOGLE_SUBJECT 格式无效")
 
 
 def sha256(value: str) -> str:
@@ -207,26 +202,6 @@ def validate_google_login_claims(
         email=email.strip().lower(),
         display_name=name.strip()[:256] if isinstance(name, str) and name.strip() else None,
     )
-
-
-def assert_configured_owner(identity: GoogleLoginIdentity, config: GoogleLoginConfig) -> None:
-    """校验身份是否属于配置的 owner。
-
-    邮箱与 subject **各自独立生效**：凡是配置了的维度都必须匹配。
-    subject 比较区分大小写，邮箱按已规范化的形式比较。
-
-    @raises ApplicationError: 身份不属于配置的 owner。
-    """
-    if (
-        (config.owner_subject is not None and identity.subject != config.owner_subject)
-        or (config.owner_email is not None and identity.email != config.owner_email.lower())
-    ):
-        raise ApplicationError(
-            code="LOGIN_DENIED",
-            message="此 Google 账户无权访问这台 Lyra 服务",
-            status_code=403,
-            retryable=False,
-        )
 
 
 class GoogleLoginClient:

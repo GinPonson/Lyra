@@ -2,6 +2,14 @@
 
 镜像 TypeScript 版 ``market-data-runtime.ts`` 的装配部分。
 
+**运行时只持有部署级共享资源**：来源函数（由供应商凭据决定）、公开报价缓存与
+供应商预算都挂在同一个 :class:`MarketDataService` 实例上。用户的来源路由是**用户
+设置**，每次请求按 ``user_id`` 从数据库读快照、显式传给报价调用。
+
+运行时**不再保存**"当前路由/当前修订号"。把某个用户的设置装进运行时实例，就是
+多用户下"谁最后保存谁覆盖所有人"的成因——同一进程里所有请求共享同一个运行时，
+任何一次保存都会改写所有人的报价来源（计划 §4.4 点名禁止）。
+
 **供应商按凭据注册，与路由无关**：一对齐全的凭据说明操作者配置了这个来源，
 即使当前没被路由选中也应当出现在可选列表里（界面需要展示"已配置但未启用"）。
 
@@ -19,13 +27,15 @@ historical 的 TTL 是 24 小时：**收盘价在当天不会变**，15 分钟�
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from threading import RLock
+from dataclasses import dataclass
+
+import duckdb
 
 from ...application.market_budget import MarketProviderPolicy
 from ...application.market_data_service import MarketDataService, ProviderQuote
 from ...domain.market_data.settings import MarketProviderOption, MarketRoutes
 from ...domain.market_data.types import MarketTiming
+from ..db.market_settings_repository import load_market_settings
 from .alpaca_provider import AlpacaMarketDataProvider
 from .config import MarketDataConfig
 from .http import MarketDataFetch
@@ -41,66 +51,71 @@ MARKETDATA_DELAY_MINUTES = 15
 
 @dataclass(frozen=True)
 class MarketDataRuntimeSettings:
-    """一次一致读取的已生效路由与持久化修订号。"""
+    """一次一致读取的、**属于某个用户**的已生效路由与修订号。
+
+    @param routes: 该用户当前生效的来源顺序（顺序即主备）。
+    @param revision: 与 ``routes`` 同一行的修订号；从未保存过为 0。
+    @param updated_at: 最近一次保存时间；从未保存过为 ``None``。
+    """
 
     routes: MarketRoutes
     revision: int
+    updated_at: str | None = None
 
 
 @dataclass
 class MarketDataRuntime:
-    """装配好的行情运行时及其当前持久化设置。"""
+    """部署级共享的行情运行时。
+
+    **只保存与用户无关的装配结果**：共享报价服务（缓存与预算）、部署配置的默认
+    路由、来源目录、超时。每个用户的路由与修订号由 :meth:`settings_snapshot` 在
+    请求内按 ``user_id`` 读取，运行时不留"当前值"。
+
+    @param service: 部署级共享的报价服务；**不得按用户复制**——那会击穿公开报价
+        缓存复用与供应商全局预算（计划 §4.4）。
+    @param provider_ids: 凭据齐全的来源 id，供选路与限流使用。
+    @param default_routes: 部署配置的路由；某个用户从未保存过设置时使用。
+    @param timeout_ms: 单次上游请求超时。
+    @param provider_options: 来源目录（含已知但未配置的来源）。
+    """
 
     service: MarketDataService
-    # 可选来源 id（凭据齐全的），供运行时选路与限流使用。
     provider_ids: tuple[str, ...]
-    # 启动配置路由；数据库中有保存值时由 initialize_settings 覆盖。
     default_routes: dict[str, tuple[str, ...]]
     timeout_ms: int
-    # 来源目录包含已知但未配置的来源，供设置页显示其真实不可用状态。
     provider_options: tuple[MarketProviderOption, ...]
-    _routes: dict[str, tuple[str, ...]] = field(init=False, repr=False)
-    _settings_revision: int = field(default=0, init=False, repr=False)
-    _settings_lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """以启动配置路由初始化服务状态。"""
+        """复制部署默认路由，避免调用方改写运行时持有的快照。"""
         self.default_routes = _copy_routes(self.default_routes)
-        self._routes = _copy_routes(self.default_routes)
 
-    def initialize_settings(
-        self, routes: MarketRoutes, revision: int
+    def settings_snapshot(
+        self, connection: duckdb.DuckDBPyConnection, user_id: str
     ) -> MarketDataRuntimeSettings:
-        """用数据库保存的路由与修订号初始化或更新运行时。
+        """读取**该用户**当前生效的行情设置快照。
 
-        @param routes: 已校验的持久化路由。
-        @param revision: 与路由同一行的修订号。
-        @returns 当前实际生效的路由快照；较旧的并发读取不会覆盖较新修订。
-        @raises ValueError: 修订号为负数。
+        HTTP 路由与 Agent 工具共用本方法，保证两处看到同一份"当前用户设置 + 共享
+        报价服务"。
+
+        **每次调用都读数据库，不做跨请求缓存**：缓存某个用户的设置等价于把它当成
+        运行时的"当前值"，多用户下必然互相覆盖（计划 §4.4）。调用方可以把它放进自己
+        的短事务，与账本快照一起构成一致读。
+
+        @param connection: 当前数据库连接。
+        @param user_id: 当前用户的 UUID 文本；设置行按用户独立。
+        @returns 该用户的路由、修订号与保存时间；从未保存过时为部署默认路由与
+            revision 0（与"保存了空路由"区分）。
         """
-        if (
-            not isinstance(revision, int)
-            or isinstance(revision, bool)
-            or revision < 0
-        ):
-            raise ValueError("行情设置 revision 不能为负数")
-        resolved = _copy_routes(routes)
-        with self._settings_lock:
-            # 请求可能先读到旧设置、后于新保存请求到达此处；只允许修订号向前推进。
-            if revision >= self._settings_revision:
-                self.service.set_routes(resolved)
-                self._routes = resolved
-                self._settings_revision = revision
+        stored = load_market_settings(connection, user_id)
+        if stored is None:
             return MarketDataRuntimeSettings(
-                routes=_copy_routes(self._routes), revision=self._settings_revision
+                routes=_copy_routes(self.default_routes), revision=0, updated_at=None
             )
-
-    def settings_snapshot(self) -> MarketDataRuntimeSettings:
-        """返回路由和修订号一致的当前快照。"""
-        with self._settings_lock:
-            return MarketDataRuntimeSettings(
-                routes=_copy_routes(self._routes), revision=self._settings_revision
-            )
+        return MarketDataRuntimeSettings(
+            routes=_copy_routes(stored.routes),
+            revision=stored.revision,
+            updated_at=stored.updated_at,
+        )
 
 
 def create_market_data_runtime(
@@ -158,6 +173,9 @@ def create_market_data_runtime(
             max_requests_per_day=config.daily_request_limit,
         )
 
+    # 部署配置的默认路由：只在"该用户从未保存过设置"时生效，属于部署配置而非用户
+    # 设置。它同时作为服务实例的装配默认值，仅 :meth:`MarketDataService.get_quote` 会
+    # 使用；按用户读行情一律走 ``read_quote(instrument, route)`` 显式传路由。
     routes = {
         "stock": config.stock_providers,
         "option": config.option_providers,

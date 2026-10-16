@@ -125,6 +125,9 @@ class _Runtime:
     last_event_sequence: int = 0
     #: 发起会话的设备；登出/撤销时据此终止该设备的在跑回合。
     device_id: str | None = None
+    #: 会话所属用户；工具调用的用户范围与"按用户取消"都取自它。空串表示未登记归属
+    #: （只有不接真实数据库的编排器单测会出现），此时任何工具调用都会明确失败。
+    user_id: str = ""
     #: 下一条消息的序号；由已落库消息数推出，避免与既有行冲突。
     next_ordinal: int = 1
     #: 本回合的起始时间；工具审计的 ``startedAt`` 用它，而不是"信号到达时间"。
@@ -159,6 +162,7 @@ class AgentTurnOrchestrator:
         *,
         last_event_sequence: int = 0,
         device_id: str | None = None,
+        user_id: str | None = None,
         next_ordinal: int = 1,
     ) -> None:
         """登记一个会话的内存运行态。
@@ -170,7 +174,10 @@ class AgentTurnOrchestrator:
         @param session: 会话快照。
         @param last_event_sequence: 已持久化的事件序号。
         @param device_id: 发起会话的设备 ID。
+        @param user_id: 会话所属用户 UUID。真实入口**必须**给出（工具调用的用户范围与
+            停用级联的按用户取消都依赖它）；缺省只服务于不接数据库的编排器单测。
         @param next_ordinal: 下一条消息的序号。
+        @raises ValueError: 试图把已登记会话改属到另一个用户。
         """
         with self._lock:
             existing = self._runtimes.get(session.id)
@@ -188,6 +195,13 @@ class AgentTurnOrchestrator:
                 )
                 if device_id is not None:
                     existing.device_id = device_id
+                if user_id is not None:
+                    # 会话身份不可变（``agent_session_identities``）：归属只能从"未登记"
+                    # 变为"已登记"，不能被改写。否则一次错误的登记就能把别人的会话
+                    # 变成自己的在飞回合。
+                    if existing.user_id and existing.user_id != user_id:
+                        raise ValueError("Agent 会话用户归属不可变更")
+                    existing.user_id = user_id
                 existing.next_ordinal = max(existing.next_ordinal, next_ordinal)
                 return
             self._runtimes[session.id] = _Runtime(
@@ -195,6 +209,7 @@ class AgentTurnOrchestrator:
                 buffer=AgentEventBuffer(session.id, self._on_event),
                 last_event_sequence=last_event_sequence,
                 device_id=device_id,
+                user_id=user_id or "",
                 next_ordinal=next_ordinal,
             )
 
@@ -241,6 +256,19 @@ class AgentTurnOrchestrator:
             runtime = self._runtimes.get(session_id)
             if runtime is not None:
                 runtime.buffer.unsubscribe(handle)
+
+    def subscriber_count(self, session_id: str) -> int:
+        """当前会话的订阅者数量；会话未登记时为 0。
+
+        供"被拒绝的订阅没有建立任何订阅"这类断言使用：归属校验不通过时若仍然注册了
+        订阅者，实时事件会照常推给未授权连接，而只看响应帧发现不了。
+
+        @param session_id: 会话 ID。
+        @returns 订阅者数量。
+        """
+        with self._lock:
+            runtime = self._runtimes.get(session_id)
+            return 0 if runtime is None else runtime.buffer.subscriber_count
 
     def subscribe_with_resume(
         self, session_id: str, push: Callable[[AgentEvent], None], *, after_sequence: int
@@ -302,6 +330,32 @@ class AgentTurnOrchestrator:
             cancelled: list[str] = []
             for session_id, runtime in list(self._runtimes.items()):
                 if runtime.device_id != device_id or runtime.session.status != "running":
+                    continue
+                if self.request_cancel(session_id, now=now) is not None:
+                    cancelled.append(session_id)
+            return tuple(cancelled)
+
+    def cancel_user_turns(self, user_id: str, *, now: datetime) -> tuple[str, ...]:
+        """请求取消该用户**全部**在跑的回合。
+
+        与 :meth:`cancel_device_turns` 的区别是维度：设备级取消要求调用方先枚举出该
+        用户的全部设备，任何一台被漏掉（新登录的设备、设备行已被清理、或者会话登记时
+        设备未知）都会留下一个继续产生并落库回答的回合。用户停用是**以用户为轴**的
+        授权撤销（计划 §4.4），因此这里直接按用户收口。
+
+        只做状态推进、不猜执行器的意图：会话被置为持久化的 ``cancelling`` 后，执行器
+        的下一个信号会让回合按取消收口（见 :meth:`run_turn` 的 ``consume``）。
+
+        @param user_id: 已停用的用户 UUID 文本。
+        @param now: 服务端时钟。
+        @returns 被请求取消的会话 ID。
+        """
+        with self._lock:
+            cancelled: list[str] = []
+            for session_id, runtime in list(self._runtimes.items()):
+                # 只按 user_id 匹配：不要求 runtime.device_id 也一致，正是为了覆盖
+                # "设备未知/已被清理"的登记态。
+                if runtime.user_id != user_id or runtime.session.status != "running":
                     continue
                 if self.request_cancel(session_id, now=now) is not None:
                     cancelled.append(session_id)
@@ -544,8 +598,13 @@ def _turn_message(
 def _turn_context(runtime: _Runtime, *, user_message_id: str) -> AgentToolContext:
     """服务端注入的回合上下文。
 
-    **它不是模型可控参数**：账户范围、账本版本与数据截止时间都来自会话，模型只能
-    在其中活动，不能自己指定——否则一句提示词注入就能把查询扩到全部账户。
+    **它不是模型可控参数**：用户身份、账户范围、账本版本与数据截止时间都来自会话，
+    模型只能在其中活动，不能自己指定——否则一句提示词注入就能把查询扩到别人的账本。
+
+    ``user_id`` 取自会话身份。它可能为空（只有不接真实数据库的单测会这样登记会话），
+    此时**不在这里回退成任何默认值**：工具处理器会以
+    ``AGENT_USER_CONTEXT_MISSING`` 明确拒绝，而不是让账本查询按空用户过滤后返回
+    一份"没有数据"的空账本。
 
     ``user_message_id`` 一并给出，是因为工具审计行有
     ``(session_id, message_id) → agent_messages`` 的外键，而助手消息要到回合末
@@ -555,6 +614,7 @@ def _turn_context(runtime: _Runtime, *, user_message_id: str) -> AgentToolContex
         session_id=runtime.session.id,
         # 未登记设备时用空串：该字段只用于归属与排查，不是授权依据。
         device_id=runtime.device_id or "",
+        user_id=runtime.user_id,
         user_message_id=user_message_id,
         account_scope=runtime.session.account_scope,
         ledger_version=runtime.session.ledger_version,

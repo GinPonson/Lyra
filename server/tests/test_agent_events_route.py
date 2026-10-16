@@ -1,16 +1,18 @@
 """事件 WebSocket 端点测试。
 
-三条性质各自对应一种真实故障：
+四条性质各自对应一种真实故障：
 
 1. **未认证必须立即关闭**（4001），而不是先订阅再校验；
 2. **每次消息都重新认证**——否则设备撤销后旧连接仍收得到数据；
-3. **不补造事件**：序号有缺口时要求客户端重新取快照，而不是拼出增量。
+3. **不补造事件**：序号有缺口时要求客户端重新取快照，而不是拼出增量；
+4. **订阅必须校验会话归属**——认证只回答"你是谁"，不回答"这个会话是不是你的"（V07）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -24,41 +26,96 @@ from lyra.api.agent_events import (
 )
 from lyra.application.agent_turn_orchestrator import AgentTurnOrchestrator
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
+from lyra.domain.agent.switching import (
+    AgentProviderAvailability,
+    create_agent_session,
+)
+from lyra.domain.agent.turn_stream import MessageDelta, MessageSnapshot, TurnSettled
+from lyra.domain.analytics.types import AccountScope
 from lyra.infrastructure.auth.login_provider import LoginIdentity
+from lyra.infrastructure.db.agent_session_repository import DuckDbAgentSessionRepository
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 
-PUBLIC_KEY_PEM = json.loads(
+DEVICE_KEYS = json.loads(
     (Path(__file__).parent / "fixtures" / "device-keys.json").read_text(encoding="utf-8")
-)["cases"][0]["inputPem"]
+)["cases"]
+PUBLIC_KEY_PEM = DEVICE_KEYS[0]["inputPem"]
 IDENTITY = LoginIdentity(provider="github", subject="12345", email=None, display_name="octocat")
+OTHER_IDENTITY = LoginIdentity(
+    provider="github", subject="events-b", email=None, display_name="B"
+)
 SESSION_ID = "33333333-3333-3333-3333-333333333333"
+OTHER_SESSION_ID = "66666666-6666-4666-8666-666666666666"
+ACCOUNT_ID = "11111111-1111-4111-8111-111111111111"
+OTHER_ACCOUNT_ID = "22222222-2222-4222-8222-222222222222"
+NOW = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
 
 
 @pytest.fixture()
 def wired(tmp_path: Path):
-    """装配应用与一个有效令牌。"""
+    """装配应用、两个用户各自的账户与会话，以及双方的有效令牌。"""
     database_path = tmp_path / "events.duckdb"
     database = open_lyra_database(str(database_path))
+    connection = database.connection
     settings = Settings(
         LYRA_DATABASE_PATH=str(database_path),
         LYRA_IMPORT_STAGING_DIR=str(tmp_path / "staging"),
         LYRA_SECRET_MASTER_KEY="0" * 64,
     )
     application = create_app(settings, database)
+    users = UserRepository(connection)
     service = DevicePairingService(
-        DuckDbDeviceRepository(database.connection), WriteCoordinator()
+        DuckDbDeviceRepository(connection), application.state.write_coordinator, users
     )
-    issued = asyncio.run(service.authorize_owner_device(
+    issued = asyncio.run(service.authorize_user_device(
         identity=IDENTITY, display_name="Pixel 9", public_key_pem=PUBLIC_KEY_PEM
     ))
+    other = asyncio.run(service.authorize_user_device(
+        identity=OTHER_IDENTITY, display_name="Other Phone",
+        public_key_pem=DEVICE_KEYS[1]["inputPem"],
+    ))
+    repository = DuckDbAgentSessionRepository(connection)
+    # 两个用户各一个会话；**两边都用同一个 legacy 账户标识**，这正是本次改造要
+    # 支持的场景。
+    for session_id, account_id, user_id, device_id in (
+        (SESSION_ID, ACCOUNT_ID, issued.user.id, issued.device_id),
+        (OTHER_SESSION_ID, OTHER_ACCOUNT_ID, other.user.id, other.device_id),
+    ):
+        connection.execute(
+            """
+            INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+            VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', 'TST001', '001')
+            """,
+            [account_id, user_id],
+        )
+        repository.create_session(
+            create_agent_session(
+                session_id=session_id, provider="genkit",
+                availability=AgentProviderAvailability(
+                    provider="genkit", status="available"
+                ),
+                account_scope=AccountScope(kind="account", account=account_id),
+                ledger_version=0, as_of="2026-10-12",
+            ),
+            device_id=device_id, user_id=user_id, now=NOW,
+        )
     try:
-        yield application, issued, database.connection
+        yield application, issued, connection, other
     finally:
         database.close()
+
+
+class _ScriptedExecutor:
+    """产生一段可见文本并收口的替身执行器（用于验证实时事件确实被投递）。"""
+
+    def run(self, *, session, content, context, emit) -> None:
+        emit(MessageDelta(delta="B 的实时增量"))
+        emit(MessageSnapshot(content="B 的实时增量", stop_reason="stop"))
+        emit(TurnSettled())
 
 
 # --------------------------------------------------------------------------
@@ -100,7 +157,7 @@ def test_rejects_invalid_subscribe_frames(raw: str) -> None:
 
 def test_connection_without_a_token_is_closed(wired) -> None:
     """**未认证立即关闭**，而不是先订阅再校验。"""
-    application, _, _ = wired
+    application, _, _, _ = wired
     with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client, pytest.raises(Exception):
         with client.websocket_connect("/v1/events") as socket:
             socket.receive_json()
@@ -108,10 +165,12 @@ def test_connection_without_a_token_is_closed(wired) -> None:
 
 def test_connection_with_a_revoked_token_is_closed(wired) -> None:
     """凭据失效的连接必须被关闭。"""
-    application, issued, connection = wired
+    application, issued, connection, _ = wired
     asyncio.run(
         DevicePairingService(
-            DuckDbDeviceRepository(connection), WriteCoordinator()
+            DuckDbDeviceRepository(connection),
+            application.state.write_coordinator,
+            UserRepository(connection),
         ).revoke_device(issued.device_id)
     )
 
@@ -124,7 +183,7 @@ def test_connection_with_a_revoked_token_is_closed(wired) -> None:
 
 def test_invalid_frame_returns_an_error_frame(wired) -> None:
     """非法订阅帧回一个 error 帧，而不是断开连接。"""
-    application, issued, _ = wired
+    application, issued, _, _ = wired
     with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client, client.websocket_connect(
         "/v1/events", headers={"Authorization": f"Bearer {issued.access_token}"}
     ) as socket:
@@ -137,7 +196,7 @@ def test_invalid_frame_returns_an_error_frame(wired) -> None:
 
 def test_subscribing_to_an_unregistered_session_requires_a_snapshot(wired) -> None:
     """会话未登记运行态时要求客户端重新取快照，而不是假装订阅成功。"""
-    application, issued, _ = wired
+    application, issued, _, _ = wired
     with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client, client.websocket_connect(
         "/v1/events", headers={"Authorization": f"Bearer {issued.access_token}"}
     ) as socket:
@@ -153,7 +212,7 @@ def test_subscribing_to_an_unregistered_session_requires_a_snapshot(wired) -> No
 
 def test_subscribing_to_a_registered_session_returns_buffered_events(wired) -> None:
     """已登记会话返回缓冲区里的增量。"""
-    application, issued, _ = wired
+    application, issued, _, _ = wired
     orchestrator: AgentTurnOrchestrator = application.state.agent_orchestrator
     from lyra.domain.agent.switching import AgentSessionSnapshot
     from lyra.domain.analytics.types import AccountScope
@@ -163,7 +222,8 @@ def test_subscribing_to_a_registered_session_returns_buffered_events(wired) -> N
             id=SESSION_ID, provider="genkit", status="idle",
             account_scope=AccountScope(kind="all"), ledger_version=0, as_of="t",
             revision=1, summary=None, messages=(),
-        )
+        ),
+        user_id=issued.user.id,
     )
 
     with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client, client.websocket_connect(
@@ -231,7 +291,7 @@ def test_subscribed_modes_are_the_documented_two() -> None:
 
 def test_error_frame_uses_the_invalid_argument_code(wired) -> None:
     """非法订阅帧回 ``error`` 帧，码为 ``INVALID_ARGUMENT``（与参考实现一致）。"""
-    application, issued, _ = wired
+    application, issued, _, _ = wired
     with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as test_client:
         with test_client.websocket_connect(
             "/v1/events", headers={"Authorization": f"Bearer {issued.access_token}"}
@@ -255,7 +315,7 @@ def test_a_connected_socket_is_registered_under_its_device(wired) -> None:
     这里只断言"真实连接确实登记在它的设备下"（``take_device`` 取到 1 个）；
     关闭动作本身由下面的替身单测覆盖。
     """
-    application, issued, _ = wired
+    application, issued, _, _ = wired
     registry = application.state.event_connections
 
     with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client, client.websocket_connect(
@@ -284,8 +344,8 @@ def test_closing_one_device_leaves_other_devices_alone() -> None:
 
     registry = EventConnectionRegistry()
     mine, other = FakeSocket(), FakeSocket()
-    registry.add("device-1", mine)
-    registry.add("device-2", other)
+    registry.add("device-1", mine, user_id="user-1")
+    registry.add("device-2", other, user_id="user-2")
 
     async def sign_out() -> None:
         for websocket in registry.take_device("device-1"):
@@ -309,7 +369,127 @@ def test_closing_a_device_socket_sends_the_unauthorized_close_code() -> None:
 
     registry = EventConnectionRegistry()
     socket = FakeSocket()
-    registry.add("device-1", socket)
+    registry.add("device-1", socket, user_id="user-1")
 
     assert UNAUTHORIZED_CLOSE_CODE == 4001
     assert registry.take_device("device-1") == (socket,)
+
+
+# --------------------------------------------------------------------------
+# 停用级联：按用户一次关掉全部连接
+# --------------------------------------------------------------------------
+
+
+def test_closing_a_user_leaves_other_users_alone() -> None:
+    """**按用户收口**：停用用户时关掉他的全部设备连接，别人的连接不受影响。"""
+    from lyra.api.agent_events import EventConnectionRegistry, _close_quietly
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.closed: list[tuple[int, str]] = []
+
+        async def close(self, code: int, reason: str) -> None:
+            self.closed.append((code, reason))
+
+    registry = EventConnectionRegistry()
+    phone, tablet, stranger = FakeSocket(), FakeSocket(), FakeSocket()
+    # 同一个用户的两台设备，各自一条连接。
+    registry.add("device-1", phone, user_id="user-1")
+    registry.add("device-2", tablet, user_id="user-1")
+    registry.add("device-3", stranger, user_id="user-2")
+
+    async def disable() -> None:
+        for websocket in registry.take_user("user-1"):
+            await _close_quietly(websocket, 4001, "disabled")
+
+    asyncio.run(disable())
+    assert phone.closed == [(4001, "disabled")]
+    assert tablet.closed == [(4001, "disabled")]
+    assert stranger.closed == [], "关掉了不属于该用户的连接"
+    # 取走后设备维度也必须清理干净：否则一次停用会让后续 take_device 拿到陈旧引用。
+    assert registry.take_device("device-1") == ()
+    assert registry.take_device("device-3") == (stranger,)
+
+
+# --------------------------------------------------------------------------
+# 订阅归属（验收 V07）
+# --------------------------------------------------------------------------
+
+
+def test_another_user_cannot_subscribe_to_the_session(wired) -> None:
+    """**A 订阅 B 的会话被拒，且历史与实时事件都不泄露**（V07）。
+
+    认证只回答"你是谁"。不校验归属时，任何已认证用户凭一个会话 ID 就能收到他人会话
+    的重放与实时增量——这里的断言同时覆盖三件事：
+
+    1. 拒绝帧与"会话不可续传"**完全一致**（不构成"该会话是否存在"的探针）；
+    2. 被拒的订阅**没有建立任何订阅**（订阅者数只算 B 自己）；
+    3. B 随后真产生事件时，只推给 B。
+    """
+    application, issued, _, other = wired
+    orchestrator: AgentTurnOrchestrator = application.state.agent_orchestrator
+    from lyra.domain.agent.switching import AgentSessionSnapshot
+
+    orchestrator.register(
+        AgentSessionSnapshot(
+            id=OTHER_SESSION_ID, provider="genkit", status="idle",
+            account_scope=AccountScope(kind="all"), ledger_version=0, as_of="t",
+            revision=1, summary=None, messages=(),
+        ),
+        user_id=other.user.id,
+    )
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        with client.websocket_connect(
+            "/v1/events", headers={"Authorization": f"Bearer {issued.access_token}"}
+        ) as a_socket, client.websocket_connect(
+            "/v1/events", headers={"Authorization": f"Bearer {other.access_token}"}
+        ) as b_socket:
+            subscribe = json.dumps({
+                "type": "subscribe", "sessionId": OTHER_SESSION_ID, "afterSequence": 0
+            })
+            b_socket.send_text(subscribe)
+            # 正对照：B 自己能订阅成功——证明下面 A 收到的拒绝帧不是"会话不可用"。
+            assert b_socket.receive_json() == {
+                "type": "subscribed", "mode": "events", "events": []
+            }
+            assert orchestrator.subscriber_count(OTHER_SESSION_ID) == 1
+
+            a_socket.send_text(subscribe)
+            assert a_socket.receive_json() == {
+                "type": "subscribed", "mode": "snapshot_required",
+                "reason": "SESSION_NOT_RESUMED",
+            }
+            # **拒绝帧之外的证据**：A 没有被登记为订阅者，因此后续实时事件不可能流向它。
+            assert orchestrator.subscriber_count(OTHER_SESSION_ID) == 1
+
+            # 真产生事件：B 收得到（证明事件确实被投递过）。
+            orchestrator.run_turn(
+                session_id=OTHER_SESSION_ID,
+                executor=_ScriptedExecutor(),
+                content="B 的问题",
+            )
+            first = b_socket.receive_json()
+            assert first["type"] == "event"
+            assert first["event"]["sessionId"] == OTHER_SESSION_ID
+            assert orchestrator.subscriber_count(OTHER_SESSION_ID) == 1
+
+
+def test_disabling_the_user_closes_the_event_stream(wired) -> None:
+    """**停用后长连接不再收数据**：每次消息都重新认证，停用即被拒并关闭（V11）。"""
+    application, issued, connection, _ = wired
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        with pytest.raises(Exception):
+            with client.websocket_connect(
+                "/v1/events", headers={"Authorization": f"Bearer {issued.access_token}"}
+            ) as socket:
+                connection.execute(
+                    "UPDATE users SET status = 'disabled' WHERE id = CAST(? AS UUID)",
+                    [issued.user.id],
+                )
+                # 停用提交后再发一帧：路由重新认证时必须关闭连接，而不是继续订阅。
+                socket.send_text(json.dumps({
+                    "type": "subscribe", "sessionId": SESSION_ID, "afterSequence": 0
+                }))
+                socket.receive_json()
+

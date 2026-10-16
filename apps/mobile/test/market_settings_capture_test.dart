@@ -44,10 +44,10 @@ Dio _system(String url) =>
                 ? {'status': 'healthy'}
                 : {
                     'server_version': '0.1.0',
-                    'protocol_version': 2,
-                    'min_supported_protocol_version': 2,
-                    'max_supported_protocol_version': 2,
-                    'schema_version': 14,
+                    'protocol_version': 3,
+                    'min_supported_protocol_version': 3,
+                    'max_supported_protocol_version': 3,
+                    'schema_version': 16,
                   },
           ),
           200,

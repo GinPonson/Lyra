@@ -19,11 +19,11 @@ from fastapi.testclient import TestClient
 
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 
 _KEYS = Path(__file__).parent / "fixtures" / "device-keys.json"
@@ -45,8 +45,12 @@ def client(tmp_path: Path):
     )
     application = create_app(settings, database)
     repository = DuckDbDeviceRepository(database.connection)
-    service = DevicePairingService(repository, WriteCoordinator())
-    issued = asyncio.run(service.authorize_owner_device(
+    service = DevicePairingService(
+        repository,
+        application.state.write_coordinator,
+        UserRepository(database.connection),
+    )
+    issued = asyncio.run(service.authorize_user_device(
         identity=_IDENTITY, display_name="Pixel 9", public_key_pem=_PUBLIC_KEY_PEM
     ))
     try:
@@ -61,7 +65,8 @@ def _auth(issued) -> dict[str, str]:
         "Authorization": f"Bearer {issued.access_token}",
         # **每个 /v1 请求都必须声明客户端协议版本**（除公开路由）。
         # 缺失时服务端返回 426——那是客户端唯一能据此升级 App 的信号。
-        "x-lyra-protocol-version": "2",
+        # 直接复用客户端协议常量，协议升版时这里自动跟随。
+        **CLIENT_PROTOCOL_HEADERS,
     }
 
 

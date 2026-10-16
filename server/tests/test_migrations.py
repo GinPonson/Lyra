@@ -10,6 +10,10 @@ Python 造的库"，而不是"自己造自己读"。
 测试随它一起消失。夹具保留了这份证据，且**来源可追溯**（见 `fixtures/README.md`）。
 
 SQL 副本现在是**唯一来源**——不再与另一个实现逐字节对照。
+
+v16 起多了一类需要外部输入才能完成的迁移：把旧库的全部资源归给一个**显式确认**的
+原用户。本文件只验证这条迁移的**入口契约**（缺少归属必须明确失败、上下文不得留在库里），
+升级后的完整结构断言在 `test_multi_user_schema.py`。
 """
 
 from __future__ import annotations
@@ -24,8 +28,13 @@ from lyra.db.connection import open_lyra_database
 from lyra.db.migrations import (
     CURRENT_SCHEMA_VERSION,
     MIGRATIONS,
+    MIGRATION_CONTEXT_TABLE,
+    MIGRATION_CONTEXT_VERSION,
+    MigrationContext,
     MigrationError,
+    MigrationOwnerIdentity,
     assert_migration_history,
+    apply_migrations,
 )
 
 PYTHON_SQL_DIRECTORY = Path(__file__).resolve().parents[1] / "src" / "lyra" / "db" / "sql"
@@ -67,6 +76,97 @@ def test_every_migration_has_a_sql_file() -> None:
         assert path.stat().st_size > 0, f"迁移 SQL 为空：{migration.file_name}"
 
 
+def test_migration_sixteen_is_the_owner_context_migration() -> None:
+    """多用户迁移必须是清单最后一条，且被标记为需要显式归属确认的那一条。"""
+    assert MIGRATION_CONTEXT_VERSION == CURRENT_SCHEMA_VERSION == 16
+    assert MIGRATIONS[-1].version == MIGRATION_CONTEXT_VERSION
+    assert MIGRATIONS[-1].file_name == "multi-user-schema.sql"
+
+
+def _populated_schema15_database(destination: Path) -> None:
+    """复制冻结夹具并放入一行账户，构造「非空但没有归属信息」的旧库。"""
+    _copy_fixture_database(destination)
+    connection = duckdb.connect(str(destination))
+    try:
+        connection.execute(
+            """
+            INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
+            VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Main', 'ACC-1', '1234')
+            """
+        )
+    finally:
+        connection.close()
+
+
+def _owner_context() -> MigrationContext:
+    """最小可用的显式归属确认。"""
+    return MigrationContext(
+        owner_user_id="11111111-1111-1111-1111-111111111111",
+        owner_display_name="Owner",
+        identities=(
+            MigrationOwnerIdentity(
+                provider="google",
+                subject="112233",
+                email="owner@example.com",
+                display_name="Owner",
+                is_device_identity=True,
+            ),
+        ),
+    )
+
+
+@pytest.mark.skipif(not FIXTURE_DATABASE.is_file(), reason="缺少冻结的既有账本夹具")
+def test_populated_database_without_owner_context_is_rejected(tmp_path: Path) -> None:
+    """**库非空却没有显式归属时必须明确失败。**
+
+    这是计划 §9.3 的硬要求：旧数据只能归给经人工确认的原 owner，绝不能落到某个默认
+    用户或首次登录者身上。失败后旧库必须原封不动。
+    """
+    target = tmp_path / "no-context.duckdb"
+    _populated_schema15_database(target)
+
+    connection = duckdb.connect(str(target))
+    try:
+        with pytest.raises(MigrationError, match="必须显式提供原 owner 归属确认"):
+            apply_migrations(connection)
+        # 失败即回滚：旧表仍在、仍是 schema 15、没有任何用户被创建。
+        assert connection.execute("SELECT count(*) FROM accounts").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_name = 'accounts' AND column_name = 'user_id'"
+        ).fetchone() == (0,)
+        assert connection.execute("SELECT max(version) FROM schema_migrations").fetchone() == (15,)
+        assert connection.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'users'"
+        ).fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.skipif(not FIXTURE_DATABASE.is_file(), reason="缺少冻结的既有账本夹具")
+def test_owner_context_is_consumed_and_not_left_behind(tmp_path: Path) -> None:
+    """迁移上下文只服务于这一次升级，不得成为运行时可读的长期归属来源。"""
+    target = tmp_path / "context.duckdb"
+    _populated_schema15_database(target)
+
+    connection = duckdb.connect(str(target))
+    try:
+        apply_migrations(connection, _owner_context())
+
+        assert connection.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+            [MIGRATION_CONTEXT_TABLE],
+        ).fetchone() == (0,)
+        assert connection.execute("SELECT max(version) FROM schema_migrations").fetchone() == (16,)
+        owner = connection.execute("SELECT id, role FROM users").fetchall()
+        assert len(owner) == 1 and owner[0][1] == "admin"
+        # 再次调用（模拟重启）不得重复迁移或新建用户。
+        apply_migrations(connection, _owner_context())
+        assert connection.execute("SELECT count(*) FROM users").fetchone() == (1,)
+    finally:
+        connection.close()
+
+
 def test_opens_and_migrates_fresh_database(tmp_path: Path) -> None:
     """全新库应能从零迁移到当前 schema 版本。"""
     database = open_lyra_database(str(tmp_path / "fresh.duckdb"))
@@ -74,15 +174,21 @@ def test_opens_and_migrates_fresh_database(tmp_path: Path) -> None:
         health = database.read_health()
         assert health["status"] == "available"
         assert health["schemaVersion"] == CURRENT_SCHEMA_VERSION
-        # 空账本的账本版本为 0。
-        assert health["ledgerVersion"] == 0
+        # **健康响应不再带账本版本**：它是全库 max(version)，多用户下属于跨用户活动量，
+        # 公开端点不得暴露（计划 §4.4）。空账本版本为 0 这件事改由按用户的业务响应断言。
+        assert "ledgerVersion" not in health
     finally:
         database.close()
 
 
 @pytest.mark.skipif(not FIXTURE_DATABASE.is_file(), reason="缺少冻结的既有账本夹具")
 def test_takes_over_typescript_created_database(tmp_path: Path) -> None:
-    """接管由 TypeScript 服务端创建的 schema 15 账本，且不改变其内容。"""
+    """接管由 TypeScript 服务端创建的 schema 15 账本，且不改变其内容。
+
+    v16 会**新增** ``users`` 与 ``user_identities`` 两张表，因此「表集合完全不变」不再是
+    正确的期望。这里把断言收紧成精确等式：接管后必须**恰好**多出这两张表、一张不少，
+    而且它们必须是空的——夹具本身没有业务数据，所以接管不得凭空造出任何用户。
+    """
     target = tmp_path / "lyra.duckdb"
     _copy_fixture_database(target)
 
@@ -112,7 +218,23 @@ def test_takes_over_typescript_created_database(tmp_path: Path) -> None:
                 "SELECT table_name FROM information_schema.tables ORDER BY table_name"
             ).fetchall()
         )
-        assert after_tables == before_tables, "接管后表集合发生了变化"
+        # v16 必须删除旧 owner 身份表：schema 16 的归属已经落在 users/user_identities 上，
+        # 留着旧表等于留下**第二条可读的授权来源**（计划 §5 P1b）。
+        assert "server_owner_identity" in before_tables, (
+            "冻结夹具里应当有旧 owner 身份表——否则这条断言测不到删除行为"
+        )
+        assert "server_owner_identity" not in after_tables, (
+            "v16 必须删除旧 owner 身份表，但接管后它仍然存在"
+        )
+        assert after_tables == sorted(
+            [table for table in before_tables if table != "server_owner_identity"]
+            + ["user_identities", "users"]
+        ), "接管后表集合与「原表 − 旧 owner 身份表 + users/user_identities」不一致"
+        # 没有业务数据的旧库不需要归属输入，也不得被凭空分配一个默认用户。
+        for table in ("users", "user_identities"):
+            assert database.connection.execute(
+                f"SELECT count(*) FROM {table}"
+            ).fetchone() == (0,)
     finally:
         database.close()
 

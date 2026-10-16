@@ -85,8 +85,13 @@ DEFAULT_MAX_CACHE_ENTRIES = 1_000
 class MarketDataService:
     """按路由读取行情。
 
+    **本服务是部署级共享的单例**：公开报价缓存与各来源的请求预算都挂在它上面。
+    ``routes`` 只是装配默认值，供 :meth:`get_quote` 在没有显式路由时使用；**多用户下
+    按用户设置读行情必须把路由显式传给 :meth:`read_quote`**，因为缓存键带来源 id 与
+    合约标识（公开报价身份），与"谁在问"无关，所以不同用户可以复用同一条缓存。
+
     @param providers: 来源 id → 取报价的函数。
-    @param routes: 资产类型 → 来源 id 顺序（**顺序即主备**）。
+    @param routes: 资产类型 → 来源 id 顺序（**顺序即主备**）；仅作装配默认值。
     @param policies: 来源 id → 策略。
     @param now: 当前毫秒时间戳提供者。
     @param max_quote_age_ms: 参考价超过该时长即视为过期。
@@ -109,29 +114,25 @@ class MarketDataService:
         self._now = now
         self._max_quote_age_ms = max_quote_age_ms
         self._max_cache_entries = max_cache_entries
+        # **缓存是公开报价身份的函数，不是用户的函数**：键由来源 id 与合约标识构成，
+        # 同一合约在两个用户之间可以复用同一条报价。按用户分片缓存等于把部署级的上游
+        # 额度乘以用户数，反而击穿缓存的意义（计划 §4.4）。
         self._cache: dict[str, _CacheEntry] = {}
         # 网络调用可并行；共享缓存、路由与预算则通过状态锁读写。
         self._state_lock = RLock()
         # 同一来源与合约只允许一个刷新请求；固定条带数避免锁表随符号数增长。
         self._instrument_locks = tuple(Lock() for _ in range(64))
+        # **预算是部署级共享的**（每来源一份，不是每用户一份）：若按用户复制服务，
+        # 每个用户都会各自拿到全额额度，实际上游请求量被放大到用户数倍，限流形同虚设。
         self._budgets: dict[str, ProviderBudget] = {
             provider_id: ProviderBudget() for provider_id in providers
         }
 
-    def set_routes(self, routes: Mapping[str, tuple[str, ...]]) -> None:
-        """热切换路由。
-
-        **不清空缓存**：缓存键里带来源 id，因此切换后旧来源的条目不会被新来源误用；
-        清空反而会让切换立刻打出一批上游请求。
-        """
-        with self._state_lock:
-            self._routes = {
-                asset_type: tuple(routes.get(asset_type, ()))
-                for asset_type in ("stock", "option")
-            }
-
     def get_quote(self, instrument: MarketInstrument) -> MarketQuoteLookup:
-        """按资产类型的路由读取报价。
+        """按**装配默认**路由读取报价。
+
+        仅用于装配默认值场景（例如来源目录自检）。多用户下按用户设置读取必须用
+        :meth:`read_quote` 显式传入该用户的路由——本方法不读任何用户设置。
 
         @param instrument: 内部合约。
         @returns 读取结果；**永不抛异常**（网络失败是数据状态）。
@@ -144,10 +145,13 @@ class MarketDataService:
     def read_quote(
         self, instrument: MarketInstrument, route: tuple[str, ...]
     ) -> MarketQuoteLookup:
-        """按给定路由读取报价。
+        """按**调用方显式给出的**路由读取报价。
+
+        路由是参数而不是服务状态：调用方（HTTP 路由或 Agent 工具）先读取当前用户的
+        设置快照，再把该用户的路由传进来，因此并发的不同用户不会互相改写来源。
 
         @param instrument: 内部合约。
-        @param route: 来源顺序。
+        @param route: 来源顺序（主备顺序）。
         @returns 读取结果。
         """
         issue: MarketQuoteIssue = "not_configured"

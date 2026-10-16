@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
 from lyra.domain.agent.switching import (
@@ -27,8 +26,11 @@ from lyra.domain.agent.switching import (
 )
 from lyra.domain.analytics.types import AccountScope
 from lyra.infrastructure.auth.login_provider import LoginIdentity
+from lyra.domain.agent.messages import AgentMessage
+from lyra.infrastructure.db.agent_message_repository import AgentMessageRepository
 from lyra.infrastructure.db.agent_session_repository import DuckDbAgentSessionRepository
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 
 PUBLIC_KEY_PEM = json.loads(
@@ -54,13 +56,6 @@ def client(tmp_path: Path):
     database_path = tmp_path / "sessions.duckdb"
     database = open_lyra_database(str(database_path))
     connection = database.connection
-    connection.execute(
-        """
-        INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-        VALUES (CAST(? AS UUID), 'Account', 'TST001', '001')
-        """,
-        [ACCOUNT_ID],
-    )
     settings = Settings(
         LYRA_DATABASE_PATH=str(database_path),
         LYRA_IMPORT_STAGING_DIR=str(tmp_path / "staging"),
@@ -68,18 +63,30 @@ def client(tmp_path: Path):
     )
     application = create_app(settings, database)
     service = DevicePairingService(
-        DuckDbDeviceRepository(database.connection), WriteCoordinator()
+        DuckDbDeviceRepository(database.connection),
+        application.state.write_coordinator,
+        UserRepository(database.connection),
     )
-    issued = asyncio.run(service.authorize_owner_device(
+    issued = asyncio.run(service.authorize_user_device(
         identity=IDENTITY, display_name="Pixel 9", public_key_pem=PUBLIC_KEY_PEM
     ))
+    # 账户与会话都必须挂在**已签发设备所属的用户**下：账户的 user_id 是 NOT NULL，
+    # 而会话归属要经不可变会话身份校验。
+    user_id = issued.user.id
+    connection.execute(
+        """
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', 'TST001', '001')
+        """,
+        [ACCOUNT_ID, user_id],
+    )
     DuckDbAgentSessionRepository(connection).create_session(
         create_agent_session(
             session_id=SESSION_ID, provider="genkit",
             availability=AgentProviderAvailability(provider="genkit", status="available"),
             account_scope=AccountScope(kind="all"), ledger_version=0, as_of="2026-10-12",
         ),
-        device_id=issued.device_id, now=NOW,
+        device_id=issued.device_id, user_id=user_id, now=NOW,
     )
     try:
         with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as test_client:
@@ -93,7 +100,8 @@ def _auth(issued) -> dict[str, str]:
         "Authorization": f"Bearer {issued.access_token}",
         # **每个 /v1 请求都必须声明客户端协议版本**（除公开路由）。
         # 缺失时服务端返回 426——那是客户端唯一能据此升级 App 的信号。
-        "x-lyra-protocol-version": "2",
+        # **引用共享常量而不是字面量**：写死会在协议升版后静默变成 426。
+        **CLIENT_PROTOCOL_HEADERS,
     }
 
 
@@ -556,3 +564,242 @@ def test_a_message_at_the_limit_is_accepted(client) -> None:
 
     # 该会话状态与运行时会决定后续结果，但**不应因长度被拒**。
     assert response.status_code != 400 or response.json().get("code") != "INVALID_ARGUMENT"
+
+
+# --------------------------------------------------------------------------
+# 会话归属（验收 V07 / V08）
+#
+# A 不能读取、取消、关闭、发消息或看审计；B 的历史与实时事件都不泄露。同用户的
+# 另一台设备（A2）必须能读到自己的历史——设备是凭据单位，不是数据归属单位。
+# --------------------------------------------------------------------------
+
+A_IDENTITY = LoginIdentity(
+    provider="github", subject="agent-isolation-a", email=None, display_name="A"
+)
+B_IDENTITY = LoginIdentity(
+    provider="github", subject="agent-isolation-b", email=None, display_name="B"
+)
+DEVICE_KEYS = json.loads(
+    (Path(__file__).parent / "fixtures" / "device-keys.json").read_text(encoding="utf-8")
+)["cases"]
+A_ACCOUNT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+B_ACCOUNT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2"
+B_SESSION_ID = "66666666-6666-4666-8666-666666666666"
+
+
+@pytest.fixture()
+def two_users(tmp_path: Path):
+    """A（两台设备 A1/A2）与 B（一台设备），各自一个会话。
+
+    B 的会话里预置一条消息：这样"读不到"就必须是**看不到内容**，而不只是状态码
+    不同——历史泄漏才是真正要防的。
+    """
+    database_path = tmp_path / "agent-isolation.duckdb"
+    database = open_lyra_database(str(database_path))
+    connection = database.connection
+    users = UserRepository(connection)
+    now = datetime.now(UTC)
+    user_a = users.find_or_create_user_for_identity(A_IDENTITY, now=now).user.id
+    user_b = users.find_or_create_user_for_identity(B_IDENTITY, now=now).user.id
+    for account_id, user_id in ((A_ACCOUNT_ID, user_a), (B_ACCOUNT_ID, user_b)):
+        connection.execute(
+            """
+            INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+            VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', 'TST001', '001')
+            """,
+            [account_id, user_id],
+        )
+    settings = Settings(
+        LYRA_DATABASE_PATH=str(database_path),
+        LYRA_IMPORT_STAGING_DIR=str(tmp_path / "staging"),
+        LYRA_SECRET_MASTER_KEY="0" * 64,
+    )
+    application = create_app(settings, database)
+    pairing = DevicePairingService(
+        DuckDbDeviceRepository(connection), application.state.write_coordinator, users
+    )
+    # A 的两台设备用**不同的公钥**，因此是同一用户下的两个设备行。
+    a1 = asyncio.run(pairing.authorize_user_device(
+        identity=A_IDENTITY, display_name="A1", public_key_pem=DEVICE_KEYS[0]["inputPem"]
+    ))
+    a2 = asyncio.run(pairing.authorize_user_device(
+        identity=A_IDENTITY, display_name="A2", public_key_pem=DEVICE_KEYS[1]["inputPem"]
+    ))
+    b1 = asyncio.run(pairing.authorize_user_device(
+        identity=B_IDENTITY, display_name="B1", public_key_pem=DEVICE_KEYS[2]["inputPem"]
+    ))
+    repository = DuckDbAgentSessionRepository(connection)
+    for session_id, account_id, user_id, device_id in (
+        (SESSION_ID, A_ACCOUNT_ID, user_a, a1.device_id),
+        (B_SESSION_ID, B_ACCOUNT_ID, user_b, b1.device_id),
+    ):
+        repository.create_session(
+            create_agent_session(
+                session_id=session_id, provider="genkit",
+                availability=AgentProviderAvailability(provider="genkit", status="available"),
+                account_scope=AccountScope(kind="account", account=account_id),
+                ledger_version=0, as_of="2026-10-12",
+            ),
+            device_id=device_id, user_id=user_id, now=now,
+        )
+    # B 的会话里放一条真实消息：A 的越权尝试必须连它一起看不到。
+    AgentMessageRepository(connection).append_message(AgentMessage(
+        id="77777777-7777-4777-8777-777777777777", session_id=B_SESSION_ID, ordinal=1,
+        role="user", provider="genkit", status="completed", content="B 的私密问题",
+        error_code=None, created_at="2026-10-12T09:00:00.000Z",
+        completed_at="2026-10-12T09:00:00.000Z",
+    ))
+    try:
+        with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as test_client:
+            yield test_client, a1, a2, b1, connection
+    finally:
+        database.close()
+
+
+def _status_of(connection, session_id: str) -> str:
+    row = connection.execute(
+        "SELECT status FROM agent_sessions WHERE id = CAST(? AS UUID)", [session_id]
+    ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def test_another_user_cannot_read_the_session(two_users) -> None:
+    """**A 读 B 的会话得到与"不存在"完全相同的 404**，且看不到任何消息（V07）。"""
+    test_client, a1, _, _, connection = two_users
+
+    forbidden = test_client.get(f"/v1/agent/sessions/{B_SESSION_ID}", headers=_auth(a1))
+    missing = test_client.get(
+        "/v1/agent/sessions/99999999-9999-4999-8999-999999999999", headers=_auth(a1)
+    )
+
+    assert forbidden.status_code == 404
+    # 逐字段一致（`request_id` 每次请求都不同，按设计排除）：多一个字段就足以成为
+    # "该会话存在"的探针。
+    def comparable(response) -> dict:
+        return {k: v for k, v in response.json().items() if k != "request_id"}
+
+    assert comparable(forbidden) == comparable(missing)
+    assert "B 的私密问题" not in forbidden.text
+    # 数据库里 B 的消息当然还在（拒绝的是读取，不是数据）。
+    stored = connection.execute(
+        "SELECT content FROM agent_messages WHERE session_id = CAST(? AS UUID)",
+        [B_SESSION_ID],
+    ).fetchone()
+    assert stored is not None and stored[0] == "B 的私密问题"
+
+
+def test_another_user_cannot_read_the_tool_audit(two_users) -> None:
+    """**工具审计是会话内容的另一种视图**，同样必须按归属拒绝（V07）。"""
+    test_client, a1, _, _, _ = two_users
+
+    response = test_client.get(
+        f"/v1/agent/sessions/{B_SESSION_ID}/tool-calls", headers=_auth(a1)
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "AGENT_SESSION_NOT_FOUND"
+
+
+def test_another_user_cannot_cancel_the_session(two_users) -> None:
+    """**A 不能取消 B 的回合**：编排器的运行态只按会话 ID 索引，入口必须拦住。"""
+    test_client, a1, _, _, connection = two_users
+    connection.execute(
+        "UPDATE agent_sessions SET status = 'running' WHERE id = CAST(? AS UUID)",
+        [B_SESSION_ID],
+    )
+
+    response = test_client.post(
+        f"/v1/agent/sessions/{B_SESSION_ID}/cancel", headers=_auth(a1)
+    )
+
+    assert response.status_code == 404
+    # 拒绝的同时不得产生副作用：B 的会话仍是 running。
+    assert _status_of(connection, B_SESSION_ID) == "running"
+
+
+def test_another_user_cannot_close_the_session(two_users) -> None:
+    """**A 不能关闭 B 的会话**，且不产生副作用。"""
+    test_client, a1, _, _, connection = two_users
+
+    response = test_client.delete(
+        f"/v1/agent/sessions/{B_SESSION_ID}", headers=_auth(a1)
+    )
+
+    assert response.status_code == 404
+    assert _status_of(connection, B_SESSION_ID) == "idle"
+
+
+def test_another_user_cannot_send_a_message(two_users) -> None:
+    """**A 不能在 B 的会话里发起回合**：那会把 B 的账本上下文交给模型。"""
+    test_client, a1, _, _, connection = two_users
+
+    response = test_client.post(
+        f"/v1/agent/sessions/{B_SESSION_ID}/messages",
+        json={"content": "替他问一句"}, headers=_auth(a1),
+    )
+
+    assert response.status_code == 404
+    assert _status_of(connection, B_SESSION_ID) == "idle"
+
+
+def test_the_owner_reads_their_history_from_another_device(two_users) -> None:
+    """**同用户的另一台设备能读自己的历史**（V08）。
+
+    设备只用于凭据撤销与审计，不能代替数据归属；把归属挂在设备上会让用户换机后
+    读不到自己的历史。
+    """
+    test_client, a1, a2, _, _ = two_users
+
+    from_first = test_client.get(f"/v1/agent/sessions/{SESSION_ID}", headers=_auth(a1))
+    from_second = test_client.get(f"/v1/agent/sessions/{SESSION_ID}", headers=_auth(a2))
+
+    assert from_first.status_code == 200
+    assert from_second.status_code == 200
+    assert from_second.json() == from_first.json()
+
+
+def test_a_disabled_user_cannot_start_a_turn(two_users) -> None:
+    """**停用提交后回合一开始执行就被拒**（V11）。
+
+    认证依赖发生在请求进入时，覆盖不了排队与长回合；回合真正开始前必须再复核一次，
+    否则一个排在停用之前、执行在停用之后的回合仍会写入并投递数据。
+    """
+    test_client, a1, _, _, connection = two_users
+    connection.execute(
+        "UPDATE users SET status = 'disabled' WHERE id = "
+        "(SELECT user_id FROM agent_session_identities WHERE id = CAST(? AS UUID))",
+        [SESSION_ID],
+    )
+
+    response = test_client.post(
+        f"/v1/agent/sessions/{SESSION_ID}/messages",
+        json={"content": "停用后还想问"}, headers=_auth(a1),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "USER_DISABLED"
+
+
+def test_create_cannot_bind_another_users_account(two_users, configured) -> None:
+    """**创建会话不得绑定他人账户**：请求参数里的账户 UUID 同样不能扩大授权。
+
+    绑定时只查"账户存在"会让 A 用 B 的账户 UUID 建出一个会话；此后每次工具调用都按
+    会话归属去读那个账户——授权边界就只剩请求体里一个字符串。
+    """
+    test_client, a1, _, _, _ = two_users
+    body = {
+        "provider": "genkit",
+        "accountScope": {"kind": "account", "account": B_ACCOUNT_ID},
+    }
+
+    forbidden = _create(test_client, a1, body)
+    # 正对照：绑自己的账户是允许的——证明上面的 400 讲的是归属而不是"账户不存在"。
+    allowed = _create(
+        test_client, a1,
+        {"provider": "genkit", "accountScope": {"kind": "account", "account": A_ACCOUNT_ID}},
+    )
+
+    assert forbidden.status_code == 400
+    assert forbidden.json()["code"] == "INVALID_ARGUMENT"
+    assert allowed.status_code == 201

@@ -54,7 +54,13 @@ class MarketProviderPolicy:
 
 @dataclass
 class ProviderBudget:
-    """一个来源的滚动窗口预算与冷却状态。"""
+    """一个来源的滚动窗口预算与冷却状态。
+
+    **预算挂在部署级共享的 :class:`~lyra.application.market_data_service.MarketDataService`
+    实例上，每个来源一份，不按用户拆分**：按用户复制服务或预算，会让每个用户都各自
+    拿到全额额度，实际打给上游的请求量被放大到用户数倍，限流形同虚设（计划 §4.4）。
+    因此多用户改造**不得**把行情服务变成"每用户一个实例"。
+    """
 
     minute_calls: list[int] = field(default_factory=list)
     daily_calls: list[int] = field(default_factory=list)

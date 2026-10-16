@@ -14,12 +14,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
 from lyra.db.serialized_connection import SerializedDuckDBConnection
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 
@@ -73,10 +73,12 @@ def authenticated_client(tmp_path: Path) -> Iterator[tuple[TestClient, str]]:
     )
     application = create_app(settings, database)
     pairing = DevicePairingService(
-        DuckDbDeviceRepository(database.connection), WriteCoordinator()
+        DuckDbDeviceRepository(database.connection),
+        application.state.write_coordinator,
+        UserRepository(database.connection),
     )
     issued = asyncio.run(
-        pairing.authorize_owner_device(
+        pairing.authorize_user_device(
             identity=_IDENTITY,
             display_name="Concurrency Test Device",
             public_key_pem=_PUBLIC_KEY_PEM,
@@ -268,3 +270,48 @@ def test_failed_transaction_end_releases_waiters_and_preserves_errors(
     assert isinstance(close_thread_error, RuntimeError)
     assert "必须重新打开数据库连接" in str(close_thread_error)
     assert raw_connection.close_calls == 1
+
+
+def test_queue_wait_is_observable_under_concurrent_writes() -> None:
+    """并发写入时排队耗时**可以被观测到**（验收 V17 的「记录排队耗时」）。
+
+    **这不是在测协调器会不会串行**——那已由设备配对测试的
+    ``test_write_coordinator_serializes_tasks`` 覆盖。它回答的是验收矩阵要的那个问题：
+    A 的长操作把 B 挡了多久？
+
+    没有这个数字，出现"某个请求卡了很久"时就没有任何依据区分**排队**与**死锁**——
+    两者在客户端看来都一样：一个迟迟不返回的请求。因此这里同时断言两件事：等待确实
+    发生了（不是没测到），以及它**有界**（不是死锁）。
+    """
+    import time
+
+    from lyra.application.write_coordinator import WriteCoordinator
+
+    coordinator = WriteCoordinator()
+    slow_seconds = 0.15
+
+    async def scenario() -> tuple[float, float]:
+        async def slow() -> None:
+            await asyncio.sleep(slow_seconds)
+
+        async def queued() -> None:
+            ran_at.append(time.perf_counter())
+
+        ran_at: list[float] = []
+        slow_task = asyncio.create_task(coordinator.enqueue(slow))
+        # 让慢任务先真正拿到锁，否则两个任务谁先入队不确定，测到的是 0。
+        await asyncio.sleep(0.02)
+        enqueued_at = time.perf_counter()
+        await coordinator.enqueue(queued)
+        finished_at = time.perf_counter()
+        await slow_task
+        assert ran_at, "排队任务没有执行"
+        return ran_at[0] - enqueued_at, finished_at - enqueued_at
+
+    wait_seconds, total_seconds = asyncio.run(scenario())
+
+    # 记录到的排队时间应当接近慢操作的剩余时长；留足余量以免在慢机器上抖动。
+    assert wait_seconds >= slow_seconds / 2, f"排队时间 {wait_seconds:.3f}s 与预期不符"
+    # **有界**：死锁会让这个数字变成超时，而不是一个略大于慢操作的常数。
+    assert total_seconds < 5.0, f"排队总耗时 {total_seconds:.3f}s 超出有界预期"
+    assert coordinator.pending_operations == 0

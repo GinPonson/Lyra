@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from lyra.db.migrations import CURRENT_SCHEMA_VERSION
+
 SCRIPT = Path(__file__).parent.parent / "scripts" / "backup_ledger.py"
 
 
@@ -57,7 +59,9 @@ def test_backup_is_verified_and_recorded(ledger: Path, tmp_path: Path) -> None:
     assert "SHA-256" in result.stdout
     assert "模式版本" in result.stdout
     # 验证查询真的跑出了值，而不是只打印了标签。
-    assert ": 15" in result.stdout
+    # **引用常量而不是字面量**：schema 版本每次迁移都会变，写死会让这条断言
+    # 在每次迁移时假失败，掩盖它真正要守的「脚本确实读到了库的版本」。
+    assert f": {CURRENT_SCHEMA_VERSION}" in result.stdout
 
 
 def test_the_record_states_it_excludes_the_secret_config(ledger: Path, tmp_path: Path) -> None:
@@ -102,7 +106,7 @@ def test_the_backup_contains_the_same_schema_version(ledger: Path, tmp_path: Pat
         version = connection.execute("SELECT max(version) FROM schema_migrations").fetchone()[0]
     finally:
         connection.close()
-    assert version == 15
+    assert version == CURRENT_SCHEMA_VERSION
 
 
 # --------------------------------------------------------------------------
@@ -209,4 +213,4 @@ def test_rollback_restores_a_working_database(ledger: Path, tmp_path: Path) -> N
         version = connection.execute("SELECT max(version) FROM schema_migrations").fetchone()[0]
     finally:
         connection.close()
-    assert version == 15
+    assert version == CURRENT_SCHEMA_VERSION

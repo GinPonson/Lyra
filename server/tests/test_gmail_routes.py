@@ -3,12 +3,19 @@
 三处**在路由层**完成的格式校验早于任何业务逻辑：``state`` 形状、UUID 形状、
 ``YYYY-MM-DD``。放在这一层的价值是**错误信息能指明是哪一段**，而不是让下游抛一个
 笼统的"参数无效"。
+
+多用户下还固定两条：
+
+- 每条业务动作都在**用户绑定视图**（``for_user(user_id)``）上执行，用户取自
+  ``request.state.auth.user_id``；
+- 用户停用后，Gmail 的入队与执行都被拒绝（403 ``USER_DISABLED``）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -17,11 +24,11 @@ from fastapi.testclient import TestClient
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 from lyra.application.app_error import ApplicationError
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 
 PUBLIC_KEY_PEM = json.loads(
@@ -33,19 +40,48 @@ MAPPING_ID = "22222222-2222-2222-2222-222222222222"
 ACCOUNT_ID = "33333333-3333-3333-3333-333333333333"
 STATE = "A" * 43
 
+GMAIL_ROUTE_PATHS = [
+    ("post", "/v1/google/authorization-transactions"),
+    ("post", f"/v1/google/authorization-transactions/{STATE}/complete"),
+    ("get", "/v1/google/connections"),
+    ("get", f"/v1/google/connections/{CONNECTION_ID}/mappings"),
+    ("put", f"/v1/google/connections/{CONNECTION_ID}/mappings/{MAPPING_ID}"),
+    ("post", f"/v1/google/connections/{CONNECTION_ID}/sync"),
+    ("delete", f"/v1/google/connections/{CONNECTION_ID}"),
+]
+class _FakeGmailUserView:
+    """用户绑定视图桩：业务调用记录在父桩上，``user_id`` 由父桩统一记账。"""
+
+    def __init__(self, parent: FakeGmailService) -> None:
+        self._parent = parent
+
+    def __getattr__(self, name: str):
+        return self._parent._action(name)
+
 
 class FakeGmailService:
     """记录调用的服务桩。
 
     **记录与返回值并存**：覆写函数只决定返回什么（或抛什么错），调用仍会被记下来。
     早期版本在覆写时直接返回覆写函数，于是断言 `calls` 的测试全部落空。
+
+    **``for_user`` 记录用户而不是业务调用**：``calls`` 的形状（含既有断言）只描述
+    业务动作；用户范围单独记在 ``scoped_user_ids``，这样"路由是否用当前用户取视图"
+    可以被独立断言。桩上**没有**业务方法本身——路由若忘了 ``for_user`` 会直接
+    ``AttributeError``，而不是静默地按无用户范围执行。
     """
 
     def __init__(self, **overrides) -> None:
         self.calls: list[tuple] = []
+        self.scoped_user_ids: list[str] = []
         self._overrides = overrides
 
-    def __getattr__(self, name: str):
+    def for_user(self, user_id: str) -> _FakeGmailUserView:
+        """返回用户绑定视图。"""
+        self.scoped_user_ids.append(user_id)
+        return _FakeGmailUserView(self)
+
+    def _action(self, name: str):
         def action(*args, **kwargs):
             # 参考实现里 `createAuthorizationTransaction(device.id)` 是**位置参数**
             # 调用，其余动作是关键字调用；桩两者都要接。
@@ -70,9 +106,11 @@ def wired(tmp_path: Path):
     )
     application = create_app(settings, database)
     service = DevicePairingService(
-        DuckDbDeviceRepository(database.connection), WriteCoordinator()
+        DuckDbDeviceRepository(database.connection),
+        application.state.write_coordinator,
+        UserRepository(database.connection),
     )
-    issued = asyncio.run(service.authorize_owner_device(
+    issued = asyncio.run(service.authorize_user_device(
         identity=IDENTITY, display_name="Pixel 9", public_key_pem=PUBLIC_KEY_PEM
     ))
     try:
@@ -86,7 +124,8 @@ def _auth(issued) -> dict[str, str]:
         "Authorization": f"Bearer {issued.access_token}",
         # **每个 /v1 请求都必须声明客户端协议版本**（除公开路由）。
         # 缺失时服务端返回 426——那是客户端唯一能据此升级 App 的信号。
-        "x-lyra-protocol-version": "2",
+        # **引用共享常量而不是字面量**：写死会在协议升版后静默变成 426。
+        **CLIENT_PROTOCOL_HEADERS,
     }
 
 
@@ -102,15 +141,7 @@ def _with_service(application, service) -> None:
 
 @pytest.mark.parametrize(
     ("method", "path"),
-    [
-        ("post", "/v1/google/authorization-transactions"),
-        ("post", f"/v1/google/authorization-transactions/{STATE}/complete"),
-        ("get", "/v1/google/connections"),
-        ("get", f"/v1/google/connections/{CONNECTION_ID}/mappings"),
-        ("put", f"/v1/google/connections/{CONNECTION_ID}/mappings/{MAPPING_ID}"),
-        ("post", f"/v1/google/connections/{CONNECTION_ID}/sync"),
-        ("delete", f"/v1/google/connections/{CONNECTION_ID}"),
-    ],
+    [pytest.param(method, path, id=f"{method} {path}") for method, path in GMAIL_ROUTE_PATHS],
 )
 def test_every_gmail_route_requires_authentication(wired, method: str, path: str) -> None:
     """**7 条路由全部要求设备认证**——这是私有账本。"""
@@ -526,3 +557,263 @@ def test_disconnect_defaults_revoke_to_false(wired) -> None:
         client.delete(f"/v1/google/connections/{CONNECTION_ID}", headers=_auth(issued))
 
     assert seen.get("revoke") is False
+
+
+# --------------------------------------------------------------------------
+# 用户范围与停用
+# --------------------------------------------------------------------------
+
+
+def _valid_requests() -> list[tuple[str, str, dict]]:
+    """7 条路由各一份**参数合法**的请求，用于验证它们都走到了用户绑定视图。"""
+    return [
+        ("post", "/v1/google/authorization-transactions", {}),
+        ("post", f"/v1/google/authorization-transactions/{STATE}/complete", {"code": "c"}),
+        ("get", "/v1/google/connections", {}),
+        ("get", f"/v1/google/connections/{CONNECTION_ID}/mappings", {}),
+        ("put", f"/v1/google/connections/{CONNECTION_ID}/mappings/{MAPPING_ID}",
+         {"accountId": ACCOUNT_ID}),
+        ("post", f"/v1/google/connections/{CONNECTION_ID}/sync", {}),
+        ("delete", f"/v1/google/connections/{CONNECTION_ID}", {}),
+    ]
+
+
+def _perform(client, method: str, path: str, body: dict, headers: dict):
+    """发一个请求；**``httpx`` 的 ``.delete()`` 不接受 ``json=``**，因此统一走 ``request``。"""
+    if method == "get":
+        return client.get(path, headers=headers)
+    return client.request(method.upper(), path, json=body, headers=headers)
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [pytest.param(*case, id=f"{case[0]} {case[1]}") for case in _valid_requests()],
+)
+def test_every_route_uses_the_authenticated_user(
+    wired, method: str, path: str, body: dict
+) -> None:
+    """**每条业务动作都在 ``for_user(当前用户)`` 的视图上执行。**
+
+    用户来自访问令牌解析出的 ``request.state.auth.user_id``，不是请求参数。
+    """
+    application, issued = wired
+    service = FakeGmailService()
+    _with_service(application, service)
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = _perform(client, method, path, body, _auth(issued))
+
+    assert response.status_code < 400, response.text
+    assert service.scoped_user_ids == [issued.user.id], path
+
+
+def test_the_user_scope_ignores_a_user_id_in_the_body(wired) -> None:
+    """**正文里的 ``userId`` 不能指定归属**（计划 §4.2）。
+
+    若路由读正文，任何已配对设备都能声明自己属于别人。
+    """
+    application, issued = wired
+    service = FakeGmailService()
+    _with_service(application, service)
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = client.put(
+            f"/v1/google/connections/{CONNECTION_ID}/mappings/{MAPPING_ID}",
+            json={"accountId": ACCOUNT_ID, "userId": "99999999-9999-9999-9999-999999999999"},
+            headers=_auth(issued),
+        )
+
+    assert response.status_code == 200
+    assert service.scoped_user_ids == [issued.user.id]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [pytest.param(*case, id=f"{case[0]} {case[1]}") for case in _valid_requests()],
+)
+def test_disabled_user_is_rejected_on_every_route(
+    wired, method: str, path: str, body: dict
+) -> None:
+    """**停用用户的 Gmail 请求在入队处就被拒绝**（403 ``USER_DISABLED``）。
+
+    这是"停用后的排队同步不能入账"的第一道闸门：请求根本进不到服务层，
+    因此也不会继续拉取或写回（计划 §4.4）。
+    """
+    application, issued = wired
+    application.state.database.connection.execute(
+        "UPDATE users SET status = 'disabled' WHERE id = CAST(? AS UUID)",
+        [issued.user.id],
+    )
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = _perform(client, method, path, body, _auth(issued))
+
+    assert response.status_code == 403, path
+    assert response.json()["code"] == "USER_DISABLED"
+
+
+# --------------------------------------------------------------------------
+# 真实服务的跨用户隔离
+# --------------------------------------------------------------------------
+
+
+def _seed_connection(application, *, user_id: str, subject: str, email: str) -> str:
+    """直接写入一条连接，用于验证真实服务的读取范围。"""
+    connection_id = str(uuid.uuid4())
+    application.state.database.connection.execute(
+        """
+        INSERT INTO gmail_connections (
+            id, user_id, google_subject, google_email, encrypted_refresh_token,
+            granted_scopes, status
+        ) VALUES (
+            CAST(? AS UUID), CAST(? AS UUID), ?, ?, 'v1.iv.ct.tag', 'scope',
+            'pending_initial_scan'
+        )
+        """,
+        [connection_id, user_id, subject, email],
+    )
+    return connection_id
+
+
+def _seed_user(application, name: str) -> str:
+    """建立第二个用户。"""
+    user_id = str(uuid.uuid4())
+    application.state.database.connection.execute(
+        "INSERT INTO users (id, display_name) VALUES (CAST(? AS UUID), ?)",
+        [user_id, name],
+    )
+    return user_id
+
+
+def test_real_service_lists_only_the_authenticated_users_connections(wired) -> None:
+    """**A 列不出 B 的连接**，但自己的连接正常可见（V09）。"""
+    application, issued = wired
+    own = _seed_connection(
+        application, user_id=issued.user.id, subject="own", email="own@example.com"
+    )
+    other_user = _seed_user(application, "User B")
+    _seed_connection(
+        application, user_id=other_user, subject="other", email="other@example.com"
+    )
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = client.get("/v1/google/connections", headers=_auth(issued))
+
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()["connections"]] == [own]
+
+
+def test_real_service_cannot_read_another_users_mappings(wired) -> None:
+    """**A 读不到 B 连接的映射**：返回空列表，与"没有映射"不可区分。"""
+    application, issued = wired
+    other_user = _seed_user(application, "User B")
+    foreign = _seed_connection(
+        application, user_id=other_user, subject="other", email="other@example.com"
+    )
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = client.get(
+            f"/v1/google/connections/{foreign}/mappings", headers=_auth(issued)
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"mappings": []}
+
+
+def test_real_service_cannot_disconnect_another_users_connection(wired) -> None:
+    """**A 断不开 B 的连接**：404，与"连接不存在"一致；B 的连接保持原状（V09）。"""
+    application, issued = wired
+    other_user = _seed_user(application, "User B")
+    foreign = _seed_connection(
+        application, user_id=other_user, subject="other", email="other@example.com"
+    )
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = client.delete(
+            f"/v1/google/connections/{foreign}", headers=_auth(issued)
+        )
+
+    assert response.status_code == 404
+    row = application.state.database.connection.execute(
+        "SELECT status FROM gmail_connections WHERE id = CAST(? AS UUID)", [foreign]
+    ).fetchone()
+    assert row is not None and row[0] == "pending_initial_scan"
+
+
+def test_real_service_cannot_sync_another_users_connection(wired) -> None:
+    """**A 同步不了 B 的连接**：真实服务在读取连接时按用户范围过滤，返回 404。
+
+    这条走的是真实同步路径（``sync`` → ``load_connection``），不是桩：连接读不到时
+    同步在刷新令牌与拉取消息之前就终止（V09 的"同步"一项）。
+    """
+    application, issued = wired
+    other_user = _seed_user(application, "User B")
+    foreign = _seed_connection(
+        application, user_id=other_user, subject="other", email="other@example.com"
+    )
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = client.post(
+            f"/v1/google/connections/{foreign}/sync", headers=_auth(issued)
+        )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "GMAIL_CONNECTION_ERROR"
+
+
+def test_real_service_reports_404_for_an_unknown_connection(wired) -> None:
+    """自己名下不存在的连接同样 404——与"别人的连接"不可区分。"""
+    application, issued = wired
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = client.delete(
+            f"/v1/google/connections/{CONNECTION_ID}", headers=_auth(issued)
+        )
+
+    assert response.status_code == 404
+
+
+def test_real_service_refuses_to_sync_after_the_user_is_disabled(wired) -> None:
+    """**停用提交后，已经在执行/排队的同步在实际执行点被拒绝**（V11 的 Gmail 侧）。
+
+    这里直接调用真实服务而不是发请求，是为了模拟"请求已通过入队检查（当时用户仍是
+    active），随后被停用"的时序：``require_user`` 拦不住这种在飞请求，唯一可靠的闸门
+    是执行点本身——同步读取连接时先确认用户仍活动，因此**在刷新令牌、拉取消息与
+    写回任何状态之前**就终止（计划 §4.4）。
+    """
+    application, issued = wired
+    connection_id = _seed_connection(
+        application, user_id=issued.user.id, subject="own", email="own@example.com"
+    )
+    service = application.state.gmail_service.for_user(issued.user.id)
+
+    # 对照：用户仍活动时，这一次调用走到"必须确认重扫范围"（409）——
+    # 说明连接确实读到了，403 不是别的原因造成的。
+    with pytest.raises(ApplicationError) as active:
+        service.sync(
+            connection_id=connection_id, confirmed_rescan_after_date=None,
+            explicit_account_id=None,
+        )
+    assert active.value.code == "GMAIL_RESYNC_CONFIRMATION_REQUIRED"
+
+    application.state.database.connection.execute(
+        "UPDATE users SET status = 'disabled' WHERE id = CAST(? AS UUID)",
+        [issued.user.id],
+    )
+
+    with pytest.raises(ApplicationError) as raised:
+        service.sync(
+            connection_id=connection_id, confirmed_rescan_after_date=None,
+            explicit_account_id=None,
+        )
+
+    assert raised.value.code == "USER_DISABLED"
+    assert raised.value.status_code == 403
+    # 连接状态没有被写回（没有 last_sync_at、状态未变）。
+    row = application.state.database.connection.execute(
+        "SELECT status, last_sync_at FROM gmail_connections WHERE id = CAST(? AS UUID)",
+        [connection_id],
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "pending_initial_scan"
+    assert row[1] is None

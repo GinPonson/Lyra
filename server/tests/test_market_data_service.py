@@ -308,15 +308,26 @@ def test_cache_is_bounded() -> None:
     assert len(service._cache) <= 2
 
 
-def test_set_routes_switches_hot_without_clearing_the_cache() -> None:
-    """热切换路由**不清空缓存**：清空会让切换立刻打出一批上游请求。"""
+def test_per_call_route_does_not_clear_the_cache() -> None:
+    """按调用显式换路由**不清空缓存**：缓存键带来源 id，旧条目不会被误用。
+
+    多用户下路由不再是服务状态（``set_routes`` 已删除），而是 :meth:`read_quote` 的
+    参数；每次调用各带自己的路由，缓存仍按公开报价身份（来源 + 合约）复用，因此换路由
+    不会在切换瞬间打出一批上游请求。
+    """
     catalog = Catalog({"primary": _available(), "secondary": _available()})
     service = _service(catalog)
-    service.get_quote(INSTRUMENT)
-    before = len(service._cache)
+    service.read_quote(INSTRUMENT, ("primary",))
+    primary_keys = set(service._cache)
+    # 主来源的报价确实进了缓存。
+    assert len(primary_keys) == 1
 
-    service.set_routes({"stock": ("secondary", "primary")})
+    result = service.read_quote(INSTRUMENT, ("secondary", "primary"))
 
-    assert len(service._cache) == before
-    # 切换后仍然可用（缓存键带来源 id，旧条目不会被误用）。
-    assert service.get_quote(INSTRUMENT).status == "available"
+    assert result.status == "available"
+    # 旧来源的条目仍在：换路由**没有清空缓存**。
+    assert primary_keys <= set(service._cache)
+    # 缓存键带来源 id：两个来源各留一条，不会互相误用。
+    assert len(service._cache) == len(primary_keys) + 1
+    # 第二次读命中的是新来源的刷新，而不是主来源的缓存。
+    assert catalog.calls == ["primary", "secondary"]

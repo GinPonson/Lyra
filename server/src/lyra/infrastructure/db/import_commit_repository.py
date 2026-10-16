@@ -68,11 +68,18 @@ class PersistedImportCommitResult:
 class DuckDbImportCommitRepository:
     """把导入提交计划写入账本。
 
+    仓储在**构造时**绑定用户（计划 §4.2）：写入路径上的账户归属校验、账本版本读取与
+    版本登记都必须落在同一个用户内。做成方法参数会让某个调用点漏传后退化成全库语义。
+
     @param connection: 已迁移到当前 schema 的连接。
+    @param user_id: 当前用户的 UUID 文本；**必填**。
     """
 
-    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+    def __init__(
+        self, connection: duckdb.DuckDBPyConnection, *, user_id: str
+    ) -> None:
         self._connection = connection
+        self._user_id = user_id
 
     def commit_import(
         self,
@@ -87,7 +94,7 @@ class DuckDbImportCommitRepository:
 
         @param account_id: 目标账户的内部 UUID。
         @param plan: 事务外已算好的提交计划。
-        @param expected_ledger_version: 预览时读到的账本版本。
+        @param expected_ledger_version: 预览时读到的**该用户**账本版本。
         @param source_reference: 记入账本版本的来源引用（导入作业 UUID）。
         @param idempotency_completion: 幂等记录的收口信息；``None`` 表示本次请求
             未携带幂等键。
@@ -138,11 +145,11 @@ class DuckDbImportCommitRepository:
 
         @param account_id: 目标账户的内部 UUID。
         @param plan: 提交计划。
-        @param expected_ledger_version: 预览时读到的账本版本。
+        @param expected_ledger_version: 预览时读到的**该用户**账本版本。
         @param source_reference: 记入账本版本的来源引用。
         @param reason: 账本版本的原因，区分来源（``file_import`` / ``gmail_import``）。
         @returns 变更结果。
-        @raises ApplicationError: 账本版本已变化（409）。
+        @raises ApplicationError: 该用户的账本版本已变化（409）。
         """
         current = self._current_ledger_version()
         if current != expected_ledger_version:
@@ -198,16 +205,22 @@ class DuckDbImportCommitRepository:
         )
 
     def _assert_account_matches(self, account_id: str, legacy_key: str) -> None:
-        """确认账户 ID 仍指向计划中的账户，且**账户处于 active**。
+        """确认账户 ID 仍指向**当前用户的**计划账户，且账户处于 active。
 
         归档账户不得再接收新交易：它已经从会计范围里消失，写入的数据会被所有查询
         忽略——用户看到"导入成功"却查不到任何交易。
 
-        @raises ApplicationError: 账户不存在、键不匹配或已归档（409）。
+        账户条件必须与用户条件同时存在：账户 UUID 全局唯一，但"这个 UUID 属于谁"只能
+        由 ``user_id`` 判定；少了它，一个被别人账户 ID 拼出来的提交会绕过归属校验。
+
+        @raises ApplicationError: 账户不存在、不属于当前用户、键不匹配或已归档（409）。
         """
         row = self._connection.execute(
-            "SELECT legacy_account_key, status FROM accounts WHERE id = CAST(? AS UUID)",
-            [account_id],
+            """
+            SELECT legacy_account_key, status FROM accounts
+            WHERE user_id = CAST(? AS UUID) AND id = CAST(? AS UUID)
+            """,
+            [self._user_id, account_id],
         ).fetchone()
         if row is None or row[0] != legacy_key or row[1] != "active":
             raise ApplicationError(
@@ -218,25 +231,40 @@ class DuckDbImportCommitRepository:
             )
 
     def _current_ledger_version(self) -> int:
-        """读取当前最大账本版本；空账本为 0。"""
+        """读取**当前用户**的最大账本版本；该用户的空账本为 0。
+
+        ``ledger_version_seq`` 仍是全局序列，因此单用户的版本号**不连续**（A 可能看到
+        1 → 3）。契约 §3.3 把「用户当前账本版本」显式定义为
+        ``max(version) WHERE user_id = ?``，**禁止**改回全局 ``max(version)``：
+
+        - 改回全局会让 B 的一次导入把 A 的基准版本推高，A 拿着旧版本提交时被判
+          ``LEDGER_VERSION_CONFLICT``——A 的预览被 B 的写入"隔空"作废（V05 明确要求
+          B 的写入不影响 A 的预览）；
+        - 也会让 A 看到并接受一个属于 B 的版本号。
+        """
         row = self._connection.execute(
-            "SELECT coalesce(max(version), 0) FROM ledger_versions"
+            "SELECT coalesce(max(version), 0) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+            [self._user_id],
         ).fetchone()
         assert row is not None
         return int(row[0])
 
     def _create_ledger_version(self, source_reference: str, *, reason: str) -> int:
-        """登记一个新的账本版本并返回其版本号。
+        """登记一个属于**当前用户**的新账本版本并返回其版本号。
+
+        版本行必须带 ``user_id``（列 NOT NULL），否则这次导入产生的版本会落到"无主"
+        状态，该用户的下一次 ``_current_ledger_version`` 读不到它，于是预览基准永远
+        停在旧值。
 
         @param source_reference: 来源引用（文件名或消息 ID）。
         @param reason: 来源类型；审计时需要区分交易来自文件还是邮件。
         """
         row = self._connection.execute(
             """
-            INSERT INTO ledger_versions (reason, source_reference)
-            VALUES (?, ?) RETURNING version
+            INSERT INTO ledger_versions (user_id, reason, source_reference)
+            VALUES (CAST(? AS UUID), ?, ?) RETURNING version
             """,
-            [reason, source_reference],
+            [self._user_id, reason, source_reference],
         ).fetchone()
         assert row is not None
         return int(row[0])

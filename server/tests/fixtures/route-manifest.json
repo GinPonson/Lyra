@@ -1,5 +1,5 @@
 {
-  "note": "路由契约（签入）。迁移前与 TypeScript 版逐项对账为 47 个 (方法, 路径) 对 + 1 个 WebSocket，此清单即那份对账结果。路径参数统一归一化为 {}——参数名两侧各有命名 习惯，不是契约的一部分，路径形状才是。新增或删除路由时必须同时改这里。",
+  "note": "路由契约（签入）。迁移前与 TypeScript 版逐项对账为 47 个 (方法, 路径) 对 + 1 个 WebSocket——**那是历史事实，不随本次改动改写**。多用户账本升级新增 3 项（GET /v1/me、GET /v1/admin/users、PATCH /v1/admin/users/{}），当前合计 50 个 (方法, 路径) 对 + 1 个 WebSocket。路径参数统一归一化为 {}——参数名两侧各有命名习惯，不是契约的一部分，路径形状才是。新增或删除路由时必须同时改这里。",
   "pairs": [
     {
       "method": "DELETE",
@@ -8,6 +8,10 @@
     {
       "method": "DELETE",
       "path": "/v1/google/connections/{}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/admin/users"
     },
     {
       "method": "GET",
@@ -123,7 +127,15 @@
     },
     {
       "method": "GET",
+      "path": "/v1/me"
+    },
+    {
+      "method": "GET",
       "path": "/v1/system/info"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/admin/users/{}"
     },
     {
       "method": "POST",

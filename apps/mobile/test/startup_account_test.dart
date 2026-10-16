@@ -21,6 +21,7 @@ const _snapshot = CredentialSnapshot(
   deviceId: 'device-1',
   accessToken: 'test-access',
   refreshToken: 'test-refresh',
+  userId: 'owner-user',
   authMethod: 'google',
   userEmail: 'owner@example.com',
   googleSubject: 'owner-subject',
@@ -299,14 +300,14 @@ void main() {
     });
   }
 
-  test('稳定 Google 身份新设备恢复指定账户；另一身份或服务端绝不继承', () async {
+  test('稳定 userId 新设备恢复指定账户；另一用户或服务端绝不继承', () async {
     final preferences = MemoryAppPreferencesStore(
       initialValue: _saved(mode: StartupAccountMode.specific),
     );
-    for (final (subject, server, expected) in [
-      ('owner-subject', 'https://startup.example/', _accountA),
-      ('different-owner', 'https://startup.example', 'all'),
-      ('owner-subject', 'https://another.example', 'all'),
+    for (final (userId, server, expected) in [
+      ('owner-user', 'https://startup.example/', _accountA),
+      ('different-user', 'https://startup.example', 'all'),
+      ('owner-user', 'https://another.example', 'all'),
     ]) {
       final container = await _start(
         _StartupFixture(),
@@ -316,9 +317,10 @@ void main() {
           deviceId: 'new-device',
           accessToken: 'new-access',
           refreshToken: 'new-refresh',
+          userId: userId,
           authMethod: 'google',
           userEmail: 'owner@example.com',
-          googleSubject: subject,
+          googleSubject: 'owner-subject',
         ),
       );
       await container.read(accountScopeReadyProvider.future);
@@ -326,7 +328,7 @@ void main() {
     }
   });
 
-  test('切换身份后旧账户查询的迟到结果不能恢复旧账户', () async {
+  test('切换用户后旧账户查询的迟到结果不能恢复旧账户', () async {
     final oldFixture = _StartupFixture()..accountsGate = Completer<void>();
     final store = MemoryAppPreferencesStore(
       initialValue: _saved(mode: StartupAccountMode.specific),
@@ -348,6 +350,7 @@ void main() {
         deviceId: 'other-device',
         accessToken: 'other-access',
         refreshToken: 'other-refresh',
+        userId: 'other-user',
         authMethod: 'google',
         userEmail: 'owner@example.com',
         googleSubject: 'other-owner',

@@ -14,6 +14,7 @@ import '../core/security/credential_store.dart';
 import '../features/agent/agent_session_store.dart';
 import '../features/auth/auth_repository.dart';
 import '../features/auth/auth_provider.dart';
+import '../features/auth/user_profile.dart';
 import '../features/ledger/ledger_models.dart';
 import '../features/ledger/ledger_repository.dart';
 
@@ -64,6 +65,9 @@ class _PendingTokenRefresh {
   final CredentialSnapshot identity;
   final Future<RefreshedDeviceTokens> tokens;
 }
+
+/// 账号停用后的统一提示；停用与令牌过期的处置相同（结束会话），原因不同。
+const String _userDisabledMessage = '账号已停用，请联系管理员。';
 
 /// OAuth 浏览器登录、设备凭据恢复、刷新轮换与退出。
 class SessionController extends AsyncNotifier<SessionState> {
@@ -118,6 +122,17 @@ class SessionController extends AsyncNotifier<SessionState> {
       );
       return _publishedState;
     }
+    // 稳定 userId 是唯一身份锚点。旧凭据缺失它时无法证明归属，必须清理会话
+    // 并要求重新登录，不能按邮箱或第三方 subject 猜测属于哪个用户。
+    if (snapshot.userId == null || snapshot.userId!.isEmpty) {
+      await _expireIdentity(
+        dependencies,
+        snapshot,
+        generation,
+        '登录凭据已更新，请重新登录。',
+      );
+      return _publishedState;
+    }
     final client = _client = _buildClient(dependencies, snapshot, generation);
     try {
       final summary = await LedgerRepository(client).summary(scope: 'all');
@@ -129,18 +144,24 @@ class SessionController extends AsyncNotifier<SessionState> {
       if (!_sameIdentity(latest, snapshot)) {
         return _restored(generation, const SessionSignedOut());
       }
+      // 账本读取成功只说明令牌有效；再用 /me 核对服务端解析出的身份与本机
+      // 凭据一致，避免把上一个身份的账本交给下一个登录。
+      await _verifyRestoredIdentity(dependencies, client, latest!, generation);
+      if (!_authActive(generation)) return _publishedState;
       return _restored(
         generation,
-        SessionAuthenticated(snapshot: latest!, summary: summary),
+        SessionAuthenticated(snapshot: latest, summary: summary),
       );
     } on LyraApiError catch (error) {
       if (!_authActive(generation)) return _publishedState;
-      if (error.statusCode == 401) {
+      if (error.statusCode == 401 || error.code == kUserDisabledCode) {
         await _expireIdentity(
           dependencies,
           snapshot,
           generation,
-          '登录已过期，请重新登录。',
+          error.code == kUserDisabledCode
+              ? _userDisabledMessage
+              : '登录已过期，请重新登录。',
         );
         return _publishedState;
       }
@@ -156,6 +177,34 @@ class SessionController extends AsyncNotifier<SessionState> {
     }
   }
 
+  /// 用 `GET /v1/me` 核对服务端当前身份与本机凭据的稳定 userId 是否一致。
+  ///
+  /// 只有明确的身份不一致才结束会话。401 与停用已由客户端回调结束会话；网络、
+  /// 服务故障或响应形态不符只是本次核对未完成，保留已恢复的会话（账本读取会
+  /// 单独给出可重试错误），不把连接失败伪装成身份不符或账号停用。
+  Future<void> _verifyRestoredIdentity(
+    SessionDependencies dependencies,
+    LyraApiClient client,
+    CredentialSnapshot identity,
+    int generation,
+  ) async {
+    final LyraUserProfile profile;
+    try {
+      profile = await UserProfileRepository(client).me();
+    } on LyraApiError {
+      return;
+    } on FormatException {
+      return;
+    }
+    if (!_authActive(generation) || profile.userId == identity.userId) return;
+    await _expireIdentity(
+      dependencies,
+      identity,
+      generation,
+      '登录身份已变化，请重新登录。',
+    );
+  }
+
   bool _authActive(int generation) =>
       ref.mounted && generation == _authGeneration;
 
@@ -169,10 +218,12 @@ class SessionController extends AsyncNotifier<SessionState> {
     if (ref.mounted) state = AsyncData(value);
   }
 
+  /// 身份同一性判定包含稳定 userId：同一设备换用户后，旧请求的结果不得写回。
   bool _sameIdentity(CredentialSnapshot? left, CredentialSnapshot right) =>
       left != null &&
       left.deviceId == right.deviceId &&
-      left.serverUrl == right.serverUrl;
+      left.serverUrl == right.serverUrl &&
+      left.userId == right.userId;
 
   /// 凭据只从 verifier 绑定的交换接口返回，浏览器不接收 Lyra 令牌。
   Future<bool> signInWithGoogle({
@@ -256,11 +307,21 @@ class SessionController extends AsyncNotifier<SessionState> {
         );
         if (!active()) return false;
         if (credentials != null) {
+          // 停用账号只能得到明确的不可重试错误；即便服务端返回 200 也不建立会话。
+          if (credentials.user.status == LyraUserStatus.disabled) {
+            throw const LyraApiError(
+              code: kUserDisabledCode,
+              message: _userDisabledMessage,
+              statusCode: 403,
+              retryable: false,
+            );
+          }
           final snapshot = CredentialSnapshot(
             serverUrl: serverUrl,
             deviceId: credentials.deviceId,
             accessToken: credentials.accessToken,
             refreshToken: credentials.refreshToken,
+            userId: credentials.user.userId,
             devicePrivateKey: base64Encode(privateKey),
             authMethod: provider.id,
             userEmail: credentials.userEmail,
@@ -561,6 +622,7 @@ class SessionController extends AsyncNotifier<SessionState> {
                 deviceId: current.deviceId,
                 accessToken: tokens.accessToken,
                 refreshToken: tokens.refreshToken,
+                userId: current.userId,
                 devicePrivateKey: current.devicePrivateKey,
                 authMethod: current.authMethod,
                 userEmail: current.userEmail,
@@ -589,6 +651,12 @@ class SessionController extends AsyncNotifier<SessionState> {
       },
       onUnauthorized: () =>
           _expireIdentity(dependencies, identity, generation, '登录已过期，请重新登录。'),
+      onUserDisabled: () => _expireIdentity(
+        dependencies,
+        identity,
+        generation,
+        _userDisabledMessage,
+      ),
     );
   }
 }

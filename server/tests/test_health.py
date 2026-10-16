@@ -151,3 +151,56 @@ def test_the_application_wires_the_real_availability_snapshot(tmp_path: Path) ->
         "availableProviders": 0,
         "unavailableProviders": 1,
     }
+
+
+def _health_with_gmail(database, attention: object) -> dict:
+    """用注入的 Gmail 聚合来源跑一次 ``GET /v1/health``。"""
+    application = FastAPI()
+    application.include_router(
+        create_health_router(database, gmail_attention_provider=lambda: attention)
+    )
+    with TestClient(application) as client:
+        response = client.get("/v1/health")
+
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_the_gmail_section_reports_status_without_user_activity_counts(database) -> None:
+    """**Gmail 段只报状态，不报数量。**
+
+    多用户下 ``totalConnections`` / ``attentionRequired`` 是用户活动计数——公开健康
+    端点暴露它们等于告诉任何人这个部署上有几个用户连了 Gmail。计划 §4.4 与 P0 契约
+    §3.4 要求移除，因此这里同时断言**形状是闭集**：多一个字段就是回归。
+    """
+    body = _health_with_gmail(database, 0)
+
+    assert body["gmail"] == {"status": "available"}
+    assert "totalConnections" not in body["gmail"]
+    assert "attentionRequired" not in body["gmail"]
+
+
+def test_a_gmail_connection_needing_attention_is_degraded(database) -> None:
+    """有连接需要处理时整体降级——但**仍然不报条数**。"""
+    body = _health_with_gmail(database, 2)
+
+    assert body["gmail"] == {"status": "degraded"}
+    assert body["status"] == "degraded"
+
+
+def test_a_failing_gmail_probe_drops_the_section_instead_of_faking_available(
+    database,
+) -> None:
+    """读取 Gmail 状态失败时该段**不出现**，而不是填一个假的 ``available``。"""
+
+    def _explode() -> int:
+        raise RuntimeError("数据库已关闭")
+
+    application = FastAPI()
+    application.include_router(
+        create_health_router(database, gmail_attention_provider=_explode)
+    )
+    with TestClient(application) as client:
+        body = client.get("/v1/health").json()
+
+    assert "gmail" not in body

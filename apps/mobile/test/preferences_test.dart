@@ -54,11 +54,13 @@ CredentialSnapshot _snapshot({
   String server = 'https://lyra.example',
   String device = 'device-1',
   String? subject = 'google-owner',
+  String? userId = 'user-1',
 }) => CredentialSnapshot(
   serverUrl: server,
   deviceId: device,
   accessToken: 'test-access',
   refreshToken: 'test-refresh',
+  userId: userId,
   authMethod: 'google',
   userEmail: 'same@example.com',
   googleSubject: subject,
@@ -75,25 +77,51 @@ Future<void> _waitFor(bool Function() predicate) async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  test('三种登录主体按提供方隔离，旧 Google 偏好身份键保持一致', () {
-    CredentialSnapshot snapshot(String provider, {String subject = '123'}) =>
-        CredentialSnapshot(
-          serverUrl: 'https://lyra.example',
-          deviceId: 'new-device',
-          accessToken: 'access',
-          refreshToken: 'refresh',
-          authMethod: provider,
-          providerSubject: subject,
-          userEmail: 'same@example.com',
-        );
-    final google = preferencesIdentityKey(snapshot('google'));
-    final github = preferencesIdentityKey(snapshot('github'));
-    final linuxdo = preferencesIdentityKey(snapshot('linuxdo'));
-    expect({google, github, linuxdo}, hasLength(3));
-    expect(google, preferencesIdentityKey(_snapshot(subject: '123')));
+  test('偏好身份键只由服务端地址与稳定 userId 决定，身份、邮箱与设备不参与', () {
+    CredentialSnapshot snapshot({
+      String provider = 'google',
+      String subject = '123',
+      String userId = 'user-1',
+      String device = 'new-device',
+      String server = 'https://lyra.example',
+    }) => CredentialSnapshot(
+      serverUrl: server,
+      deviceId: device,
+      accessToken: 'access',
+      refreshToken: 'refresh',
+      userId: userId,
+      authMethod: provider,
+      providerSubject: subject,
+      userEmail: 'same@example.com',
+    );
+    final key = preferencesIdentityKey(snapshot());
+    // 同一 userId 的不同第三方身份与不同设备共用偏好键：服务端已把它们明确
+    // 关联到同一个用户，客户端不再按 provider/subject 二次切分。
     expect(
-      preferencesIdentityKey(snapshot('github', subject: '456')),
-      isNot(github),
+      preferencesIdentityKey(
+        snapshot(provider: 'github', subject: '456', device: 'other-device'),
+      ),
+      key,
+    );
+    expect(
+      preferencesIdentityKey(snapshot(server: 'https://LYRA.EXAMPLE:443/')),
+      key,
+    );
+    // 不同 userId 或不同服务端绝不继承。
+    expect(preferencesIdentityKey(snapshot(userId: 'user-2')), isNot(key));
+    expect(
+      preferencesIdentityKey(snapshot(server: 'https://other.example')),
+      isNot(key),
+    );
+    // 相同邮箱不构成同一身份。
+    expect(
+      preferencesIdentityKey(snapshot(userId: 'user-2', subject: '123')),
+      isNot(key),
+    );
+    // 旧凭据缺少 userId 时明确失败，不回落设备或邮箱身份。
+    expect(
+      () => preferencesIdentityKey(_snapshot(userId: null)),
+      throwsStateError,
     );
   });
 
@@ -315,7 +343,7 @@ void main() {
     expect(container.read(amountsHiddenProvider), isFalse);
   });
 
-  test('稳定 subject 跨新设备恢复，不同服务器或身份不继承，旧凭据只回落设备身份', () async {
+  test('稳定 userId 跨新设备恢复，不同服务器或 userId 不继承，旧凭据明确失败', () async {
     final key = preferencesIdentityKey(_snapshot());
     expect(
       preferencesIdentityKey(
@@ -324,17 +352,16 @@ void main() {
       key,
     );
     expect(
-      preferencesIdentityKey(_snapshot(subject: 'other-owner')),
+      preferencesIdentityKey(_snapshot(userId: 'other-user')),
       isNot(key),
     );
     expect(
       preferencesIdentityKey(_snapshot(server: 'https://other.example')),
       isNot(key),
     );
-    expect(preferencesIdentityKey(_snapshot(subject: null)), isNot(key));
     expect(
-      preferencesIdentityKey(_snapshot(subject: null, device: 'another')),
-      isNot(preferencesIdentityKey(_snapshot(subject: null))),
+      () => preferencesIdentityKey(_snapshot(userId: null)),
+      throwsStateError,
     );
     final store = MemoryAppPreferencesStore();
     final first = _container(store, identity: key);
@@ -345,7 +372,7 @@ void main() {
     first.dispose();
     final other = _container(
       store,
-      identity: preferencesIdentityKey(_snapshot(subject: 'other-owner')),
+      identity: preferencesIdentityKey(_snapshot(userId: 'other-user')),
     );
     addTearDown(other.dispose);
     await other.read(appPreferencesProvider.future);

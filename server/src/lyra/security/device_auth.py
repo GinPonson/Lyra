@@ -177,9 +177,16 @@ class NormalizedDevicePublicKey:
 
 @dataclass(frozen=True)
 class PairedDeviceRecord:
-    """与 paired_devices 表对齐且不含设备私钥的完整记录。"""
+    """与 paired_devices 表对齐且不含设备私钥的完整记录。
+
+    ``user_id`` 与 ``identity_id`` 是 schema 16 起 paired_devices 的必填列：设备
+    **一旦归属用户就不再改 owner**，且必须记住本次登录用的是哪一条身份，供
+    ``GET /v1/me`` 直接取用（P0 契约 §3.7）。
+    """
 
     id: str
+    user_id: str
+    identity_id: str
     display_name: str
     public_key_pem: str
     public_key_fingerprint: str
@@ -370,22 +377,33 @@ def create_paired_device_record(
     display_name: str,
     public_key: NormalizedDevicePublicKey,
     now: datetime,
+    *,
+    user_id: str,
+    identity_id: str,
 ) -> PairedDeviceRecord:
-    """在配对码已成功消费后创建可持久化的活动设备记录。
+    """在登录身份已解析后创建可持久化的活动设备记录。
 
     只接受 :func:`normalize_device_public_key` 的结果，因此记录保存的是规范
     SPKI 公钥、稳定指纹与算法名，不接触设备私钥。
+
+    ``user_id`` 与 ``identity_id`` 是**必填**而非可选：设备没有归属用户是不可表示的
+    状态（schema 16 的 ``NOT NULL`` + 复合外键），留一个默认为空的字段只会让漏传
+    变成运行时才发现的越权。
 
     @param device_id: 服务端生成的不可变设备 UUID。
     @param display_name: 用户可识别的设备名称。
     @param public_key: 已规范化的设备公钥。
     @param now: 配对事务提交时间。
+    @param user_id: 设备的归属用户 UUID；此后不再变更。
+    @param identity_id: 本次登录使用的身份 UUID，必须与该用户一致。
     @returns 可持久化的设备记录。
-    @raises ValueError: 设备 ID 或名称为空白。
+    @raises ValueError: 设备 ID、名称、归属用户或身份为空白。
     """
     timestamp = _iso(now)
     return PairedDeviceRecord(
         id=_require_device_text(device_id, "设备 ID"),
+        user_id=_require_device_text(user_id, "归属用户"),
+        identity_id=_require_device_text(identity_id, "登录身份"),
         display_name=_require_device_text(display_name, "设备名称"),
         public_key_pem=public_key.pem,
         public_key_fingerprint=public_key.fingerprint,

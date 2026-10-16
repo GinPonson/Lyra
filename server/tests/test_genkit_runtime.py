@@ -477,7 +477,7 @@ def _config(*, max_turns: int = 10) -> GenkitConfig:
 def _tool_context() -> AgentToolContext:
     """构造一个会话绑定的服务端工具上下文。"""
     return AgentToolContext(
-        session_id="s-1", device_id="d-1", user_message_id="u-1",
+        session_id="s-1", device_id="d-1", user_id=AUDIT_USER_ID, user_message_id="u-1",
         account_scope=AccountScope(kind="all"), ledger_version=3,
         as_of="2026-09-01T00:00:00.000Z",
     )
@@ -776,6 +776,8 @@ AUDIT_DEVICE_ID = "22222222-2222-2222-2222-222222222222"
 AUDIT_SESSION_ID = "33333333-3333-3333-3333-333333333333"
 AUDIT_MESSAGE_ID = "44444444-4444-4444-4444-444444444444"
 AUDIT_STARTED_AT = "2026-10-12T09:00:01.000Z"
+AUDIT_USER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+AUDIT_IDENTITY_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 AUDIT_COMPLETED_AT = "2026-10-12T09:00:02.000Z"
 
 
@@ -797,21 +799,32 @@ def _audit_repository(tmp_path):
     database = open_lyra_database(str(tmp_path / "audit.duckdb"))
     connection = database.connection
     connection.execute(
+        "INSERT INTO users (id, display_name) VALUES (CAST(? AS UUID), 'Owner')",
+        [AUDIT_USER_ID],
+    )
+    connection.execute(
         """
-        INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-        VALUES (CAST(? AS UUID), 'Account', 'TST001', '001')
+        INSERT INTO user_identities (id, user_id, provider, subject)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'github', 'audit-subject')
         """,
-        [AUDIT_ACCOUNT_ID],
+        [AUDIT_IDENTITY_ID, AUDIT_USER_ID],
+    )
+    connection.execute(
+        """
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', 'TST001', '001')
+        """,
+        [AUDIT_ACCOUNT_ID, AUDIT_USER_ID],
     )
     connection.execute(
         """
         INSERT INTO paired_devices
-            (id, display_name, public_key_pem, public_key_fingerprint, key_algorithm,
-             status)
-        VALUES (CAST(? AS UUID), 'Pixel 9', '-----BEGIN PUBLIC KEY-----', ?, 'ec',
-                'active')
+            (id, user_id, identity_id, display_name, public_key_pem,
+             public_key_fingerprint, key_algorithm, status)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), CAST(? AS UUID), 'Pixel 9',
+                '-----BEGIN PUBLIC KEY-----', ?, 'ec', 'active')
         """,
-        [AUDIT_DEVICE_ID, "f" * 64],
+        [AUDIT_DEVICE_ID, AUDIT_USER_ID, AUDIT_IDENTITY_ID, "f" * 64],
     )
     DuckDbAgentSessionRepository(connection).create_session(
         create_agent_session(
@@ -820,7 +833,8 @@ def _audit_repository(tmp_path):
             account_scope=AccountScope(kind="all"), ledger_version=3,
             as_of="2026-09-01T00:00:00.000Z",
         ),
-        device_id=AUDIT_DEVICE_ID, now=datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC),
+        device_id=AUDIT_DEVICE_ID, user_id=AUDIT_USER_ID,
+        now=datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC),
     )
     repository = AgentMessageRepository(connection)
     repository.append_message(start_agent_message(
@@ -845,7 +859,8 @@ def _audit_run(definition, provider) -> list:
         content="这个月赚了多少",
         context=AgentToolContext(
             session_id=AUDIT_SESSION_ID, device_id=AUDIT_DEVICE_ID,
-            user_message_id=AUDIT_MESSAGE_ID, account_scope=AccountScope(kind="all"),
+            user_id=AUDIT_USER_ID, user_message_id=AUDIT_MESSAGE_ID,
+            account_scope=AccountScope(kind="all"),
             ledger_version=3, as_of="2026-09-01T00:00:00.000Z",
         ),
         emit=signals.append,
@@ -955,16 +970,25 @@ def test_bound_session_cannot_reach_other_accounts_end_to_end(tmp_path) -> None:
 
     bound = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    user_a = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    user_b = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
     database = open_lyra_database(str(tmp_path / "scope.duckdb"))
     try:
         connection = database.connection
-        for account_id, key in ((bound, "TST001"), (other, "TST002")):
+        # 两个账户分属**两个用户**：否则"拿不到别的账户"可能只是因为同属一个用户。
+        for user_id, display in ((user_a, "A"), (user_b, "B")):
+            connection.execute(
+                "INSERT INTO users (id, display_name) VALUES (CAST(? AS UUID), ?)",
+                [user_id, display],
+            )
+        for account_id, key, owner in ((bound, "TST001", user_a), (other, "TST002", user_b)):
             connection.execute(
                 """
-                INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-                VALUES (CAST(? AS UUID), 'Account', ?, '001')
+                INSERT INTO accounts (id, user_id, display_name, legacy_account_key,
+                                      masked_suffix)
+                VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', ?, '001')
                 """,
-                [account_id, key],
+                [account_id, owner, key],
             )
         scope = AccountScope(kind="account", account=bound)
         provider = ScriptedProvider([
@@ -988,7 +1012,8 @@ def test_bound_session_cannot_reach_other_accounts_end_to_end(tmp_path) -> None:
             ),
             content="列出我授权范围内的账户",
             context=AgentToolContext(
-                session_id="s-1", device_id="d-1", user_message_id="u-1",
+                session_id="s-1", device_id="d-1", user_id=user_a,
+                user_message_id="u-1",
                 account_scope=scope, ledger_version=3,
                 as_of="2026-09-01T00:00:00.000Z",
             ),

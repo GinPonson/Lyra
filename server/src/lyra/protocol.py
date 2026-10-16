@@ -1,7 +1,8 @@
 """服务端协议版本与公开元数据。
 
 镜像 TypeScript 版 ``protocol-version.ts``。协议版本是客户端与服务端之间的
-硬契约：迁移期间**不得变更**，否则 Flutter 端需要同步改动。
+硬契约：客户端与服务端必须同步升级，**最低支持版本随之抬高**，旧客户端会被
+协议门槛以 426 拒绝，而不是拿到形状不符的响应。
 """
 
 from __future__ import annotations
@@ -9,9 +10,11 @@ from __future__ import annotations
 from typing import TypedDict
 
 # 当前移动端与服务端共享的协议版本。
-LYRA_PROTOCOL_VERSION = 2
-# 当前服务端接受的最旧协议版本。
-MIN_SUPPORTED_PROTOCOL_VERSION = 2
+# 3：登录与 ``/v1/me`` 返回带稳定 ``userId`` 的 ``user`` 对象，并新增 ``USER_DISABLED``。
+LYRA_PROTOCOL_VERSION = 3
+# 当前服务端接受的最旧协议版本。**与当前版本同步抬高**：协议 2 的客户端不理解
+# ``user`` 对象，放行它会让它在多用户服务端上按单账本语义工作。
+MIN_SUPPORTED_PROTOCOL_VERSION = 3
 # 当前服务端接受的最新协议版本。
 MAX_SUPPORTED_PROTOCOL_VERSION = LYRA_PROTOCOL_VERSION
 

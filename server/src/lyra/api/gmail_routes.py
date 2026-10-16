@@ -12,7 +12,12 @@
 | ``POST /v1/google/connections/{id}/sync`` | 触发同步 |
 | ``DELETE /v1/google/connections/{id}`` | 断开连接 |
 
-**全部要求设备认证**：这是私有账本，连接与同步都只对已配对设备开放。
+**全部要求用户认证**：这是私有账本，连接与同步都只对已配对设备开放。
+
+**每一条业务动作都在用户绑定视图上执行**：处理器先取
+``request.state.auth.user_id``（由路由级 ``require_user`` 从访问令牌解析，见 P0 契约
+§3.8），再用 ``service.for_user(user_id)`` 取得该用户的服务视图。**用户绝不来自请求
+正文或查询串**——那会让一个伪造参数就换到别人的连接、映射与同步。
 
 三处**在路由层**完成的格式校验（早于任何业务逻辑）：
 
@@ -31,7 +36,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from ..application.app_error import ApplicationError
-from .dependencies import require_device
+from .dependencies import require_user
 
 _UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -44,9 +49,9 @@ _LOCAL_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 def create_gmail_router() -> APIRouter:
     """构造 Gmail 路由。
 
-    @returns 含 7 条路由的路由器；全部要求设备认证。
+    @returns 含 7 条路由的路由器；全部要求用户认证。
     """
-    router = APIRouter(dependencies=[Depends(require_device)])
+    router = APIRouter(dependencies=[Depends(require_user)])
 
     @router.post("/v1/google/authorization-transactions", status_code=201)
     def create_authorization_transaction(request: Request) -> Any:
@@ -54,9 +59,9 @@ def create_gmail_router() -> APIRouter:
 
         **事务绑定发起它的设备**：另一台设备拿到 state 也无法完成兑换。
         """
-        device = _device(request)
-        service = _service(request)
-        transaction = service.create_authorization_transaction(device.id)
+        auth = _auth(request)
+        service = _service(request).for_user(auth.user_id)
+        transaction = service.create_authorization_transaction(auth.device_id)
         if transaction is None:
             # Google OAuth 未配置：503 而不是 500——服务是好的，只是少了配置。
             raise HTTPException(
@@ -69,9 +74,9 @@ def create_gmail_router() -> APIRouter:
     async def complete_authorization_transaction(state: str, request: Request) -> Any:
         """用授权码完成授权。
 
-        正文为 ``{"code": "..."}``。
+        建立的连接归属当前认证用户；正文为 ``{"code": "..."}``。
         """
-        device = _device(request)
+        auth = _auth(request)
         if not _STATE.fullmatch(state):
             raise HTTPException(
                 status_code=400, detail={"code": "INVALID_ARGUMENT", "message": "Google 授权事务标识无效"}
@@ -89,20 +94,30 @@ def create_gmail_router() -> APIRouter:
                 detail={"code": "INVALID_ARGUMENT", "message": "Google 授权完成参数无效"},
             )
         return _call(
-            _service(request).complete_authorization_transaction,
-            device_id=device.id, state=state, authorization_code=code.strip(),
+            _service(request).for_user(auth.user_id).complete_authorization_transaction,
+            device_id=auth.device_id, state=state, authorization_code=code.strip(),
         )
 
     @router.get("/v1/google/connections")
     def list_connections(request: Request) -> Any:
-        """列出已连接的 Google 账号。"""
-        return {"connections": _service(request).list_connections()}
+        """列出当前用户已连接的 Google 账号。"""
+        auth = _auth(request)
+        return {"connections": _service(request).for_user(auth.user_id).list_connections()}
 
     @router.get("/v1/google/connections/{connection_id}/mappings")
     def list_mappings(connection_id: str, request: Request) -> Any:
-        """列出某连接的账户映射。"""
+        """列出某连接的账户映射。
+
+        连接不属于当前用户时返回空列表：映射查询沿连接归属过滤，与"该连接还没有映射"
+        不可区分，不泄露他人连接是否存在。
+        """
+        auth = _auth(request)
         _require_uuid(connection_id, "Gmail 连接 ID 无效")
-        return {"mappings": _service(request).list_mappings(connection_id)}
+        return {
+            "mappings": _service(request)
+            .for_user(auth.user_id)
+            .list_mappings(connection_id)
+        }
 
     @router.put("/v1/google/connections/{connection_id}/mappings/{mapping_id}")
     async def update_mapping(
@@ -110,8 +125,9 @@ def create_gmail_router() -> APIRouter:
     ) -> Any:
         """改绑一条账户映射。
 
-        正文为 ``{"accountId": "<uuid>"}``。
+        正文为 ``{"accountId": "<uuid>"}``；目标账户必须属于当前用户。
         """
+        auth = _auth(request)
         _require_uuid(connection_id, "Gmail 连接 ID 无效")
         _require_uuid(mapping_id, "Gmail 映射 ID 无效")
         try:
@@ -124,7 +140,7 @@ def create_gmail_router() -> APIRouter:
         _require_uuid(account_id, "Gmail 映射更新参数无效")
         return {
             "mapping": _call(
-                _service(request).update_mapping,
+                _service(request).for_user(auth.user_id).update_mapping,
                 connection_id=connection_id, mapping_id=mapping_id,
                 target_account_id=account_id,
             )
@@ -132,13 +148,14 @@ def create_gmail_router() -> APIRouter:
 
     @router.post("/v1/google/connections/{connection_id}/sync")
     async def sync_connection(connection_id: str, request: Request) -> Any:
-        """触发一次同步。
+        """触发一次属于当前用户的同步。
 
         正文可选：``{"confirmedRescanAfterDate": "YYYY-MM-DD", "explicitAccountId": "<uuid>"}``。
 
         **``confirmedRescanAfterDate`` 由用户提供**：首次扫描或重扫的起始日期不能由
         服务端代选（§108.1）。
         """
+        auth = _auth(request)
         _require_uuid(connection_id, "Gmail 连接 ID 无效")
         raw = await _optional_json(request)
         after_date = raw.get("confirmedRescanAfterDate")
@@ -153,7 +170,7 @@ def create_gmail_router() -> APIRouter:
         if explicit is not None:
             _require_uuid(explicit, "Gmail 同步参数无效")
         return _call(
-            _service(request).sync,
+            _service(request).for_user(auth.user_id).sync,
             connection_id=connection_id,
             confirmed_rescan_after_date=after_date,
             explicit_account_id=explicit,
@@ -161,7 +178,7 @@ def create_gmail_router() -> APIRouter:
 
     @router.delete("/v1/google/connections/{connection_id}")
     async def disconnect_connection(connection_id: str, request: Request) -> Any:
-        """断开连接。
+        """断开当前用户的连接。
 
         **``revoke`` 来自请求体而不是查询串**（参考实现的 ``disconnectSchema``）。
         正文可为空，省略时按 ``false`` 处理。
@@ -173,6 +190,7 @@ def create_gmail_router() -> APIRouter:
         ``revoke=true`` 时同时向 Google 撤销授权；**撤销失败会上报**，
         不会静默地把连接标成已断开（§112.4）。
         """
+        auth = _auth(request)
         _require_uuid(connection_id, "Gmail 连接 ID 无效")
         raw = await _optional_json(request)
         # ``z.coerce.boolean()`` 对缺失与假值一致，因此这里只认显式的真值。
@@ -180,7 +198,7 @@ def create_gmail_router() -> APIRouter:
         revoke = value is True or (isinstance(value, str) and value.lower() == "true")
         return {
             "connection": _call(
-                _service(request).disconnect,
+                _service(request).for_user(auth.user_id).disconnect,
                 connection_id=connection_id, revoke=revoke,
             )
         }
@@ -188,20 +206,20 @@ def create_gmail_router() -> APIRouter:
     return router
 
 
-def _device(request: Request) -> Any:
-    """取出已认证设备。
+def _auth(request: Request) -> Any:
+    """取出已认证请求的用户上下文。
 
-    设备由路由级的 ``require_device`` 依赖写入 ``request.state``；这里直接读它，
+    它由路由级的 ``require_user`` 依赖写入 ``request.state``；这里直接读它，
     而不是再次调用依赖（那会因缺少授权头参数而失败）。
 
     @raises HTTPException: 依赖未生效（说明路由漏挂认证）。
     """
-    device = getattr(request.state, "device", None)
-    if device is None:
+    auth = getattr(request.state, "auth", None)
+    if auth is None:
         raise HTTPException(
             status_code=401, detail={"code": "DEVICE_CREDENTIAL_INVALID", "message": "设备访问令牌无效"}
         )
-    return device
+    return auth
 
 
 def _service(request: Request) -> Any:

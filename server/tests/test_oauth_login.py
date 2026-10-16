@@ -2,6 +2,11 @@
 
 用可注入的抓取器替代真实网络，因此这些测试是**确定性的**，同时保留了真实
 实现的安全约束：固定端点、不传播底层异常、响应体积上限、身份字段严格校验。
+
+**已删除的覆盖**：单 owner 白名单（``OAuthLoginConfig.owner_subject`` 字段、
+``assert_oauth_configured_owner`` 准入函数，以及"另一来源同 subject 不得获得权限"
+"邮箱相同不构成准入依据"等用例）已被多用户改造整体移除，由首次登录自动注册取代
+（契约 §3.10）。``is_canonical_subject`` 保留——它仍服务离线管理员初始化入口。
 """
 
 from __future__ import annotations
@@ -13,7 +18,6 @@ from typing import Any
 import pytest
 
 from lyra.application.app_error import ApplicationError
-from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.auth.oauth_login_client import (
     EXCHANGE_TIMEOUT_SECONDS,
     GITHUB_LOGIN_CALLBACK_PATH,
@@ -21,7 +25,6 @@ from lyra.infrastructure.auth.oauth_login_client import (
     OAuthHttpResponse,
     OAuthLoginClient,
     OAuthLoginConfig,
-    assert_oauth_configured_owner,
     identity_from_profile,
     is_canonical_subject,
     load_oauth_login_config,
@@ -34,14 +37,12 @@ GITHUB = OAuthLoginConfig(
     client_id="cid",
     client_secret="secret",
     redirect_uri=f"https://lyra.example.com{GITHUB_LOGIN_CALLBACK_PATH}",
-    owner_subject="12345",
 )
 LINUXDO = OAuthLoginConfig(
     provider="linuxdo",
     client_id="cid",
     client_secret="secret",
     redirect_uri=f"https://lyra.example.com{LINUXDO_LOGIN_CALLBACK_PATH}",
-    owner_subject="67890",
 )
 
 
@@ -109,13 +110,11 @@ def test_load_accepts_complete_configuration() -> None:
             "LYRA_LOGIN_LINUXDO_CLIENT_ID": " cid ",
             "LYRA_LOGIN_LINUXDO_CLIENT_SECRET": "secret",
             "LYRA_LOGIN_LINUXDO_REDIRECT_URI": f"https://l.example{LINUXDO_LOGIN_CALLBACK_PATH}",
-            "LYRA_OWNER_LINUXDO_SUBJECT": "67890",
         },
         "linuxdo",
     )
     assert config is not None
     assert config.client_id == "cid"
-    assert config.owner_subject == "67890"
 
 
 @pytest.mark.parametrize(
@@ -143,10 +142,13 @@ def test_validate_allows_loopback_http(host: str) -> None:
 
 
 @pytest.mark.parametrize("subject", ["", "0", "01", "12345678901234567", "abc", "-1", "1.0"])
-def test_validate_rejects_non_canonical_owner_subject(subject: str) -> None:
-    """owner ID 必须是规范的正整数文本，不接受前导零或溢出值。"""
-    with pytest.raises(ValueError, match="正整数用户 ID"):
-        validate_oauth_login_config(replace(GITHUB, owner_subject=subject))
+def test_is_canonical_subject_rejects_non_canonical_ids(subject: str) -> None:
+    """主体标识必须是规范的正整数文本，不接受前导零或溢出值。
+
+    适配说明：原用例前半段断言 ``validate_oauth_login_config`` 拒绝非规范 owner
+    subject，那半边随 ``owner_subject`` 字段一起被有意移除；``is_canonical_subject``
+    本身仍然有效（离线管理员初始化入口用它校验 ``--subject``），因此保留这部分断言。
+    """
     assert is_canonical_subject(subject) is False
 
 
@@ -164,40 +166,16 @@ def test_validate_rejects_invalid_credentials(credential: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# owner 准入
+# owner 准入（已整体删除）
 # --------------------------------------------------------------------------
-
-
-def test_owner_assertion_accepts_matching_subject() -> None:
-    """provider 与 subject 都匹配时通过。"""
-    assert_oauth_configured_owner(
-        LoginIdentity(provider="github", subject="12345", email=None, display_name=None), GITHUB
-    )
-
-
-def test_owner_assertion_rejects_other_provider_with_same_subject() -> None:
-    """另一个来源即使 subject 相同也不得获得权限。"""
-    with pytest.raises(ApplicationError) as raised:
-        assert_oauth_configured_owner(
-            LoginIdentity(provider="linuxdo", subject="12345", email=None, display_name=None),
-            GITHUB,
-        )
-    assert raised.value.code == "LOGIN_DENIED"
-    assert raised.value.status_code == 403
-
-
-def test_owner_assertion_never_uses_email() -> None:
-    """邮箱相同不构成准入依据。"""
-    with pytest.raises(ApplicationError):
-        assert_oauth_configured_owner(
-            LoginIdentity(
-                provider="github",
-                subject="99999",
-                email="owner@example.com",
-                display_name="owner",
-            ),
-            GITHUB,
-        )
+#
+# ``test_owner_assertion_accepts_matching_subject`` /
+# ``test_owner_assertion_rejects_other_provider_with_same_subject`` /
+# ``test_owner_assertion_never_uses_email`` 测的是 ``assert_oauth_configured_owner``
+# 这一单 owner 白名单闸门。该函数与 ``owner_subject`` 字段已随多用户改造移除：
+# 身份到用户的映射改由 ``UserRepository.find_or_create_user_for_identity`` 按
+# ``(provider, subject)`` 解析并自动注册，来源隔离由身份键本身保证（契约 §3.10）。
+# 这里刻意不留同名占位测试——它已无任何在产行为可断言。
 
 
 # --------------------------------------------------------------------------

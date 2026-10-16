@@ -49,6 +49,15 @@ class AgentEventBuffer:
         """当前缓冲的事件数。"""
         return len(self._events)
 
+    @property
+    def subscriber_count(self) -> int:
+        """当前订阅者数量。
+
+        用于验证"被拒绝的订阅确实没有建立"：归属校验不通过时若仍注册了订阅者，事件会
+        照常推给他——只看响应帧是看不出这一点的。
+        """
+        return len(self._subscribers)
+
     def append(self, event: AgentEvent) -> None:
         """追加事件，超出上限时丢弃最旧的一条。
 

@@ -25,7 +25,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
 from lyra.domain.agent.switching import (
@@ -44,6 +43,7 @@ from lyra.domain.analytics.types import AccountScope
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.agent_session_repository import DuckDbAgentSessionRepository
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 
@@ -84,9 +84,11 @@ def wired(tmp_path: Path):
     )
     application = create_app(settings, database)
     service = DevicePairingService(
-        DuckDbDeviceRepository(database.connection), WriteCoordinator()
+        DuckDbDeviceRepository(database.connection),
+        application.state.write_coordinator,
+        UserRepository(database.connection),
     )
-    issued = asyncio.run(service.authorize_owner_device(
+    issued = asyncio.run(service.authorize_user_device(
         identity=IDENTITY, display_name="Pixel 9", public_key_pem=PUBLIC_KEY_PEM
     ))
     DuckDbAgentSessionRepository(database.connection).create_session(
@@ -95,7 +97,7 @@ def wired(tmp_path: Path):
             availability=AgentProviderAvailability(provider="genkit", status="available"),
             account_scope=AccountScope(kind="all"), ledger_version=0, as_of="2026-10-13",
         ),
-        device_id=issued.device_id, now=NOW,
+        device_id=issued.device_id, user_id=issued.user.id, now=NOW,
     )
     executor = FakeExecutor()
     application.state.agent_executor = executor
@@ -109,7 +111,7 @@ def wired(tmp_path: Path):
 def _auth(issued) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {issued.access_token}",
-        "x-lyra-protocol-version": "2",
+        **CLIENT_PROTOCOL_HEADERS,
     }
 
 
@@ -186,7 +188,9 @@ def test_a_rejected_turn_start_leaves_no_half_written_session(wired) -> None:
     # 登记一个 **过期** 的 revision：起始写入的 CAS 必然失配。
     snapshot = repository.load_session(SESSION_ID)
     assert snapshot is not None
-    orchestrator.register(_with_revision(snapshot, snapshot.revision + 5))
+    orchestrator.register(
+        _with_revision(snapshot, snapshot.revision + 5), user_id=snapshot.user_id
+    )
 
     with pytest.raises(ValueError, match="并发修改"):
         orchestrator.run_turn(
@@ -393,18 +397,34 @@ def test_the_real_executor_completes_a_turn_through_the_orchestrator(tmp_path: P
     try:
         repository = DuckDbAgentSessionRepository(database.connection)
         device_id = "55555555-5555-5555-5555-555555555555"
-        # 会话对设备有外键，测试里直接落一行最小设备（不必走签发流程）。
+        user_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        identity_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        # 设备与会话都有归属列（schema 16 起 users 是必填父行），测试里直接落最小行
+        # （不必走完整签发流程）。
+        database.connection.execute(
+            "INSERT INTO users (id, display_name) VALUES (CAST(? AS UUID), 'Owner')",
+            [user_id],
+        )
+        database.connection.execute(
+            """
+            INSERT INTO user_identities (id, user_id, provider, subject)
+            VALUES (CAST(? AS UUID), CAST(? AS UUID), 'github', 'subject-real')
+            """,
+            [identity_id, user_id],
+        )
         database.connection.execute(
             """
             INSERT INTO paired_devices (
-                id, display_name, public_key_pem, public_key_fingerprint,
-                key_algorithm, status, paired_at, updated_at
+                id, user_id, identity_id, display_name, public_key_pem,
+                public_key_fingerprint, key_algorithm, status, paired_at, updated_at
             ) VALUES (
-                CAST(? AS UUID), 'Pixel 9', 'pem', ?, 'rsa', 'active',
+                CAST(? AS UUID), CAST(? AS UUID), CAST(? AS UUID), 'Pixel 9', 'pem',
+                ?, 'rsa', 'active',
                 CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP)
             )
             """,
-            [device_id, "b" * 64, "2026-10-13T09:00:00", "2026-10-13T09:00:00"],
+            [device_id, user_id, identity_id, "b" * 64,
+             "2026-10-13T09:00:00", "2026-10-13T09:00:00"],
         )
         repository.create_session(
             create_agent_session(
@@ -412,14 +432,17 @@ def test_the_real_executor_completes_a_turn_through_the_orchestrator(tmp_path: P
                 availability=AgentProviderAvailability(provider="genkit", status="available"),
                 account_scope=AccountScope(kind="all"), ledger_version=0, as_of="2026-10-13",
             ),
-            device_id=device_id, now=NOW,
+            device_id=device_id, user_id=user_id, now=NOW,
         )
         orchestrator = AgentTurnOrchestrator(
             store=DuckDbAgentTurnStore(database.connection), now=lambda: NOW
         )
         row = repository.load_session(SESSION_ID)
         assert row is not None
-        orchestrator.register(_with_revision(row, row.revision), device_id=row.device_id)
+        orchestrator.register(
+            _with_revision(row, row.revision), device_id=row.device_id,
+            user_id=row.user_id,
+        )
 
         result = orchestrator.run_turn(
             session_id=SESSION_ID, executor=executor, content="这个月赚了多少"
@@ -519,3 +542,38 @@ def test_real_store_history_excludes_the_current_user_message(wired) -> None:
         (str(rows[1][0]), "assistant", "回答 1"),
     ]
     assert all(message.id != str(rows[2][0]) for message in history)
+
+
+# --------------------------------------------------------------------------
+# 停用级联：按用户取消在飞回合（验收 V11）
+# --------------------------------------------------------------------------
+
+
+def test_cancel_user_turns_stops_only_that_users_turns(wired) -> None:
+    """**停用按用户收口**：只终止该用户的在飞回合，不动别人的。
+
+    设备级取消要求调用方先枚举出该用户的全部设备，漏一台就留下一个继续产生并落库
+    回答的回合；用户停用是以用户为轴的操作，因此编排器要能直接按用户收口。
+    """
+    test_client, issued, _, database = wired
+    orchestrator = test_client.app.state.agent_orchestrator
+    repository = DuckDbAgentSessionRepository(database.connection)
+    database.connection.execute(
+        "UPDATE agent_sessions SET status = 'running' WHERE id = CAST(? AS UUID)",
+        [SESSION_ID],
+    )
+    row = repository.load_session(SESSION_ID)
+    assert row is not None
+    orchestrator.register(_with_revision(row, row.revision), user_id=row.user_id)
+
+    # 另一个用户停用：不得误伤 A 的回合。
+    assert orchestrator.cancel_user_turns(
+        "99999999-9999-4999-8999-999999999999", now=NOW
+    ) == ()
+    assert repository.load_session(SESSION_ID).status == "running"  # type: ignore[union-attr]
+
+    assert orchestrator.cancel_user_turns(issued.user.id, now=NOW) == (SESSION_ID,)
+    stored = repository.load_session(SESSION_ID)
+    assert stored is not None and stored.status == "cancelling"
+    # 幂等：重复停用不会二次推进状态。
+    assert orchestrator.cancel_user_turns(issued.user.id, now=NOW) == ()

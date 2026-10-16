@@ -28,6 +28,11 @@ from lyra.security.device_auth import (
 
 PAIRED_AT = datetime(2026, 10, 1, 0, 0, 0, tzinfo=UTC)
 
+# schema 16 起设备必须归属一个用户与一条登录身份（``user_id`` / ``identity_id``
+# 为 NOT NULL + 复合外键），构造记录时不能再省略。
+USER_ID = "11111111-1111-1111-1111-111111111111"
+IDENTITY_ID = "22222222-2222-2222-2222-222222222222"
+
 
 def _device(
     *,
@@ -39,6 +44,8 @@ def _device(
     """构造一台设备记录。"""
     return PairedDeviceRecord(
         id="device-1",
+        user_id=USER_ID,
+        identity_id=IDENTITY_ID,
         display_name="Pixel 9",
         public_key_pem="-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----\n",
         public_key_fingerprint="f" * 64,

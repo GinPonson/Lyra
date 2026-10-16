@@ -171,6 +171,7 @@ void main() {
       expect(find.byType(LoginScreen), findsNothing);
       expect(find.byType(NavigationBar), findsOneWidget);
       final saved = (await fixture.store.read())!;
+      expect(saved.userId, '${provider.id}-user');
       expect(saved.authMethod, provider.id);
       expect(saved.subject, 'subject-${provider.id}');
       expect(saved.userDisplayName, 'Demo ${provider.label}');
@@ -198,6 +199,62 @@ void main() {
       expect(find.text('${provider.label} 已登录'), findsOneWidget);
     });
   }
+
+  testWidgets('登录页说明首次登录自动创建账号，不提供注册表单', (tester) async {
+    final fixture = LoginFixture();
+    await pumpLogin(tester, fixture);
+    expect(find.text('首次登录将自动创建账号。'), findsOneWidget);
+    expect(find.byType(TextField), findsNothing);
+    expect(
+      fixture.requests.where(
+        (request) => request.uri.path.contains('register'),
+      ),
+      isEmpty,
+    );
+  });
+
+  testWidgets('账号被停用时明确提示并保持未登录，不进入刷新重试', (tester) async {
+    final fixture = LoginFixture()..loginError = 'USER_DISABLED';
+    await pumpLogin(tester, fixture);
+    await tapLogin(tester, find.byKey(const ValueKey('login-google')));
+    expect(find.text('账号已停用，请联系管理员。'), findsOneWidget);
+    expect(find.byType(LoginScreen), findsOneWidget);
+    expect(await fixture.store.read(), isNull);
+    final exchanges = fixture.requests.where(
+      (request) => request.uri.path == '/v1/auth/google/exchange',
+    );
+    expect(exchanges, hasLength(1));
+    expect(
+      fixture.requests.where(
+        (request) => request.uri.path == '/v1/devices/tokens',
+      ),
+      isEmpty,
+    );
+  });
+
+  testWidgets('注册事务失败明确失败并允许重试，不假装登录成功', (tester) async {
+    // 服务端把注册事务失败收敛为 LOGIN_FAILED（401，不可重试）。
+    final fixture = LoginFixture()
+      ..loginError = 'LOGIN_FAILED'
+      ..loginErrorStatus = 401;
+    await pumpLogin(tester, fixture);
+    await tapLogin(tester, find.byKey(const ValueKey('login-google')));
+    expect(find.text('登录未能完成，请重新登录。'), findsOneWidget);
+    expect(find.byType(LoginScreen), findsOneWidget);
+    expect(await fixture.store.read(), isNull);
+    // 写入协调器级故障（5xx）同样明确失败，不显示后台原始消息。
+    fixture
+      ..loginError = 'INTERNAL_ERROR'
+      ..loginErrorStatus = 500;
+    await tapLogin(tester, find.byKey(const ValueKey('login-google')));
+    expect(find.text('登录服务暂时不可用，请稍后重试。'), findsOneWidget);
+    expect(find.textContaining('INTERNAL_ERROR'), findsNothing);
+    expect(await fixture.store.read(), isNull);
+    fixture.loginError = null;
+    await tapLogin(tester, find.byKey(const ValueKey('login-google')));
+    expect(find.byType(LoginScreen), findsNothing);
+    expect((await fixture.store.read())!.userId, 'google-user');
+  });
 
   testWidgets('不可用的登录方式禁用并自动重查，不暴露配置状态', (tester) async {
     final fixture = LoginFixture()..available = {AuthProvider.github};

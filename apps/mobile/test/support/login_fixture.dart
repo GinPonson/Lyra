@@ -12,6 +12,30 @@ import 'ledger_fixture.dart';
 
 const loginFixtureServer = 'https://demo.lyra.example';
 
+/// 已配对凭据的稳定 userId；`/v1/me` 必须返回同一个值，否则会话会被判定换人。
+const loginFixtureUserId = 'restored-user';
+
+/// 按 P0 冻结契约 §3.9 生成登录响应与 `/v1/me` 共用的 `user` 对象。
+Map<String, Object?> userPayload({
+  required String userId,
+  required AuthProvider provider,
+  required String subject,
+  String? email,
+  String displayName = 'Demo Google',
+  String status = 'active',
+  String role = 'member',
+}) => {
+  'userId': userId,
+  'displayName': displayName,
+  'status': status,
+  'role': role,
+  'identity': {
+    'provider': provider.id,
+    'subject': subject,
+    'email': email,
+  },
+};
+
 class LoginCredentialStore extends MemoryCredentialStore {
   bool failClear = false;
   @override
@@ -32,6 +56,7 @@ class LoginFixture extends LedgerFixture {
   bool logoutOffline = false;
   bool credentialsExpired = false;
   String? loginError;
+  int loginErrorStatus = 403;
   int? catalogStatus;
   AuthProvider? exchangedProvider;
   String? authorizationUrlOverride;
@@ -69,13 +94,25 @@ class LoginFixture extends LedgerFixture {
         }
         return ResponseBody.fromString('', 204);
       }
+      if (path == '/v1/me') {
+        // 身份核对读取当前设备会话解析出的用户；与已配对凭据使用同一 userId。
+        return json({
+          'user': userPayload(
+            userId: loginFixtureUserId,
+            provider: AuthProvider.google,
+            subject: 'legacy-google-subject',
+            email: 'demo@example.com',
+            displayName: 'Demo Google',
+          ),
+        });
+      }
       if (path == '/v1/system/info') {
         return json({
           'server_version': '0.1.0',
-          'protocol_version': 2,
-          'min_supported_protocol_version': 2,
-          'max_supported_protocol_version': 2,
-          'schema_version': 15,
+          'protocol_version': 3,
+          'min_supported_protocol_version': 3,
+          'max_supported_protocol_version': 3,
+          'schema_version': 16,
         });
       }
       if (path == '/v1/health') return json({'status': 'healthy'});
@@ -109,20 +146,21 @@ class LoginFixture extends LedgerFixture {
             'code': loginError,
             'message': '此账号尚未获准访问这个服务端。',
             'retryable': false,
-          }, 403);
+          }, loginErrorStatus);
         }
         if (pending) return json({'status': 'pending'}, 202);
         final resultProvider = exchangedProvider ?? provider;
         return json({
           'status': 'complete',
-          'user': {
-            'provider': resultProvider.id,
-            'subject': 'subject-${resultProvider.id}',
-            'email': resultProvider == AuthProvider.google
+          'user': userPayload(
+            userId: '${resultProvider.id}-user',
+            provider: resultProvider,
+            subject: 'subject-${resultProvider.id}',
+            email: resultProvider == AuthProvider.google
                 ? 'demo@example.com'
                 : null,
-            'displayName': 'Demo ${resultProvider.label}',
-          },
+            displayName: 'Demo ${resultProvider.label}',
+          ),
           'deviceId': '${resultProvider.id}-device',
           'displayName': 'Lyra Mobile',
           'accessToken': '${resultProvider.id}-access',
@@ -171,6 +209,7 @@ class LoginFixture extends LedgerFixture {
           deviceId: 'restored-device',
           accessToken: 'restored-access',
           refreshToken: 'restored-refresh',
+          userId: loginFixtureUserId,
           authMethod: 'google',
           googleSubject: 'legacy-google-subject',
           userEmail: 'demo@example.com',

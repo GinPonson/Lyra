@@ -217,6 +217,55 @@ flutter test --no-pub test/market_settings_capture_test.dart \
 - 构建前后核对 112 个移动端源码、Android 配置、依赖锁文件和资产；内容清单 SHA-256 为 `d79078a11b7a2f5a264fe415e531ab525540ace8e534cb57ae01731ca7be93bf`，交付副本与原构建 APK 哈希一致。
 - 本轮没有服务端改动；117 套件 / 279 项是上一轮服务端完整回归的通过结果。本轮仍未进行真实 Google、真实模型或 Android 真机验收。
 
+## 多用户独立账本（2026-10-16）
+
+计划与执行记录见 [多用户独立账本执行计划](plans/lyra-multi-user-ledger-20261015.md) 与 [P0 冻结契约](plans/lyra-multi-user-ledger-p0-contract-20261016.md)。
+
+同一个 Server 现在支持少量用户各自拥有独立账本，沿用既有 Google / Linux DO / GitHub OAuth，**首次登录自动注册普通用户**。固定决策：不建共享账本与成员关系模型（现有账户汇总就是该用户的账本）；不新增密码登录；不做自助绑定与管理后台；角色只有 `admin`/`member`，且管理员调用账本接口时也只能访问自己的数据。目标版本：schema **15 → 16**、协议 **2 → 3**（最低支持版本同步抬到 3，协议 2 客户端返回 426）。
+
+### 关键实现
+
+- **数据模型**：新增 `users` / `user_identities`；设备、账户、导入作业、Agent 会话、Gmail 连接、行情设置全部带 `user_id`。`accounts.legacy_account_key` 与 `gmail_connections.google_subject` 的唯一键改为**用户内唯一**。`transactions` / `lots` / `realized` 等子表**刻意不加** `user_id`（经 account 间接归属），其跨用户保护完全落在应用层查询范围上——这一点在契约 §3.2 明确记录，验收也据此逐个场景撞。
+- **迁移 16 是整库重建**：实测 DuckDB 1.5.6 **不支持**给已有表加 `NOT NULL` 列、不支持 `ADD/DROP CONSTRAINT`、且被外键引用的父表不能改名。因此只能"CTAS 到无外键暂存表 → 拆旧图 → 以最终名字重建 → 回填归属"，全部在一个事务内。
+- **身份与设备**：身份键恒为已验证的 `(provider, subject)`。`paired_devices` 增 `user_id` 与 `identity_id`，并加复合外键 `(user_id, identity_id) → user_identities(user_id, id)`，由数据库保证"设备绑定的身份与设备同属一个用户"。
+- **停用级联**：`revoke_user_devices` 撤销该用户**全部**设备与凭据并走写协调器排队；关闭其事件流、取消在飞回合；恢复后需重新登录，**旧令牌不复活**（凭据是真撤销，不是只改标志位）。
+- **从运行时状态里拿出来的全局值**：行情来源设置不再存于 `MarketDataRuntime` 实例（原设计下"谁最后保存谁覆盖所有人"），改为每次请求按 `user_id` 读库；`ReadQuote` 把路由变成调用参数。**公开报价缓存与供应商预算保持部署级共享**——按用户复制预算会把上游请求量放大到用户数倍，限流形同虚设。
+- **公开健康接口收口**：移除 `gmail.totalConnections` / `attentionRequired`（用户活动计数）与 `database.ledgerVersion`（全库 `max(version)`），只保留部署可用性与 schema 版本。**没有填伪造的 0 维持旧形状**。
+- **离线入口**：`python -m lyra.admin` 显式指定首个管理员的 `(provider, subject)`；旧库升级用 `--owner-identity` 逐条确认归属，**未确认的历史身份不关联原用户**（它们之后按自动注册规则各自得到独立空账本），非空库无法确定归属时明确失败。旧设备凭据在迁移中一并撤销，所有人需重新登录。
+
+### 过程中发现并修复的既有缺陷
+
+这些都是**基线里就存在**、因为缺少端到端覆盖而长期未被发现的路径；其中三条只有在本次改造把它们接通之后才真正可达或显形：
+
+| 位置 | 症状 | 触发条件 |
+| --- | --- | --- |
+| `main.py` `login_provider_ids` | 启动即崩（`AttributeError`） | 配齐任一 OAuth 来源——测试环境从不配置，空字典让循环体不执行，因此一直未暴露 |
+| `import_routes._device()` | **提交幂等被静默关闭** | 读已删除的 `request.state.device`，恒返回 `None` 使 `_plan_idempotency` 返回 `None`；不崩溃，只是重复提交会真的再执行一次 |
+| `gmail_routes` 的 `.sync` | 每次同步 500 | 路由调用的 `GmailService.sync` 在生产中根本不存在 |
+| `service_factory.fetch_initial` | 首次同步 500 | 从**不存在的** `domain.gmail.search_query` 导入；此前是死代码，`GmailService.sync` 实现后才可达 |
+| `GET .../agent/sessions/{id}/tool-calls` | 越权探测 | 连会话 ID 校验都没有就直接返回空列表——用空结果掩盖失败 |
+
+另修正两处与计划的偏差：迁移 16 原先不删旧 owner 身份表（离线入口只覆盖升级路径，新库会留空表导致两条路径表集合不一致），以及迁移原先**原样保留**旧设备凭据（计划 §1.8/§9.4 要求撤销）。
+
+### 验证（全部为实测）
+
+| 命令 | 结果 |
+| --- | --- |
+| 服务端 `uv run pytest -q` | **2663 passed, 4 skipped, 0 failed**（退出码 0） |
+| 服务端 `uv run ruff check .` | All checks passed |
+| Flutter `flutter analyze --no-pub` | No issues found |
+| Flutter `flutter test ...` | **282 passed, 5 skipped, 0 failed** |
+
+改造过程中一度出现 **444 个失败/错误横跨 30 个测试文件**（根因单一：`NOT NULL constraint failed: accounts.user_id`），随各模块迁移调用方逐步收敛到 0。相对本次改造前的基线（服务端 2453 / Flutter 262），净增 **211 + 20** 个测试。
+
+**契约漂移防护**：新增 `server/scripts/export_contract_samples.py` 与 `apps/mobile/test/contract_samples_test.dart`，用服务端**真实端点**（登录、`/me`、建账户、账户清单、账本汇总、导入预览、行情设置）产出 [contracts/samples.json](../contracts/README.md)，再由 Flutter 的**生产解析器**逐条解析（9 条断言）。样本缺失时**明确失败而不是跳过**。过程中这套断言抓到两处真实分歧：创建类端点返回 201 而非 200，以及 `createAccount` 的正文是 `{account}` 而**不带** `{metadata,data}` 信封。
+
+**发布门槛**：预检脚本四项关键检查通过（协议 3、模式版本自洽 16、能无损打开冻结的 schema 15 夹具、50 条路由与契约一致）。
+
+### 未执行 / 待联调
+
+生产 OAuth 的真实第三方授权、真实 Gmail 账号同步、真实模型调用、Android 真机与生产部署**均未执行**，因此不能声称已上线。合成库与测试夹具上的迁移、隔离与回归已按验收矩阵验证。
+
 ## 进度状态
 
 | 状态 | 含义 |
@@ -600,6 +649,9 @@ flutter test --no-pub test/market_settings_capture_test.dart \
 | 2026-10-13 | 文档校对 + `cd server && UV_CACHE_DIR=/tmp/uv-cache uv run --frozen pytest -q tests/test_preflight_script.py`（5 项通过）/ `uv run --frozen pytest -q --collect-only`（2311 项可收集）/ `uv run --frozen ruff check .` | 通过（有边界，见备注） | **文档与构建上下文同步到 Python 服务端现状**：切流运行手册（`server/` 路径、预检七项与 `preflight_cutover.py` 的 `CHECKS` 逐项一致、阶段 3 探针改为 `verify_running_service.py`、阶段 6 回退改为可执行并把 TS 定位到 git 历史 `6887bec`、阶段 7 不再含删除 `server/` 的命令）、`docs/deployment.md`（`python3 deploy/init-env.py`、`verify_running_service.py`、`python:3.12-slim-bookworm`、PyPI 依赖、`lyra`/10001 属主、删除 Node 时代的工具与端点（旧探针脚本、配置检查 CLI、`/mcp`）用法、去掉已不再注入且服务端从不读取的 `LYRA_PUBLIC_ORIGIN` 描述）、`.dockerignore`（放行 `server/pyproject.toml`、`uv.lock`、`src/**`、`scripts/verify_running_service.py`；排除 `server/tests`、`server/.venv`、`__pycache__`）、`README.md`、`server/README.md`、`docs/genkit-oauth.md`。`preflight_cutover.py`：静态检查改项目级 `ruff check .`、接管既有账本改在当前解释器内只读打开夹具（不再 spawn `uv run`）、主密钥检查加加解密往返并对夹具密文只作提示、检查清单提为模块级 `CHECKS` 常量；`test_preflight_script.py` 改为断言清单（名称/条数/函数）而非仅断言函数存在；`verify_running_service.py` 文档串端口 8080 → 3141（无逻辑改动）。**边界**：本环境无 Docker Engine，镜像构建与 `.dockerignore` 的实际过滤未实测；`ruff check .` 当前仍有 1 处错误类发现位于并行修改中的 `server/tests/test_device_repository.py`；`docs/plans/lyra-python-migration-20261012.md`（历史迁移计划，74 处旧目录名）与上方历史条目中的旧脚本引用按历史记录保留，未改写 |
 
 | 2026-10-14 | Medium_Phone 模拟器端到端验收（Python 服务端）+ `pytest -q` / `ruff check .` / `preflight_cutover.py` | 通过（修复 1 处阻断缺陷） | **模拟机实测发现并修复：账本只读响应缺少 `{metadata, data}` 信封**。此前 `/v1/ledger/*` 与 `/v1/analytics/*` 直接返回数据段，Flutter 解析 `body["metadata"]` 得到 `null`，总览恒显示"数据未能加载"——服务端 200、客户端报错，而既有测试只校验路径与状态码，看不见响应形状（`ledger_routes.py` 的模块 docstring 早已把它记成 M4 待办，切流前未补齐）。现在 17 条只读端点统一返回参考实现的信封：`accountScope`/`accountIds`/`currencyGroups`/`aggregateCurrency`/`ledgerVersion`/`asOf`/`fetchedAt` 全部由服务端生成；`/v1/ledger/accounts` 同时补齐 `?scope=` 必填（与参考实现一致，"查全部账户"必须显式）。**验收过程**：Python 服务端跑在 3141（账本为 `data/lyra.duckdb` 的副本，迁移 11→15），模拟机经 `adb reverse` 连接；用 parity 夹具里一份真实 Schwab CSV 走完 `POST /v1/ledger/accounts` → `/v1/imports/preview` → `/v1/imports/{id}/commit`（6 行入库、`ledgerVersion=1`），App 随后正确渲染总览（已实现损益 -34.00、现金余额 -336.00、6 笔交易、2 项持仓）、股票页（期权行权价显示 `50`/`60`，无尾随零）、交易页（6 条 USD 明细）与我的页；访问令牌过期后 `POST /v1/devices/tokens` 刷新链路亦实测通过（轮换返回新 refresh）。**边界**：本机没有第三方登录凭据，登录页只能验证到"三种方式均不可用"的如实提示，已认证路径通过临时调试入口（验收后已删除，未进入提交）注入服务端签发的设备凭据；Agent 回合未跑真实模型（`LYRA_GENKIT_*` 未配置）。|
+
+| 2026-10-16 | 服务端 `uv run pytest -q` / `uv run ruff check .`；Flutter `flutter analyze --no-pub` / `flutter test --no-pub`；`preflight_cutover.py` 四项关键检查 | 通过（修复 5 处既有缺陷） | **多用户独立账本改造完成**（schema 15→16、协议 2→3）。服务端 **2664 passed / 4 skipped / 0 failed**（改造前基线 2453，净增 211）；Flutter **282 passed / 5 skipped**（基线 262，净增 20）；`ruff check .` 与 `flutter analyze` 均无问题。改造中途一度出现 444 个失败/错误横跨 30 个文件（根因单一：`NOT NULL constraint failed: accounts.user_id`），随各模块迁移调用方收敛到 0。**过程中修复 5 处既有缺陷**，全部是基线里就存在、因缺少端到端覆盖而未被发现的路径：`main.py` 的 `login_provider_ids` 迭代字典得到字符串（配齐任一 OAuth 来源即启动崩溃，测试环境从不配置故从未暴露）；`import_routes._device()` 读已删除的 `request.state.device` 致**提交幂等被静默关闭**；`gmail_routes` 调用的 `GmailService.sync` 在生产中不存在（每次同步 500）；`service_factory.fetch_initial` 从不存在的 `domain.gmail.search_query` 导入（首次同步 500）；`GET .../tool-calls` 无任何校验即返回空列表（越权探测）。另修正两处与计划的偏差（迁移 16 未删旧 owner 身份表、未撤销旧设备凭据）。**预检四项**：协议版本为 3、模式版本自洽 16、能无损打开冻结的 schema 15 夹具、50 条路由与契约一致。**边界**：生产 OAuth 真实授权、真实 Gmail 账号、真实模型、Android 真机与生产部署均未执行 |
+| 2026-10-16 | `server/scripts/export_contract_samples.py` + `flutter test test/contract_samples_test.dart` | 通过 | **新增契约漂移防护**：生成器在临时空库上装配真实应用（只替换 OAuth 来源客户端），走**真实端点**采集 7 条样本（登录、`/me`、建账户、账户清单、账本汇总、导入预览、行情设置）写入 `contracts/samples.json`；Flutter 用**生产解析器**（`LyraUserProfile`/`BrokerageAccount`/`LedgerSummaryRead`/`ImportPreviewView`/`MarketSettings`）逐条解析，**9 条断言全绿**。样本缺失时明确失败而非跳过。该防护当场抓到两处真实分歧：创建类端点返回 201 而非 200；`createAccount` 正文是 `{account}` 而**不带** `{metadata,data}` 信封 |
 
 ## 当前环境事项
 

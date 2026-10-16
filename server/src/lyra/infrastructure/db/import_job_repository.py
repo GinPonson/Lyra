@@ -30,30 +30,43 @@ from ...application.import_job import (
 class DuckDbImportJobRepository:
     """导入作业仓储。
 
+    仓储在**构造时**绑定用户（计划 §4.2）：导入作业必须直接关联 user，因为上传阶段
+    可能还没有目标账户，仅靠 ``target_account_id`` 无法确定归属（schema 16 注释）。
+    因此本仓储的**每一个**方法——读取、CAS、预览写入、崩溃恢复——都带用户条件；
+    不属于当前用户的作业一律读不到，与「不存在」返回同一个结果。
+
     @param connection: 已迁移到当前 schema 的连接；写操作由单写队列串行化。
+    @param user_id: 当前用户的 UUID 文本；**必填**。
     """
 
-    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+    def __init__(
+        self, connection: duckdb.DuckDBPyConnection, *, user_id: str
+    ) -> None:
         self._connection = connection
+        self._user_id = user_id
 
     def create_import_job(self, record: PersistedImportJobRecord) -> None:
-        """插入一条新作业记录。"""
+        """插入一条新作业记录，归属为构造时绑定的用户。
+
+        ``user_id`` 来自仓储而不是记录对象：作业记录的字段形状是公开投影与状态机的
+        输入，把归属塞进去等于给每条调用链多一个可以传错的位置。
+        """
         self._connection.execute(
             """
             INSERT INTO import_files (
-                id, file_hash, original_file_name, file_type, file_size_bytes,
+                id, user_id, file_hash, original_file_name, file_type, file_size_bytes,
                 parser_version, status, target_account_id, preview_token_hash,
                 preview_ledger_version, total_rows, inserted_rows, skipped_rows,
                 error_code, error_summary, committed_ledger_version, created_at, updated_at
             ) VALUES (
-                CAST(? AS UUID), ?, ?, ?, ?, ?, ?, CAST(? AS UUID), ?, ?, ?, ?, ?, ?, ?, ?,
-                CAST(? AS TIMESTAMPTZ), CAST(? AS TIMESTAMPTZ)
+                CAST(? AS UUID), CAST(? AS UUID), ?, ?, ?, ?, ?, ?, CAST(? AS UUID), ?,
+                ?, ?, ?, ?, ?, ?, ?, CAST(? AS TIMESTAMPTZ), CAST(? AS TIMESTAMPTZ)
             )
             """,
             [
-                record.id, record.file_hash, record.original_file_name, record.file_type,
-                record.file_size_bytes, record.parser_version, record.status,
-                record.target_account_id, record.preview_token_hash,
+                record.id, self._user_id, record.file_hash, record.original_file_name,
+                record.file_type, record.file_size_bytes, record.parser_version,
+                record.status, record.target_account_id, record.preview_token_hash,
                 record.preview_ledger_version, record.total_rows, record.inserted_rows,
                 record.skipped_rows, record.error_code, record.error_summary,
                 record.committed_ledger_version, record.created_at, record.updated_at,
@@ -61,7 +74,12 @@ class DuckDbImportJobRepository:
         )
 
     def load_import_job(self, job_id: str) -> PersistedImportJobRecord | None:
-        """按 ID 读取作业；不存在返回 ``None``。"""
+        """按 ID 读取**当前用户的**作业；不存在或不属于该用户时返回 ``None``。
+
+        两种情况刻意不可区分：调用方据此返回同一个 409/404，攻击者无法靠状态码枚举
+        出别人的作业 ID 是否存在。这也是「先按用户查作业，再校验预览令牌与幂等」的
+        第一道闸门——后续的暂存文件读取与删除都建立在这个结果之上。
+        """
         row = self._connection.execute(
             """
             SELECT id, file_hash, original_file_name, file_type, file_size_bytes,
@@ -69,9 +87,10 @@ class DuckDbImportJobRepository:
                    preview_ledger_version, total_rows, inserted_rows, skipped_rows,
                    error_code, error_summary, committed_ledger_version, created_at, updated_at,
                    preview_fingerprint, preview_expires_at
-            FROM import_files WHERE id = CAST(? AS UUID)
+            FROM import_files
+            WHERE user_id = CAST(? AS UUID) AND id = CAST(? AS UUID)
             """,
-            [job_id],
+            [self._user_id, job_id],
         ).fetchone()
         if row is None:
             return None
@@ -116,6 +135,9 @@ class DuckDbImportJobRepository:
             ``→ committed`` 时给出。
         @returns 是否成功；``False`` 表示状态已被并发请求改动，调用方须重新读取。
 
+        ``WHERE`` 同时带 ``user_id``：作业 ID 全局唯一，但"这个 ID 属于谁"只能由用户
+        条件判定；少了它，一个拼出来的作业 ID 就能推动别人的作业状态。
+
         **账本版本必须与状态在同一次更新里写入。** 分两次写会出现"状态已 committed
         但版本还没落"的窗口；期间的重放请求会退回基准版本，**返回一个与首次提交不同
         的 ledgerVersion**——客户端据此判断"是否产生了新版本"就会出错。
@@ -141,10 +163,13 @@ class DuckDbImportJobRepository:
             UPDATE import_files
             SET status = ?, updated_at = CAST(? AS TIMESTAMPTZ),
                 committed_ledger_version = coalesce(?, committed_ledger_version)
-            WHERE id = CAST(? AS UUID) AND status = ?
+            WHERE user_id = CAST(? AS UUID) AND id = CAST(? AS UUID) AND status = ?
             RETURNING id
             """,
-            [next_status, _iso(now), committed_ledger_version, job_id, expected_status],
+            [
+                next_status, _iso(now), committed_ledger_version,
+                self._user_id, job_id, expected_status,
+            ],
         ).fetchone()
         return row is not None
 
@@ -170,14 +195,16 @@ class DuckDbImportJobRepository:
             """
             UPDATE import_files
             SET status = 'preview_ready', updated_at = CAST(? AS TIMESTAMPTZ)
-            WHERE id = CAST(? AS UUID) AND status = 'committing'
+            WHERE user_id = CAST(? AS UUID) AND id = CAST(? AS UUID)
+              AND status = 'committing'
               AND NOT EXISTS (
                 SELECT 1 FROM ledger_versions
-                WHERE reason = 'file_import' AND source_reference = ?
+                WHERE user_id = CAST(? AS UUID)
+                  AND reason = 'file_import' AND source_reference = ?
               )
             RETURNING id
             """,
-            [_iso(now), job_id, job_id],
+            [_iso(now), self._user_id, job_id, self._user_id, job_id],
         ).fetchone()
         return row is not None
 
@@ -213,13 +240,14 @@ class DuckDbImportJobRepository:
                 preview_ledger_version = ?,
                 total_rows = ?, inserted_rows = ?, skipped_rows = ?,
                 updated_at = CAST(? AS TIMESTAMPTZ)
-            WHERE id = CAST(? AS UUID) AND status = 'parsing'
+            WHERE user_id = CAST(? AS UUID) AND id = CAST(? AS UUID) AND status = 'parsing'
             RETURNING id
             """,
             [
                 target_account_id, preview_token_hash, preview_fingerprint,
                 _iso(preview_expires_at), preview_ledger_version,
-                total_rows, inserted_rows, skipped_rows, _iso(now), job_id,
+                total_rows, inserted_rows, skipped_rows, _iso(now),
+                self._user_id, job_id,
             ],
         ).fetchone()
         return row is not None

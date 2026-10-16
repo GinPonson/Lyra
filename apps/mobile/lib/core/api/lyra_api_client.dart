@@ -4,7 +4,12 @@ import '../security/credential_store.dart';
 import 'lyra_api_error.dart';
 
 /// 服务端协议版本；与 TypeScript 服务端的门禁保持一致。
-const String kLyraProtocolVersion = '2';
+const String kLyraProtocolVersion = '3';
+
+/// 用户已停用的稳定错误码（403、不可重试）。
+///
+/// 停用是终态：客户端据此结束会话，绝不进入令牌刷新与请求重放循环。
+const String kUserDisabledCode = 'USER_DISABLED';
 
 /// Lyra 服务端 HTTP 客户端。
 ///
@@ -17,6 +22,7 @@ class LyraApiClient {
     required this.credentialStore,
     required this.tokenRefresher,
     this.onUnauthorized,
+    this.onUserDisabled,
     Dio? dio,
   }) : _dio =
            dio ??
@@ -38,6 +44,9 @@ class LyraApiClient {
   final CredentialStore credentialStore;
   final Future<String?> Function() tokenRefresher;
   final Future<void> Function()? onUnauthorized;
+
+  /// 服务端返回 [kUserDisabledCode] 时通知接线方结束会话。
+  final Future<void> Function()? onUserDisabled;
   final Dio _dio;
 
   /// 供文件上传等数据层复用同一套拦截器（协议头与令牌注入）。
@@ -103,6 +112,12 @@ class LyraApiClient {
       if (error.error is LyraApiError) throw error.error!;
       if (_invalidated) throw _sessionChanged;
       final response = error.response;
+      final disabled = _userDisabledError(error);
+      if (disabled != null) {
+        // 停用是终态：先结束会话再抛出不可重试错误，绝不进入刷新与重放。
+        await _endDisabledSession();
+        throw disabled;
+      }
       if (response?.statusCode == 401) {
         await _readBoundCredentials();
         final attempted = error.requestOptions.headers['authorization'];
@@ -113,7 +128,12 @@ class LyraApiClient {
               ? _accessToken
               : await _refreshOnce();
         } on LyraApiError catch (refreshError) {
-          if (refreshError.statusCode == 401) await _unauthorized();
+          // 刷新本身发现用户已停用时同样结束会话，不再重试。
+          if (refreshError.code == kUserDisabledCode) {
+            await _endDisabledSession();
+          } else if (refreshError.statusCode == 401) {
+            await _unauthorized();
+          }
           rethrow;
         }
         if (newToken == null) {
@@ -133,6 +153,11 @@ class LyraApiClient {
         } on DioException catch (retryError) {
           if (retryError.error is LyraApiError) throw retryError.error!;
           if (_invalidated) throw _sessionChanged;
+          final retryDisabled = _userDisabledError(retryError);
+          if (retryDisabled != null) {
+            await _endDisabledSession();
+            throw retryDisabled;
+          }
           if (retryError.response?.statusCode == 401) await _unauthorized();
           throw LyraApiError.fromResponseBody(
             retryError.response?.data,
@@ -167,6 +192,23 @@ class LyraApiClient {
   Future<void> _unauthorized() async {
     _accessToken = null;
     await onUnauthorized?.call();
+  }
+
+  /// 解析 403 中的用户停用错误；其他 403 保持既有业务语义。
+  LyraApiError? _userDisabledError(DioException error) {
+    if (error.response?.statusCode != 403) return null;
+    final parsed = LyraApiError.fromResponseBody(
+      error.response?.data,
+      403,
+      requestId: _requestId(error),
+    );
+    return parsed.code == kUserDisabledCode ? parsed : null;
+  }
+
+  /// 用户停用后本客户端不再持有令牌；凭据与会话清理由 [onUserDisabled] 接线方完成。
+  Future<void> _endDisabledSession() async {
+    _accessToken = null;
+    await onUserDisabled?.call();
   }
 
   /// 服务端在 x-request-id 响应头中回传关联 ID；缺失时不构造占位值。

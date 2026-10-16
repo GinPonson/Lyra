@@ -130,20 +130,21 @@ def check_schema_version_is_self_consistent() -> Check:
 
 
 def check_protocol_version() -> Check:
-    """协议版本必须是 2——**它是 Flutter 客户端无需改动的依据**。"""
+    """协议版本必须是 3——**它是客户端与服务端同步升级后的契约版本**。"""
     text = (SERVER_PY / "src/lyra/protocol.py").read_text(encoding="utf-8")
     value = None
     for line in text.splitlines():
         if line.startswith("LYRA_PROTOCOL_VERSION"):
             value = line.split("=")[1].strip()
-    return Check("协议版本为 2", value == "2", f"LYRA_PROTOCOL_VERSION={value}")
+    return Check("协议版本为 3", value == "3", f"LYRA_PROTOCOL_VERSION={value}")
 
 
 def check_route_contract() -> Check:
     """**实际路由必须与签入的契约一致。**
 
-    契约在 ``tests/fixtures/route-manifest.json``：47 个 (方法, 路径) 对 + 1 个 WebSocket，
-    即迁移期间与 TypeScript 版逐项对账的结果。
+    契约在 ``tests/fixtures/route-manifest.json``：迁移期与 TypeScript 版逐项对账为
+    47 个 (方法, 路径) 对 + 1 个 WebSocket（历史事实），多用户账本升级新增 3 项后当前
+    合计 50 个 + 1 个 WebSocket。
 
     此前这项检查直接读 TypeScript 的路由注册源码——那份耦合已随 TS 服务端移除。**保护
     没有消失，只是从"比对另一个实现"变成了"回归检测"。**
@@ -267,7 +268,7 @@ CHECKS: tuple[tuple[str, Callable[[], Check]], ...] = (
     ("错误类静态检查", check_static_checks),
     ("接管既有账本", check_can_take_over_an_existing_ledger),
     ("模式版本自洽", check_schema_version_is_self_consistent),
-    ("协议版本为 2", check_protocol_version),
+    ("协议版本为 3", check_protocol_version),
     ("路由契约", check_route_contract),
     ("LYRA_SECRET_MASTER_KEY 形态", check_encrypted_secret_master_key),
 )

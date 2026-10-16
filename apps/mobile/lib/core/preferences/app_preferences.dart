@@ -154,21 +154,20 @@ bool _validScopeId(Object? value, {bool allowAll = true}) =>
     !RegExp(r'[\x00-\x1f\x7f]').hasMatch(value) &&
     (allowAll || value != 'all');
 
-/// 旧凭据没有稳定 subject 时只按设备隔离，绝不使用可能复用的邮箱认领旧设置。
+/// 偏好身份键：只由归一化服务端地址与稳定 `userId` 组成。
+///
+/// 邮箱、第三方 subject 与设备 ID 都不参与归属判断：邮箱与 subject 可能被复用
+/// 或无法证明属于同一自然人，设备 ID 会让同一用户换设备后丢失偏好。同一用户的
+/// 不同 OAuth 身份在服务端明确关联到同一 userId 后自然共用同一个键。
+///
+/// 旧凭据缺少 userId 时这里明确失败，由会话层清理并要求重新登录；不提供任何
+/// 回落身份，避免把上一个用户的偏好交给下一个登录。
 String preferencesIdentityKey(CredentialSnapshot snapshot) {
-  final subject = snapshot.subject?.trim();
-  return jsonEncode([
-    normalizePreferencesServerUrl(snapshot.serverUrl),
-    if (const ['google', 'linuxdo', 'github'].contains(snapshot.authMethod) &&
-        subject != null &&
-        subject.isNotEmpty) ...[
-      snapshot.authMethod,
-      subject,
-    ] else ...[
-      'device',
-      snapshot.deviceId,
-    ],
-  ]);
+  final userId = snapshot.userId;
+  if (userId == null || userId.isEmpty) {
+    throw StateError('登录凭据缺少稳定用户标识，请重新登录');
+  }
+  return jsonEncode([normalizePreferencesServerUrl(snapshot.serverUrl), userId]);
 }
 
 String normalizePreferencesServerUrl(String value) {

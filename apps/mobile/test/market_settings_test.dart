@@ -731,6 +731,7 @@ void main() {
           deviceId: 'other-device',
           accessToken: 'other-synthetic-token',
           refreshToken: 'other-synthetic-refresh',
+          userId: 'other-user',
           authMethod: 'google',
         ),
       );

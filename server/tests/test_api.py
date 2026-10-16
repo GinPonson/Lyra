@@ -54,10 +54,12 @@ def test_health_reports_available_database(client: TestClient) -> None:
     # 服务能工作，只是对话能力未知。
     assert body["status"] == "degraded"
     assert body["process"] == {"status": "available"}
+    # **``ledgerVersion`` 已从健康响应移除**：它是全库 ``max(version)``，多用户下属于
+    # 跨用户活动量，公开端点不得暴露（计划 §4.4）。这里用闭集断言守住形状——多一个
+    # 字段就是一次未记录的协议变更。
     assert body["database"] == {
         "status": "available",
         "schemaVersion": CURRENT_SCHEMA_VERSION,
-        "ledgerVersion": 0,
     }
     # checkedAt 必须是 UTC ISO 时间戳，与 JavaScript toISOString() 同形。
     assert body["checkedAt"].endswith("Z")
@@ -80,9 +82,10 @@ def test_health_reports_all_seven_sections(client: TestClient) -> None:
     }
     assert body["writeQueue"]["status"] in ("available", "draining")
     assert isinstance(body["writeQueue"]["pendingOperations"], int)
+    # **Gmail 段只报状态**：``totalConnections`` 与 ``attentionRequired`` 是多用户下的
+    # 用户活动计数，公开端点不得暴露（计划 §4.4）。段内字段是闭集。
+    assert body["gmail"] == {"status": body["gmail"]["status"]}
     assert body["gmail"]["status"] in ("available", "degraded")
-    assert isinstance(body["gmail"]["totalConnections"], int)
-    assert body["gmail"]["attentionRequired"] >= 0
     assert body["agents"]["status"] in ("available", "degraded", "unknown")
 
 
@@ -117,16 +120,16 @@ def test_health_returns_503_when_database_unavailable(tmp_path: Path) -> None:
     assert response.json()["database"] == {"status": "unavailable"}
 
 
-def test_system_info_exposes_protocol_two(client: TestClient) -> None:
-    """协议元数据必须与 TypeScript 版一致：协议 2、区间 2–2。"""
+def test_system_info_exposes_protocol_three(client: TestClient) -> None:
+    """协议元数据与多用户服务端一致：协议 3、区间 3–3。"""
     response = client.get("/v1/system/info")
 
     assert response.status_code == 200
     assert response.json() == {
         "server_version": "0.1.0",
-        "protocol_version": 2,
-        "min_supported_protocol_version": 2,
-        "max_supported_protocol_version": 2,
+        "protocol_version": 3,
+        "min_supported_protocol_version": 3,
+        "max_supported_protocol_version": 3,
         "schema_version": CURRENT_SCHEMA_VERSION,
     }
 
@@ -144,16 +147,16 @@ def test_system_info_reports_the_compiled_schema_version(client) -> None:
 
     body = client.get("/v1/system/info").json()
 
-    assert body["schema_version"] == CURRENT_SCHEMA_VERSION == 15
+    assert body["schema_version"] == CURRENT_SCHEMA_VERSION == 16
 
 
 def test_system_info_reports_the_protocol_window(client) -> None:
-    """协议版本区间与参考实现一致（``2`` / ``2`` / ``2``）。"""
+    """协议版本区间为 ``3`` / ``3`` / ``3``。"""
     body = client.get("/v1/system/info").json()
 
-    assert body["protocol_version"] == 2
-    assert body["min_supported_protocol_version"] == 2
-    assert body["max_supported_protocol_version"] == 2
+    assert body["protocol_version"] == 3
+    assert body["min_supported_protocol_version"] == 3
+    assert body["max_supported_protocol_version"] == 3
     assert body["server_version"] == "0.1.0"
 
 

@@ -6,6 +6,15 @@
 2. **state 绑定**——未登记或畸形的 state 一律失败关闭；
 3. **兑换必须带 App verifier**——只有 loginId 或浏览器 URL 都不足以领取凭据；
 4. **容量与限流**——滥用者不得让所有者永久无法登录。
+
+**已删除的覆盖**：``ConfiguredLoginProvider.assert_owner`` 这一单 owner 白名单闸门已
+被多用户改造移除，身份到用户的解析改在设备签发用例里按 ``(provider, subject)``
+自动注册（契约 §3.10）。因此这里不再构造"拒绝 owner"的来源；原先借它触发的
+「失败事务必须被记录、兑换时重放同一错误」仍由 ``access_denied``（用户取消授权）
+这一仍在产路径覆盖。
+
+**适配点**：登录响应中的 ``user`` 现在是解析出的 ``UserRecord``，来源身份挂在
+``identity`` 上（契约 §3.9），设备签发用例负责一并返回二者。
 """
 
 from __future__ import annotations
@@ -19,11 +28,11 @@ from typing import Any
 import pytest
 
 from lyra.application.app_error import ApplicationError
-from lyra.application.owner_login_service import (
+from lyra.application.login_service import (
     LOGIN_TTL_MILLISECONDS,
     MAX_STARTS_PER_SOURCE_WINDOW,
     LoginStartInput,
-    OwnerLoginService,
+    UserLoginService,
     pkce_challenge,
     sha256_text,
 )
@@ -31,12 +40,38 @@ from lyra.infrastructure.auth.login_provider import (
     ConfiguredLoginProvider,
     LoginIdentity,
 )
+from lyra.infrastructure.db.user_repository import (
+    UserIdentityRecord,
+    UserRecord,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "device-keys.json"
 PUBLIC_KEY_PEM = json.loads(FIXTURES.read_text(encoding="utf-8"))["cases"][0]["inputPem"]
 
 NOW = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
 CODE_CHALLENGE = pkce_challenge("v" * 43)
+
+# 设备签发用例按契约 §3.9 一并返回解析出的用户与来源身份；登录响应因此可以直接
+# 透出与 ``GET /v1/me`` 同形的 ``user``。此处用真实记录类型而不是鸭子类型替身。
+STAMP = "2026-10-12T09:00:00.000Z"
+RESOLVED_USER = UserRecord(
+    id="11111111-1111-1111-1111-111111111111",
+    display_name="octocat",
+    status="active",
+    role="member",
+    created_at=STAMP,
+    updated_at=STAMP,
+)
+RESOLVED_IDENTITY = UserIdentityRecord(
+    id="22222222-2222-2222-2222-222222222222",
+    user_id=RESOLVED_USER.id,
+    provider="github",
+    subject="12345",
+    email=None,
+    display_name="octocat",
+    created_at=STAMP,
+    updated_at=STAMP,
+)
 
 
 class FakeProviderClient:
@@ -60,34 +95,38 @@ class FakeProviderClient:
         return self.identity
 
 
-def _provider(identity: LoginIdentity | None = None, *, fail: bool = False, deny: bool = False):
-    """构造一个来源，可选地拒绝 owner。"""
+def _provider(identity: LoginIdentity | None = None, *, fail: bool = False):
+    """构造一个来源；``fail`` 让它模拟上游交换失败。
+
+    单 owner 白名单的 ``assert_owner`` 钩子已随多用户改造移除（契约 §3.10），
+    来源不再持有任何准入判定，身份到用户的映射发生在设备签发用例里。
+    """
     resolved = identity or LoginIdentity(
         provider="github", subject="12345", email=None, display_name="octocat"
     )
 
-    def assert_owner(candidate: LoginIdentity) -> None:
-        if deny:
-            raise ApplicationError(
-                code="LOGIN_DENIED", message="无权访问", status_code=403, retryable=False
-            )
-
     client = FakeProviderClient(resolved, fail=fail)
-    return ConfiguredLoginProvider(
-        id="github", name="GitHub", client=client, assert_owner=assert_owner
-    )
+    return ConfiguredLoginProvider(id="github", name="GitHub", client=client)
 
 
-def _service(*, now: datetime = NOW, **provider_kwargs: Any) -> OwnerLoginService:
+def _service(*, now: datetime = NOW, **provider_kwargs: Any) -> UserLoginService:
     """构造只带 GitHub 来源的服务，并注入固定时钟与设备签发记录器。"""
     issued: list[dict[str, Any]] = []
 
     async def authorize(**kwargs: Any) -> dict[str, Any]:
         # 设备签发是异步的：它需要单写队列，而队列用 asyncio.Lock 串行化。
+        # ``user`` / ``identity`` 与设备字段一并返回：登录响应必须给出与
+        # ``GET /v1/me`` 同形的 user 对象（契约 §3.9）。
         issued.append(kwargs)
-        return {"deviceId": "device-1", "accessToken": "at", "refreshToken": "rt"}
+        return {
+            "deviceId": "device-1",
+            "accessToken": "at",
+            "refreshToken": "rt",
+            "user": RESOLVED_USER,
+            "identity": RESOLVED_IDENTITY,
+        }
 
-    service = OwnerLoginService(
+    service = UserLoginService(
         [_provider(**provider_kwargs)], authorize, now=lambda: _service.clock
     )
     service.issued = issued  # type: ignore[attr-defined]
@@ -107,9 +146,9 @@ def _start_payload(**overrides: Any) -> LoginStartInput:
     return LoginStartInput(**base)
 
 
-def _exchange(service: OwnerLoginService, *args, **kwargs):
+def _exchange(service: UserLoginService, *args, **kwargs):
     """同步调用异步的兑换方法（测试用）。"""
-    return asyncio.run(OwnerLoginService.exchange(service, *args, **kwargs))
+    return asyncio.run(UserLoginService.exchange(service, *args, **kwargs))
 
 
 def _advance(minutes: float) -> None:
@@ -247,7 +286,7 @@ def test_capacity_eviction_prefers_oldest_not_rejecting_newest() -> None:
 # --------------------------------------------------------------------------
 
 
-def _started(**provider_kwargs: Any) -> tuple[OwnerLoginService, str, str]:
+def _started(**provider_kwargs: Any) -> tuple[UserLoginService, str, str]:
     """创建事务并返回 (服务, loginId, state)，state 从客户端调用记录中取出。"""
     service = _service(**provider_kwargs)
     response = service.start("github", _start_payload())
@@ -265,7 +304,9 @@ def test_callback_completes_and_approves() -> None:
     result = _exchange(service, "github", login_id=login_id, code_verifier="v" * 43)
     assert result["status"] == "complete"
     assert result["deviceId"] == "device-1"
-    assert result["user"].subject == "12345"
+    # user 现在是解析出的 ``UserRecord``，来源身份（含 subject）挂在 identity 上。
+    assert result["user"] == RESOLVED_USER
+    assert result["identity"].subject == "12345"
 
 
 def test_callback_rejects_unknown_state() -> None:
@@ -303,11 +344,16 @@ def test_callback_maps_access_denied() -> None:
     assert raised.value.code == "LOGIN_DENIED"
 
 
-def test_callback_marks_attempt_failed_on_owner_denial() -> None:
-    """owner 不符时事务必须进入 failed，且兑换返回同一错误。"""
-    service, login_id, state = _started(deny=True)
+def test_callback_marks_attempt_failed_on_login_denial() -> None:
+    """登录被取消时事务必须进入 failed，且兑换返回同一错误。
+
+    适配说明：原用例借已移除的 ``assert_owner`` 白名单制造 ``LOGIN_DENIED``。同一
+    错误码在产路径仍由上游 ``access_denied``（用户取消授权）产生，因此改用该触发
+    方式，保留「失败事务被记录、兑换时重放同一错误」这条有效覆盖。
+    """
+    service, login_id, state = _started()
     with pytest.raises(ApplicationError) as raised:
-        service.complete_callback("github", state=state, code="c")
+        service.complete_callback("github", state=state, error="access_denied")
     assert raised.value.code == "LOGIN_DENIED"
 
     with pytest.raises(ApplicationError) as redeemed:
@@ -397,10 +443,12 @@ def test_exchange_never_returns_third_party_tokens() -> None:
     service.complete_callback("github", state=state, code="c")
     result = _exchange(service, "github", login_id=login_id, code_verifier="v" * 43)
 
-    assert set(result) == {"status", "deviceId", "accessToken", "refreshToken", "user"}
-    assert result["user"] == LoginIdentity(
-        provider="github", subject="12345", email=None, display_name="octocat"
-    )
+    assert set(result) == {
+        "status", "deviceId", "accessToken", "refreshToken", "user", "identity",
+    }
+    # 来源身份原样透出；user 是解析出的账本用户，不再拿 LoginIdentity 冒充（契约 §3.9）。
+    assert result["identity"] == RESOLVED_IDENTITY
+    assert result["user"] == RESOLVED_USER
 
 
 def test_exchange_unknown_login_id_reports_expired() -> None:

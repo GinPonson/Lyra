@@ -291,6 +291,7 @@ const CredentialSnapshot _snapshot = CredentialSnapshot(
   deviceId: 'd1000000-0000-4000-8000-000000000001',
   accessToken: 'access-token-1',
   refreshToken: 'refresh-token-1',
+  userId: 'agent-user',
   authMethod: 'google',
 );
 

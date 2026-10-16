@@ -24,6 +24,20 @@ from lyra.infrastructure.db.import_job_repository import DuckDbImportJobReposito
 ACCOUNT_ID = "11111111-1111-1111-1111-111111111111"
 JOB_ID = "44444444-4444-4444-4444-444444444444"
 NOW = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
+USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
+OTHER_USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa2"
+
+
+def _seed_users(connection) -> None:
+    """写入两个用户；账户、账本版本与导入作业的归属列都是 NOT NULL。"""
+    for user_id in (USER_ID, OTHER_USER_ID):
+        connection.execute(
+            """
+            INSERT INTO users (id, display_name, status, role)
+            VALUES (CAST(? AS UUID), ?, 'active', 'member')
+            """,
+            [user_id, f"User {user_id[-1]}"],
+        )
 
 
 def _record(**overrides) -> PersistedImportJobRecord:
@@ -57,20 +71,25 @@ def wired(tmp_path: Path):
     """在临时真实库上装配仓储与账户。"""
     database = open_lyra_database(str(tmp_path / "jobs.duckdb"))
     connection = database.connection
+    _seed_users(connection)
     connection.execute(
         """
-        INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-        VALUES (CAST(? AS UUID), 'Account', 'TST001', '001')
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', 'TST001', '001')
         """,
-        [ACCOUNT_ID],
+        [ACCOUNT_ID, USER_ID],
     )
     # import_files.preview_ledger_version 引用 ledger_versions，先让序列分配出版本号。
     for _ in range(3):
         connection.execute(
-            "INSERT INTO ledger_versions (reason, source_reference) VALUES ('file_import', 'seed')"
+            """
+            INSERT INTO ledger_versions (user_id, reason, source_reference)
+            VALUES (CAST(? AS UUID), 'file_import', 'seed')
+            """,
+            [USER_ID],
         )
     try:
-        yield DuckDbImportJobRepository(connection), connection
+        yield DuckDbImportJobRepository(connection, user_id=USER_ID), connection
     finally:
         database.close()
 
@@ -229,3 +248,53 @@ def test_preview_ledger_version_must_exist(wired) -> None:
             skipped_rows=0,
             now=NOW,
         )
+
+
+# --------------------------------------------------------------------------
+# 用户范围（V04）：作业按用户隔离
+# --------------------------------------------------------------------------
+
+
+def test_job_created_by_one_user_is_invisible_to_another(wired) -> None:
+    """**别人用户的作业读不到**，而且与「不存在」不可区分。
+
+    导入作业在上传阶段就可能没有目标账户，因此归属只能落在 ``import_files.user_id``
+    上。仓储的每个方法都带用户条件，这条测试钉住"漏掉任何一处都会读到别人的作业"。
+    """
+    repository, connection = wired
+    repository.create_import_job(_record(status="parsing"))
+
+    intruder = DuckDbImportJobRepository(connection, user_id=OTHER_USER_ID)
+
+    assert intruder.load_import_job(JOB_ID) is None
+    # CAS 与预览写入同样不得命中别人的作业（0 行受影响 → False）。
+    assert intruder.transition_status(JOB_ID, "parsing", "preview_ready", NOW) is False
+    assert intruder.record_preview(
+        JOB_ID,
+        target_account_id=ACCOUNT_ID,
+        preview_token_hash="e" * 64,
+        preview_fingerprint="f" * 64,
+        preview_expires_at=NOW,
+        preview_ledger_version=3,
+        total_rows=1,
+        inserted_rows=1,
+        skipped_rows=0,
+        now=NOW,
+    ) is False
+    # 作业仍是原主人创建时的状态，未被越权写入推进。
+    assert repository.load_import_job(JOB_ID) is not None
+    assert connection.execute(
+        "SELECT status, preview_token_hash FROM import_files WHERE id = CAST(? AS UUID)",
+        [JOB_ID],
+    ).fetchone() == ("parsing", None)
+
+
+def test_job_owner_is_written_from_the_repository_scope(wired) -> None:
+    """作业入库的 ``user_id`` 来自仓储构造时的用户，不来自记录对象。"""
+    repository, connection = wired
+    repository.create_import_job(_record())
+
+    row = connection.execute(
+        "SELECT user_id FROM import_files WHERE id = CAST(? AS UUID)", [JOB_ID]
+    ).fetchone()
+    assert row is not None and str(row[0]) == USER_ID

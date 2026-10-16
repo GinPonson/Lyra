@@ -12,6 +12,7 @@ import 'package:lyra_mobile/app/session.dart';
 import 'package:lyra_mobile/core/security/credential_store.dart';
 import 'package:lyra_mobile/core/api/lyra_api_error.dart';
 import 'package:lyra_mobile/features/agent/agent_session_store.dart';
+import 'package:lyra_mobile/features/auth/auth_provider.dart';
 import 'package:lyra_mobile/features/auth/auth_workspace.dart';
 
 import 'support/faulty_stores.dart';
@@ -38,7 +39,13 @@ class FakeLyraAdapter implements HttpClientAdapter {
 const String _loginResponse = '''
 {
   "status": "complete",
-  "user": {"provider":"google", "subject":"test-user", "email":"owner@example.com", "displayName":"Owner"},
+  "user": {
+    "userId": "user-1",
+    "displayName": "Owner",
+    "status": "active",
+    "role": "member",
+    "identity": {"provider":"google", "subject":"test-user", "email":"owner@example.com"}
+  },
   "deviceId": "d1000000-0000-4000-8000-000000000001",
   "displayName": "Test phone",
   "accessToken": "access-token-1",
@@ -127,7 +134,7 @@ void main() {
                     RequestOptions options,
                   ) async {
                     final path = options.uri.path;
-                    expect(options.headers['x-lyra-protocol-version'], '2');
+                    expect(options.headers['x-lyra-protocol-version'], '3');
                     if (path == '/v1/auth/providers') {
                       return _response(
                         jsonEncode({
@@ -255,6 +262,7 @@ void main() {
     final stored = await store.read();
     expect(stored, isNotNull);
     expect(stored?.deviceId, 'd1000000-0000-4000-8000-000000000001');
+    expect(stored?.userId, 'user-1');
     expect(stored?.authMethod, 'google');
     expect(stored?.userEmail, 'owner@example.com');
     expect(stored?.googleSubject, 'test-user');
@@ -377,6 +385,237 @@ void main() {
     expect(await agentStore.read(), isNull);
   });
 
+  test('旧凭据缺少稳定 userId 时清理会话并要求重新登录', () async {
+    final store = MemoryCredentialStore();
+    await store.write(
+      const CredentialSnapshot(
+        serverUrl: 'https://lyra.example.com',
+        deviceId: 'legacy-device',
+        accessToken: 'legacy-access',
+        refreshToken: 'legacy-refresh',
+        authMethod: 'google',
+        googleSubject: 'test-user',
+        userEmail: 'owner@example.com',
+      ),
+    );
+    final agentStore = MemoryAgentSessionStore();
+    await agentStore.write('legacy-session');
+    final container = _sessionContainer(
+      store,
+      (_) async => throw StateError('缺少 userId 的凭据不能联网'),
+      agentStore: agentStore,
+    );
+    addTearDown(container.dispose);
+    final state = await container.read(sessionProvider.future);
+    expect(state, isA<SessionSignedOut>());
+    // 不按邮箱或 subject 猜归属：明确提示并要求重新登录，凭据与 Agent 会话一起清理。
+    expect((state as SessionSignedOut).message, '登录凭据已更新，请重新登录。');
+    expect(await store.read(), isNull);
+    expect(await agentStore.read(), isNull);
+  });
+
+  test('账号被停用直接结束会话，不进入刷新重试循环', () async {
+    final store = MemoryCredentialStore();
+    await store.write(_authenticatedSnapshot);
+    final agentStore = MemoryAgentSessionStore();
+    await agentStore.write('disabled-session');
+    var refreshes = 0;
+    final container = _sessionContainer(store, (options) async {
+      if (options.uri.path == '/v1/devices/tokens') {
+        refreshes++;
+        return _response(
+          '{"code":"USER_DISABLED","message":"该账号已停用","retryable":false}',
+          403,
+        );
+      }
+      return _response(
+        '{"code":"USER_DISABLED","message":"该账号已停用","retryable":false}',
+        403,
+      );
+    }, agentStore: agentStore);
+    addTearDown(container.dispose);
+    final state = await container.read(sessionProvider.future);
+    expect(state, isA<SessionSignedOut>());
+    expect((state as SessionSignedOut).message, '账号已停用，请联系管理员。');
+    expect(container.read(sessionProvider.notifier).client, isNull);
+    expect(refreshes, 0);
+    expect(await store.read(), isNull);
+    expect(await agentStore.read(), isNull);
+  });
+
+  test('刷新阶段发现停用同样结束会话，不反复刷新', () async {
+    final store = MemoryCredentialStore();
+    await store.write(_authenticatedSnapshot);
+    var refreshes = 0;
+    final container = _sessionContainer(store, (options) async {
+      if (options.uri.path == '/v1/ledger/summary') {
+        return _response(_summaryResponse, 200);
+      }
+      if (options.uri.path == '/v1/me') return _response(_meResponse(), 200);
+      if (options.uri.path == '/v1/devices/tokens') {
+        refreshes++;
+        return _response(
+          '{"code":"USER_DISABLED","message":"该账号已停用","retryable":false}',
+          403,
+        );
+      }
+      return _response('{"code":"DEVICE_AUTH_INVALID","message":"expired"}', 401);
+    });
+    addTearDown(container.dispose);
+    await container.read(sessionProvider.future);
+    final controller = container.read(sessionProvider.notifier);
+    await expectLater(
+      controller.client!.get<Object?>('/private', {}),
+      throwsA(
+        isA<LyraApiError>().having((e) => e.code, 'code', 'USER_DISABLED'),
+      ),
+    );
+    await pumpEventQueue();
+    expect(container.read(sessionProvider).value, isA<SessionSignedOut>());
+    expect((container.read(sessionProvider).value as SessionSignedOut).message,
+        '账号已停用，请联系管理员。');
+    expect(refreshes, 1);
+    expect(await store.read(), isNull);
+  });
+
+  test('/me 返回其他 userId 时结束会话并清理凭据', () async {
+    final store = MemoryCredentialStore();
+    await store.write(_authenticatedSnapshot);
+    final container = _sessionContainer(store, (options) async {
+      if (options.uri.path == '/v1/ledger/summary') {
+        return _response(_summaryResponse, 200);
+      }
+      if (options.uri.path == '/v1/me') {
+        return _response(
+          jsonEncode({
+            'user': {
+              'userId': 'another-user',
+              'displayName': 'Other',
+              'status': 'active',
+              'role': 'member',
+              'identity': {
+                'provider': 'google',
+                'subject': 'test-user',
+                'email': 'owner@example.com',
+              },
+            },
+          }),
+          200,
+        );
+      }
+      return _response('unexpected', 404);
+    });
+    addTearDown(container.dispose);
+    final state = await container.read(sessionProvider.future);
+    expect(state, isA<SessionSignedOut>());
+    expect((state as SessionSignedOut).message, '登录身份已变化，请重新登录。');
+    expect(await store.read(), isNull);
+  });
+
+  test('/me 核对通过时保留会话，网络失败不伪装成停用或身份不符', () async {
+    final store = MemoryCredentialStore();
+    await store.write(_authenticatedSnapshot);
+    final verified = _sessionContainer(store, (options) async {
+      if (options.uri.path == '/v1/ledger/summary') {
+        return _response(_summaryResponse, 200);
+      }
+      if (options.uri.path == '/v1/me') {
+        return _response(
+          jsonEncode({
+            'user': {
+              'userId': 'test-user-id',
+              'displayName': 'Owner',
+              'status': 'active',
+              'role': 'member',
+              'identity': {
+                'provider': 'google',
+                'subject': 'test-user',
+                'email': 'owner@example.com',
+              },
+            },
+          }),
+          200,
+        );
+      }
+      return _response('unexpected', 404);
+    });
+    addTearDown(verified.dispose);
+    final state = await verified.read(sessionProvider.future);
+    expect(state, isA<SessionAuthenticated>());
+    expect((state as SessionAuthenticated).snapshot.userId, 'test-user-id');
+    expect((await store.read())?.userId, 'test-user-id');
+
+    final offlineStore = MemoryCredentialStore();
+    await offlineStore.write(_authenticatedSnapshot);
+    final offline = _sessionContainer(offlineStore, (options) async {
+      if (options.uri.path == '/v1/ledger/summary') {
+        return _response(_summaryResponse, 200);
+      }
+      if (options.uri.path == '/v1/me') {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.connectionTimeout,
+        );
+      }
+      return _response('unexpected', 404);
+    });
+    addTearDown(offline.dispose);
+    final offlineState = await offline.read(sessionProvider.future);
+    expect(offlineState, isA<SessionAuthenticated>());
+    expect((await offlineStore.read())?.userId, 'test-user-id');
+  });
+
+  test('A 切换到 B 后，A 的迟到账本响应不能恢复旧会话', () async {
+    final store = MemoryCredentialStore();
+    await store.write(_authenticatedSnapshot);
+    final agentStore = MemoryAgentSessionStore();
+    await agentStore.write('session-a');
+    final lateSummary = Completer<ResponseBody>();
+    var summaries = 0;
+    final container = _sessionContainer(store, (options) async {
+      final path = options.uri.path;
+      if (path == '/v1/ledger/summary') {
+        summaries++;
+        if (summaries == 1) return _response(_summaryResponse, 200);
+        return lateSummary.future;
+      }
+      if (path == '/v1/auth/google/start') {
+        return _response(_startResponse(), 201);
+      }
+      if (path == '/v1/auth/google/exchange') {
+        final body = jsonDecode(_loginResponse) as Map<String, Object?>;
+        (body['user']! as Map<String, Object?>)['userId'] = 'user-b';
+        body['deviceId'] = 'device-b';
+        body['accessToken'] = 'access-b';
+        body['refreshToken'] = 'refresh-b';
+        return _response(jsonEncode(body), 200);
+      }
+      return _response('unexpected', 404);
+    }, agentStore: agentStore);
+    addTearDown(container.dispose);
+    await container.read(sessionProvider.future);
+    final controller = container.read(sessionProvider.notifier);
+    final late = controller.refreshLedger();
+    await pumpEventQueue();
+    // 旧会话的读请求仍在飞时切换到 B：旧 client 失效、凭据与 Agent 会话被替换。
+    final switched = await controller.signIn(
+      provider: AuthProvider.google,
+      serverUrl: 'https://lyra.example.com',
+      displayName: 'Second',
+    );
+    expect(switched, isTrue);
+    expect((await store.read())?.userId, 'user-b');
+    expect((await store.read())?.deviceId, 'device-b');
+    // Agent 活跃会话属于上一个登录：切换时必须清理，不能带给 B。
+    expect(await agentStore.read(), isNull);
+    lateSummary.complete(_response(_summaryResponse, 200));
+    expect(await late, isFalse);
+    final state = container.read(sessionProvider).value;
+    expect(state, isA<SessionAuthenticated>());
+    expect((state as SessionAuthenticated).snapshot.userId, 'user-b');
+    expect((state).summary, isNull);
+  });
+
   test('刷新令牌被撤销后回到登录页，网络中断不清除有效凭据', () async {
     final store = MemoryCredentialStore();
     await store.write(_authenticatedSnapshot);
@@ -439,6 +678,7 @@ void main() {
       if (options.uri.path == '/v1/ledger/summary') {
         return _response(_summaryResponse, 200);
       }
+      if (options.uri.path == '/v1/me') return _response(_meResponse(), 200);
       if (options.uri.path == '/v1/devices/tokens') {
         refreshCalls++;
         if (refreshCalls == 1) {
@@ -557,6 +797,7 @@ void main() {
     final container = _sessionContainer(store, (options) async {
       final path = options.uri.path;
       if (path == '/v1/ledger/summary') return _response(_summaryResponse, 200);
+      if (path == '/v1/me') return _response(_meResponse(), 200);
       if (path == '/v1/devices/tokens') {
         refreshedWith.add(_requestBody(options)['refreshToken'] as String);
         generation++;
@@ -607,6 +848,7 @@ void main() {
       final newer = Completer<ResponseBody>();
       var reads = 0;
       final container = _sessionContainer(store, (options) async {
+        if (options.uri.path == '/v1/me') return _response(_meResponse(), 200);
         reads++;
         if (reads == 1) return _response(_summaryResponse, 200);
         return reads == 2 ? older.future : newer.future;
@@ -685,9 +927,25 @@ const _authenticatedSnapshot = CredentialSnapshot(
   deviceId: 'test-device',
   accessToken: 'access-token-1',
   refreshToken: 'refresh-token-1',
+  userId: 'test-user-id',
   authMethod: 'google',
   googleSubject: 'test-user',
 );
+
+/// 身份核对响应；与 [_authenticatedSnapshot] 的稳定 userId 保持一致。
+String _meResponse({String userId = 'test-user-id'}) => jsonEncode({
+  'user': {
+    'userId': userId,
+    'displayName': 'Owner',
+    'status': 'active',
+    'role': 'member',
+    'identity': {
+      'provider': 'google',
+      'subject': 'test-user',
+      'email': 'owner@example.com',
+    },
+  },
+});
 
 String _startResponse() => jsonEncode({
   'loginId': 'test-login',

@@ -42,7 +42,9 @@ def test_generation_does_not_block_http_or_live_events(wired) -> None:
     row = DuckDbAgentSessionRepository(database.connection).load_session(SESSION_ID)
     assert row is not None
     client.app.state.agent_orchestrator.register(
-        _with_revision(row, row.revision), device_id=issued.device_id
+        # 与生产路径一致的登记方式：设备与用户都来自会话行。
+        _with_revision(row, row.revision), device_id=issued.device_id,
+        user_id=row.user_id,
     )
     with ThreadPoolExecutor(max_workers=3) as pool:
         try:

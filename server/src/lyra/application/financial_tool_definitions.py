@@ -8,6 +8,11 @@
 单账户时，一个不传范围字段的调用会静默升级为"全部账户"，而系统提示词里的授权说明
 拦不住它——提示词不是访问控制。
 
+**用户身份同样是注入的**：账本读取的用户范围来自 :attr:`AgentToolContext.user_id`
+（会话身份 ``agent_session_identities.user_id``），绝不从请求参数、模型参数或任何
+进程级"当前用户"变量读取。因此 ``all`` 只等于"该用户的全部账户"，模型无法把它扩大
+成全库；每次工具执行前还会复核该用户仍处于 ``active``（停用后拒绝继续执行，计划 §4.4）。
+
 本模块绑定全部 **18 个工具**（7 条币种信封命令 + 7 条详情命令 + `accounts` +
 `market-positions`）。
 """
@@ -25,6 +30,7 @@ from ..domain.analytics.types import AccountScope
 from ..infrastructure.db.account_lookup import resolve_legacy_account_key
 from ..infrastructure.db.ledger_repository import DuckDbLedgerRepository
 from .app_error import ApplicationError
+from .device_authenticator import user_disabled_error
 from .financial_tool_handlers import (
     CURRENCY_GROUPED_COMMANDS,
     LEDGER_DETAIL_COMMANDS,
@@ -126,6 +132,38 @@ def build_tool_definitions(
         此时持仓估值照常返回行、只是不含参考价（**数据状态而非错误**）。
     @returns 工具定义，顺序与 `financial_tools.FINANCIAL_TOOLS` 一致。
     """
+    def active_user_id(context: AgentToolContext) -> str:
+        """取出本次调用所属的用户，并确认它仍然可用。
+
+        **两道检查都不能省**：
+
+        1. ``user_id`` 为空说明上下文不是由真实会话构造的（正常路径由
+           ``agent_turn_orchestrator`` 从会话身份注入）。空归属继续往下走会让账本查询
+           变成"按 NULL 用户过滤"，得到空账本而不是错误——**空结果被读成"没有数据"**，
+           因此这里直接失败。
+        2. 用户状态可能在本回合开始**之后**才被停用：停用提交后，这一回合剩余的工具
+           调用与后续投递都必须停下（计划 §4.4、V11）。权限依赖只覆盖请求开始的那一刻，
+           覆盖不了长时间运行的模型回合，所以每次工具执行前复核一次。
+
+        @param context: 服务端注入的工具上下文。
+        @returns 当前用户 UUID 文本。
+        @raises ApplicationError: 缺少用户上下文（500）或用户已停用（403）。
+        """
+        user_id = context.user_id
+        if not user_id:
+            raise ApplicationError(
+                code="AGENT_USER_CONTEXT_MISSING",
+                message="Agent 工具调用缺少用户上下文",
+                status_code=500,
+                retryable=False,
+            )
+        row = connection_provider().execute(
+            "SELECT status FROM users WHERE id = CAST(? AS UUID)", [user_id]
+        ).fetchone()
+        if row is None or row[0] != "active":
+            raise user_disabled_error()
+        return user_id
+
     def resolved_scope(context: AgentToolContext) -> AccountScope:
         """把会话授权的账户范围解析为账本用的账户键。
 
@@ -135,10 +173,13 @@ def build_tool_definitions(
 
         @param context: 服务端注入的工具上下文。
         @returns 账本可用的账户范围。
-        @raises ApplicationError: 会话未绑定账户，或绑定的账户不存在。
+        @raises ApplicationError: 用户已停用、会话未绑定账户，或绑定的账户不属于该用户。
         """
+        user_id = active_user_id(context)
         scope = context.account_scope
         if scope.kind == "all":
+            # ``all`` 是"该用户的全部账户"：用户条件由 DuckDbLedgerRepository 的构造期
+            # 范围叠加，这里不需要再给出账户键。
             return AccountScope(kind="all")
         if not scope.account:
             raise ApplicationError(
@@ -147,7 +188,9 @@ def build_tool_definitions(
                 status_code=400,
                 retryable=False,
             )
-        key = resolve_legacy_account_key(connection_provider(), scope.account)
+        # 账户 UUID 解析**带用户范围**：B 的账户 UUID 在 A 的会话里必须表现为"不存在"，
+        # 否则模型只要拿到一个 UUID 就能读到别人的账本（P0 契约 §3.11）。
+        key = resolve_legacy_account_key(connection_provider(), user_id, scope.account)
         if key is None:
             raise ApplicationError(
                 code="ACCOUNT_NOT_FOUND",
@@ -171,38 +214,48 @@ def build_tool_definitions(
         """生成一条币种信封命令的处理器。"""
         def handler(arguments: Mapping[str, Any], context: AgentToolContext) -> Any:
             scope = resolved_scope(context)
-            snapshot = DuckDbLedgerRepository(connection_provider()).load_snapshot(scope)
+            # 仓储在构造期绑定用户：账本表自身没有 user_id 列，跨用户保护完全依赖
+            # 这里的查询范围（P0 契约 §3.2）。
+            snapshot = DuckDbLedgerRepository(
+                connection_provider(), user_id=context.user_id
+            ).load_snapshot(scope)
             return handle_currency_grouped(
                 command, snapshot, scope, effective_arguments(context, arguments)
             )
         return handler
 
     def accounts_handler(arguments: Mapping[str, Any], context: AgentToolContext) -> Any:
-        """账户列表；**只返回会话授权范围内的账户**。
+        """账户列表；**只返回当前用户在会话授权范围内的账户**。
 
         会话绑定单账户时若仍列出全部账户，模型可以直接读出授权范围外的账户，
         再针对它们发问——授权边界就只剩提示词里的一句话。
         """
+        user_id = active_user_id(context)
         scope = context.account_scope
         if scope.kind == "account":
-            # 先解析一次：账户不存在时显式失败，而不是返回空列表被读成"没有账户"。
+            # 先解析一次：账户不存在或不属于当前用户时显式失败，而不是返回空列表
+            # 被读成"没有账户"。
             resolved_scope(context)
             rows = connection_provider().execute(
                 """
                 SELECT id, display_name, broker, masked_suffix, base_currency, status,
                        created_at
                 FROM accounts
-                WHERE id = CAST(? AS UUID)
+                WHERE id = CAST(? AS UUID) AND user_id = CAST(? AS UUID)
                 """,
-                [scope.account],
+                [scope.account, user_id],
             ).fetchall()
         else:
+            # ``all`` 限于**该用户**的全部账户。少了这个条件，一次会话范围的工具调用
+            # 就会把全库账户列给模型（V08）。
             rows = connection_provider().execute(
                 """
                 SELECT id, display_name, broker, masked_suffix, base_currency, status,
                        created_at
                 FROM accounts
-                """
+                WHERE user_id = CAST(? AS UUID)
+                """,
+                [user_id],
             ).fetchall()
         accounts = [
             {
@@ -229,6 +282,9 @@ def build_tool_definitions(
         return handle_market_positions(
             connection_provider(), resolved_scope(context), runtime,
             _authorized_arguments(arguments).get("underlying"),
+            # 持仓的账本读取与行情设置快照都按用户读取，二者都必须拿到服务端注入的
+            # 用户身份；模型参数无法提供也无法覆盖它。
+            user_id=context.user_id,
         )
 
     definitions: list[ToolDefinition] = [
@@ -268,7 +324,9 @@ def build_tool_definitions(
         """生成一条详情命令的处理器。"""
         def handler(arguments: Mapping[str, Any], context: AgentToolContext) -> Any:
             scope = resolved_scope(context)
-            snapshot = DuckDbLedgerRepository(connection_provider()).load_snapshot(scope)
+            snapshot = DuckDbLedgerRepository(
+                connection_provider(), user_id=context.user_id
+            ).load_snapshot(scope)
             return handle_ledger_detail(
                 command, snapshot, scope, effective_arguments(context, arguments)
             )

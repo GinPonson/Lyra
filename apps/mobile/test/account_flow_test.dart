@@ -28,6 +28,7 @@ const _snapshot = CredentialSnapshot(
   deviceId: 'test-device',
   accessToken: 'test-access',
   refreshToken: 'test-refresh',
+  userId: 'account-user',
   authMethod: 'google',
 );
 
@@ -92,7 +93,7 @@ class _FirstUseFixture extends LedgerFixture {
   Future<ResponseBody> handle(RequestOptions options) async {
     requests.add(options);
     // 适配器回调可能与测试的 pump 同时执行，使用同步断言保持协议校验。
-    expectSync(options.headers['x-lyra-protocol-version'], '2');
+    expectSync(options.headers['x-lyra-protocol-version'], '3');
     final path = options.uri.path;
     if (path == '/v1/auth/logout') return ResponseBody.fromString('', 204);
     if (path == '/v1/ledger/accounts' && options.method == 'POST') {
@@ -314,6 +315,7 @@ Future<void> _replaceIdentity(
       deviceId: 'new-device',
       accessToken: 'new-access',
       refreshToken: 'new-refresh',
+      userId: 'other-user',
       authMethod: 'google',
     ),
   );

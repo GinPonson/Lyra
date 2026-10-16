@@ -7,6 +7,12 @@
 最重要的一条认识：签名验证由官方库负责，本模块只做官方库不覆盖的边界。
 因此测试里注入的"验签入口"直接返回 payload——**它模拟的是已经验签成功的输入**，
 而不是在测试里绕过验签。
+
+**已删除的覆盖**：单 owner 白名单（``owner_email`` / ``owner_subject`` 配置项、
+``assert_configured_owner`` 准入函数，以及"未配置 owner 时拒绝启动""非 owner 邮箱
+被拒"等用例）已被多用户改造整体移除，由首次登录自动注册取代（契约 §3.10）。这些
+用例测的是已被有意删除的行为，不是丢失覆盖；本模块只保留配置解析、OIDC 声明校验
+与交换流程。
 """
 
 from __future__ import annotations
@@ -23,7 +29,6 @@ from lyra.infrastructure.auth.google_login_client import (
     GOOGLE_LOGIN_CALLBACK_PATH,
     GoogleLoginClient,
     GoogleLoginConfig,
-    assert_configured_owner,
     load_google_login_config,
     matches_hash,
     sha256,
@@ -41,8 +46,6 @@ CONFIG = GoogleLoginConfig(
     client_id=CLIENT_ID,
     client_secret="secret",
     redirect_uri=f"https://lyra.example.com{GOOGLE_LOGIN_CALLBACK_PATH}",
-    owner_email="owner@example.com",
-    owner_subject=None,
 )
 
 
@@ -91,7 +94,7 @@ class Recorder:
 
 
 def test_load_returns_none_when_unconfigured() -> None:
-    """五项全空时来源未启用。"""
+    """三项凭据全空时来源未启用。"""
     assert load_google_login_config({}) is None
 
 
@@ -101,26 +104,10 @@ def test_load_rejects_partial_configuration() -> None:
         load_google_login_config({"LYRA_LOGIN_GOOGLE_CLIENT_ID": "cid"})
 
 
-def test_load_requires_an_owner() -> None:
-    """必须配置至少一个 owner 维度——Lyra 不开放注册。"""
-    with pytest.raises(ValueError, match="LYRA_OWNER_EMAIL 或 LYRA_OWNER_GOOGLE_SUBJECT"):
-        load_google_login_config({
-            "LYRA_LOGIN_GOOGLE_CLIENT_ID": "cid",
-            "LYRA_LOGIN_GOOGLE_CLIENT_SECRET": "s",
-            "LYRA_LOGIN_GOOGLE_REDIRECT_URI": f"https://l.example{GOOGLE_LOGIN_CALLBACK_PATH}",
-        })
-
-
-def test_load_normalizes_owner_email_case() -> None:
-    """owner 邮箱统一小写保存，避免大小写造成准入差异。"""
-    config = load_google_login_config({
-        "LYRA_LOGIN_GOOGLE_CLIENT_ID": "cid",
-        "LYRA_LOGIN_GOOGLE_CLIENT_SECRET": "s",
-        "LYRA_LOGIN_GOOGLE_REDIRECT_URI": f"https://l.example{GOOGLE_LOGIN_CALLBACK_PATH}",
-        "LYRA_OWNER_EMAIL": " Owner@Example.COM ",
-    })
-    assert config is not None
-    assert config.owner_email == "owner@example.com"
+# 已删除：``test_load_requires_an_owner``（未配置 owner 时拒绝启动）与
+# ``test_load_normalizes_owner_email_case``（owner 邮箱小写归一）。二者测的是已被
+# 多用户自动注册取代的单 owner 白名单配置，``GoogleLoginConfig`` 已不再包含
+# ``owner_email`` / ``owner_subject`` 字段（契约 §3.10）。
 
 
 @pytest.mark.parametrize(
@@ -138,11 +125,8 @@ def test_validate_rejects_non_fixed_callback(redirect_uri: str) -> None:
         validate_google_login_config(replace(CONFIG, redirect_uri=redirect_uri))
 
 
-@pytest.mark.parametrize("email", ["not-an-email", "a@b", "@example.com", "a b@example.com"])
-def test_validate_rejects_malformed_owner_email(email: str) -> None:
-    """owner 邮箱格式必须合法。"""
-    with pytest.raises(ValueError, match="LYRA_OWNER_EMAIL 格式无效"):
-        validate_google_login_config(replace(CONFIG, owner_email=email))
+# 已删除：``test_validate_rejects_malformed_owner_email``。owner 邮箱格式校验随
+# 白名单字段一起移除；邮箱现在只作展示，不参与准入。
 
 
 # --------------------------------------------------------------------------
@@ -239,40 +223,14 @@ def test_display_name_is_truncated() -> None:
 
 
 # --------------------------------------------------------------------------
-# owner 准入
+# owner 准入（已整体删除）
 # --------------------------------------------------------------------------
-
-
-def _identity(subject: str = "112233445566778899000", email: str = "owner@example.com"):
-    from lyra.infrastructure.auth.google_login_client import GoogleLoginIdentity
-
-    return GoogleLoginIdentity(provider="google", subject=subject, email=email, display_name=None)
-
-
-def test_owner_accepts_matching_email() -> None:
-    """邮箱匹配即通过（未配置 subject 时）。"""
-    assert_configured_owner(_identity(), CONFIG)
-
-
-def test_owner_rejects_other_email() -> None:
-    """其它邮箱必须被拒。"""
-    with pytest.raises(ApplicationError) as raised:
-        assert_configured_owner(_identity(email="other@example.com"), CONFIG)
-    assert raised.value.code == "LOGIN_DENIED"
-    assert raised.value.status_code == 403
-
-
-def test_owner_requires_every_configured_dimension() -> None:
-    """**配置了的每个维度都必须匹配**，不能只满足其一。"""
-    both = replace(CONFIG, owner_subject="112233445566778899000")
-    assert_configured_owner(_identity(), both)
-
-    # subject 对但邮箱错 → 拒绝。
-    with pytest.raises(ApplicationError):
-        assert_configured_owner(_identity(email="other@example.com"), both)
-    # 邮箱对但 subject 错 → 拒绝。
-    with pytest.raises(ApplicationError):
-        assert_configured_owner(_identity(subject="9"), both)
+#
+# ``test_owner_accepts_matching_email`` / ``test_owner_rejects_other_email`` /
+# ``test_owner_requires_every_configured_dimension`` 测的是 ``assert_configured_owner``
+# 这一单 owner 白名单闸门，该函数与整个白名单已随多用户改造移除，身份到用户的
+# 映射改由 ``UserRepository.find_or_create_user_for_identity`` 按
+# ``(provider, subject)`` 解析并自动注册（契约 §3.10）。此处刻意不留同名占位测试。
 
 
 # --------------------------------------------------------------------------

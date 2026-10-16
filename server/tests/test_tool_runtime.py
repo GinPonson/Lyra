@@ -30,7 +30,7 @@ SCHEMA: dict = {
 def _context() -> AgentToolContext:
     """一个会话范围内的服务端上下文。"""
     return AgentToolContext(
-        session_id="s-1", device_id="d-1", user_message_id="m-1",
+        session_id="s-1", device_id="d-1", user_id="u-1", user_message_id="m-1",
         account_scope=AccountScope(kind="all"), ledger_version=3,
         as_of="2026-09-01T00:00:00.000Z",
     )

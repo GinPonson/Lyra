@@ -135,6 +135,7 @@ const CredentialSnapshot _snapshot = CredentialSnapshot(
   deviceId: 'd1000000-0000-4000-8000-000000000001',
   accessToken: 'access-token-1',
   refreshToken: 'refresh-token-1',
+  userId: 'agent-user',
   authMethod: 'google',
 );
 
@@ -436,6 +437,8 @@ void main() {
         agentControllerProvider,
         (AgentUiState? previous, AgentUiState next) {},
       );
+      // Agent 恢复等待会话恢复完成（含 /me 身份核对）；显式等待避免依赖事件循环轮数。
+      await secondContainer.read(sessionProvider.future);
       await pumpEventQueue();
       final restored = secondContainer.read(agentControllerProvider);
       expect(restored, isA<AgentSessionActive>());
@@ -634,7 +637,7 @@ void main() {
         Iterable<String> protocols,
         Map<String, String> headers,
       ) {
-        expect(headers['x-lyra-protocol-version'], '2');
+        expect(headers['x-lyra-protocol-version'], '3');
         connectionTokens.add(headers['authorization']);
         final controller = StreamChannelController<dynamic>(
           allowForeignErrors: false,

@@ -16,6 +16,10 @@
 **取消是两阶段的**：``POST .../cancel`` 只把状态推进到 ``cancelling``，真正的中止
 由编排器在收到供应商信号后完成并回到 ``idle``。客户端看到 ``cancelling`` 表示
 "请求已受理、尚未停止"。
+
+**每一条按 ID 的路由都按「当前用户 + 会话 ID」读取会话**：会话归属记在不可变的
+``agent_session_identities`` 上，A 访问 B 的会话一律与"会话不存在"返回同一个 404，
+历史消息与工具审计因此都不会泄漏（计划 §4.1/§4.2、V07）。
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 
 from ..application.agent_availability import create_agent_availability_snapshot
+from ..application.device_authenticator import user_disabled_error
 from ..application.public_projection import project_agent_session
 from ..domain.agent.lifecycle import AgentSessionStateError, transition_agent_session
 from ..domain.agent.switching import (
@@ -37,8 +42,11 @@ from ..domain.agent.switching import (
 )
 from ..domain.analytics.types import AccountScope
 from ..infrastructure.db.agent_message_repository import AgentMessageRepository
-from ..infrastructure.db.agent_session_repository import DuckDbAgentSessionRepository
-from .dependencies import _UUID_PATTERN, require_device
+from ..infrastructure.db.agent_session_repository import (
+    AgentSessionRow,
+    DuckDbAgentSessionRepository,
+)
+from .dependencies import _UUID_PATTERN, require_user
 
 # 单条消息上限，与参考实现的 schema 一致（8192 字符）。
 _MAX_MESSAGE_LENGTH = 8_192
@@ -47,9 +55,9 @@ _MAX_MESSAGE_LENGTH = 8_192
 def create_agent_router() -> APIRouter:
     """构造 Agent 路由。
 
-    @returns 能力发现端点；要求设备认证。
+    @returns 能力发现端点；要求用户认证。
     """
-    router = APIRouter(dependencies=[Depends(require_device)])
+    router = APIRouter(dependencies=[Depends(require_user)])
 
     @router.get("/v1/agents")
     def read_agents(request: Request) -> Any:
@@ -150,16 +158,23 @@ def create_agent_router() -> APIRouter:
                 detail={"code": "AGENT_UNAVAILABLE", "reason": "not_configured"},
             )
         connection = request.app.state.database.connection
+        user_id = request.state.auth.user_id
         scope = AccountScope(kind="all") if not account_id else AccountScope(
             kind="account", account=account_id
         )
         if scope.kind == "account":
             # 会话里的账户是 UUID；不存在的 UUID 会让后续账本查询静默返回空。
-            # **只接受 active 账户**：归档账户能建会话的话，后续每次工具调用都会
-            # 静默返回空账本，用户看到"没有数据"而不是"账户已归档"。
+            # **只接受该用户自己的 active 账户**：账户条件必须叠加用户条件，否则 A 可以
+            # 用 B 的账户 UUID 建会话，之后每次工具调用都按会话归属去读那个账户。
+            # **只接受 active**：归档账户能建会话的话，后续每次工具调用都会静默返回空
+            # 账本，用户看到"没有数据"而不是"账户已归档"。
             exists = connection.execute(
-                "SELECT 1 FROM accounts WHERE id = CAST(? AS UUID) AND status = 'active'",
-                [account_id],
+                """
+                SELECT 1 FROM accounts
+                WHERE id = CAST(? AS UUID) AND user_id = CAST(? AS UUID)
+                  AND status = 'active'
+                """,
+                [account_id, user_id],
             ).fetchone()
             if exists is None:
                 raise HTTPException(
@@ -171,8 +186,11 @@ def create_agent_router() -> APIRouter:
                 )
 
         now = datetime.now(UTC)
+        # 账本基线版本按**当前用户**读取：全局 max(version) 会让 A 的会话拿到一个
+        # 由 B 的导入推高的版本号（P0 契约 §3.3）。
         ledger_row = connection.execute(
-            "SELECT coalesce(max(version), 0) FROM ledger_versions"
+            "SELECT coalesce(max(version), 0) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+            [user_id],
         ).fetchone()
         try:
             snapshot = create_agent_session(
@@ -191,12 +209,18 @@ def create_agent_router() -> APIRouter:
             ) from error
 
         DuckDbAgentSessionRepository(connection).create_session(
-            snapshot, device_id=request.state.device.id, now=now
+            snapshot,
+            device_id=request.state.auth.device_id,
+            # 归属写进不可变会话身份：它同时是之后每次读取与工具调用的授权依据。
+            user_id=user_id,
+            now=now,
         )
         # **创建后立即登记运行态**：否则"建会话 → 订阅事件"的标准时序里，第一次订阅
         # 必然拿到 snapshot_required（运行态不存在），而参考实现此时会返回空事件列表。
         request.app.state.agent_orchestrator.register(
-            snapshot, device_id=request.state.device.id
+            snapshot,
+            device_id=request.state.auth.device_id,
+            user_id=user_id,
         )
         return {"session": project_agent_session(snapshot)}
 
@@ -219,19 +243,23 @@ def create_agent_router() -> APIRouter:
     def read_session(session_id: str, request: Request) -> Any:
         """读取会话快照与消息。
 
-        @raises HTTPException: 会话不存在（404）。
+        @raises HTTPException: 会话不存在或不属于当前用户（404）。
         """
         _require_session_id(session_id)
         connection = request.app.state.database.connection
-        row = DuckDbAgentSessionRepository(connection).load_session(session_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail={"code": "AGENT_SESSION_NOT_FOUND"})
+        row = _owned_session(request, session_id)
         messages = AgentMessageRepository(connection).load_messages(session_id)
         return {"session": project_agent_session(_rebuild(row, messages))}
 
     @router.get("/v1/agent/sessions/{session_id}/tool-calls")
     def read_tool_calls(session_id: str, request: Request) -> Any:
-        """读取会话的工具调用审计记录。"""
+        """读取会话的工具调用审计记录。
+
+        **审计列表同样要校验归属**：它是会话内容的另一种视图，少了这一步，任何已认证
+        用户都能凭一个会话 ID 读到别人问过什么、调了哪些工具（V07）。
+        """
+        _require_session_id(session_id)
+        _owned_session(request, session_id)
         connection = request.app.state.database.connection
         calls = AgentMessageRepository(connection).load_tool_calls(session_id)
         # **信封键必须是 ``toolCalls``**：客户端读的是这个键（缺失时静默显示为空），
@@ -244,9 +272,13 @@ def create_agent_router() -> APIRouter:
         """请求取消：把会话推进到 ``cancelling``。
 
         **真正的中止由编排器完成**，本端点只标记意图。客户端看到 ``cancelling``
-        表示"请求已受理、尚未停止"，不应据此认为回合已经结束。
+        表示"请求已受理、尚未停止"。
+
+        归属校验先于取消：编排器的运行态只按会话 ID 索引，若不在入口处校验，
+        A 就能取消 B 正在跑的回合。
         """
         _require_session_id(session_id)
+        _owned_session(request, session_id)
         snapshot = request.app.state.agent_orchestrator.request_cancel(
             session_id, now=datetime.now(UTC)
         )
@@ -285,15 +317,17 @@ def create_agent_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"code": "INVALID_ARGUMENT"})
 
         connection = request.app.state.database.connection
-        row = DuckDbAgentSessionRepository(connection).load_session(session_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail={"code": "AGENT_SESSION_NOT_FOUND"})
+        row = _owned_session(request, session_id)
         if row.status != "idle":
             # 回合边界之外不能发新消息——否则两个回合会交错。
             raise HTTPException(
                 status_code=409,
                 detail={"code": "AGENT_SESSION_STATE_CONFLICT", "from": row.status},
             )
+        # **回合真正开始前再复核一次授权**：请求经过认证依赖之后、模型真正开跑之前可能
+        # 已经被停用（停用与业务写入经同一写协调器排序，提交后排队任务一开始执行就必须
+        # 被拒）。权限依赖只覆盖请求进入的那一刻，覆盖不了线程池排队与长回合（V11）。
+        _require_active_user(connection, row.user_id)
 
         executor = request.app.state.agent_executor
         if executor is None:
@@ -310,6 +344,8 @@ def create_agent_router() -> APIRouter:
                 _rebuild(row, messages),
                 last_event_sequence=row.last_event_sequence,
                 device_id=row.device_id,
+                # 工具调用的用户范围只认会话身份；模型参数无法指定它。
+                user_id=row.user_id,
                 # 用户与助手消息接着既有行排列，运行态在开始回合时原子推进序号。
                 next_ordinal=len(messages) + 1,
             )
@@ -336,21 +372,68 @@ def create_agent_router() -> APIRouter:
     @router.delete("/v1/agent/sessions/{session_id}")
     def close_session(session_id: str, request: Request) -> Any:
         """关闭会话；只有 ``idle`` 会话可以关闭。"""
+        _require_session_id(session_id)
+        _owned_session(request, session_id)
         return _transition(request, session_id, "closed")
 
     return router
 
 
+def _owned_session(request: Request, session_id: str) -> AgentSessionRow:
+    """按「当前用户 + 会话 ID」读取会话，读不到即 404。
+
+    **归属校验落在仓储查询里**，而不是"取到行再比对 user_id"：比对写法只要漏一次就是
+    一次越权，而带范围的查询漏不了。不属于当前用户的会话与不存在的会话返回同一个
+    404，避免用错误码探测他人会话是否存在（计划 §4.2）。
+
+    @param request: 请求对象；用户取自已认证上下文。
+    @param session_id: 会话 ID（调用方需先校验 UUID 格式）。
+    @returns 会话行；保证属于当前用户。
+    @raises HTTPException: 会话不存在或不属于当前用户（404）。
+    """
+    connection = request.app.state.database.connection
+    row = DuckDbAgentSessionRepository(connection).load_session_for_user(
+        session_id, request.state.auth.user_id
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail={"code": "AGENT_SESSION_NOT_FOUND"})
+    return row
+
+
+def _require_active_user(connection: Any, user_id: str) -> None:
+    """确认该用户仍处于活动状态，否则按 ``USER_DISABLED`` 拒绝。
+
+    令牌认证本身已经查过用户状态，但那发生在请求进入时。停用与业务写入走同一个写
+    协调器，因此**停用提交之后才开始执行的排队任务必须在这里被拦下**（计划 §4.4、
+    V11）——否则一个排在停用之前、执行在停用之后的回合仍会写入并投递数据。
+
+    @param connection: 数据库连接。
+    @param user_id: 待校验的用户 UUID 文本。
+    @raises HTTPException: 用户不存在或已停用（403）。
+    """
+    row = connection.execute(
+        "SELECT status FROM users WHERE id = CAST(? AS UUID)", [user_id]
+    ).fetchone()
+    if row is not None and row[0] == "active":
+        return
+    error = user_disabled_error()
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": error.message},
+    )
+
+
 def _transition(request: Request, session_id: str, target: str) -> Any:
     """按状态机推进会话，并以 CAS 落库。
 
-    @raises HTTPException: 会话不存在（404）或转换非法（409）。
+    归属校验在这里再做一次（而不是只依赖调用方）：本函数同样可以被尚无内存运行态的
+    路径调用，漏校验就等于给了另一条越权入口。
+
+    @raises HTTPException: 会话不存在或不属于当前用户（404）、转换非法（409）。
     """
     connection = request.app.state.database.connection
     repository = DuckDbAgentSessionRepository(connection)
-    row = repository.load_session(session_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail={"code": "AGENT_SESSION_NOT_FOUND"})
+    row = _owned_session(request, session_id)
 
     snapshot = _rebuild(row, ())
     try:

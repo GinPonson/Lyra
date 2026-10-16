@@ -48,8 +48,14 @@ String _loginFailureMessage(LyraApiError error) => switch (error.code) {
   'AUTH_NOT_CONFIGURED' => '此登录方式暂不可用，请选择其他方式。',
   'LOGIN_RATE_LIMITED' => '尝试次数较多，请稍后重试。',
   'CLIENT_VERSION_INCOMPATIBLE' => '请更新 Lyra 后重试。',
+  // 停用是终态：明确告知原因，不提供刷新或重试入口。
+  kUserDisabledCode => '账号已停用，请联系管理员。',
+  // 兑换阶段的通用失败（含自动注册事务失败）：明确失败并要求重新登录。
+  'LOGIN_FAILED' => '登录未能完成，请重新登录。',
   _ when error.statusCode == 429 => '尝试次数较多，请稍后重试。',
   _ when error.statusCode == 0 => '暂时无法登录，请检查网络后重试。',
+  // 服务端写入故障（含注册事务异常）：明确失败并允许重试，不假装成功。
+  _ when error.statusCode >= 500 => '登录服务暂时不可用，请稍后重试。',
   _ => '登录未完成，请重试。',
 };
 
@@ -336,6 +342,13 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
             ),
             const SizedBox(height: 12),
           ],
+          // 不提供独立注册表单：完成授权即自动创建账号，新用户直接进入空账本
+          // 与既有首次导入流程。这里只做说明，不新增任何输入项。
+          const Text(
+            '首次登录将自动创建账号。',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: LyraColors.muted, fontSize: 13, height: 1.5),
+          ),
           if (_submitting) ...[
             Semantics(
               liveRegion: true,

@@ -54,6 +54,7 @@ class CredentialSnapshot {
     required this.deviceId,
     required this.accessToken,
     required this.refreshToken,
+    this.userId,
     this.devicePrivateKey,
     this.authMethod,
     this.userEmail,
@@ -66,6 +67,12 @@ class CredentialSnapshot {
   final String deviceId;
   final String accessToken;
   final String refreshToken;
+
+  /// 服务端稳定用户 ID；登录响应的 `user.userId` 是唯一身份锚点。
+  ///
+  /// 缺失表示协议 2 时期的旧凭据：会话层必须清理并要求重新登录，绝不能按
+  /// 邮箱或第三方 subject 猜测归属。
+  final String? userId;
 
   /// 缺失表示旧版配对凭据，迁移后必须重新登录。
   final String? authMethod;
@@ -116,6 +123,7 @@ class SecureCredentialStore implements CredentialStore {
       deviceId: deviceId,
       accessToken: accessToken,
       refreshToken: refreshToken,
+      userId: await _storage.read(key: _keyUserId),
       devicePrivateKey: await _storage.read(key: _keyDevicePrivateKey),
       authMethod: await _storage.read(key: _keyAuthMethod),
       userEmail: await _storage.read(key: _keyUserEmail),
@@ -131,6 +139,7 @@ class SecureCredentialStore implements CredentialStore {
     await _storage.write(key: _keyDeviceId, value: snapshot.deviceId);
     await _storage.write(key: _keyAccessToken, value: snapshot.accessToken);
     await _storage.write(key: _keyRefreshToken, value: snapshot.refreshToken);
+    await _storage.write(key: _keyUserId, value: snapshot.userId);
     await _storage.write(key: _keyAuthMethod, value: snapshot.authMethod);
     await _storage.write(key: _keyUserEmail, value: snapshot.userEmail);
     await _storage.write(key: _keyGoogleSubject, value: snapshot.googleSubject);
@@ -153,6 +162,7 @@ class SecureCredentialStore implements CredentialStore {
     await _storage.delete(key: _keyDeviceId);
     await _storage.delete(key: _keyAccessToken);
     await _storage.delete(key: _keyRefreshToken);
+    await _storage.delete(key: _keyUserId);
     await _storage.delete(key: _keyDevicePrivateKey);
     await _storage.delete(key: _keyAuthMethod);
     await _storage.delete(key: _keyUserEmail);
@@ -162,6 +172,7 @@ class SecureCredentialStore implements CredentialStore {
   }
 
   static const String _keyDevicePrivateKey = 'lyra.devicePrivateKey';
+  static const String _keyUserId = 'lyra.userId';
   static const String _keyAuthMethod = 'lyra.authMethod';
   static const String _keyUserEmail = 'lyra.userEmail';
   static const String _keyGoogleSubject = 'lyra.googleSubject';

@@ -9,7 +9,7 @@ import 'package:lyra_mobile/core/security/credential_store.dart';
 import 'session_flow_test.dart' show FakeLyraAdapter;
 
 void main() {
-  test('并发 401 共享一次刷新，所有请求使用新令牌重放且携带协议 2', () async {
+  test('并发 401 共享一次刷新，所有请求使用新令牌重放且携带协议 3', () async {
     final store = MemoryCredentialStore();
     await store.write(_snapshot);
     final started = Completer<void>();
@@ -27,7 +27,7 @@ void main() {
       },
       dio: Dio(BaseOptions(baseUrl: _snapshot.serverUrl))
         ..httpClientAdapter = FakeLyraAdapter((options) async {
-          expect(options.headers['x-lyra-protocol-version'], '2');
+          expect(options.headers['x-lyra-protocol-version'], '3');
           final authorization = options.headers['authorization'];
           headers.add(authorization);
           return _response(authorization == 'Bearer fresh-token' ? 200 : 401);
@@ -103,6 +103,7 @@ void main() {
           deviceId: otherServer ? _snapshot.deviceId : 'other-device',
           accessToken: 'other-private-token',
           refreshToken: 'other-refresh',
+          userId: 'other-user',
           authMethod: 'google',
         ),
       );
@@ -120,6 +121,52 @@ void main() {
       expect((await store.read())?.accessToken, 'other-private-token');
     });
   }
+
+  test('用户停用结束会话且不刷新、不重放，错误保持不可重试', () async {
+    final store = MemoryCredentialStore();
+    await store.write(_snapshot);
+    var requests = 0;
+    var refreshes = 0;
+    var disabledSessions = 0;
+    final client = LyraApiClient(
+      serverUrl: _snapshot.serverUrl,
+      deviceId: _snapshot.deviceId,
+      credentialStore: store,
+      tokenRefresher: () async {
+        refreshes++;
+        return 'fresh-token';
+      },
+      onUserDisabled: () async {
+        disabledSessions++;
+        await store.clear();
+      },
+      dio: Dio(BaseOptions(baseUrl: _snapshot.serverUrl))
+        ..httpClientAdapter = FakeLyraAdapter((options) async {
+          requests++;
+          return ResponseBody.fromString(
+            '{"code":"USER_DISABLED","message":"该账号已停用","retryable":false}',
+            403,
+            headers: {
+              Headers.contentTypeHeader: [Headers.jsonContentType],
+            },
+          );
+        }),
+    );
+    await expectLater(
+      client.get<Object?>('/v1/ledger/summary', {}),
+      throwsA(
+        isA<LyraApiError>()
+            .having((e) => e.code, 'code', 'USER_DISABLED')
+            .having((e) => e.statusCode, 'status', 403)
+            .having((e) => e.retryable, 'retryable', isFalse),
+      ),
+    );
+    expect(disabledSessions, 1);
+    expect(refreshes, 0);
+    expect(requests, 1);
+    expect(client.accessToken, isNull);
+    expect(await store.read(), isNull);
+  });
 
   test('身份失效后的旧客户端不能重用缓存令牌', () async {
     final store = MemoryCredentialStore();
@@ -151,6 +198,7 @@ const _snapshot = CredentialSnapshot(
   deviceId: 'test-device',
   accessToken: 'expired-token',
   refreshToken: 'refresh-token',
+  userId: 'client-user',
   authMethod: 'google',
 );
 

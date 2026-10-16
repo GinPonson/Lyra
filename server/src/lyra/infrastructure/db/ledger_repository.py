@@ -8,6 +8,10 @@
    比较（``open_date``、``close_date``）；直接传对象会让排序退化成对象比较。
 2. **账户以脱敏键呈现**。表里存的是 ``account_id`` UUID，领域层的账户身份是
    ``legacy_account_key``；少了这层 JOIN，所有账户范围过滤都会失效。
+
+**用户范围是构造期绑定、不可绕过的基底**：``transactions`` / ``lots`` / ``realized``
+按契约刻意不带 ``user_id``（P0 契约 §3.2），它们唯一的跨用户保护就是本模块每条查询
+里的 ``a.user_id = ?``。
 """
 
 from __future__ import annotations
@@ -63,16 +67,25 @@ class LedgerSnapshot:
 class DuckDbLedgerRepository:
     """账本快照仓储。
 
+    仓储在**构造时**绑定用户：账本的所有表（``transactions`` / ``lots`` /
+    ``realized``）经 account 归属隔离，自身没有 ``user_id`` 列，跨用户保护**完全依赖
+    本模块的查询范围**（P0 契约 §3.2）。把 ``user_id`` 做成方法参数会让每个调用点都能
+    忘记传它；做成构造参数则每个实例天然只可能看到一个用户的账本。
+
     @param connection: 已迁移到当前 schema 的连接；本仓储只读。
+    @param user_id: 当前用户的 UUID 文本；**必填**，不接受 ``None`` 表示全部用户。
     """
 
-    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+    def __init__(
+        self, connection: duckdb.DuckDBPyConnection, *, user_id: str
+    ) -> None:
         self._connection = connection
+        self._user_id = user_id
 
     def load_snapshot(self, account_scope: AccountScope | None = None) -> LedgerSnapshot:
         """读取全部标准交易、未平批次与已实现明细。
 
-        @param account_scope: 可选账户范围；``None`` 表示全部账户。
+        @param account_scope: 可选账户范围；``None`` 表示**该用户的**全部账户。
         @returns 按稳定顺序排列的三组领域对象。
         """
         scope = account_scope
@@ -84,13 +97,25 @@ class DuckDbLedgerRepository:
         )
 
     def _scope_filter(self, scope: AccountScope | None) -> tuple[str, list[Any]]:
-        """构造账户范围过滤子句。
+        """构造账户范围过滤子句，**永远叠加当前用户条件**。
 
-        @returns ``(SQL 片段, 参数)``；范围为空时两者都为空。
+        ``scope.kind == "all"`` 以前不加任何条件，那在多用户下等于"返回全库账本"：
+        A 的 ``scope=all`` 会算出 B 的持仓与已实现损益。因此这里把它改成
+        「该用户的全部账户」——用户条件是**基底**，账户条件只是在它之上的收窄。
+
+        账户键本身已在用户内唯一，仍与用户条件同时保留：账户键是用户输入（
+        ``?scope=`` 最终会走到这里），只靠键匹配意味着任何人只要猜中别人的键就能读到
+        别人的账本。
+
+        @param scope: 账户范围；``None`` 或 ``kind == "all"`` 表示该用户的全部账户。
+        @returns ``(SQL 片段, 参数)``；片段始终非空，参数以 ``user_id`` 开头。
         """
-        if scope is None or scope.kind == "all":
-            return "", []
-        return "AND a.legacy_account_key = ?", [scope.account]
+        where = "AND a.user_id = CAST(? AS UUID)"
+        params: list[Any] = [self._user_id]
+        if scope is not None and scope.kind != "all":
+            where += " AND a.legacy_account_key = ?"
+            params.append(scope.account)
+        return where, params
 
     def _accounts(self, scope: AccountScope | None) -> tuple[LedgerAccount, ...]:
         """读取账户身份与基础币种，供公开响应按币种分组。"""

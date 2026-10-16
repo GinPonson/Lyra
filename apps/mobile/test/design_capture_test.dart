@@ -140,9 +140,9 @@ Dio _systemClient(String url) => Dio(BaseOptions(baseUrl: url))
     final response = switch (options.uri.path) {
       '/v1/system/info' => {
         'server_version': '0.1.0',
-        'protocol_version': 2,
-        'min_supported_protocol_version': 2,
-        'max_supported_protocol_version': 2,
+        'protocol_version': 3,
+        'min_supported_protocol_version': 3,
+        'max_supported_protocol_version': 3,
         'schema_version': 2,
       },
       '/v1/health' => {'status': 'healthy'},
@@ -266,6 +266,7 @@ void main() {
             deviceId: 'visual-qa-device',
             accessToken: 'synthetic-visual-token',
             refreshToken: 'synthetic-visual-refresh',
+            userId: 'synthetic-visual-user',
             authMethod: 'google',
             userEmail: 'demo@example.com',
             googleSubject: 'synthetic-visual-user',

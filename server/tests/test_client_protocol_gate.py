@@ -22,11 +22,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 
@@ -47,8 +47,10 @@ def application(tmp_path: Path):
     )
     application = create_app(settings, database)
     repository = DuckDbDeviceRepository(database.connection)
-    service = DevicePairingService(repository, WriteCoordinator())
-    issued = asyncio.run(service.authorize_owner_device(
+    service = DevicePairingService(
+        repository, application.state.write_coordinator, UserRepository(database.connection)
+    )
+    issued = asyncio.run(service.authorize_user_device(
         identity=_IDENTITY, display_name="Pixel 9", public_key_pem=_PUBLIC_KEY_PEM
     ))
     try:
@@ -85,15 +87,20 @@ def test_the_426_body_carries_the_supported_range(application) -> None:
         body = client.get("/v1/ledger/accounts").json()
 
     assert body["details"] == {
-        "min_supported_protocol_version": 2,
-        "max_supported_protocol_version": 2,
+        "min_supported_protocol_version": 3,
+        "max_supported_protocol_version": 3,
     }
     assert body["retryable"] is False
 
 
-@pytest.mark.parametrize("raw", ["", "abc", "1", "999", "-1", "2.5"])
+@pytest.mark.parametrize("raw", ["", "abc", "1", "2", "999", "-1", "2.5"])
 def test_out_of_range_versions_are_rejected(application, raw: str) -> None:
-    """非整数或超出区间的版本一律 426。"""
+    """非整数或超出区间的版本一律 426。
+
+    ``"2"`` 必须在这个列表里：多用户服务端抬高了最低支持版本，协议 2 的客户端
+    不理解 ``user`` 对象，放行它会让它按单账本语义工作。这条断言就是 V16 的
+    「旧协议被清楚拒绝」。
+    """
     app, _ = application
     with TestClient(app, headers={"x-lyra-protocol-version": raw}) as client:
         response = client.get("/v1/ledger/accounts")

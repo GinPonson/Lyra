@@ -6,12 +6,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:lyra_mobile/core/api/lyra_api_error.dart';
 import 'package:lyra_mobile/features/system/system_repository.dart';
 
+/// 协议 3 服务端；客户端协议同为 3，必须判为兼容。
 const _metadata = <String, Object?>{
   'server_version': '0.1.0',
-  'protocol_version': 2,
-  'min_supported_protocol_version': 2,
-  'max_supported_protocol_version': 2,
-  'schema_version': 13,
+  'protocol_version': 3,
+  'min_supported_protocol_version': 3,
+  'max_supported_protocol_version': 3,
+  'schema_version': 16,
 };
 
 void main() {
@@ -34,14 +35,15 @@ void main() {
     repository.close();
   });
 
-  test('新版服务端仍支持当前协议时保持兼容', () async {
+  test('更高协议的服务端仍支持当前协议时保持兼容', () async {
     final repository = _repository(
       (request) async => _json(
         request.path.endsWith('/info')
             ? {
                 ..._metadata,
-                'protocol_version': 3,
-                'max_supported_protocol_version': 3,
+                'protocol_version': 4,
+                'min_supported_protocol_version': 3,
+                'max_supported_protocol_version': 4,
               }
             : {'status': 'degraded'},
       ),
@@ -52,15 +54,15 @@ void main() {
     repository.close();
   });
 
-  test('协议不兼容和服务不可达分别处理', () async {
+  test('协议 3 客户端拒绝只支持协议 2 的服务端，且不发健康请求', () async {
     var calls = 0;
     final repository = _repository((request) async {
       calls++;
       return _json({
         ..._metadata,
-        'protocol_version': 3,
-        'min_supported_protocol_version': 3,
-        'max_supported_protocol_version': 3,
+        'protocol_version': 2,
+        'min_supported_protocol_version': 2,
+        'max_supported_protocol_version': 2,
       });
     });
     final result = await repository.check();

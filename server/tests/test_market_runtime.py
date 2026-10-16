@@ -57,23 +57,60 @@ def test_provider_catalog_reports_real_timing_and_cache_settings() -> None:
     assert providers["marketdata"].cache_ttl_seconds == 900
 
 
-def test_persisted_routes_initialize_runtime_without_revision_rollback() -> None:
-    """数据库设置覆盖启动默认值，较旧读取不能回退运行时修订号。"""
-    from lyra.domain.market_data.types import StockInstrument
+def test_settings_snapshot_is_read_per_user(tmp_path) -> None:
+    """设置快照**按用户**读取，运行时不再保存"当前路由/修订号"。
+
+    旧设计把库里的设置装进运行时实例（``initialize_settings``），多用户下等于让最后
+    保存的用户覆盖所有人的来源（计划 §4.4「禁止每个请求覆盖同一 runtime 的全局
+    路由」）。这里逐条验证新契约：两个用户各自读回自己的行，实例上不存在可被请求改写
+    的当前路由。
+    """
+    from datetime import UTC, datetime
+
+    from lyra.db.connection import open_lyra_database
+    from lyra.domain.market_data.settings import normalize_routes
+    from lyra.infrastructure.auth.login_provider import LoginIdentity
+    from lyra.infrastructure.db.market_settings_repository import persist_market_settings
+    from lyra.infrastructure.db.user_repository import UserRepository
 
     runtime = _runtime()
+    database = open_lyra_database(str(tmp_path / "runtime-settings.duckdb"))
+    try:
+        connection = database.connection
+        users = UserRepository(connection)
+        now = datetime(2026, 10, 15, tzinfo=UTC)
+        owner = users.find_or_create_user_for_identity(
+            LoginIdentity(provider="github", subject="1", email=None, display_name="owner"),
+            now=now,
+        ).user
+        other = users.find_or_create_user_for_identity(
+            LoginIdentity(provider="github", subject="2", email=None, display_name="other"),
+            now=now,
+        ).user
+        persist_market_settings(
+            connection, owner.id,
+            expected_revision=0,
+            routes=normalize_routes({"stock": ["marketdata"], "option": ["alpaca"]}),
+            now=now,
+        )
 
-    initialized = runtime.initialize_settings(
-        {"stock": ("marketdata",), "option": ("alpaca",)}, 4
-    )
-    stale_read = runtime.initialize_settings(
-        {"stock": (), "option": ()}, 3
-    )
+        snapshot = runtime.settings_snapshot(connection, owner.id)
+        assert snapshot.revision == 1
+        assert snapshot.routes == {"stock": ("marketdata",), "option": ("alpaca",)}
+        assert snapshot.updated_at is not None
 
-    assert initialized.revision == 4
-    assert stale_read == initialized
-    assert runtime.settings_snapshot() == initialized
-    assert runtime.service.get_quote(StockInstrument(symbol="INTC")).issue == "not_configured"
+        # 另一个用户读回自己的（从未保存 → 部署默认路由、revision 0）。
+        other_snapshot = runtime.settings_snapshot(connection, other.id)
+        assert other_snapshot.revision == 0
+        assert other_snapshot.updated_at is None
+        assert other_snapshot.routes != snapshot.routes
+
+        # 运行时上不再有"当前路由/当前修订号"这类可被请求改写的实例状态。
+        assert not hasattr(runtime, "initialize_settings")
+        assert not hasattr(runtime, "_routes")
+        assert not hasattr(runtime, "_settings_revision")
+    finally:
+        database.close()
 
 
 def test_providers_are_registered_by_credentials_not_routes() -> None:

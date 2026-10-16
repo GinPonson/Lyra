@@ -86,7 +86,7 @@ class LoginAttempt:
     error: ApplicationError | None = None
 
 
-class OwnerLoginService:
+class UserLoginService:
     """绑定来源、状态与 PKCE 的一次性登录事务。"""
 
     def __init__(
@@ -207,15 +207,19 @@ class OwnerLoginService:
         code: str | None = None,
         error: str | None = None,
     ) -> None:
-        """浏览器回调：校验 state、交换并核准 owner。
+        """浏览器回调：校验 state 并交换授权码，得到**已验证的来源身份**。
 
         **在首个可选失败点之前就占用状态**，阻止同一授权码被并发消费。
+
+        **这里不创建用户**：回调只证明"浏览器完成了来源验证"。用户是在
+        :meth:`exchange` 中、App 用绑定 verifier 兑换凭据时才解析或自动注册的
+        ——授权取消、code 无效或事务过期都不会留下一个用户（计划 §4.3）。
 
         @param provider_id: 来源 ID。
         @param state: 回调携带的 state 原文。
         @param code: 授权码。
         @param error: 上游返回的错误标识。
-        @raises ApplicationError: state 无效、事务已用、交换失败或 owner 不符。
+        @raises ApplicationError: state 无效、事务已用或授权码交换失败。
         """
         provider = self._provider(provider_id)
         login_id = self._states.get(sha256_text(state)) if _CODE_CHALLENGE.fullmatch(state) else None
@@ -246,7 +250,6 @@ class OwnerLoginService:
             self._assert_not_expired(attempt)
             if identity.provider != provider_id or not identity.subject:
                 raise _login_failed()
-            provider.assert_owner(identity)
             # 只保留统一身份字段，不透传上游额外资料或第三方令牌。
             attempt.identity = LoginIdentity(
                 provider=identity.provider,
@@ -270,11 +273,16 @@ class OwnerLoginService:
     ) -> dict[str, Any]:
         """轮询与最终兑换；两者都必须带 App verifier。
 
+        **自动注册发生在本方法的成功路径上**：verifier 与 challenge 比对通过、事务处于
+        ``approved`` 之后才调用设备签发用例，而后者按已验证身份解析或创建用户。
+        未完成验证（pending / failed / 已兑换）时不会创建任何用户。
+
         @param provider_id: 来源 ID。
         @param login_id: 登录事务 ID。
         @param code_verifier: App 侧 PKCE verifier。
-        @returns ``{"status": "pending"}`` 或兑换完成的凭据与身份。
-        @raises ApplicationError: verifier 不符、事务失败、已用或已过期。
+        @returns ``{"status": "pending"}`` 或兑换完成的凭据与用户对象。
+        @raises ApplicationError: verifier 不符、事务失败、已用或已过期；
+            该身份的用户已停用时返回 ``USER_DISABLED``（403）。
         """
         # **verifier 的格式检查先于"来源是否配置"。**
         #
@@ -305,7 +313,9 @@ class OwnerLoginService:
             attempt.status = "consumed"
             attempt.terminated_at = self._now_ms()
             attempt.identity = None
-            return {"status": "complete", **credentials, "user": identity}
+            # 凭据里已经带上本次解析出的 ``user`` 与 ``identity``（由设备签发用例返回），
+            # 因此这里不再自己拼一个 user 字段——两处各拼一次必然会在某个字段上漂移。
+            return {"status": "complete", **credentials}
         except Exception as error:
             attempt.status = "failed"
             attempt.terminated_at = self._now_ms()

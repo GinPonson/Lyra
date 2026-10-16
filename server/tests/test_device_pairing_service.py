@@ -7,6 +7,17 @@
 2. **重新配对先撤销旧凭据**——否则旧 refresh 在新的会话建立后仍可用；
 3. **重用检测撤销整个凭据族**——只拒绝这一次请求等于把窗口留给攻击者；
 4. **撤销幂等**——重放退出登录不改写审计时间。
+
+**多用户适配**：``DevicePairingService`` 现在还需要 ``UserRepository``（第三个必填
+参数），登录签发路径的**外层事务由用户仓储开启**，设备仓储的 ``transaction()``
+只服务刷新与撤销。因此：
+
+- 内存替身新增 :class:`FakeUserRepository`，按 ``(provider, subject)`` 自动注册用户
+  与身份；设备记录通过 ``user_id`` / ``identity_id`` 绑定到它们（schema 16 的
+  ``NOT NULL`` + 复合外键）；
+- ``claim_server_owner_identity`` 这一单 owner 归属动作已随白名单一起删除（契约
+  §3.10），不再有对应断言；
+- 签发路径的「恰好一个事务」改为断言**用户仓储**的事务计数。
 """
 
 from __future__ import annotations
@@ -17,6 +28,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -28,6 +40,11 @@ from lyra.application.device_pairing_service import (
 )
 from lyra.application.write_coordinator import WriteCoordinator
 from lyra.infrastructure.auth.login_provider import LoginIdentity
+from lyra.infrastructure.db.user_repository import (
+    ResolvedUser,
+    UserIdentityRecord,
+    UserRecord,
+)
 from lyra.security.device_auth import (
     DeviceAccessTokenRecord,
     DeviceRefreshCredentialRecord,
@@ -47,6 +64,74 @@ NOW = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
 IDENTITY = LoginIdentity(provider="github", subject="12345", email=None, display_name="octocat")
 
 
+class FakeUserRepository:
+    """内存用户目录：只实现签发路径用到的两个动作。
+
+    与真实 :class:`UserRepository` 同形——``transaction()`` 可重入（这里用计数近似，
+    服务只开一层）与 ``find_or_create_user_for_identity`` 按 ``(provider, subject)``
+    解析或自动注册普通用户。
+    """
+
+    def __init__(self) -> None:
+        self.users: dict[str, UserRecord] = {}
+        self.identities: dict[tuple[str, str], UserIdentityRecord] = {}
+        self.transactions = 0
+        self.calls: list[str] = []
+
+    @contextmanager
+    def transaction(self):
+        """记录事务边界；异常时不做部分提交（内存实现天然如此）。"""
+        self.transactions += 1
+        self.calls.append("begin")
+        try:
+            yield
+        except Exception:
+            self.calls.append("rollback")
+            raise
+        self.calls.append("commit")
+
+    def find_or_create_user_for_identity(
+        self, identity: LoginIdentity, *, now: datetime
+    ) -> ResolvedUser:
+        """按 ``(provider, subject)`` 解析；未命中即创建 ``member`` 用户与身份。"""
+        key = (identity.provider, identity.subject)
+        existing = self.identities.get(key)
+        if existing is not None:
+            return ResolvedUser(
+                user=self.users[existing.user_id], identity=existing, created=False
+            )
+
+        stamp = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        user = UserRecord(
+            id=str(uuid4()),
+            display_name=identity.display_name or identity.subject,
+            status="active",
+            role="member",
+            created_at=stamp,
+            updated_at=stamp,
+        )
+        record = UserIdentityRecord(
+            id=str(uuid4()),
+            user_id=user.id,
+            provider=identity.provider,
+            subject=identity.subject,
+            email=identity.email,
+            display_name=identity.display_name,
+            created_at=stamp,
+            updated_at=stamp,
+        )
+        self.users[user.id] = user
+        self.identities[key] = record
+        return ResolvedUser(user=user, identity=record, created=True)
+
+    def identity_by_id(self, identity_id: str) -> UserIdentityRecord | None:
+        """按身份 UUID 读取身份；供设备仓储替身回读绑定身份。"""
+        for record in self.identities.values():
+            if record.id == identity_id:
+                return record
+        return None
+
+
 class FakeRepository:
     """内存仓储：与协议一一对应，并记录调用顺序。"""
 
@@ -54,7 +139,8 @@ class FakeRepository:
         self.devices: dict[str, PairedDeviceRecord] = {}
         self.refresh: dict[str, DeviceRefreshCredentialRecord] = {}
         self.access: dict[str, DeviceAccessTokenRecord] = {}
-        self.owner_identity: LoginIdentity | None = None
+        # 用户目录替身由 ``_service`` 注入；服务持有同一个实例，这里只是为了断言。
+        self.users: FakeUserRepository
         self.transactions = 0
         self.calls: list[str] = []
 
@@ -70,14 +156,11 @@ class FakeRepository:
             raise
         self.calls.append("commit")
 
-    def claim_server_owner_identity(self, identity: LoginIdentity, now: datetime) -> None:
-        self.owner_identity = identity
-        self.calls.append("claim_owner")
-
-    def find_device_id_by_public_key(self, fingerprint: str) -> str | None:
+    def find_device_id_by_public_key(self, user_id: str, fingerprint: str) -> str | None:
+        """按 ``(user_id, 指纹)`` 查找设备：同一把公钥在两个用户下是两台设备。"""
         self.calls.append("find_device")
         for device_id, record in self.devices.items():
-            if record.public_key_fingerprint == fingerprint:
+            if record.user_id == user_id and record.public_key_fingerprint == fingerprint:
                 return device_id
         return None
 
@@ -90,6 +173,8 @@ class FakeRepository:
         device = self.devices[device_id]
         self.devices[device_id] = PairedDeviceRecord(
             id=device.id,
+            user_id=device.user_id,
+            identity_id=device.identity_id,
             display_name=display_name,
             public_key_pem=device.public_key_pem,
             public_key_fingerprint=device.public_key_fingerprint,
@@ -132,6 +217,28 @@ class FakeRepository:
             id=device.id, status=device.status, revoked_at=device.revoked_at
         )
 
+    def load_device_user(self, device_id: str) -> UserRecord | None:
+        """刷新前复核设备归属用户的状态。"""
+        self.calls.append("load_device_user")
+        device = self.devices.get(device_id)
+        if device is None:
+            return None
+        return self.users.users.get(device.user_id)
+
+    def load_device_identity(self, device_id: str) -> UserIdentityRecord | None:
+        """回读设备实际绑定的身份，供登录响应与 ``GET /v1/me`` 保持一致。"""
+        self.calls.append("load_device_identity")
+        device = self.devices.get(device_id)
+        if device is None:
+            return None
+        return self.users.identity_by_id(device.identity_id)
+
+    def list_device_ids_for_user(self, user_id: str) -> tuple[str, ...]:
+        self.calls.append("list_user_devices")
+        return tuple(
+            device_id for device_id, record in self.devices.items() if record.user_id == user_id
+        )
+
     def load_refresh_credential_family(
         self, device_id: str, family_id: str
     ) -> tuple[DeviceRefreshCredentialRecord, ...]:
@@ -172,14 +279,16 @@ def _replace(record: Any, **changes: Any) -> Any:
 def _service(now: datetime = NOW) -> tuple[DevicePairingService, FakeRepository]:
     """构造服务与内存仓储。"""
     repository = FakeRepository()
-    service = DevicePairingService(repository, WriteCoordinator(), now=lambda: now)
+    users = FakeUserRepository()
+    repository.users = users
+    service = DevicePairingService(repository, WriteCoordinator(), users, now=lambda: now)
     return service, repository
 
 
 def _authorize(service: DevicePairingService, pem: str = PUBLIC_KEY_PEM, name: str = "Pixel 9"):
     """签发设备凭据。"""
     return asyncio.run(
-        service.authorize_owner_device(
+        service.authorize_user_device(
             identity=IDENTITY, display_name=name, public_key_pem=pem
         )
     )
@@ -191,7 +300,7 @@ def _authorize(service: DevicePairingService, pem: str = PUBLIC_KEY_PEM, name: s
 
 
 def test_authorize_issues_device_and_both_credentials() -> None:
-    """签发应返回设备 ID、名称与一对凭据，并记录 owner 身份。"""
+    """签发应返回设备 ID、名称与一对凭据，并把设备归属到本次解析出的用户与身份。"""
     service, repository = _service()
 
     response = _authorize(service)
@@ -200,7 +309,15 @@ def test_authorize_issues_device_and_both_credentials() -> None:
     assert response.display_name == "Pixel 9"
     assert response.access_token
     assert response.refresh_token
-    assert repository.owner_identity == IDENTITY
+    # 首次登录自动注册为普通用户（契约 §3.10），响应同时给出 user 与 identity。
+    assert response.user.role == "member"
+    assert response.user.status == "active"
+    assert response.identity.provider == "github"
+    assert response.identity.subject == "12345"
+    # 设备行记下归属，且与登录响应报出的身份一致。
+    device = repository.devices[response.device_id]
+    assert device.user_id == response.user.id
+    assert device.identity_id == response.identity.id
     assert len(repository.refresh) == 1
     assert len(repository.access) == 1
 
@@ -234,11 +351,13 @@ def test_authorize_revokes_previous_credentials_on_repair() -> None:
     first = _authorize(service)
     old_hash = hash_opaque_credential(first.refresh_token)
 
+    # 只标记第二次授权那一轮：签发路径不再使用设备仓储的事务（外层事务由用户
+    # 仓储开启），因此按调用长度切分而不是按 ``commit`` 位置。
+    second_round_start = len(repository.calls)
     _authorize(service)
 
     assert repository.refresh[old_hash].status == "revoked"
-    # 只看第二次授权那一轮：`.index` 返回首次出现的位置，跨轮比较会得出错误结论。
-    second_round = repository.calls[repository.calls.index("commit") + 1 :]
+    second_round = repository.calls[second_round_start:]
     assert second_round.index("revoke_credentials") < second_round.index("create_refresh")
 
 
@@ -259,15 +378,18 @@ def test_authorize_rejects_invalid_public_key() -> None:
     with pytest.raises(Exception, match="公钥"):
         _authorize(service, pem="not a key")
     assert repository.transactions == 0
+    assert repository.users.transactions == 0
 
 
 def test_authorize_is_atomic() -> None:
-    """一次签发恰好使用一个事务。"""
+    """一次签发恰好使用一个事务，且由用户仓储持有（用户、身份、设备与凭据同提交）。"""
     service, repository = _service()
     _authorize(service)
 
-    assert repository.transactions == 1
-    assert repository.calls[-1] == "commit"
+    assert repository.users.transactions == 1
+    assert repository.users.calls[-1] == "commit"
+    # 设备仓储的 transaction() 不参与签发路径——重复 BEGIN 会中止 DuckDB 外层事务。
+    assert repository.transactions == 0
 
 
 # --------------------------------------------------------------------------

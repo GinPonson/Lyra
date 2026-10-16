@@ -1,7 +1,12 @@
 """设备会话的 DuckDB 仓储。
 
-把 :class:`DeviceRepository` 协议落到 schema 15 的真实表上：``paired_devices``、
-``device_refresh_credentials``、``device_access_tokens``、``server_owner_identity``。
+把 :class:`DeviceRepository` 协议落到 schema 16 的真实表上：``paired_devices``、
+``device_refresh_credentials``、``device_access_tokens``。
+
+设备**归属用户**：``paired_devices`` 带 ``user_id`` 与 ``identity_id``，唯一键是
+``(user_id, public_key_fingerprint)``，且 ``(user_id, identity_id)`` 有指向
+``user_identities`` 的复合外键。因此本模块不再写 owner 身份表——那张表在迁移 16 后
+已不存在，用户与身份的登记统一走 :class:`UserRepository`（P0 契约 §3.1/§3.7）。
 
 **时间戳一律以 ISO UTC 文本进出**（毫秒 + ``Z``），与现有实现同形：领域层按文本
 比较时间，若这里返回 ``datetime`` 对象，比较会静默失败。
@@ -18,7 +23,6 @@ import duckdb
 
 from ...application.app_error import ApplicationError
 from ...application.device_pairing_service import DeviceRepository
-from ...infrastructure.auth.login_provider import LoginIdentity
 from ...security.device_auth import (
     DeviceAccessTokenRecord,
     DeviceRefreshCredentialRecord,
@@ -26,6 +30,7 @@ from ...security.device_auth import (
     PairedDeviceRecord,
     RotatedDeviceRefreshCredential,
 )
+from .user_repository import UserIdentityRecord, UserRecord, UserRepository
 
 
 class DuckDbDeviceRepository(DeviceRepository):
@@ -36,6 +41,9 @@ class DuckDbDeviceRepository(DeviceRepository):
 
     def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
         self._connection = connection
+        # 用户目录读取复用 P1a 的仓储，而不是在这里重写一份 users/user_identities SQL：
+        # 状态与角色的解析规则只应有一处，否则两处会各自漂移。
+        self._users = UserRepository(connection)
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -56,53 +64,53 @@ class DuckDbDeviceRepository(DeviceRepository):
             raise
         self._connection.execute("COMMIT")
 
-    def claim_server_owner_identity(self, identity: LoginIdentity, now: datetime) -> None:
-        """登记该来源的 owner 身份。
+    def find_device_id_by_public_key(self, user_id: str, fingerprint: str) -> str | None:
+        """在**该用户范围内**按公钥指纹查找既有设备。
 
-        schema 15 的表是**每来源一行**（``provider`` 为主键），因此按 provider 更新；
-        邮箱与昵称不参与跨来源关联。
+        范围必须带用户：唯一键已从全局指纹改为 ``(user_id, 指纹)``，不带范围会让
+        两个持有同一把公钥的用户互相顶掉对方的设备行。
+
+        @param user_id: 归属用户 UUID 文本。
+        @param fingerprint: 设备公钥的 SHA-256 指纹。
+        @returns 既有设备 ID；该用户没有这台设备时 ``None``。
         """
-        stamp = _iso(now)
-        self._connection.execute(
-            """
-            INSERT INTO server_owner_identity
-                (singleton_key, provider, subject, email, display_name, created_at, updated_at)
-            VALUES (1, ?, ?, ?, ?, CAST(? AS TIMESTAMPTZ), CAST(? AS TIMESTAMPTZ))
-            ON CONFLICT (provider) DO UPDATE SET
-                subject = excluded.subject,
-                email = excluded.email,
-                display_name = excluded.display_name,
-                updated_at = excluded.updated_at
-            """,
-            [identity.provider, identity.subject, identity.email, identity.display_name, stamp, stamp],
-        )
-
-    def find_device_id_by_public_key(self, fingerprint: str) -> str | None:
-        """按公钥指纹查找既有设备；用于重装 App 后复用同一设备 ID。"""
         row = self._connection.execute(
-            "SELECT id FROM paired_devices WHERE public_key_fingerprint = ?", [fingerprint]
+            """
+            SELECT id FROM paired_devices
+            WHERE user_id = CAST(? AS UUID) AND public_key_fingerprint = ?
+            """,
+            [user_id, fingerprint],
         ).fetchone()
         return None if row is None else str(row[0])
 
     def create_paired_device(self, record: PairedDeviceRecord) -> None:
-        """插入一条新的活动设备记录。"""
+        """插入一条新的活动设备记录（含归属用户与本次登录身份）。"""
         self._connection.execute(
             """
             INSERT INTO paired_devices
-                (id, display_name, public_key_pem, public_key_fingerprint, key_algorithm,
+                (id, user_id, identity_id, display_name, public_key_pem,
+                 public_key_fingerprint, key_algorithm,
                  status, paired_at, last_seen_at, revoked_at, updated_at)
-            VALUES (CAST(? AS UUID), ?, ?, ?, ?, ?, CAST(? AS TIMESTAMPTZ), NULL, NULL,
-                    CAST(? AS TIMESTAMPTZ))
+            VALUES (CAST(? AS UUID), CAST(? AS UUID), CAST(? AS UUID), ?, ?, ?, ?,
+                    ?, CAST(? AS TIMESTAMPTZ), NULL, NULL, CAST(? AS TIMESTAMPTZ))
             """,
             [
-                record.id, record.display_name, record.public_key_pem,
-                record.public_key_fingerprint, record.key_algorithm, record.status,
-                record.paired_at, record.updated_at,
+                record.id, record.user_id, record.identity_id, record.display_name,
+                record.public_key_pem, record.public_key_fingerprint, record.key_algorithm,
+                record.status, record.paired_at, record.updated_at,
             ],
         )
 
     def reactivate_paired_device(self, device_id: str, display_name: str, now: datetime) -> None:
-        """重新配对：恢复 active、清空撤销时间，并且不回退 ``updated_at``。"""
+        """重新配对：恢复 active、清空撤销时间，且不回退 ``updated_at``。
+
+        **不更新 ``user_id``，也不更新 ``identity_id``**：设备一旦归属用户就不再改
+        owner，身份同理（契约 §3.1/§3.7）。这也不只是设计选择——DuckDB 1.5.6 对
+        「被外键引用的父行」更新**外键列**会直接抛
+        ``ConstraintException: ... is still referenced by a foreign key``（已实测），
+        而该设备的凭据行必须保留（重放检测依赖它们），所以这条路径上不可能改身份。
+        复合外键保证留存的身份始终与该设备同属一个用户。
+        """
         self._connection.execute(
             """
             UPDATE paired_devices
@@ -219,6 +227,71 @@ class DuckDbDeviceRepository(DeviceRepository):
             status=row[1],
             revoked_at=_iso(row[2]) if row[2] is not None else None,
         )
+
+    def load_device_user(self, device_id: str) -> UserRecord | None:
+        """读取设备的归属用户（认证与刷新时校验状态与角色）。
+
+        @param device_id: 设备 UUID 文本。
+        @returns 归属用户记录；设备不存在时 ``None``。
+        """
+        row = self._connection.execute(
+            "SELECT user_id FROM paired_devices WHERE id = CAST(? AS UUID)", [device_id]
+        ).fetchone()
+        if row is None:
+            return None
+        return self._users.find_user_by_id(str(row[0]))
+
+    def load_device_identity(self, device_id: str) -> UserIdentityRecord | None:
+        """读取设备**本次登录**对应的已验证身份。
+
+        ``GET /v1/me`` 的身份只能来自这条关联，不能由请求参数指定（契约 §3.9）；
+        复合外键 ``(user_id, identity_id)`` 保证它与设备同属一个用户。
+
+        @param device_id: 设备 UUID 文本。
+        @returns 身份记录；设备或身份不存在时 ``None``。
+        """
+        row = self._connection.execute(
+            """
+            SELECT i.id, i.user_id, i.provider, i.subject, i.email, i.display_name,
+                   i.created_at, i.updated_at
+            FROM paired_devices AS d
+            JOIN user_identities AS i
+              ON i.id = d.identity_id AND i.user_id = d.user_id
+            WHERE d.id = CAST(? AS UUID)
+            """,
+            [device_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return UserIdentityRecord(
+            id=str(row[0]),
+            user_id=str(row[1]),
+            provider=str(row[2]),  # type: ignore[arg-type] - 取值受 CHECK 约束限定为已知来源
+            subject=str(row[3]),
+            email=None if row[4] is None else str(row[4]),
+            display_name=None if row[5] is None else str(row[5]),
+            created_at=_iso(row[6]),
+            updated_at=_iso(row[7]),
+        )
+
+    def list_device_ids_for_user(self, user_id: str) -> Sequence[str]:
+        """列出该用户的全部设备 ID（含已撤销），供停用级联收口。
+
+        含已撤销设备是刻意的：级联要关闭事件流、终止在飞回合，而这些资源可能还挂在
+        一台刚被撤销的设备上。
+
+        @param user_id: 用户 UUID 文本。
+        @returns 设备 ID 元组，按配对时间排序。
+        """
+        rows = self._connection.execute(
+            """
+            SELECT id FROM paired_devices
+            WHERE user_id = CAST(? AS UUID)
+            ORDER BY paired_at, id
+            """,
+            [user_id],
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows)
 
     def load_refresh_credential_family(
         self, device_id: str, family_id: str

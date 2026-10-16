@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -21,11 +21,11 @@ from fastapi.testclient import TestClient
 
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 
 KEYS = Path(__file__).parent / "fixtures" / "device-keys.json"
@@ -38,17 +38,21 @@ def _h(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
-def _seed_ledger(connection) -> None:
+def _seed_ledger(connection, user_id: str) -> None:
     """写入一条买入 + 一条卖出，使总览与回撤都有内容。"""
     connection.execute(
-        "INSERT INTO ledger_versions (version, reason, source_reference) VALUES (1, 'file_import', 'src')"
+        """
+        INSERT INTO ledger_versions (version, user_id, reason, source_reference)
+        VALUES (1, CAST(? AS UUID), 'file_import', 'src')
+        """,
+        [user_id],
     )
     connection.execute(
         """
-        INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-        VALUES (CAST(? AS UUID), 'Account', 'TST001', '001')
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', 'TST001', '001')
         """,
-        [ACCOUNT_ID],
+        [ACCOUNT_ID, user_id],
     )
     for index, (action, date, price, amount) in enumerate(
         [
@@ -137,7 +141,12 @@ def client(tmp_path: Path):
     """构造已认证可用的应用与一个有效访问令牌。"""
     database_path = tmp_path / "api.duckdb"
     database = open_lyra_database(str(database_path))
-    _seed_ledger(database.connection)
+    # **先用同一个身份把用户建出来**：账户的归属列是 NOT NULL，而设备配对时按
+    # ``(provider, subject)`` 解析用户；同一个身份两次解析必然收敛到同一个 userId。
+    user_id = UserRepository(database.connection).find_or_create_user_for_identity(
+        IDENTITY, now=datetime.now(UTC)
+    ).user.id
+    _seed_ledger(database.connection, user_id)
 
     settings = Settings(
         LYRA_DATABASE_PATH=str(database_path),
@@ -146,8 +155,12 @@ def client(tmp_path: Path):
     )
     application = create_app(settings, database)
     repository = DuckDbDeviceRepository(database.connection)
-    service = DevicePairingService(repository, WriteCoordinator())
-    issued = asyncio.run(service.authorize_owner_device(
+    service = DevicePairingService(
+        repository,
+        application.state.write_coordinator,
+        UserRepository(database.connection),
+    )
+    issued = asyncio.run(service.authorize_user_device(
         identity=IDENTITY, display_name="Pixel 9", public_key_pem=PUBLIC_KEY_PEM
     ))
     try:
@@ -162,7 +175,8 @@ def _auth(issued) -> dict[str, str]:
         "Authorization": f"Bearer {issued.access_token}",
         # **每个 /v1 请求都必须声明客户端协议版本**（除公开路由）。
         # 缺失时服务端返回 426——那是客户端唯一能据此升级 App 的信号。
-        "x-lyra-protocol-version": "2",
+        # 直接复用客户端协议常量，协议升版时这里自动跟随。
+        **CLIENT_PROTOCOL_HEADERS,
     }
 
 
@@ -202,8 +216,15 @@ def test_rejects_invalid_authorization(client, header: str) -> None:
 def test_rejects_revoked_token(client) -> None:
     """设备撤销后原访问令牌必须立即失效。"""
     test_client, issued = client
-    repository = DuckDbDeviceRepository(test_client.app.state.database.connection)
-    asyncio.run(DevicePairingService(repository, WriteCoordinator()).revoke_device(issued.device_id))
+    connection = test_client.app.state.database.connection
+    repository = DuckDbDeviceRepository(connection)
+    asyncio.run(
+        DevicePairingService(
+            repository,
+            test_client.app.state.write_coordinator,
+            UserRepository(connection),
+        ).revoke_device(issued.device_id)
+    )
 
     response = test_client.get("/v1/ledger/summary", headers=_auth(issued), params={"scope": "all"})
     assert response.status_code == 401
@@ -216,7 +237,7 @@ def test_summary_returns_ledger_result(client) -> None:
 
     assert response.status_code == 200
     data = _summary_data(response.json())
-    # 公开字段是 camelCase，与客户端协议 2 一致。
+    # 公开字段是 camelCase，与客户端协议一致（该约定不随协议版本变化）。
     assert data["transactionCount"] == 2
     assert data["realizedPnlTotal"] == "200.0000"
 

@@ -1,9 +1,13 @@
 """账本快照仓储的集成测试。
 
-跑在真实 schema 15 上：插入一批交易、未平批次与已实现记录，再读回领域对象。
+跑在真实 schema 16 上：插入一批交易、未平批次与已实现记录，再读回领域对象。
 
 重点验证两条形状约定：**日期以 ISO 文本往返**（领域层按文本排序与比较），
 以及**账户以脱敏键呈现**（表里是 UUID，领域层用 ``legacy_account_key``）。
+
+另有一条多用户性质：``transactions`` / ``lots`` / ``realized`` 刻意没有 ``user_id``
+列（契约 §3.2），它们的跨用户保护完全落在仓储的用户范围上，因此这里直接断言
+「A 看不到 B 的同键账户」。
 """
 
 from __future__ import annotations
@@ -20,6 +24,21 @@ from lyra.infrastructure.db.ledger_repository import DuckDbLedgerRepository
 
 ACCOUNT_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_ACCOUNT_ID = "22222222-2222-2222-2222-222222222222"
+# 另一个用户与他的同名账户：账户标识只在用户内唯一，因此 A/B 可以各有 ``TST001``。
+USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
+OTHER_USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa2"
+OTHER_USER_ACCOUNT_ID = "33333333-3333-3333-3333-333333333333"
+
+
+def _seed_user(connection, user_id: str) -> None:
+    """写入一个用户行；``accounts`` / ``ledger_versions`` 的归属列都是 NOT NULL。"""
+    connection.execute(
+        """
+        INSERT INTO users (id, display_name, status, role)
+        VALUES (CAST(? AS UUID), ?, 'active', 'member')
+        """,
+        [user_id, f"User {user_id[-1]}"],
+    )
 
 
 def _h(label: str) -> str:
@@ -29,8 +48,14 @@ def _h(label: str) -> str:
 
 def _seed(connection) -> None:
     """写入一份最小但完整的账本。"""
+    for user_id in (USER_ID, OTHER_USER_ID):
+        _seed_user(connection, user_id)
     connection.execute(
-        "INSERT INTO ledger_versions (version, reason, source_reference) VALUES (1, 'file_import', 'src')"
+        """
+        INSERT INTO ledger_versions (version, user_id, reason, source_reference)
+        VALUES (1, CAST(? AS UUID), 'file_import', 'src')
+        """,
+        [USER_ID],
     )
     for account_id, key, suffix in (
         (ACCOUNT_ID, "TST001", "001"),
@@ -38,10 +63,10 @@ def _seed(connection) -> None:
     ):
         connection.execute(
             """
-            INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-            VALUES (CAST(? AS UUID), ?, ?, ?)
+            INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+            VALUES (CAST(? AS UUID), CAST(? AS UUID), ?, ?, ?)
             """,
-            [account_id, f"Account {key}", key, suffix],
+            [account_id, USER_ID, f"Account {key}", key, suffix],
         )
 
     transactions = [
@@ -101,14 +126,20 @@ def _seed(connection) -> None:
 
 
 @pytest.fixture()
-def repository(tmp_path: Path):
-    """在临时真实库上装配仓储。"""
-    database = open_lyra_database(str(tmp_path / "ledger.duckdb"))
-    _seed(database.connection)
+def database(tmp_path: Path):
+    """在临时真实库上装配库与仓储。"""
+    db = open_lyra_database(str(tmp_path / "ledger.duckdb"))
+    _seed(db.connection)
     try:
-        yield DuckDbLedgerRepository(database.connection)
+        yield db
     finally:
-        database.close()
+        db.close()
+
+
+@pytest.fixture()
+def repository(database):
+    """归属 ``USER_ID`` 的账本仓储。"""
+    return DuckDbLedgerRepository(database.connection, user_id=USER_ID)
 
 
 def test_loads_all_transactions_with_legacy_account_key(repository) -> None:
@@ -239,3 +270,93 @@ def test_account_scope_filters_accounts_too(repository) -> None:
     snapshot = repository.load_snapshot(AccountScope(kind="account", account="TST001"))
 
     assert [account.legacy_account_key for account in snapshot.accounts] == ["TST001"]
+
+
+# --------------------------------------------------------------------------
+# 跨用户隔离（V03）：``scope=all`` 只含本人，同键账户互不混入
+# --------------------------------------------------------------------------
+
+
+def _seed_other_user_same_key(connection) -> None:
+    """给另一个用户一个**与 A 相同的 legacy key** 的账户，并写入一笔交易。"""
+    connection.execute(
+        """
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'B Account', 'TST001', '001')
+        """,
+        [OTHER_USER_ACCOUNT_ID, OTHER_USER_ID],
+    )
+    connection.execute(
+        """
+        INSERT INTO transactions
+            (account_id, record_date, transaction_date, action, raw_symbol, description,
+             asset_type, underlying, quantity, price, amount, source_type, source_reference,
+             source_hash, sequence, occurrence, business_hash, transaction_hash,
+             parser_version, ledger_version)
+        VALUES (CAST(? AS UUID), CAST('2026-03-01' AS DATE), CAST('2026-03-01' AS DATE),
+                'Buy', 'NVDA', 'NVIDIA CORP', 'stock', 'NVDA',
+                CAST('1' AS DECIMAL(18,6)), CAST('500' AS DECIMAL(18,6)),
+                CAST('-500' AS DECIMAL(18,4)), 'csv', 'b-file', ?, 1, 1, ?, ?, 2, 1)
+        """,
+        [OTHER_USER_ACCOUNT_ID, _h("b-source"), _h("b-business"), _h("b-txn")],
+    )
+
+
+def test_scope_all_only_contains_the_current_user(database) -> None:
+    """``scope=all`` 是「该用户的全部账户」——**不是全库**。
+
+    契约 §3.11 点名这条分支：``all`` 以前不加任何条件。多用户下那个"任何条件"就是
+    ``a.user_id = ?``，少了它 A 的总览与持仓会算出 B 的数据。
+    """
+    _seed_other_user_same_key(database.connection)
+
+    mine = DuckDbLedgerRepository(database.connection, user_id=USER_ID).load_snapshot()
+    theirs = DuckDbLedgerRepository(
+        database.connection, user_id=OTHER_USER_ID
+    ).load_snapshot()
+
+    assert {t.account for t in mine.transactions} == {"TST001", "TST002"}
+    assert "NVDA" not in {t.raw_symbol for t in mine.transactions}
+    assert {account.id for account in mine.accounts} == {ACCOUNT_ID, OTHER_ACCOUNT_ID}
+    # B 只看到自己那一个账户，尽管它与 A 的账户键完全相同。
+    assert {account.legacy_account_key for account in theirs.accounts} == {"TST001"}
+    assert {account.id for account in theirs.accounts} == {OTHER_USER_ACCOUNT_ID}
+    assert {t.raw_symbol for t in theirs.transactions} == {"NVDA"}
+
+
+def test_same_legacy_key_does_not_mix_under_account_scope(database) -> None:
+    """同一个账户键在两个用户下都合法，按账户查询**不得混入对方的行**。"""
+    _seed_other_user_same_key(database.connection)
+
+    mine = DuckDbLedgerRepository(database.connection, user_id=USER_ID).load_snapshot(
+        AccountScope(kind="account", account="TST001")
+    )
+    theirs = DuckDbLedgerRepository(
+        database.connection, user_id=OTHER_USER_ID
+    ).load_snapshot(AccountScope(kind="account", account="TST001"))
+
+    assert {t.raw_symbol for t in mine.transactions} == {"INTC"}
+    assert {account.id for account in mine.accounts} == {ACCOUNT_ID}
+    assert {t.raw_symbol for t in theirs.transactions} == {"NVDA"}
+    assert {account.id for account in theirs.accounts} == {OTHER_USER_ACCOUNT_ID}
+    # A 在该范围内只有自己的 INTC 往返：批次属于 TST002 被范围滤掉，已实现明细留下。
+    assert len(mine.realized_records) == 1
+    assert {record.account for record in mine.realized_records} == {"TST001"}
+    assert mine.open_lots == ()
+    assert theirs.open_lots == ()
+    assert theirs.realized_records == ()
+
+
+def test_unknown_user_sees_an_empty_ledger(database) -> None:
+    """一个没有任何账户的用户得到空账本，而**不是**落回全库数据。"""
+    stranger_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa9"
+    _seed_user(database.connection, stranger_id)
+
+    snapshot = DuckDbLedgerRepository(
+        database.connection, user_id=stranger_id
+    ).load_snapshot()
+
+    assert snapshot.accounts == ()
+    assert snapshot.transactions == ()
+    assert snapshot.open_lots == ()
+    assert snapshot.realized_records == ()

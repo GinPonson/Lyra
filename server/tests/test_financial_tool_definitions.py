@@ -4,8 +4,10 @@
 **同一个分析经工具调用与经 HTTP 端点必须得到同样的形状**。若两侧各写一套分析，
 字段与口径迟早分叉，而这种分叉在单侧测试里看不出来。
 
-另一条是授权边界：**账户范围来自会话而不是模型参数**。会话绑定单账户时，一次不传
-范围字段的调用必须仍然只看那个账户——否则"模型不传 account 就能查全部账户"。
+另一条是授权边界：**账户范围与用户身份来自会话而不是模型参数**。会话绑定单账户时，
+一次不传范围字段的调用必须仍然只看那个账户——否则"模型不传 account 就能查全部账户"。
+用户身份同理：``all`` 只等于"该用户的全部账户"，B 的账户 UUID 在 A 的会话里必须与
+不存在不可区分（V08）。
 """
 
 from __future__ import annotations
@@ -25,16 +27,21 @@ from lyra.domain.analytics.types import AccountScope
 
 ACCOUNT_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_ACCOUNT_ID = "22222222-2222-2222-2222-222222222222"
+USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+OTHER_USER_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 AS_OF = "2026-09-01T00:00:00.000Z"
 
 
-def context(*, account: str | None = None) -> AgentToolContext:
+def context(
+    *, account: str | None = None, user_id: str = USER_ID
+) -> AgentToolContext:
     """构造服务端注入的工具上下文。
 
     @param account: 绑定的账户 **UUID**；``None`` 表示全部账户范围。
+    @param user_id: 会话所属用户；**服务端身份**，不是模型参数。
     """
     return AgentToolContext(
-        session_id="s-1", device_id="d-1", user_message_id="m-1",
+        session_id="s-1", device_id="d-1", user_id=user_id, user_message_id="m-1",
         account_scope=(
             AccountScope(kind="all") if account is None
             else AccountScope(kind="account", account=account)
@@ -45,14 +52,29 @@ def context(*, account: str | None = None) -> AgentToolContext:
 
 @pytest.fixture()
 def runtime(tmp_path: Path):
-    """在临时真实库上装配工具运行时。"""
+    """在临时真实库上装配工具运行时（两个用户各一个账户）。"""
     database = open_lyra_database(str(tmp_path / "tools.duckdb"))
-    database.connection.execute(
+    connection = database.connection
+    for user_id, display_name in ((USER_ID, "Owner"), (OTHER_USER_ID, "Other")):
+        connection.execute(
+            "INSERT INTO users (id, display_name) VALUES (CAST(? AS UUID), ?)",
+            [user_id, display_name],
+        )
+    connection.execute(
         """
-        INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-        VALUES (CAST(? AS UUID), 'Account', 'TST001', '001')
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', 'TST001', '001')
         """,
-        [ACCOUNT_ID],
+        [ACCOUNT_ID, USER_ID],
+    )
+    # **另一个用户的账户用同一个 legacy key**：账户键在多用户下用户内唯一，
+    # 同键跨用户共存正是需要验证的场景。
+    connection.execute(
+        """
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Other', 'TST001', '002')
+        """,
+        [OTHER_ACCOUNT_ID, OTHER_USER_ID],
     )
     try:
         yield (
@@ -136,7 +158,9 @@ def test_tool_result_matches_the_http_endpoint(runtime, command: str) -> None:
     from lyra.application.financial_tool_handlers import handle_currency_grouped
     from lyra.infrastructure.db.ledger_repository import DuckDbLedgerRepository
 
-    snapshot = DuckDbLedgerRepository(connection).load_snapshot(AccountScope(kind="all"))
+    snapshot = DuckDbLedgerRepository(connection, user_id=USER_ID).load_snapshot(
+        AccountScope(kind="all")
+    )
     via_handler = handle_currency_grouped(
         command, snapshot, AccountScope(kind="all"), {"asOf": "2026-09-01"}
     )
@@ -211,7 +235,7 @@ def test_account_uuid_is_resolved_to_the_ledger_account_key(runtime) -> None:
     from lyra.infrastructure.db.account_lookup import resolve_legacy_account_key
 
     tool_runtime, connection = runtime
-    assert resolve_legacy_account_key(connection, ACCOUNT_ID) == "TST001"
+    assert resolve_legacy_account_key(connection, USER_ID, ACCOUNT_ID) == "TST001"
 
     result = tool_runtime.invoke("summary", {}, context(account=ACCOUNT_ID))
 
@@ -220,20 +244,78 @@ def test_account_uuid_is_resolved_to_the_ledger_account_key(runtime) -> None:
 
 def test_accounts_tool_hides_accounts_outside_the_session_scope(runtime) -> None:
     """会话绑定单账户时，``accounts`` 不得列出授权范围外的账户。"""
-    tool_runtime, connection = runtime
-    connection.execute(
-        """
-        INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-        VALUES (CAST(? AS UUID), 'Other', 'TST002', '002')
-        """,
-        [OTHER_ACCOUNT_ID],
-    )
+    tool_runtime, _ = runtime
 
     bound = tool_runtime.invoke("accounts", {}, context(account=ACCOUNT_ID))
     everything = tool_runtime.invoke("accounts", {}, context())
 
     assert [row["id"] for row in bound["rows"]] == [ACCOUNT_ID]
-    assert {row["id"] for row in everything["rows"]} == {ACCOUNT_ID, OTHER_ACCOUNT_ID}
+    # ``all`` 是**该用户的**全部账户，不是全库：另一个用户的账户不得出现。
+    assert {row["id"] for row in everything["rows"]} == {ACCOUNT_ID}
+
+
+def test_the_all_scope_only_covers_the_current_users_accounts(runtime) -> None:
+    """**``all`` 范围不得跨用户**：另一个用户的账户不出现在列表与账本里（V08）。"""
+    tool_runtime, _ = runtime
+
+    mine = tool_runtime.invoke("accounts", {}, context(user_id=USER_ID))
+    theirs = tool_runtime.invoke("accounts", {}, context(user_id=OTHER_USER_ID))
+
+    assert {row["id"] for row in mine["rows"]} == {ACCOUNT_ID}
+    assert {row["id"] for row in theirs["rows"]} == {OTHER_ACCOUNT_ID}
+
+
+def test_another_users_account_uuid_cannot_be_bound(runtime) -> None:
+    """**拿别人的账户 UUID 建上下文不能读到别人的账本。**
+
+    会话范围里的账户是同类型字符串，越权在这里不会抛类型错误；因此解析必须带用户
+    范围，解析不到就按"账户不存在"明确失败（而不是返回空账本）。
+    """
+    tool_runtime, _ = runtime
+
+    with pytest.raises(ApplicationError) as raised:
+        tool_runtime.invoke("summary", {}, context(account=OTHER_ACCOUNT_ID))
+
+    assert raised.value.code == "ACCOUNT_NOT_FOUND"
+
+
+def test_a_forged_user_argument_cannot_widen_the_scope(runtime) -> None:
+    """**模型无法用参数指定或覆盖 userId**：它不在 schema 里，传了就被拒。"""
+    tool_runtime, _ = runtime
+
+    for arguments in (
+        {"userId": OTHER_USER_ID},
+        {"user_id": OTHER_USER_ID},
+        {"account": OTHER_ACCOUNT_ID},
+    ):
+        with pytest.raises(ApplicationError) as raised:
+            tool_runtime.invoke("accounts", arguments, context())
+        assert raised.value.code == "TOOL_ARGUMENTS_INVALID", arguments
+
+
+def test_a_context_without_a_user_is_rejected(runtime) -> None:
+    """**缺少用户上下文时明确失败**，而不是按空归属查出空账本被读成"没有数据"。"""
+    tool_runtime, _ = runtime
+
+    with pytest.raises(ApplicationError) as raised:
+        tool_runtime.invoke("accounts", {}, context(user_id=""))
+
+    assert raised.value.code == "AGENT_USER_CONTEXT_MISSING"
+    assert raised.value.status_code == 500
+
+
+def test_a_disabled_user_cannot_execute_tools(runtime) -> None:
+    """**停用提交后工具调用被拒**：长回合里的后续调用不再读取任何数据（V11）。"""
+    tool_runtime, connection = runtime
+    connection.execute(
+        "UPDATE users SET status = 'disabled' WHERE id = CAST(? AS UUID)", [USER_ID]
+    )
+
+    with pytest.raises(ApplicationError) as raised:
+        tool_runtime.invoke("summary", {}, context())
+
+    assert raised.value.code == "USER_DISABLED"
+    assert raised.value.status_code == 403
 
 
 def test_public_descriptions_cover_all_bound_tools(runtime) -> None:

@@ -31,20 +31,26 @@ def _iso_z(value: object) -> str:
 
 
 def load_brokerage_account(
-    connection: duckdb.DuckDBPyConnection, account_id: str
+    connection: duckdb.DuckDBPyConnection, user_id: str, account_id: str
 ) -> dict[str, object] | None:
-    """按 ID 读取账户。
+    """按 ID 读取账户，**且限定在当前用户范围内**。
+
+    ``user_id`` 放在 ``account_id`` 之前：两者都是字符串，顺序写反不会报错，只会读到
+    别人的账户。不属于该用户的账户返回 ``None``，与「不存在」不可区分——调用方据此
+    返回同一个 404，而不是用空账户掩盖越权（计划 §4.2）。
 
     @param connection: 数据库连接。
+    @param user_id: 当前用户的 UUID 文本。
     @param account_id: 账户 UUID。
-    @returns 账户行（内部字段名）；不存在时 ``None``。
+    @returns 账户行（内部字段名）；不存在或不属于该用户时 ``None``。
     """
     row = connection.execute(
         """
         SELECT id, display_name, broker, masked_suffix, base_currency, status, created_at
-        FROM accounts WHERE id = CAST(? AS UUID)
+        FROM accounts
+        WHERE user_id = CAST(? AS UUID) AND id = CAST(? AS UUID)
         """,
-        [account_id],
+        [user_id, account_id],
     ).fetchone()
     if row is None:
         return None
@@ -73,24 +79,29 @@ def persist_created_account(
     """原子写入账户、审计事件与幂等收口。
 
     @param connection: 数据库连接。
-    @param account: 账户字段。
+    @param account: 账户字段；**必须带 ``user_id``**（归属列 NOT NULL）。
     @param audit_event: 审计事件字段。
     @param idempotency_completion: ``(record_id, result_resource_id, status, at)``；
         未携带幂等键时为 ``None``。
     """
     connection.execute("BEGIN TRANSACTION")
     try:
-        # **事务内预检重复标识**。依赖表的 UNIQUE 约束也能挡住，但那样的报错是一句
-        # 底层的约束信息，客户端拿不到稳定错误码。
+        # **事务内预检重复标识，且按用户比对**。依赖表的 ``UNIQUE (user_id,
+        # legacy_account_key)`` 也能挡住，但那样的报错是一句底层的约束信息，客户端拿不到
+        # 稳定错误码。
         #
         # 比对用 ``upper(trim(...))``：标识在归一化后才入库，但仍以这一步兜住历史数据
         # 中的大小写差异——**已归档账户同样不能重复创建**。
+        #
+        # **范围必须是当前用户**：唯一键已从全局改为用户内唯一，不带 user_id 会让 B 的
+        # 同名标识把 A 的创建请求挡成 409——A/B 用相同标识共存正是本次改造的目标。
         duplicate = connection.execute(
             """
             SELECT 1 FROM accounts
-            WHERE upper(trim(legacy_account_key)) = ? LIMIT 1
+            WHERE user_id = CAST(? AS UUID)
+              AND upper(trim(legacy_account_key)) = ? LIMIT 1
             """,
-            [str(account["legacy_account_key"]).upper()],
+            [account["user_id"], str(account["legacy_account_key"]).upper()],
         ).fetchone()
         if duplicate is not None:
             from ...application.app_error import ApplicationError
@@ -104,15 +115,16 @@ def persist_created_account(
         connection.execute(
             """
             INSERT INTO accounts
-                (id, display_name, legacy_account_key, broker, masked_suffix,
+                (id, user_id, display_name, legacy_account_key, broker, masked_suffix,
                  base_currency, status, created_at, updated_at)
-            VALUES (CAST(? AS UUID), ?, ?, ?, ?, ?, ?, CAST(? AS TIMESTAMPTZ),
-                    CAST(? AS TIMESTAMPTZ))
+            VALUES (CAST(? AS UUID), CAST(? AS UUID), ?, ?, ?, ?, ?, ?,
+                    CAST(? AS TIMESTAMPTZ), CAST(? AS TIMESTAMPTZ))
             """,
             [
-                account["id"], account["display_name"], account["legacy_account_key"],
-                account["broker"], account["masked_suffix"], account["base_currency"],
-                account["status"], account["created_at"], account["created_at"],
+                account["id"], account["user_id"], account["display_name"],
+                account["legacy_account_key"], account["broker"],
+                account["masked_suffix"], account["base_currency"], account["status"],
+                account["created_at"], account["created_at"],
             ],
         )
         connection.execute(

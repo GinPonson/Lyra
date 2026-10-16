@@ -1,11 +1,13 @@
 """认证路由测试。
 
-三条要点：
+四条要点：
 
 1. **`GET /v1/auth/providers` 不要求设备认证**——它本身就是获取认证的入口；
 2. **`POST /v1/devices/tokens` 也不要求访问令牌**——用已过期或已撤销的访问令牌去
    刷新是行不通的，身份由刷新凭据本身证明；
-3. **正文类型收口在路由层**——非字符串字段必须 400，不能穿透到服务层变成 500。
+3. **正文类型收口在路由层**——非字符串字段必须 400，不能穿透到服务层变成 500；
+4. **新身份在兑换成功后自动注册为 `member` 并获得空账本**，登录响应与 `GET /v1/me`
+   给出同一个 `user` 对象（P0 契约 §3.9）。
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 from lyra.api.agent_events import EventConnectionRegistry
 from lyra.application.agent_turn_orchestrator import AgentTurnOrchestrator
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.owner_login_service import OwnerLoginService
+from lyra.application.login_service import UserLoginService, pkce_challenge
 from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
@@ -34,11 +36,18 @@ from lyra.infrastructure.auth.login_provider import (
     LoginIdentity,
 )
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import (
+    UserIdentityRecord,
+    UserRecord,
+    UserRepository,
+)
 from lyra.main import create_app
 
-PUBLIC_KEY_PEM = json.loads(
+_KEYS = json.loads(
     (Path(__file__).parent / "fixtures" / "device-keys.json").read_text(encoding="utf-8")
-)["cases"][0]["inputPem"]
+)["cases"]
+PUBLIC_KEY_PEM = _KEYS[0]["inputPem"]
+OTHER_KEY_PEM = _KEYS[1]["inputPem"]
 IDENTITY = LoginIdentity(provider="github", subject="12345", email=None, display_name="octocat")
 
 
@@ -52,15 +61,40 @@ def client(tmp_path: Path):
         LYRA_SECRET_MASTER_KEY="0" * 64,
     )
     application = create_app(settings, database)
+    # 签发必须走**应用级**写协调器：另建一个会让健康端点的 writeQueue 与实际写入脱节。
     service = DevicePairingService(
-        DuckDbDeviceRepository(database.connection), WriteCoordinator()
+        DuckDbDeviceRepository(database.connection),
+        application.state.write_coordinator,
+        UserRepository(database.connection),
     )
-    issued = asyncio.run(service.authorize_owner_device(
+    issued = asyncio.run(service.authorize_user_device(
         identity=IDENTITY, display_name="Pixel 9", public_key_pem=PUBLIC_KEY_PEM
     ))
     try:
         with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as test_client:
             yield test_client, issued
+    finally:
+        database.close()
+
+
+@pytest.fixture()
+def fresh_client(tmp_path: Path):
+    """**没有任何预置用户**的应用与客户端。
+
+    自动注册的用例必须能在"库里一个人都没有"这个前提下断言用户数，否则夹具自己
+    签发的那台设备会污染计数，让"未完成验证不创建用户"这类断言失去意义。
+    """
+    database_path = tmp_path / "fresh-auth.duckdb"
+    database = open_lyra_database(str(database_path))
+    settings = Settings(
+        LYRA_DATABASE_PATH=str(database_path),
+        LYRA_IMPORT_STAGING_DIR=str(tmp_path / "staging"),
+        LYRA_SECRET_MASTER_KEY="0" * 64,
+    )
+    application = create_app(settings, database)
+    try:
+        with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as test_client:
+            yield test_client
     finally:
         database.close()
 
@@ -165,7 +199,9 @@ def test_revoked_device_cannot_refresh(client) -> None:
     connection = test_client.app.state.database.connection
     asyncio.run(
         DevicePairingService(
-            DuckDbDeviceRepository(connection), WriteCoordinator()
+            DuckDbDeviceRepository(connection),
+            test_client.app.state.write_coordinator,
+            UserRepository(connection),
         ).revoke_device(issued.device_id)
     )
 
@@ -540,13 +576,12 @@ def configured_client(client):
     掩盖掉"类型非法应当 400"这条断言。
     """
     test_client, issued = client
-    test_client.app.state.login_service = OwnerLoginService(
+    test_client.app.state.login_service = UserLoginService(
         [
             ConfiguredLoginProvider(
                 id="github",
                 name="GitHub",
                 client=_FakeLoginClient(),
-                assert_owner=lambda identity: None,
             )
         ],
         lambda **kwargs: None,
@@ -630,20 +665,21 @@ def test_auth_writes_use_the_app_write_coordinator_singleton(client) -> None:
 
 
 # --------------------------------------------------------------------------
-# 兑换响应：必须带 user.email
+# 兑换响应：契约 §3.9 的 user 对象
 # --------------------------------------------------------------------------
 
 
 class _CompletingLoginService:
     """固定返回一次已完成兑换的登录服务；只用于验证响应组装。"""
 
-    def __init__(self, identity: LoginIdentity) -> None:
+    def __init__(self, user: Any, identity: Any) -> None:
+        self._user = user
         self._identity = identity
 
     async def exchange(
         self, provider_id: str, *, login_id: str, code_verifier: str
     ) -> dict[str, Any]:
-        """返回一份完整的兑换结果。"""
+        """返回一份完整的兑换结果（含已解析的用户与身份）。"""
         return {
             "status": "complete",
             "deviceId": "device-1",
@@ -652,21 +688,38 @@ class _CompletingLoginService:
             "accessTokenExpiresAt": "2026-10-13T00:10:00.000Z",
             "refreshToken": "refresh",
             "refreshTokenExpiresAt": "2026-11-12T00:00:00.000Z",
-            "user": self._identity,
+            "user": self._user,
+            "identity": self._identity,
         }
 
 
-def test_exchange_returns_the_user_email(client) -> None:
-    """``user.email`` 必须出现在响应里。
+def test_exchange_returns_the_frozen_user_object(client) -> None:
+    """兑换响应的 ``user`` 必须是契约 §3.9 的完整形状。
 
-    客户端把它展示在个人资料页（``user?['email']``）；丢了它 App 会静默显示空邮箱。
+    身份收在 ``identity`` 子对象里：身份上的 display_name 是第三方昵称，与用户在
+    Lyra 的显示名不是一回事。``email`` 与 ``userId`` 缺一不可——客户端用同一个模型
+    解析它与 ``GET /v1/me``。
     """
     test_client, _ = client
-    test_client.app.state.login_service = _CompletingLoginService(
-        LoginIdentity(
-            provider="github", subject="12345", email="owner@example.com", display_name="octocat"
-        )
+    user = UserRecord(
+        id="11111111-1111-1111-1111-111111111111",
+        display_name="octocat",
+        status="active",
+        role="member",
+        created_at="2026-10-13T00:00:00.000Z",
+        updated_at="2026-10-13T00:00:00.000Z",
     )
+    identity = UserIdentityRecord(
+        id="22222222-2222-2222-2222-222222222222",
+        user_id=user.id,
+        provider="github",
+        subject="12345",
+        email="owner@example.com",
+        display_name="octocat",
+        created_at="2026-10-13T00:00:00.000Z",
+        updated_at="2026-10-13T00:00:00.000Z",
+    )
+    test_client.app.state.login_service = _CompletingLoginService(user, identity)
 
     response = test_client.post(
         "/v1/auth/github/exchange",
@@ -675,11 +728,702 @@ def test_exchange_returns_the_user_email(client) -> None:
 
     assert response.status_code == 200
     assert response.json()["user"] == {
-        "provider": "github",
-        "subject": "12345",
-        "email": "owner@example.com",
+        "userId": user.id,
         "displayName": "octocat",
+        "status": "active",
+        "role": "member",
+        "identity": {
+            "provider": "github",
+            "subject": "12345",
+            "email": "owner@example.com",
+        },
     }
+    # 设备与令牌字段保持原形状。
+    assert response.json()["deviceId"] == "device-1"
+    assert response.json()["displayName"] == "Pixel 9"
+
+
+# --------------------------------------------------------------------------
+# 来源可用性只取决于 OAuth 配置
+# --------------------------------------------------------------------------
+
+
+def test_a_provider_is_available_without_any_owner_subject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**只配齐 OAuth 凭据（不配任何 ``LYRA_OWNER_*``）该来源就必须可用。**
+
+    多用户下谁能登录由 ``(provider, subject)`` 的用户解析决定，部署配置里不再需要
+    一份 subject 名单；启动也不该因为缺少它而失败（契约 §3.10）。首个管理员改由
+    离线入口显式创建。
+    """
+    monkeypatch.setenv("LYRA_LOGIN_GITHUB_CLIENT_ID", "cid")
+    monkeypatch.setenv("LYRA_LOGIN_GITHUB_CLIENT_SECRET", "secret")
+    monkeypatch.setenv(
+        "LYRA_LOGIN_GITHUB_REDIRECT_URI", "https://lyra.example.com/v1/auth/github/callback"
+    )
+    database_path = tmp_path / "providers.duckdb"
+    database = open_lyra_database(str(database_path))
+    settings = Settings(
+        LYRA_DATABASE_PATH=str(database_path),
+        LYRA_IMPORT_STAGING_DIR=str(tmp_path / "staging"),
+        LYRA_SECRET_MASTER_KEY="0" * 64,
+    )
+    try:
+        application = create_app(settings, database)
+        with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as test_client:
+            catalog = test_client.get("/v1/auth/providers").json()
+            availability = {entry["id"]: entry["available"] for entry in catalog["providers"]}
+            assert availability == {"google": False, "linuxdo": False, "github": True}
+
+            started = test_client.post("/v1/auth/github/start", json={
+                "displayName": "Pixel 9",
+                "publicKeyPem": PUBLIC_KEY_PEM,
+                "codeChallenge": _CHALLENGE,
+                "codeChallengeMethod": "S256",
+            })
+            assert started.status_code == 200, started.text
+            assert started.json()["authorizationUrl"].startswith(
+                "https://github.com/login/oauth/authorize?"
+            )
+    finally:
+        database.close()
+
+
+def test_a_partially_configured_provider_still_fails_at_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """部分配置仍然在启动时明确失败。
+
+    去掉 owner 名单不等于放宽"部分配置"这条约束：让服务带着"看起来启用了但永远
+    登不进去"的状态上线是最糟的选择。
+    """
+    monkeypatch.setenv("LYRA_LOGIN_GITHUB_CLIENT_ID", "cid")
+    database_path = tmp_path / "partial.duckdb"
+    database = open_lyra_database(str(database_path))
+    settings = Settings(
+        LYRA_DATABASE_PATH=str(database_path),
+        LYRA_IMPORT_STAGING_DIR=str(tmp_path / "staging"),
+        LYRA_SECRET_MASTER_KEY="0" * 64,
+    )
+    try:
+        with pytest.raises(ValueError, match="LYRA_LOGIN_GITHUB_CLIENT_SECRET"):
+            create_app(settings, database)
+    finally:
+        database.close()
+
+
+# --------------------------------------------------------------------------
+# 自动注册：完整 OAuth 验证 + 客户端 verifier 校验之后才创建用户
+# --------------------------------------------------------------------------
+
+
+# 一个满足 PKCE verifier 字符集与长度的固定 verifier；挑战由它算出。
+_VERIFIER = "v" * 43
+_CHALLENGE = pkce_challenge(_VERIFIER)
+
+
+class _ScriptedLoginClient:
+    """按脚本返回来源身份的客户端；其余行为与真实客户端无关。"""
+
+    def __init__(self, identity: LoginIdentity) -> None:
+        self.identity = identity
+
+    def authorization_url(self, *, state: str, nonce: str, code_challenge: str) -> str:
+        """返回带 state 的固定授权地址；state 由调用方解析后回填给回调。"""
+        return f"https://provider.example/authorize?state={state}"
+
+    def exchange_code(self, **kwargs: Any) -> LoginIdentity:
+        """返回脚本身份；参数校验由服务层的其它测试覆盖。"""
+        return self.identity
+
+
+def _wired_login_client(test_client: Any, identity: LoginIdentity, provider: str = "github"):
+    """装配一个**真实**登录服务：真实用户解析 + 真实设备签发。
+
+    只把来源客户端换成脚本替身，因此自动注册、设备归属与凭据签发走的都是生产代码。
+    """
+    connection = test_client.app.state.database.connection
+    pairing = DevicePairingService(
+        DuckDbDeviceRepository(connection),
+        test_client.app.state.write_coordinator,
+        UserRepository(connection),
+    )
+
+    async def authorize(*, identity: LoginIdentity, public_key_pem: str, display_name: str):
+        """兑换成功后的用户解析与设备签发。"""
+        issued = await pairing.authorize_user_device(
+            identity=identity, public_key_pem=public_key_pem, display_name=display_name
+        )
+        return {
+            "deviceId": issued.device_id,
+            "displayName": issued.display_name,
+            "accessToken": issued.access_token,
+            "accessTokenExpiresAt": issued.access_token_expires_at,
+            "refreshToken": issued.refresh_token,
+            "refreshTokenExpiresAt": issued.refresh_token_expires_at,
+            "user": issued.user,
+            "identity": issued.identity,
+        }
+
+    test_client.app.state.login_service = UserLoginService(
+        [
+            ConfiguredLoginProvider(
+                id=provider,  # type: ignore[arg-type]
+                name="GitHub",
+                client=_ScriptedLoginClient(identity),
+            )
+        ],
+        authorize,
+    )
+    return test_client
+
+
+def _start_login(test_client: Any, provider: str = "github", pem: str = PUBLIC_KEY_PEM) -> dict:
+    """发起一次登录并返回 start 响应正文。"""
+    response = test_client.post(
+        f"/v1/auth/{provider}/start",
+        json={
+            "displayName": "Pixel 9",
+            "publicKeyPem": pem,
+            "codeChallenge": _CHALLENGE,
+            "codeChallengeMethod": "S256",
+        },
+    )
+    # 处理器返回显式构造的 ``JSONResponse``，它的默认状态码是 200——装饰器上的
+    # ``status_code=201`` 只在返回普通 dict 时生效。这里固定**实际**行为。
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _complete_callback(test_client: Any, started: dict, provider: str = "github") -> None:
+    """用授权地址里的 state 走一次浏览器回调。"""
+    from urllib.parse import parse_qs, urlsplit
+
+    state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
+    response = test_client.get(
+        f"/v1/auth/{provider}/callback", params={"state": state, "code": "auth-code"}
+    )
+    assert response.status_code == 200
+
+
+def _exchange(test_client: Any, started: dict, provider: str = "github"):
+    """用 App verifier 兑换凭据。"""
+    return test_client.post(
+        f"/v1/auth/{provider}/exchange",
+        json={"loginId": started["loginId"], "codeVerifier": _VERIFIER},
+    )
+
+
+def _count(connection: Any, table: str) -> int:
+    """统计表行数。"""
+    row = connection.execute(f"SELECT count(*) FROM {table}").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+@pytest.mark.parametrize(
+    ("provider", "identity"),
+    [
+        ("github", LoginIdentity("github", "9001", None, "octocat")),
+        ("linuxdo", LoginIdentity("linuxdo", "9002", "user@example.com", "linuxdo-user")),
+        ("google", LoginIdentity("google", "9003", "g@example.com", "Google User")),
+    ],
+)
+def test_a_new_identity_registers_as_a_member_with_an_empty_ledger(
+    fresh_client, provider: str, identity: LoginIdentity
+) -> None:
+    """三来源的新身份都能自动注册为 ``member``，并获得空账本。
+
+    **空账本不是"没报错"**：这里显式断言该用户名下没有账户，且用户账本版本为 0
+    （契约 §3.3 的定义：``max(version) WHERE user_id = ?``）。
+    """
+    test_client = fresh_client
+    _wired_login_client(test_client, identity, provider)
+    connection = test_client.app.state.database.connection
+
+    started = _start_login(test_client, provider)
+    _complete_callback(test_client, started, provider)
+    response = _exchange(test_client, started, provider)
+
+    assert response.status_code == 200, response.text
+    user = response.json()["user"]
+    assert user["role"] == "member"
+    assert user["status"] == "active"
+    assert user["identity"] == {
+        "provider": provider,
+        "subject": identity.subject,
+        "email": identity.email,
+    }
+    assert _count(connection, "users") == 1
+    assert _count(connection, "user_identities") == 1
+    accounts = connection.execute(
+        "SELECT count(*) FROM accounts WHERE user_id = CAST(? AS UUID)", [user["userId"]]
+    ).fetchone()
+    assert accounts is not None and int(accounts[0]) == 0
+    version = connection.execute(
+        "SELECT coalesce(max(version), 0) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [user["userId"]],
+    ).fetchone()
+    assert version is not None and int(version[0]) == 0
+
+
+def test_the_same_identity_logs_in_as_the_same_user(fresh_client) -> None:
+    """同一身份再次登录：同一 userId，不新建用户，也不重置账本归属。"""
+    test_client = fresh_client
+    _wired_login_client(test_client, LoginIdentity("github", "9001", None, "octocat"))
+    connection = test_client.app.state.database.connection
+
+    first = _exchange(test_client, _after_callback(test_client))
+    second = _exchange(test_client, _after_callback(test_client))
+
+    assert first.json()["user"]["userId"] == second.json()["user"]["userId"]
+    assert _count(connection, "users") == 1
+    assert _count(connection, "user_identities") == 1
+
+
+def _after_callback(test_client: Any, provider: str = "github") -> dict:
+    """发起登录并完成回调，返回 start 响应正文。"""
+    started = _start_login(test_client, provider)
+    _complete_callback(test_client, started, provider)
+    return started
+
+
+def test_two_independent_logins_converge_to_one_user(fresh_client) -> None:
+    """同一身份的两次独立登录事务收敛到同一 userId（对应 V02）。
+
+    两个服务各自持有自己的写协调器，模拟两个独立登录事务；唯一约束与
+    ``find_or_create_user_for_identity`` 的重查必须让它们落到同一个用户上。
+    """
+    test_client = fresh_client
+    connection = test_client.app.state.database.connection
+    identity = LoginIdentity("github", "9001", None, "octocat")
+
+    async def two_logins() -> tuple[str, str]:
+        """并发跑两次签发；两次都必须成功且返回同一用户。"""
+        results = []
+        for _ in range(2):
+            pairing = DevicePairingService(
+                DuckDbDeviceRepository(connection),
+                WriteCoordinator(),
+                UserRepository(connection),
+            )
+            results.append(await pairing.authorize_user_device(
+                identity=identity, display_name="Pixel 9", public_key_pem=PUBLIC_KEY_PEM
+            ))
+        return results[0].user.id, results[1].user.id
+
+    first_user, second_user = asyncio.run(two_logins())
+
+    assert first_user == second_user
+    assert _count(connection, "users") == 1
+    assert _count(connection, "user_identities") == 1
+
+
+def test_a_pending_exchange_does_not_create_a_user(fresh_client) -> None:
+    """**未完成验证不创建用户**：回调还没发生时兑换返回 202。"""
+    test_client = fresh_client
+    _wired_login_client(test_client, LoginIdentity("github", "9001", None, "octocat"))
+    connection = test_client.app.state.database.connection
+
+    started = _start_login(test_client)
+    response = _exchange(test_client, started)
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "pending"}
+    assert _count(connection, "users") == 0
+    assert _count(connection, "user_identities") == 0
+
+
+def test_a_denied_authorization_does_not_create_a_user(fresh_client) -> None:
+    """授权被取消（``error=access_denied``）时兑换失败，且不创建用户。"""
+    test_client = fresh_client
+    _wired_login_client(test_client, LoginIdentity("github", "9001", None, "octocat"))
+    connection = test_client.app.state.database.connection
+
+    started = _start_login(test_client)
+    from urllib.parse import parse_qs, urlsplit
+
+    state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
+    test_client.get(
+        "/v1/auth/github/callback", params={"state": state, "error": "access_denied"}
+    )
+    response = _exchange(test_client, started)
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "LOGIN_DENIED"
+    assert _count(connection, "users") == 0
+
+
+def test_a_wrong_verifier_does_not_create_a_user(fresh_client) -> None:
+    """verifier 不匹配时兑换失败，且不创建用户。"""
+    test_client = fresh_client
+    _wired_login_client(test_client, LoginIdentity("github", "9001", None, "octocat"))
+    connection = test_client.app.state.database.connection
+
+    started = _after_callback(test_client)
+    response = test_client.post(
+        "/v1/auth/github/exchange",
+        json={"loginId": started["loginId"], "codeVerifier": "x" * 43},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "LOGIN_FAILED"
+    assert _count(connection, "users") == 0
+
+
+def test_the_same_email_in_two_providers_does_not_merge_users(fresh_client) -> None:
+    """**同邮箱不合并**：身份键始终是 ``(provider, subject)``。"""
+    test_client = fresh_client
+    connection = test_client.app.state.database.connection
+
+    _wired_login_client(test_client, LoginIdentity("github", "9001", "same@example.com", "a"))
+    github = _exchange(test_client, _after_callback(test_client))
+
+    _wired_login_client(
+        test_client, LoginIdentity("google", "9002", "same@example.com", "b"), "google"
+    )
+    google = _exchange(test_client, _after_callback(test_client, "google"), "google")
+
+    assert github.status_code == 200 and google.status_code == 200
+    assert github.json()["user"]["userId"] != google.json()["user"]["userId"]
+    assert _count(connection, "users") == 2
+    assert _count(connection, "user_identities") == 2
+
+
+def test_a_disabled_identity_cannot_log_in_or_refresh(fresh_client) -> None:
+    """停用身份既不能重新登录，也不能刷新。"""
+    test_client = fresh_client
+    _wired_login_client(test_client, LoginIdentity("github", "9001", None, "octocat"))
+    connection = test_client.app.state.database.connection
+    first = _exchange(test_client, _after_callback(test_client))
+    user_id = first.json()["user"]["userId"]
+    connection.execute(
+        "UPDATE users SET status = 'disabled' WHERE id = CAST(? AS UUID)", [user_id]
+    )
+
+    # 刷新被拒，且是 403 USER_DISABLED（不是 401）：客户端据此结束会话。
+    refresh = test_client.post(
+        "/v1/devices/tokens", json={"refreshToken": first.json()["refreshToken"]}
+    )
+    assert refresh.status_code == 403
+    assert refresh.json()["code"] == "USER_DISABLED"
+
+    # 重新登录被拒，且不新建用户（保留身份映射以防同一身份重新注册）。
+    relogin = _exchange(test_client, _after_callback(test_client))
+    assert relogin.status_code == 403
+    assert relogin.json()["code"] == "USER_DISABLED"
+    assert _count(connection, "users") == 1
+
+
+def test_me_returns_the_same_user_object_as_the_login_response(fresh_client) -> None:
+    """``GET /v1/me`` 与登录完成响应给出**同一个** user 对象。"""
+    test_client = fresh_client
+    _wired_login_client(test_client, LoginIdentity("github", "9001", "me@example.com", "octocat"))
+    logged_in = _exchange(test_client, _after_callback(test_client))
+
+    response = test_client.get(
+        "/v1/me", headers={"Authorization": f"Bearer {logged_in.json()['accessToken']}"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"user": logged_in.json()["user"]}
+
+
+def test_me_requires_authentication(fresh_client) -> None:
+    """``/v1/me`` 必须要求访问令牌。"""
+    assert fresh_client.get("/v1/me").status_code == 401
+
+
+def test_me_reports_a_disabled_user(client) -> None:
+    """用户被停用后 ``/v1/me`` 返回 403 ``USER_DISABLED``（未撤销设备时）。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    connection.execute(
+        "UPDATE users SET status = 'disabled' WHERE id = CAST(? AS UUID)", [issued.user.id]
+    )
+
+    response = test_client.get(
+        "/v1/me", headers={"Authorization": f"Bearer {issued.access_token}"}
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "USER_DISABLED"
+
+
+# --------------------------------------------------------------------------
+# 管理路由：仅 admin，受限分页，首版只改状态
+# --------------------------------------------------------------------------
+
+
+def _promote(connection: Any, user_id: str) -> None:
+    """把用户提升为管理员（本代理无权通过接口改角色）。"""
+    connection.execute(
+        "UPDATE users SET role = 'admin' WHERE id = CAST(? AS UUID)", [user_id]
+    )
+
+
+def test_admin_users_requires_an_admin(client) -> None:
+    """普通成员访问用户目录：403 ``ADMIN_REQUIRED``。"""
+    test_client, issued = client
+
+    response = test_client.get(
+        "/v1/admin/users", headers={"Authorization": f"Bearer {issued.access_token}"}
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "ADMIN_REQUIRED"
+
+
+def test_admin_users_lists_paginated_users_without_secrets(client) -> None:
+    """管理员可读取受限分页的用户目录，且响应不含凭据或账本数据。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+
+    response = test_client.get(
+        "/v1/admin/users?limit=10&offset=0",
+        headers={"Authorization": f"Bearer {issued.access_token}"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["limit"] == 10 and body["offset"] == 0
+    assert [entry["userId"] for entry in body["users"]] == [issued.user.id]
+    assert body["users"][0]["role"] == "admin"
+    raw = response.text
+    for leaked in ("accessToken", "refreshToken", "publicKey", "token"):
+        assert leaked not in raw
+
+
+def test_admin_users_rejects_an_out_of_range_page_size(client) -> None:
+    """``limit`` 越界返回 400，而不是静默截断成另一页。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+
+    response = test_client.get(
+        "/v1/admin/users?limit=100000",
+        headers={"Authorization": f"Bearer {issued.access_token}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_ARGUMENT"
+
+
+def test_admin_patch_disables_a_member_and_revokes_its_sessions(client) -> None:
+    """停用成员：状态变更 + 撤销其全部设备凭据（不是只改一个字段）。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+    admin_token = issued.access_token
+    member = asyncio.run(_second_member(test_client))
+
+    response = test_client.patch(
+        f"/v1/admin/users/{member['userId']}",
+        json={"status": "disabled"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user"]["status"] == "disabled"
+    devices = connection.execute(
+        "SELECT count(*) FROM paired_devices WHERE user_id = CAST(? AS UUID) AND status = 'revoked'",
+        [member["userId"]],
+    ).fetchone()
+    assert devices is not None and int(devices[0]) == 1
+    # 该成员既不能用旧访问令牌，也不能刷新。
+    assert test_client.get(
+        "/v1/me", headers={"Authorization": f"Bearer {member['accessToken']}"}
+    ).status_code in (401, 403)
+    refresh = test_client.post(
+        "/v1/devices/tokens", json={"refreshToken": member["refreshToken"]}
+    )
+    assert refresh.status_code == 403
+    assert refresh.json()["code"] == "USER_DISABLED"
+
+
+async def _second_member(test_client: Any) -> dict:
+    """在同一个应用里直接注册第二个成员并签发设备，返回其凭据。"""
+    connection = test_client.app.state.database.connection
+    pairing = DevicePairingService(
+        DuckDbDeviceRepository(connection),
+        test_client.app.state.write_coordinator,
+        UserRepository(connection),
+    )
+    issued = await pairing.authorize_user_device(
+        identity=LoginIdentity("google", "7001", "member@example.com", "Member"),
+        display_name="Tablet",
+        public_key_pem=OTHER_KEY_PEM,
+    )
+    return {
+        "userId": issued.user.id,
+        "deviceId": issued.device_id,
+        "accessToken": issued.access_token,
+        "refreshToken": issued.refresh_token,
+    }
+
+
+def test_restoring_a_user_does_not_revive_old_credentials(client) -> None:
+    """恢复用户沿用原 userId，但**旧凭据不复活**（计划 §4.4、V12）。
+
+    这条守的是一个不显然的区别：停用如果只把 ``users.status`` 改成 ``disabled``，
+    旧令牌在过期前仍然有效——认证层会因停用拒绝它，**但恢复后它又会重新通过**。
+    正确做法是停用同时**撤销**全部设备凭据，于是恢复只能让用户以新登录重新进入。
+
+    只断言"停用期间被拒"是不够的：那种断言对「只改状态」和「真的撤销」两种实现
+    都成立，区分不出后者。必须把状态改回 ``active`` 再验旧令牌。
+    """
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+    admin_token = issued.access_token
+    member = asyncio.run(_second_member(test_client))
+    user_id = member["userId"]
+
+    for status in ("disabled", "active"):
+        patched = test_client.patch(
+            f"/v1/admin/users/{user_id}",
+            json={"status": status},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert patched.status_code == 200
+        assert patched.json()["user"]["status"] == status
+
+    # 身份沿用同一 userId，没有新建用户。
+    assert patched.json()["user"]["userId"] == user_id
+    assert connection.execute(
+        "SELECT count(*) FROM users WHERE id = CAST(? AS UUID)", [user_id]
+    ).fetchone() == (1,)
+
+    # **恢复之后旧凭据依然无效**：访问令牌与刷新令牌都不复活。
+    assert test_client.get(
+        "/v1/me", headers={"Authorization": f"Bearer {member['accessToken']}"}
+    ).status_code in (401, 403)
+    assert test_client.post(
+        "/v1/devices/tokens", json={"refreshToken": member["refreshToken"]}
+    ).status_code in (401, 403)
+
+    # 重新登录可以拿到新凭据，证明用户本身已恢复可用。
+    reissued = asyncio.run(_second_member(test_client))
+    assert reissued["userId"] == user_id
+    assert test_client.get(
+        "/v1/me", headers={"Authorization": f"Bearer {reissued['accessToken']}"}
+    ).status_code == 200
+
+
+def test_admin_patch_disable_closes_the_members_event_stream(client) -> None:
+    """停用必须踢掉该用户已建立的事件长连接。
+
+    **不得只改状态字段就报告停用完成**：长连接与在飞回合属于"已经建立"的访问路径，
+    它们不会因为下一次请求被拒而停止推送（计划 §4.4）。
+    """
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+    member = asyncio.run(_second_member(test_client))
+    registry: EventConnectionRegistry = test_client.app.state.event_connections
+    socket = _FakeSocket()
+    registry.add(member["deviceId"], socket)
+
+    response = test_client.patch(
+        f"/v1/admin/users/{member['userId']}",
+        json={"status": "disabled"},
+        headers={"Authorization": f"Bearer {issued.access_token}"},
+    )
+
+    assert response.status_code == 200
+    assert socket.closed == [(4001, "signed out")]
+    assert registry.take_device(member["deviceId"]) == ()
+
+
+def test_admin_patch_refuses_role_changes(client) -> None:
+    """**角色不能通过管理接口修改**：请求被明确拒绝，而不是被静默忽略。
+
+    静默忽略最危险：调用方以为提权成功了，而实际没有（或反过来），两者都会让
+    权限判断与实际状态脱节。
+    """
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+
+    response = test_client.patch(
+        f"/v1/admin/users/{issued.user.id}",
+        json={"role": "admin"},
+        headers={"Authorization": f"Bearer {issued.access_token}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_ARGUMENT"
+
+
+def test_admin_patch_refuses_unknown_fields(client) -> None:
+    """正文只接受 ``status``；多带字段一律 400。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+
+    response = test_client.patch(
+        f"/v1/admin/users/{issued.user.id}",
+        json={"status": "active", "displayName": "x"},
+        headers={"Authorization": f"Bearer {issued.access_token}"},
+    )
+
+    assert response.status_code == 400
+
+
+def test_admin_patch_protects_the_last_active_admin(client) -> None:
+    """**不得停用最后一个活动管理员**：否则部署再没有任何 HTTP 入口能恢复。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+
+    response = test_client.patch(
+        f"/v1/admin/users/{issued.user.id}",
+        json={"status": "disabled"},
+        headers={"Authorization": f"Bearer {issued.access_token}"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "LAST_ADMIN_PROTECTION"
+    row = connection.execute(
+        "SELECT status FROM users WHERE id = CAST(? AS UUID)", [issued.user.id]
+    ).fetchone()
+    assert row is not None and row[0] == "active"
+
+
+def test_admin_patch_allows_disabling_an_admin_when_another_stays_active(client) -> None:
+    """还有别的活动管理员时可以停用（保护的是"最后一个"，不是"所有管理员"）。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+    member = asyncio.run(_second_member(test_client))
+    _promote(connection, member["userId"])
+
+    response = test_client.patch(
+        f"/v1/admin/users/{issued.user.id}",
+        json={"status": "disabled"},
+        headers={"Authorization": f"Bearer {issued.access_token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user"]["status"] == "disabled"
+
+
+def test_admin_patch_reports_an_unknown_user(client) -> None:
+    """不存在的用户返回 404，而不是创建或静默成功。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _promote(connection, issued.user.id)
+
+    response = test_client.patch(
+        "/v1/admin/users/11111111-1111-1111-1111-111111111111",
+        json={"status": "disabled"},
+        headers={"Authorization": f"Bearer {issued.access_token}"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "USER_NOT_FOUND"
 
 
 # --------------------------------------------------------------------------

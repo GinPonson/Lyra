@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,12 +17,12 @@ from fastapi.testclient import TestClient
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 from lyra.application.device_pairing_service import DevicePairingService
 from lyra.application.import_job import PersistedImportJobRecord
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
 from lyra.infrastructure.db.import_job_repository import DuckDbImportJobRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 
 PUBLIC_KEY_PEM = json.loads(
@@ -49,15 +50,22 @@ def client(tmp_path: Path):
     """构造已认证的应用与一个有效访问令牌，并预置一个作业。"""
     database_path = tmp_path / "imports.duckdb"
     database = open_lyra_database(str(database_path))
+    # **先用同一个身份把用户建出来**：账户与导入作业的归属列都是 NOT NULL，而设备
+    # 配对时按 ``(provider, subject)`` 解析用户；同一身份两次解析收敛到同一个 userId。
+    user_id = UserRepository(database.connection).find_or_create_user_for_identity(
+        IDENTITY, now=datetime.now(UTC)
+    ).user.id
     # 预览需要把文件里的账户标识绑定到账户，因此夹具必须有一个账户。
     database.connection.execute(
         """
-        INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-        VALUES (CAST(? AS UUID), 'Account', 'TST001', '001')
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', 'TST001', '001')
         """,
-        [ACCOUNT_ID],
+        [ACCOUNT_ID, user_id],
     )
-    DuckDbImportJobRepository(database.connection).create_import_job(_job())
+    DuckDbImportJobRepository(
+        database.connection, user_id=user_id
+    ).create_import_job(_job())
 
     settings = Settings(
         LYRA_DATABASE_PATH=str(database_path),
@@ -66,9 +74,11 @@ def client(tmp_path: Path):
     )
     application = create_app(settings, database)
     service = DevicePairingService(
-        DuckDbDeviceRepository(database.connection), WriteCoordinator()
+        DuckDbDeviceRepository(database.connection),
+        application.state.write_coordinator,
+        UserRepository(database.connection),
     )
-    issued = asyncio.run(service.authorize_owner_device(
+    issued = asyncio.run(service.authorize_user_device(
         identity=IDENTITY, display_name="Pixel 9", public_key_pem=PUBLIC_KEY_PEM
     ))
     try:
@@ -83,7 +93,8 @@ def _auth(issued) -> dict[str, str]:
         "Authorization": f"Bearer {issued.access_token}",
         # **每个 /v1 请求都必须声明客户端协议版本**（除公开路由）。
         # 缺失时服务端返回 426——那是客户端唯一能据此升级 App 的信号。
-        "x-lyra-protocol-version": "2",
+        # 直接复用客户端协议常量，协议升版时这里自动跟随。
+        **CLIENT_PROTOCOL_HEADERS,
     }
 
 

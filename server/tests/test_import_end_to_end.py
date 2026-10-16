@@ -42,6 +42,7 @@ ACCOUNT_ID = "11111111-1111-1111-1111-111111111111"
 LEGACY_KEY = "TST001"
 PARSER_VERSION = "2"
 SOURCE_HASH = "a" * 64
+USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
 
 
 def _row(
@@ -64,15 +65,27 @@ def ledger(tmp_path: Path):
     """装配真实库、账户与仓储。"""
     database = open_lyra_database(str(tmp_path / "e2e.duckdb"))
     connection = database.connection
+    # 账户归属 NOT NULL；账本仓储与提交仓储都绑定同一个用户。
     connection.execute(
         """
-        INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-        VALUES (CAST(? AS UUID), 'Account', ?, '001')
+        INSERT INTO users (id, display_name, status, role)
+        VALUES (CAST(? AS UUID), 'E2E User', 'active', 'member')
         """,
-        [ACCOUNT_ID, LEGACY_KEY],
+        [USER_ID],
+    )
+    connection.execute(
+        """
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', ?, '001')
+        """,
+        [ACCOUNT_ID, USER_ID, LEGACY_KEY],
     )
     try:
-        yield connection, DuckDbImportCommitRepository(connection), DuckDbLedgerRepository(connection)
+        yield (
+            connection,
+            DuckDbImportCommitRepository(connection, user_id=USER_ID),
+            DuckDbLedgerRepository(connection, user_id=USER_ID),
+        )
     finally:
         database.close()
 
@@ -103,7 +116,9 @@ def _commit(connection, repository, preview, expected_version: int):
     """按预览生成计划并提交。"""
     plan = build_import_commit_plan(
         ImportCommitPreview(account=preview.account, transactions=preview.transactions),
-        tuple(DuckDbLedgerRepository(connection).load_snapshot().transactions),
+        tuple(
+            DuckDbLedgerRepository(connection, user_id=USER_ID).load_snapshot().transactions
+        ),
     )
     return repository.commit_import(
         account_id=ACCOUNT_ID,

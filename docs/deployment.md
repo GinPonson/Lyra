@@ -11,8 +11,7 @@
 | 服务域名 | `deploy/.env` 的 `LYRA_DOMAIN` | 纯主机名，例如 `lyra.your-domain.com`；不要带协议、端口或路径 |
 | 至少一种登录来源的 client ID / secret | `deploy/server.env` 对应的 `LYRA_LOGIN_*` 组 | Google Web application、Linux DO Connect 或 GitHub OAuth App；密钥只存服务端 |
 | 各来源的 redirect URI | 对应开发者控制台及 `deploy/server.env` | `https://你的域名/v1/auth/{google\|linuxdo\|github}/callback`，各方分别登记且完全一致 |
-| Google 所有者（启用时） | `LYRA_OWNER_EMAIL` 或 `LYRA_OWNER_GOOGLE_SUBJECT` | 已验证邮箱或稳定 `sub`；两项同时设置时须同时匹配 |
-| GitHub / Linux.do 所有者（启用时） | `LYRA_OWNER_GITHUB_SUBJECT` / `LYRA_OWNER_LINUXDO_SUBJECT` | 自己在该来源的不可变正整数用户 ID；不填用户名、昵称或邮箱 |
+| 首个管理员的 `(provider, subject)` | 离线入口命令行参数 | **不再有 `LYRA_OWNER_*` 环境变量**；管理员在服务启动后用 `python -m lyra.admin` 显式创建，见第 4 节 |
 | 模型基址、模型名、API key | 三项 `LYRA_GENKIT_*` | 支持流式 Chat Completions 和 tool calling 的兼容服务 |
 
 主机需要 Docker Engine、**Docker Compose 2.30 或更高版本**，以及 **`python3`**（只用于运行 `deploy/init-env.py`，它只用标准库、不装依赖）。服务运行在 **`python:3.12-slim-bookworm`** 容器中，依赖由 `uv` 按 `server/uv.lock` 安装。运行探测脚本的机器需要 `uv`（它会自行取用 Python 3.12，见第 4 节）。已有其他反向代理时，可以只启动 Lyra 容器。
@@ -39,17 +38,17 @@ python3 deploy/init-env.py
 
 ### 启用登录来源
 
-模板将三种登录全部写成注释，避免未使用来源的占位值被误认为配置。**至少完整启用一组**，也可同时启用多组；不使用的组保持整组未设置。每组都包含 client ID、client secret、完整回调以及明确的所有者限制，任一组部分填写都会失败，不能因另一组可用而忽略错误配置。
+模板将三种登录全部写成注释，避免未使用来源的占位值被误认为配置。**至少完整启用一组**，也可同时启用多组；不使用的组保持整组未设置。每组只包含 client ID、client secret 与完整回调，任一组部分填写都会失败，不能因另一组可用而忽略错误配置。
 
-| 来源 | 注册应用 | 回调路径 | 所有者配置 |
-| --- | --- | --- | --- |
-| Google | Google Cloud 的 Web application OAuth client | `/v1/auth/google/callback` | 已验证邮箱或稳定 `sub` |
-| Linux.do | [Linux DO Connect](https://connect.linux.do) 的应用接入 | `/v1/auth/linuxdo/callback` | Connect 用户资料返回的稳定数字 `id` |
-| GitHub | GitHub Developer settings → OAuth apps | `/v1/auth/github/callback` | GitHub 用户 API 返回的稳定数字 `id` |
+| 来源 | 注册应用 | 回调路径 |
+| --- | --- | --- |
+| Google | Google Cloud 的 Web application OAuth client | `/v1/auth/google/callback` |
+| Linux.do | [Linux DO Connect](https://connect.linux.do) 的应用接入 | `/v1/auth/linuxdo/callback` |
+| GitHub | GitHub Developer settings → OAuth apps | `/v1/auth/github/callback` |
 
-在相应开发者控制台登记自己的完整 HTTPS 回调，再在服务器本地填写同一地址。GitHub 数字 ID 可从官方公开用户接口查询；Linux.do ID 按 Connect 官方接入示例核对自己的用户资料。具体变量、ID 核对和官方说明见 [Genkit 与多来源登录](genkit-oauth.md#3-配置-googlelinuxdo-与-github)。不要把示例用户名或数字当作自己的 ID，也不要为取得 ID 而移除所有者限制。
+在相应开发者控制台登记自己的完整 HTTPS 回调，再在服务器本地填写同一地址。具体变量与官方说明见 [Genkit 与多来源登录](genkit-oauth.md#3-配置-googlelinuxdo-与-github)。
 
-多种来源访问同一份私有账本，各来源都须显式声明允许的身份。首次成功兑换后，数据库按来源固定 `subject`；相同邮箱或昵称不会自动关联，修改环境变量不能让其他账号接管已经绑定的来源。新增来源声明的是对这份账本的访问权限，当前不是多用户独立账本服务。
+**不再有所有者白名单。** 三种来源都是**各自独立的登录入口**，新身份首次登录自动注册为普通用户并获得自己的空账本。身份键是已验证的 `(provider, subject)`，相同邮箱或昵称不会自动合并成一个用户。管理员必须由离线入口显式创建（见第 4 节）——任何登录路径都不会产生管理员，也没有「第一位访问者自动认领」这条路径。
 
 修改登录配置后重启服务器（配置在启动时校验），再在 App 登录页重新检测即可看到来源可用性。配置完整不等于真实凭据已通过提供方验证；关闭来源只阻止新的授权，不代替撤销已经签发的设备会话。
 
@@ -59,7 +58,7 @@ python3 deploy/init-env.py
 
 模板默认 `LYRA_MARKET_STOCK_PROVIDERS=none`、`LYRA_MARKET_OPTION_PROVIDERS=none`，推荐保留这两个值。需要行情时，先在服务器填写供应商的完整凭据并重启（凭据不完整或只填一半会在启动时失败）；对应来源随后在 App 中变为可选，填写密钥本身不会启用远程读取。
 
-之后在 **「我的 → 行情与估值」** 分别为股票和期权选择主来源、可选备用来源或关闭；每次选择都会自动提交，服务端确认后立即对新行情查询生效，日常切源无需重启。等待时显示「正在切换」并防止重复提交，失败时界面恢复最后已确认的选择并提示重试。选择通过 schema 14 引入的配置表持久化在服务端，对同一所有者的全部设备与 Genkit 共用，随数据库备份并在重启后恢复。
+之后在 **「我的 → 行情与估值」** 分别为股票和期权选择主来源、可选备用来源或关闭；每次选择都会自动提交，服务端确认后立即对新行情查询生效，日常切源无需重启。等待时显示「正在切换」并防止重复提交，失败时界面恢复最后已确认的选择并提示重试。选择通过 schema 14 引入的配置表持久化在服务端，**按用户保存**：该用户的全部设备与 Lyra 助手共用，各用户互不影响，随数据库备份并在重启后恢复。
 
 例如，两类资产都使用 MarketData 历史模式时，服务器填写 `LYRA_MARKETDATA_API_TOKEN`，保留 `LYRA_MARKETDATA_MODE=historical` 和每日本地请求上限 `80`；在 App 内依次将两类主来源选为 MarketData，每次选择会自动提交。该模式显式向上游请求 `mode=historical`，以实际报价时间为准；不保证收盘后立即可取，也没有后台定时任务。数据模式权限以提供方账户为准。
 
@@ -111,7 +110,7 @@ UV_CACHE_DIR=../.uv-tmp/cache UV_PYTHON_INSTALL_DIR=../.uv-tmp/python \
 
 `--base-url` 必填，`--device-token` 可选；不传令牌时会跳过带令牌的三项检查，并明确提示**没有验证过真实账本读取**。
 
-探测逐项验证：`/v1/health` 返回 200 且 `status` 为 `healthy` **或 `degraded`**；`/v1/system/info` 的 `schema_version` 为 15、`protocol_version` 为 2；缺少 `x-lyra-protocol-version` 请求头时受保护端点返回 **426**（而不是 401）；未认证访问受保护端点返回 **401 且错误体是扁平信封**；带令牌读取账本返回 200。它不会登录、建账户、导入文件或请求模型。首次证书签发可能晚于容器进入运行状态；遇到 TLS 连接失败时，核对 DNS 和 Caddy 日志后重试。
+探测逐项验证：`/v1/health` 返回 200 且 `status` 为 `healthy` **或 `degraded`**；`/v1/system/info` 的 `schema_version` 为 16、`protocol_version` 为 3；缺少 `x-lyra-protocol-version` 请求头时受保护端点返回 **426**（而不是 401）；未认证访问受保护端点返回 **401 且错误体是扁平信封**；带令牌读取账本返回 200。它不会登录、建账户、导入文件或请求模型。首次证书签发可能晚于容器进入运行状态；遇到 TLS 连接失败时，核对 DNS 和 Caddy 日志后重试。
 
 （原先的 Node 版探测脚本已随 Node 侧整体删除，它的检查项全部并入这个脚本；`/mcp` 端点更早已移除，脚本不探测它。）
 
@@ -120,6 +119,24 @@ UV_CACHE_DIR=../.uv-tmp/cache UV_PYTHON_INSTALL_DIR=../.uv-tmp/python \
 ```
 
 健康检查接受账本可用的 `degraded` 状态；可选 AI 未配置不应阻止账本服务启动。Genkit 的本地 `available` 仅表示配置完整，不能据此判断模型额度、API key、工具调用或任何登录来源的真实授权已经验证。
+
+### 新安装：显式创建首个管理员
+
+多用户账本**没有**「第一位访问者自动成为管理员」这条路径，也不会因为你配了某个来源就把它当管理员。首个管理员必须由离线入口**显式指定** `(provider, subject)`：
+
+```bash
+./deploy/compose.sh exec lyra \
+  python -m lyra.admin --database /var/lib/lyra/lyra.duckdb \
+  --provider google --subject '<你的不可变 Google subject>' \
+  --display-name '<显示名>'
+```
+
+- 该身份由第三方 OAuth 在**首次登录时**验证，入口只负责登记，不验证它真的属于你。
+- **不要**用邮箱或用户名充当 subject：身份键始终是已验证的 `(provider, subject)`。
+- 入口不打印任何 token，也不读取「首个请求」当凭据。
+- 重复执行会明确失败并报出既有 userId，不会静默改绑。
+
+除管理员以外的身份首次 OAuth 登录时**自动注册为普通用户**并获得自己的空账本，无需审批。管理员调用账本接口时也只能访问自己的数据——角色只影响用户管理功能。
 
 ### 已有 Nginx、Caddy 或其他 HTTPS 入口
 
@@ -166,6 +183,38 @@ schema 14 只新增行情选择的持久化，不撤销 schema 13 的有效 OAut
 
 回退需要使用**升级前备份 + 相匹配的旧服务和旧 App**；不能直接拿旧程序打开已经迁移到新 schema 的库。具体迁移规则见 [Genkit 与多来源登录](genkit-oauth.md#7-启动与升级)。TS → Python 切流的回退（TS 源码只存在于 git 历史、镜像 `lyra-server:local` 无固定 tag/digest）见[切流运行手册](plans/lyra-cutover-runbook-20261013.md)第 6 阶段。
 
+### 多用户账本升级（schema 16，需要重新登录）
+
+schema 16 引入**多用户独立账本**：同一个 Server 支持少量用户各自拥有独立账本，设备、证券账户、导入作业、Agent 会话、Gmail 连接与行情设置都带上用户归属。协议同时升到 **3**，服务端**不再接受协议 2 的客户端**。
+
+**这次升级与以往不同：旧设备凭据会被全部撤销，所有人都要重新 OAuth 登录。** 这是有意的——schema 15 的凭据是在没有用户概念时签发的，让它们穿过一次授权模型的引入是反方向。凭据只改状态不删行，重放检测与审计需要保留它们。
+
+升级步骤（每一步成功后再继续）：
+
+1. **先完成本地验收**：`uv run pytest -q` 与 `flutter analyze/test` 全绿，且已准备好协议 3 的 App。App 与服务端必须同时升级——协议 2 的 App 会被 426 拒绝，那是它唯一能据此提示升级的信号。
+2. **停服并备份**（见上一节的备份命令）。除数据库目录外，`deploy/server.env` 里的主密钥与供应商凭据要另外保管——**数据库副本不能替代密钥**，Gmail token 是加密存储的。
+3. **显式确认原 owner 的每一来源身份**。旧库的 `server_owner_identity` 只是「曾经登录过」的记录，**不是原账本的永久授权**。逐个核对后把它们作为 `--owner-identity` 传入；**没有确认的身份不会被关联到原用户**，它们之后按自动注册规则各自得到独立空账本。非空库若无法确定归属，迁移会明确失败——这是刻意的，不要绕过。
+4. **跑离线升级入口**（容器内执行，路径按实际挂载调整）：
+
+   ```bash
+   python -m lyra.admin --database /var/lib/lyra/lyra.duckdb \
+     --owner-identity google:<原 Google subject> \
+     --owner-identity github:<原 GitHub subject> \
+     --provider google --subject <既有设备使用的那个身份> \
+     --display-name '<原用户显示名>'
+   ```
+
+   `--provider/--subject` 在旧库升级时表示**既有设备的身份来源**，它必须已经列在 `--owner-identity` 里。设备原有的「本次登录用了哪个身份」没有被记录，因此必须显式指定；不指定而旧库又有设备时，迁移会明确失败而不是替谁挑一条。
+
+   入口会打印归属摘要、已确认身份，以及**未被确认的历史身份警告**——那些身份对应的用户升级后会登录到空账本，漏看这条警告是本次升级最主要的操作风险。
+
+5. **核对结果并重启**：入口完成后重新打开库确认 `users` / `user_identities` / 各表的 `user_id` 归属，再启动新服务。所有设备此时凭据已撤销，用户需要重新登录；重新登录会按 `(provider, subject)` 关联回原用户，账本、Gmail 与历史都会回来。
+6. **在受限访问范围内验证后再开放**：先用合成或明确授权的测试账号验证自动注册与用户间隔离，确认无误后再对真实用户开放。
+
+成员关系、共享账本、自助绑定额外登录方式、管理后台都**不在首版范围**：身份键始终是已验证的 `(provider, subject)`，**同邮箱的不同来源身份不会自动合并**。
+
+**失败与回退**：升级失败时保持服务关闭并报告原因，不要带着半迁移状态启动。回退使用**升级前的完整备份 + 相匹配的旧服务与旧 App**；旧程序不能打开 schema 16 的库，也不能只恢复部分表。新版本一旦接收过写入，就不能直接用旧备份覆盖——要先单独保存新增数据并制定恢复方案。
+
 ## 6. 手机上完成真实联调
 
 构建与当前服务端匹配的 App，并通过 `--dart-define=LYRA_SERVER_URL=实际部署的HTTPS地址` 注入后台地址。新安装在独立登录页直接选择账号，用户不填写地址或管理连接；旧安装继续使用已有凭据绑定或历史记住的原地址。此前版本的 APK 不包含本轮简化登录页与新增登录方式，当前验收需要重新构建移动端源码。
@@ -194,14 +243,17 @@ schema 14 只新增行情选择的持久化，不撤销 schema 13 的有效 OAut
 
 服务端验证入口是 `cd server && uv run --frozen pytest -q`（全量测试）与 `uv run --frozen ruff check .`（错误类静态检查）；HEAD（`ed522c7`）实测 **2307 项通过 / 4 项跳过**（数字随提交变动，以执行时输出为准）。该结果来自受控身份提供方与本地测试，不代表真实 OAuth 已上线。本轮未部署到 VPS、未重新构建 APK，也未用真实行情 Key 完成联调。
 
-部署前需要确定域名、服务器环境、至少一个登录来源及其所有者 ID，以及按需使用的兼容模型服务；凭据在服务器本地配置。真实环境联调完成前，现有迁移 PR 继续保持草稿。
+部署前需要确定域名、服务器环境、至少一个登录来源，以及按需使用的兼容模型服务和首个管理员的 `(provider, subject)`；凭据在服务器本地配置。真实环境联调完成前，现有迁移 PR 继续保持草稿。
 
 ## 8. 登录入口的已知安全边界
 
-当前登录流程的**事务绑定的是发起方，而不是在浏览器里完成授权的人**（完整说明见 [多来源登录的安全边界](genkit-oauth.md#app-登录过程)）。Google、Linux.do 和 GitHub 均沿用这一流程；任何能访问登录入口的人都可以自行创建登录事务，把生成好的授权链接发给所有者，诱导其完成授权后领取所有者的设备凭据。来源隔离、state 与 PKCE 不能证明浏览器授权者持有发起设备。
+当前登录流程的**事务绑定的是发起方，而不是在浏览器里完成授权的人**（完整说明见 [多来源登录的安全边界](genkit-oauth.md#app-登录过程)）。Google、Linux.do 和 GitHub 均沿用这一流程；任何能访问登录入口的人都可以自行创建登录事务，把生成好的授权链接发给**某个用户**，诱导其完成授权后领取**该用户**的设备凭据。来源隔离、state 与 PKCE 不能证明浏览器授权者持有发起设备。
+
+**多用户下这条边界的影响面更大**：首次登录会自动注册，未登录过的第三方也能自建事务，因此登录入口的暴露范围直接决定谁能在这个部署上获得账号。
 
 该问题本轮未修复（需要引入只有人类可传递的共享秘密，属协议与交互改动）。在该改动落地前，运维必须遵守：
 
 - 只使用自己在 App 内选择 Google、Linux.do 或 GitHub 后生成的授权页，**不要点击或转发他人提供的 Lyra 授权链接**；
-- 不要把登录入口暴露在不受信任的网络或公开索引中；公网部署应限制来源范围，并优先保证只有所有者本人访问该域名；
+- 不要把登录入口暴露在不受信任的网络或公开索引中；公网部署应限制来源范围，并确保只有你信任的用户能访问该域名；
+- 管理员账号用离线入口显式登记（见「新安装：显式创建首个管理员」），不要依赖任何自动认领路径；
 - 「我的 → 确认退出」只请求撤销当前设备凭据；不能将当前设备退出视为其他设备已撤销，服务端撤销失败时也不能视为凭据已失效。

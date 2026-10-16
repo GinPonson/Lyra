@@ -6,6 +6,17 @@
 持久化它等于把"未完成的授权"变成需要清理的历史数据，而进程重启后它本就应当消失。
 
 **授权事务绑定发起设备**：另一台设备拿到 state 也无法完成兑换。
+
+**用户范围通过 :meth:`GmailService.for_user` 注入，而不是每个方法的参数**：路由持有
+的是一个单例服务（``app.state.gmail_service``），而「当前用户」是**每请求**才确定的。
+``for_user`` 返回一个把 ``user_id`` 绑进依赖视图的服务副本，因此：
+
+- 每一条仓储调用都天然带用户范围，不存在"某个方法漏传 user_id 退化成全库"的路径；
+- 业务方法的形状（``list_connections()`` / ``disconnect(connection_id=...)``）保持不变，
+  路由与既有单元测试只多一层 ``for_user``，不必逐个方法改签名。
+
+**没有"不带用户的默认视图"**：``for_user`` 需要显式 ``user_id``；未绑定用户的服务在
+真实依赖上调用任何方法都会因缺少参数而**立刻报错**，而不是退回全库语义。
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ from ..infrastructure.gmail.oauth_transaction import (
     create_google_oauth_transaction,
 )
 from .app_error import ApplicationError
+from .gmail_sync_service import sync_gmail_connection
 from .gmail_views import (
     create_public_gmail_account_mapping_list,
     create_public_gmail_connection,
@@ -52,18 +64,43 @@ class GmailService:
 
     @param dependencies: 外部动作集合。
     @param oauth: OAuth 配置；``None`` 表示未配置。
+    @param transactions: 一次性授权事务表；``for_user`` 的副本共享同一个表。
     """
 
-    def __init__(self, *, dependencies: Any, oauth: GmailOAuthConfig | None) -> None:
+    def __init__(
+        self,
+        *,
+        dependencies: Any,
+        oauth: GmailOAuthConfig | None,
+        transactions: dict[str, Any] | None = None,
+    ) -> None:
         self._deps = dependencies
         self._oauth = oauth
         # 键为 state 的一次性事务表；进程重启即清空（本就应该如此）。
-        self._transactions: dict[str, Any] = {}
+        #
+        # **由 :meth:`for_user` 的副本共享**：创建事务的请求与完成事务的请求是两个
+        # 请求，各自拿到自己的服务副本；表若不共享，完成那一步永远找不到事务。
+        self._transactions: dict[str, Any] = {} if transactions is None else transactions
 
     @property
     def configured(self) -> bool:
         """OAuth 是否已配置。"""
         return self._oauth is not None
+
+    def for_user(self, user_id: str) -> GmailService:
+        """返回绑定到指定用户的服务视图。
+
+        **这是路由唯一的取服务方式**：用户来自 ``request.state.auth.user_id``（由
+        ``require_user`` 从访问令牌解析），绝不来自请求正文或查询串（计划 §4.2）。
+
+        @param user_id: 当前用户的 UUID 文本；**必填**。
+        @returns 所有仓储调用都限定在该用户内的服务副本。
+        """
+        return GmailService(
+            dependencies=_UserScopedGmailDependencies(self._deps, user_id),
+            oauth=self._oauth,
+            transactions=self._transactions,
+        )
 
     # ------------------------------------------------------------------
     # 授权事务
@@ -74,6 +111,9 @@ class GmailService:
 
         **只返回 ``authorizationUrl`` 与 ``expiresAt``，不返回 ``state``**：
         客户端从 Google 重定向里取 state，不需要（也不该）从本响应里取。
+
+        **不额外绑定用户**：事务已绑定发起设备，而设备归属唯一，因此设备匹配已经
+        蕴含用户匹配——再多存一个 user_id 只是同一约束的第二份副本。
 
         @param device_id: 发起授权的设备。
         @returns 授权地址与过期时间；OAuth 未配置时为 ``None``。
@@ -96,13 +136,14 @@ class GmailService:
     def complete_authorization_transaction(
         self, *, device_id: str, state: str, authorization_code: str
     ) -> dict[str, Any]:
-        """用授权码完成授权并建立连接。
+        """用授权码完成授权并建立**属于当前用户**的连接。
 
         @param device_id: 发起授权的设备。
         @param state: 回调携带的 state。
         @param authorization_code: Google 授权码。
         @returns 公开的连接视图。
-        @raises ApplicationError: OAuth 未配置（503）或事务无效/过期/已用。
+        @raises ApplicationError: OAuth 未配置（503）、事务无效/过期/已用（400），
+            或该用户已连接同一个 Google 账号（409）。
         """
         if self._oauth is None:
             raise ApplicationError(
@@ -142,11 +183,12 @@ class GmailService:
             cipher=self._deps.cipher,
             now=self._deps.now(),
         )
-        try:
-            self._deps.create_connection(connection)
-        except ApplicationError:
-            # 同一 Google 账号已有连接：**不新建**，否则两条连接的同步游标会互相覆盖。
-            raise
+        # 归属由依赖视图注入：``create_connection`` 落库时带上当前用户的 user_id。
+        #
+        # 同一 Google 账号在**同一用户**下已有连接时插入会冲突（409）；在**另一个
+        # 用户**下则是各自独立的一条连接，不再互相顶掉（唯一键 ``(user_id,
+        # google_subject)``，P0 契约 §3.12）。
+        self._deps.create_connection(connection)
         return create_public_gmail_connection(connection).to_json()
 
     # ------------------------------------------------------------------
@@ -206,10 +248,11 @@ class GmailService:
         "本地已断开但 Google 侧仍授权"的状态——那是最糟的组合。
 
         @returns 公开的连接视图。
-        @raises ApplicationError: 连接不存在（404）或撤销失败（503，可重试）。
+        @raises ApplicationError: 连接不存在或不属于当前用户（404）、撤销失败（503，可重试）。
         """
         connection = self._deps.load_connection(connection_id)
         if connection is None:
+            # 不属于该用户的连接与不存在的连接返回同一个 404，不区分二者。
             raise ApplicationError(
                 code="GMAIL_CONNECTION_ERROR", message="Gmail 连接不存在",
                 status_code=404, retryable=False,
@@ -227,6 +270,128 @@ class GmailService:
         disconnected = disconnect_gmail_connection(record, self._deps.now())
         self._deps.save_connection(disconnected, expected_updated_at=connection.updated_at)
         return create_public_gmail_connection(disconnected).to_json()
+
+    # ------------------------------------------------------------------
+    # 同步
+    # ------------------------------------------------------------------
+
+    def sync(
+        self,
+        *,
+        connection_id: str,
+        confirmed_rescan_after_date: str | None,
+        explicit_account_id: str | None,
+    ) -> dict[str, Any]:
+        """执行一次属于当前用户的增量同步或有界重扫。
+
+        **用户活动状态在真正的执行点再查一次**：请求进入时 ``require_user`` 已经拒绝
+        过停用用户（入队检查），但同步是长流程，用户可能在拉取期间被停用。依赖视图里
+        的每一次读取/写入都会重新确认活动状态，因此停用一旦提交，本次同步既不会继续
+        拉取，也不会入账（计划 §4.4；P0 契约 §3.5 说明本服务没有独立后台 worker，
+        "排队任务"即等待单写队列或已在进行中的请求）。
+
+        @param connection_id: 连接 ID；必须属于当前用户。
+        @param confirmed_rescan_after_date: 用户确认的重扫起始日期。
+        @param explicit_account_id: 用户显式指定的账户。
+        @returns 同步摘要。
+        @raises ApplicationError: 连接不存在（404）、用户已停用（403）、
+            OAuth 未配置（503）、需要确认重扫（409）、授权失效（401）等。
+        """
+        return sync_gmail_connection(
+            connection_id=connection_id,
+            confirmed_rescan_after_date=confirmed_rescan_after_date,
+            explicit_account_id=explicit_account_id,
+            dependencies=self._deps.build_sync_dependencies(),
+        )
+
+
+class _UserScopedGmailDependencies:
+    """把 ``user_id`` 绑进每一次依赖调用的适配器。
+
+    **为什么不在服务方法上加 ``user_id`` 参数**：那样每个调用点都要记住传参，漏传
+    一次就退化成全库语义，而且失败是静默的（读到别人的数据）。把用户放进依赖视图后，
+    仓储调用**不可能**漏掉用户范围——它根本不在调用点上。
+
+    这里刻意只转发 :class:`GmailService` 真正会用到的方法，不做通用 ``__getattr__``
+    代理：依赖接口扩张时应当显式暴露，而不是自动获得一个可能不带用户范围的新方法。
+
+    @param inner: 真实的依赖集合；其方法首参为 ``user_id``。
+    @param user_id: 绑定的用户 UUID 文本。
+    """
+
+    def __init__(self, inner: Any, user_id: str) -> None:
+        self._inner = inner
+        self._user_id = user_id
+
+    @property
+    def user_id(self) -> str:
+        """绑定的用户 UUID 文本；测试与日志据此确认作用域。"""
+        return self._user_id
+
+    @property
+    def cipher(self) -> Any:
+        """凭据加密器；授权码交换后创建连接记录时使用。"""
+        return self._inner.cipher
+
+    def now(self) -> Any:
+        """服务端可信时间。"""
+        return self._inner.now()
+
+    def new_id(self) -> str:
+        """新连接 ID。"""
+        return self._inner.new_id()
+
+    def exchange_code(self, **kwargs: Any) -> dict:
+        """用授权码换取凭据与身份。"""
+        return self._inner.exchange_code(**kwargs)
+
+    def create_connection(self, record: Any) -> None:
+        """插入连接行，归属为绑定的用户。"""
+        self._inner.create_connection(self._user_id, record)
+
+    def list_connections(self) -> tuple:
+        """列出绑定用户的连接。"""
+        return self._inner.list_connections(self._user_id)
+
+    def load_connection(self, connection_id: str) -> Any:
+        """读取一条属于绑定用户的连接。"""
+        return self._inner.load_connection(self._user_id, connection_id)
+
+    def save_connection(
+        self, record: Any, *, expected_updated_at: str, **overrides: Any
+    ) -> None:
+        """保存绑定用户的连接状态（带 CAS）。"""
+        self._inner.save_connection(
+            self._user_id, record, expected_updated_at=expected_updated_at, **overrides
+        )
+
+    def list_mappings(self, connection_id: str) -> tuple:
+        """列出绑定用户某连接的映射。"""
+        return self._inner.list_mappings(self._user_id, connection_id)
+
+    def load_mapping(self, mapping_id: str) -> Any:
+        """读取一条属于绑定用户的映射。"""
+        return self._inner.load_mapping(self._user_id, mapping_id)
+
+    def list_accounts(self) -> tuple:
+        """列出绑定用户的账本账户。"""
+        return self._inner.list_accounts(self._user_id)
+
+    def plan_mapping_update(self, **kwargs: Any) -> Any:
+        """规划一次映射改绑；账户集合已由绑定用户范围产出。"""
+        return self._inner.plan_mapping_update(**kwargs)
+
+    def update_mapping(self, **kwargs: Any) -> None:
+        """执行改绑（旧账户 ID 做 CAS），并确认目标账户属于绑定用户。"""
+        self._inner.update_mapping(self._user_id, **kwargs)
+
+    def revoke(self, connection: Any) -> None:
+        """向 Google 撤销授权。"""
+        self._inner.revoke(connection)
+
+    def build_sync_dependencies(self) -> Any:
+        """构造绑定用户的同步依赖集合。"""
+        return self._inner.build_sync_dependencies(self._user_id)
 
 
 def _identity(payload: dict[str, Any]) -> Any:

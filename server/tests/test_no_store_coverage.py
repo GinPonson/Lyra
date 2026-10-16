@@ -25,11 +25,11 @@ from fastapi.testclient import TestClient
 
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 from lyra.application.device_pairing_service import DevicePairingService
-from lyra.application.write_coordinator import WriteCoordinator
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 
 _KEYS = Path(__file__).parent / "fixtures" / "device-keys.json"
@@ -52,8 +52,10 @@ def client(tmp_path: Path):
     )
     application = create_app(settings, database)
     repository = DuckDbDeviceRepository(database.connection)
-    service = DevicePairingService(repository, WriteCoordinator())
-    issued = asyncio.run(service.authorize_owner_device(
+    service = DevicePairingService(
+        repository, application.state.write_coordinator, UserRepository(database.connection)
+    )
+    issued = asyncio.run(service.authorize_user_device(
         identity=_IDENTITY, display_name="Pixel 9", public_key_pem=_PUBLIC_KEY_PEM
     ))
     try:

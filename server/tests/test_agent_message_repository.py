@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from lyra.infrastructure.db.agent_session_repository import DuckDbAgentSessionRe
 ACCOUNT_ID = "11111111-1111-1111-1111-111111111111"
 DEVICE_ID = "22222222-2222-2222-2222-222222222222"
 SESSION_ID = "33333333-3333-3333-3333-333333333333"
+USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 NOW = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
 T1 = "2026-10-12T09:00:01.000Z"
 T2 = "2026-10-12T09:00:02.000Z"
@@ -38,23 +40,37 @@ T2 = "2026-10-12T09:00:02.000Z"
 
 @pytest.fixture()
 def wired(tmp_path: Path):
-    """装配真实库、账户、设备与会话。"""
+    """装配真实库、用户、账户、设备与会话。"""
     database = open_lyra_database(str(tmp_path / "msg.duckdb"))
     connection = database.connection
     connection.execute(
+        "INSERT INTO users (id, display_name) VALUES (CAST(? AS UUID), 'Owner')",
+        [USER_ID],
+    )
+    connection.execute(
         """
-        INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-        VALUES (CAST(? AS UUID), 'Account', 'TST001', '001')
+        INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'Account', 'TST001', '001')
         """,
-        [ACCOUNT_ID],
+        [ACCOUNT_ID, USER_ID],
+    )
+    identity_id = str(uuid.uuid4())
+    connection.execute(
+        """
+        INSERT INTO user_identities (id, user_id, provider, subject)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'github', 'subject-1')
+        """,
+        [identity_id, USER_ID],
     )
     connection.execute(
         """
         INSERT INTO paired_devices
-            (id, display_name, public_key_pem, public_key_fingerprint, key_algorithm, status)
-        VALUES (CAST(? AS UUID), 'Pixel 9', '-----BEGIN PUBLIC KEY-----', ?, 'ec', 'active')
+            (id, user_id, identity_id, display_name, public_key_pem,
+             public_key_fingerprint, key_algorithm, status)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), CAST(? AS UUID), 'Pixel 9',
+                '-----BEGIN PUBLIC KEY-----', ?, 'ec', 'active')
         """,
-        [DEVICE_ID, "f" * 64],
+        [DEVICE_ID, USER_ID, identity_id, "f" * 64],
     )
     DuckDbAgentSessionRepository(connection).create_session(
         create_agent_session(
@@ -62,7 +78,7 @@ def wired(tmp_path: Path):
             availability=AgentProviderAvailability(provider="genkit", status="available"),
             account_scope=AccountScope(kind="all"), ledger_version=0, as_of=T1,
         ),
-        device_id=DEVICE_ID, now=NOW,
+        device_id=DEVICE_ID, user_id=USER_ID, now=NOW,
     )
     try:
         yield AgentMessageRepository(connection), connection

@@ -44,7 +44,7 @@ def test_every_documented_check_is_wired_in() -> None:
         "错误类静态检查",
         "接管既有账本",
         "模式版本自洽",
-        "协议版本为 2",
+        "协议版本为 3",
         "路由契约",
         "LYRA_SECRET_MASTER_KEY 形态",
     }
@@ -86,7 +86,7 @@ def test_the_protocol_version_check_reports_the_value() -> None:
     result = module.check_protocol_version()
 
     assert "LYRA_PROTOCOL_VERSION=" in result.detail
-    assert result.passed, "协议版本应为 2"
+    assert result.passed, "协议版本应为 3"
 
 
 def test_the_route_check_reports_counts_on_success() -> None:

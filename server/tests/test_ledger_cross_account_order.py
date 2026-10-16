@@ -28,10 +28,14 @@ def _h(label: str) -> str:
 
 ACCOUNT_A = "11111111-1111-1111-1111-111111111111"
 ACCOUNT_B = "22222222-2222-2222-2222-222222222222"
+USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
 
 
 def _seed_two_accounts(connection) -> None:
-    """写入两个账户，各一笔**同一天、同一 sequence** 的交易。
+    """写入两个**同属一个用户**的账户，各一笔**同一天、同一 sequence** 的交易。
+
+    两个账户同属一个用户是刻意的：跨账户排序只有在同一个用户范围内才有意义，若分属
+    两个用户，用户范围会把它们分开、这条排序分支根本触发不到。
 
     关键在哈希的取值：账户 B 的交易哈希**排在账户 A 之前**（按字典序）。
     因此：
@@ -42,15 +46,26 @@ def _seed_two_accounts(connection) -> None:
     两种顺序都能通过"是全序"的检查，只有对照参考实现的规则才能区分。
     """
     connection.execute(
-        "INSERT INTO ledger_versions (version, reason, source_reference) VALUES (1, 'file_import', 'src')"
+        """
+        INSERT INTO users (id, display_name, status, role)
+        VALUES (CAST(? AS UUID), 'Order User', 'active', 'member')
+        """,
+        [USER_ID],
+    )
+    connection.execute(
+        """
+        INSERT INTO ledger_versions (version, user_id, reason, source_reference)
+        VALUES (1, CAST(? AS UUID), 'file_import', 'src')
+        """,
+        [USER_ID],
     )
     for account_id, key, suffix in ((ACCOUNT_A, "TST001", "001"), (ACCOUNT_B, "TST002", "002")):
         connection.execute(
             """
-            INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-            VALUES (CAST(? AS UUID), ?, ?, ?)
+            INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+            VALUES (CAST(? AS UUID), CAST(? AS UUID), ?, ?, ?)
             """,
-            [account_id, f"Account {suffix}", key, suffix],
+            [account_id, USER_ID, f"Account {suffix}", key, suffix],
         )
     # 账户 B 的哈希故意排在账户 A 之前。
     rows = [
@@ -85,7 +100,7 @@ def test_same_day_same_sequence_rows_are_ordered_by_account(tmp_path) -> None:
     database = open_lyra_database(str(tmp_path / "order.duckdb"))
     try:
         _seed_two_accounts(database.connection)
-        snapshot = DuckDbLedgerRepository(database.connection).load_snapshot(
+        snapshot = DuckDbLedgerRepository(database.connection, user_id=USER_ID).load_snapshot(
             AccountScope(kind="all")
         )
 

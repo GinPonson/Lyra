@@ -8,6 +8,9 @@
    泄漏它等于泄漏"哪份文件属于哪个账户"；
 2. **幂等重放返回同一个账户**，不重复创建；
 3. 账户、审计与幂等收口**同一事务**（见 :mod:`.account_repository`）。
+
+**账户标识只在用户内唯一**：A/B 可以各自拥有同键账户，因此重复检测、重放读取与落库
+都带显式 ``user_id``，且该值只能来自服务端认证上下文（契约 §3.8）。
 """
 
 from __future__ import annotations
@@ -113,6 +116,7 @@ def create_account(
     connection: Any,
     *,
     body: Any,
+    user_id: str,
     device_id: str,
     request_id: str,
     idempotency_key: str | None,
@@ -120,10 +124,14 @@ def create_account(
     account_id: str | None = None,
     audit_id: str | None = None,
 ) -> tuple[dict[str, object], bool]:
-    """创建一个账户（幂等）。
+    """创建一个**属于指定用户**的账户（幂等）。
+
+    ``user_id`` 是必填关键字参数：账户标识已在用户内唯一，归属必须显式给出，不接受
+    ``None`` 表示"当前用户"或全库。调用方只能从 ``AuthContext`` 取值（契约 §3.8）。
 
     @param connection: 数据库连接。
     @param body: 请求正文。
+    @param user_id: 新账户的归属用户 UUID 文本。
     @param device_id: 发起设备 UUID。
     @param request_id: 请求 ID，写入审计便于关联日志。
     @param idempotency_key: 明文幂等键；``None`` 表示客户端未要求幂等。
@@ -154,7 +162,10 @@ def create_account(
         )
 
     if isinstance(planned, IdempotentMutationReplay):
-        existing = load_brokerage_account(connection, planned.result_resource_id)
+        # 幂等记录是**设备级**的（唯一键 ``(device_id, operation, key_hash)``），而该设备
+        # 只能属于一个用户，因此重放读取仍带用户范围——这是纵深防御：即便幂等记录被
+        # 伪造或历史数据串了设备，也不会把别人的账户读出来。
+        existing = load_brokerage_account(connection, user_id, planned.result_resource_id)
         if existing is None:
             # 幂等记录说"已完成"，但目标账户不存在——数据库处于不一致状态。
             # **宁可报错也不静默重建**：静默重建会掩盖一次真实的数据损坏。
@@ -170,6 +181,9 @@ def create_account(
     created_at = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
     account: dict[str, object] = {
         "id": new_id,
+        # **归属列必须在字典里**：``accounts.user_id`` 是 NOT NULL，且用户内唯一键
+        # ``(user_id, legacy_account_key)`` 正是靠它才允许"同一标识在不同用户下共存"。
+        "user_id": user_id,
         "display_name": request["display_name"],
         # **文件账户标识本身不入公开响应**，但必须落库——它是导入时的匹配键。
         "legacy_account_key": request["legacy_account_key"],

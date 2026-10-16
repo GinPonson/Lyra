@@ -65,6 +65,9 @@ class AgentToolContext:
 
     @param session_id: 所属会话。
     @param device_id: 发起会话的设备；工具调用因此可归属到一次可撤销的登录。
+    @param user_id: 会话所属用户的 UUID；**账本读取的用户范围只认它**。它来自服务端
+        的会话身份（``agent_session_identities.user_id``），请求正文与模型参数都无法
+        改写——``all`` 因此只等于"该用户的全部账户"，而不是全库。
     @param user_message_id: 工具调用挂靠的**已落库**消息 ID。``agent_tool_calls``
         对 ``agent_messages`` 有外键，而助手消息要到回合结束才落库，所以工具调用
         只能绑定本轮的用户消息。
@@ -76,6 +79,7 @@ class AgentToolContext:
 
     session_id: str
     device_id: str
+    user_id: str
     user_message_id: str
     account_scope: AccountScope
     ledger_version: int

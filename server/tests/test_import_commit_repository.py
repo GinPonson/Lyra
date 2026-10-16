@@ -28,10 +28,26 @@ from lyra.infrastructure.db.import_job_repository import DuckDbImportJobReposito
 ACCOUNT_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_ACCOUNT_ID = "22222222-2222-2222-2222-222222222222"
 LEGACY_KEY = "TST001"
+USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
+OTHER_USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa2"
+# 另一个用户的账户，**legacy key 与 A 的账户完全相同**：账户标识只在用户内唯一。
+FOREIGN_ACCOUNT_ID = "33333333-3333-3333-3333-333333333333"
 
 
 def _h(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _seed_users(connection) -> None:
+    """写入两个用户；账户与账本版本的归属列都是 NOT NULL。"""
+    for user_id in (USER_ID, OTHER_USER_ID):
+        connection.execute(
+            """
+            INSERT INTO users (id, display_name, status, role)
+            VALUES (CAST(? AS UUID), ?, 'active', 'member')
+            """,
+            [user_id, f"User {user_id[-1]}"],
+        )
 
 
 def _txn(
@@ -65,19 +81,23 @@ def wired(tmp_path: Path):
     """在临时真实库上装配仓储与账户。"""
     database = open_lyra_database(str(tmp_path / "commit.duckdb"))
     connection = database.connection
-    for account_id, key, suffix in (
-        (ACCOUNT_ID, LEGACY_KEY, "001"),
-        (OTHER_ACCOUNT_ID, "TST002", "002"),
+    _seed_users(connection)
+    # 前两个账户属于 USER_ID（A 自己的 TST001/TST002）；第三个属于另一个用户，
+    # 但 **legacy key 与 A 的 TST001 相同**——用户内唯一键允许两者共存。
+    for account_id, user_id, key, suffix in (
+        (ACCOUNT_ID, USER_ID, LEGACY_KEY, "001"),
+        (OTHER_ACCOUNT_ID, USER_ID, "TST002", "002"),
+        (FOREIGN_ACCOUNT_ID, OTHER_USER_ID, LEGACY_KEY, "001"),
     ):
         connection.execute(
             """
-            INSERT INTO accounts (id, display_name, legacy_account_key, masked_suffix)
-            VALUES (CAST(? AS UUID), ?, ?, ?)
+            INSERT INTO accounts (id, user_id, display_name, legacy_account_key, masked_suffix)
+            VALUES (CAST(? AS UUID), CAST(? AS UUID), ?, ?, ?)
             """,
-            [account_id, f"Account {key}", key, suffix],
+            [account_id, user_id, f"Account {key}", key, suffix],
         )
     try:
-        yield DuckDbImportCommitRepository(connection), connection
+        yield DuckDbImportCommitRepository(connection, user_id=USER_ID), connection
     finally:
         database.close()
 
@@ -254,7 +274,7 @@ def _job(*, status: str) -> PersistedImportJobRecord:
 def test_recover_stale_committing_rolls_back_without_a_ledger_version(wired) -> None:
     """**崩溃恢复**：CAS 与账本事务之间崩溃留下的 committing 作业必须能判回重试。"""
     _, connection = wired
-    jobs = DuckDbImportJobRepository(connection)
+    jobs = DuckDbImportJobRepository(connection, user_id=USER_ID)
     jobs.create_import_job(_job(status="committing"))
 
     assert jobs.recover_stale_committing(JOB_ID, NOW) is True
@@ -265,11 +285,14 @@ def test_recover_stale_committing_rolls_back_without_a_ledger_version(wired) -> 
 def test_recover_stale_committing_leaves_a_written_ledger_alone(wired) -> None:
     """**账本已写入时不回退**：回退会让同一个令牌再提交一次、把交易导入两次。"""
     _, connection = wired
-    jobs = DuckDbImportJobRepository(connection)
+    jobs = DuckDbImportJobRepository(connection, user_id=USER_ID)
     jobs.create_import_job(_job(status="committing"))
     connection.execute(
-        "INSERT INTO ledger_versions (reason, source_reference) VALUES ('file_import', ?)",
-        [JOB_ID],
+        """
+        INSERT INTO ledger_versions (user_id, reason, source_reference)
+        VALUES (CAST(? AS UUID), 'file_import', ?)
+        """,
+        [USER_ID, JOB_ID],
     )
 
     assert jobs.recover_stale_committing(JOB_ID, NOW) is False
@@ -308,9 +331,10 @@ def test_replacement_is_scoped_to_one_account(wired) -> None:
     # 下一次 nextval 仍会返回同一个值并撞主键。
     connection.execute(
         """
-        INSERT INTO ledger_versions (reason, source_reference)
-        VALUES ('file_import', 'other')
-        """
+        INSERT INTO ledger_versions (user_id, reason, source_reference)
+        VALUES (CAST(? AS UUID), 'file_import', 'other')
+        """,
+        [USER_ID],
     )
     # lots.open_transaction_hash 有指向 transactions 的外键，因此先插入对应交易。
     connection.execute(
@@ -361,3 +385,73 @@ def test_missing_fifo_product_is_rejected(wired) -> None:
     with pytest.raises(ValueError, match="缺少 FIFO 产物"):
         _commit(repository, broken)
     assert _count(connection, "transactions") == 0
+
+
+# --------------------------------------------------------------------------
+# 账本版本按用户（V05）：B 的写入不得影响 A 的预览
+# --------------------------------------------------------------------------
+
+
+def test_ledger_version_is_scoped_to_the_user(wired) -> None:
+    """「用户当前账本版本」是 ``max(version) WHERE user_id = ?``，**不是全局最大值**。
+
+    ``ledger_version_seq`` 仍是全局序列，因此单用户版本号不连续；但用户的**基准**必须
+    只看自己的版本行。用全局 ``max(version)`` 时，B 的一次导入会把 A 的基准抬高，A 拿着
+    预览时的旧版本提交就被判 ``LEDGER_VERSION_CONFLICT``——A 的预览被 B 的写入隔空作废。
+    """
+    repository, connection = wired
+    other = DuckDbImportCommitRepository(connection, user_id=OTHER_USER_ID)
+
+    # A 先提交：A 的账本版本 1，B 的账本仍是空的。
+    first = _commit(repository, build_import_commit_plan(_preview(_txn("a")), ()))
+    assert first.ledger_version == 1
+    assert repository._current_ledger_version() == 1
+    assert other._current_ledger_version() == 0, "B 的基准被 A 的写入抬高了"
+
+    # B 用自己的账户提交：版本号来自全局序列（因此是 2），但基准仍是 0。
+    b_plan = build_import_commit_plan(_preview(_txn("b")), ())
+    b_result = other.commit_import(
+        account_id=FOREIGN_ACCOUNT_ID,
+        plan=b_plan,
+        expected_ledger_version=0,
+        source_reference="b-src",
+    )
+    assert b_result.ledger_version == 2
+    assert other._current_ledger_version() == 2
+
+    # **A 的基准不受 B 的写入影响**：A 仍停在 1。
+    assert repository._current_ledger_version() == 1
+
+    owners = {
+        str(row[0]): int(row[1])
+        for row in connection.execute(
+            "SELECT user_id, version FROM ledger_versions ORDER BY version"
+        ).fetchall()
+    }
+    assert owners == {USER_ID: 1, OTHER_USER_ID: 2}
+
+
+def test_another_users_account_is_rejected_even_with_the_same_key(wired) -> None:
+    """账户键相同也不放行：**归属由 ``user_id`` 判定**，不由键判定。
+
+    A 的账户与 B 的账户可以有完全相同的 legacy key。提交前复核必须同时校验用户与键，
+    否则拿别人的账户 UUID（键恰好相同）就能把交易写进别人的账本。
+    """
+    repository, connection = wired
+    plan = build_import_commit_plan(_preview(_txn("a")), ())
+
+    with pytest.raises(ApplicationError) as raised:
+        _commit(repository, plan, account_id=FOREIGN_ACCOUNT_ID)
+
+    assert raised.value.code == "ACCOUNT_MAPPING_REQUIRED"
+    assert _count(connection, "transactions") == 0
+    assert _count(connection, "ledger_versions") == 0
+
+
+def test_commit_records_the_owner_on_every_ledger_version(wired) -> None:
+    """账本版本行必须带当前用户，否则该用户的下一次读取看不到自己的版本。"""
+    repository, connection = wired
+    _commit(repository, build_import_commit_plan(_preview(_txn("a")), ()))
+
+    row = connection.execute("SELECT user_id FROM ledger_versions").fetchone()
+    assert row is not None and str(row[0]) == USER_ID

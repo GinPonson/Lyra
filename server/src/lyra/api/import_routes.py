@@ -13,6 +13,12 @@
 ``x-lyra-file-name`` 头——与 TypeScript 侧一致，不使用 multipart。
 预览响应与 Flutter ``ImportPreviewView.fromJson`` 对齐：根对象携带 ``importId`` 与
 一次性 ``confirmToken``，统计与账户信息位于 ``preview`` 对象中。
+
+**归属边界**：作业在创建时就绑定当前用户（上传阶段可能还没有目标账户，因此不能靠
+``targetAccountId`` 推断归属）。读取、提交、取消三条路径都**先按用户查作业**，再校验
+预览令牌与幂等；暂存文件的读取与删除都发生在作业已通过用户范围读取之后，不单独授权。
+不属于当前用户的作业与不存在的作业返回同一个冲突响应——区分两者会让攻击者靠状态码
+枚举他人作业是否存在。
 """
 
 from __future__ import annotations
@@ -69,7 +75,7 @@ from ..infrastructure.db.mutation_idempotency_repository import (
     start_mutation_idempotency_record,
 )
 from ..infrastructure.imports.staged_upload import StagedUploadStore
-from .dependencies import _UUID_PATTERN, require_device
+from .dependencies import _UUID_PATTERN, require_user
 
 # 预览令牌有效期：15 分钟。这是用户读预览并确认的时间窗。
 PREVIEW_TTL_MILLISECONDS = 15 * 60 * 1000
@@ -78,13 +84,25 @@ PREVIEW_TTL_MILLISECONDS = 15 * 60 * 1000
 def create_import_router() -> APIRouter:
     """构造导入作业路由。
 
-    @returns 全部导入端点；均要求设备认证。
+    @returns 全部导入端点；均要求用户认证。
     """
-    router = APIRouter(dependencies=[Depends(require_device)])
+    router = APIRouter(dependencies=[Depends(require_user)])
+
+    def _user_id(request: Request) -> str:
+        """取出当前请求的用户 UUID。
+
+        **只能来自服务端认证上下文**：``AuthContext`` 由认证器在「令牌有效 → 设备未
+        撤销 → 用户仍活动」三步通过后构造，请求正文与查询参数都不得指定或覆盖它
+        （契约 §3.8）。导入的每一步——作业归属、账户候选、账本版本、暂存文件——都从
+        这一个值派生。
+        """
+        return request.state.auth.user_id
 
     def _store(request: Request) -> DuckDbImportJobRepository:
-        """按应用持有的数据库构造作业仓储。"""
-        return DuckDbImportJobRepository(request.app.state.database.connection)
+        """按应用持有的数据库与**当前用户**构造作业仓储。"""
+        return DuckDbImportJobRepository(
+            request.app.state.database.connection, user_id=_user_id(request)
+        )
 
     @router.post("/v1/imports/preview", status_code=201)
     async def create_preview(
@@ -114,13 +132,17 @@ def create_import_router() -> APIRouter:
             )
         content = await request.body()
         connection = request.app.state.database.connection
+        user_id = _user_id(request)
 
         try:
             # 账户标识来自文件名，只有解析后才知道；而预览需要该账户的账本上下文。
             # 因此顺序是：解析 → 绑定账户 → 读取账本上下文 → 生成预览。
+            #
+            # **候选账户只取当前用户的**：绑定失败时的候选 UUID 会回给客户端，全库候选
+            # 等于把别人账户的存在与脱敏后缀一并暴露。
             parsed = parse_uploaded_file(file_name=x_lyra_file_name, content=content)
             resolved = resolve_import_account(
-                parsed.batch.account, _active_accounts(connection), account_id
+                parsed.batch.account, _active_accounts(connection, user_id), account_id
             )
         except ApplicationError as error:
             raise HTTPException(
@@ -137,7 +159,7 @@ def create_import_router() -> APIRouter:
                 detail={"code": "IMPORT_VALIDATION_FAILED", "message": str(error)},
             ) from error
 
-        base_version, existing = _ledger_context(connection, resolved.account_id)
+        base_version, existing = _ledger_context(connection, user_id, resolved.account_id)
         now = datetime.now(UTC)
         preview = create_import_preview(CreateImportPreviewInput(
             batch=parsed.batch,
@@ -240,7 +262,11 @@ def create_import_router() -> APIRouter:
             )
 
         connection = request.app.state.database.connection
+        user_id = _user_id(request)
         store = _store(request)
+        # **先按用户查作业。** 不属于当前用户的作业在这里就是 ``None``，与「不存在」
+        # 走同一个冲突响应；下面的令牌校验、幂等回放、暂存文件读取与删除全部建立在这个
+        # 结果之上——它们没有独立的授权判断，因此这一步不能省。
         job = store.load_import_job(import_id)
         if job is None:
             raise _conflict()
@@ -260,7 +286,7 @@ def create_import_router() -> APIRouter:
         now = datetime.now(UTC)
         try:
             idempotency_plan = _plan_idempotency(
-                connection, device=_device(request), key=idempotency_key,
+                connection, device_id=_device_id(request), key=idempotency_key,
                 request_hash=_request_fingerprint(import_id, token), now=now,
             )
             if isinstance(idempotency_plan, IdempotentMutationReplay):
@@ -292,7 +318,11 @@ def create_import_router() -> APIRouter:
             parsed = parse_uploaded_file(file_name=job.original_file_name, content=content)
             # 计划必须在事务外算好：去重需要该账户当前的全部交易。
             normalized = normalize_transaction_batch(parsed.batch)
-            snapshot = DuckDbLedgerRepository(connection).load_snapshot(
+            # 快照按当前用户读取：账户键已在用户内唯一，不带用户范围会把别的用户同名
+            # 账户的交易当成"已有交易"而误判为重复。
+            snapshot = DuckDbLedgerRepository(
+                connection, user_id=user_id
+            ).load_snapshot(
                 AccountScope(kind="account", account=normalized.account)
             )
             plan = build_import_commit_plan(
@@ -311,7 +341,7 @@ def create_import_router() -> APIRouter:
                 status_code=error.status_code, detail={"code": error.code, "message": error.message}
             ) from error
 
-        repository = DuckDbImportCommitRepository(connection)
+        repository = DuckDbImportCommitRepository(connection, user_id=user_id)
 
         try:
             if isinstance(idempotency_plan, IdempotentMutationStart):
@@ -386,8 +416,14 @@ def create_import_router() -> APIRouter:
     return router
 
 
-def _active_accounts(connection: Any) -> tuple[ImportAccountRecord, ...]:
-    """读取全部账户（含已归档）；是否参与绑定由绑定逻辑决定。"""
+def _active_accounts(connection: Any, user_id: str) -> tuple[ImportAccountRecord, ...]:
+    """读取**当前用户的**全部账户（含已归档）；是否参与绑定由绑定逻辑决定。
+
+    ``user_id`` 是必填位置参数：账户键已在用户内唯一，A/B 可以有同名账户。不带用户
+    范围时，A 上传的文件会同时匹配到 A 与 B 的同键账户，绑定逻辑看到"多个精确匹配"
+    便报 ``ACCOUNT_MAPPING_REQUIRED``——A 永远无法导入自己的文件。反过来，如果绑定
+    逻辑退化成"取第一个匹配"，A 的文件就会被写到 B 的账户上。
+    """
     return tuple(
         ImportAccountRecord(
             id=str(row[0]), legacy_account_key=row[1], masked_suffix=row[2], status=row[3]
@@ -395,19 +431,29 @@ def _active_accounts(connection: Any) -> tuple[ImportAccountRecord, ...]:
         for row in connection.execute(
             """
             SELECT id, legacy_account_key, masked_suffix, status
-            FROM accounts ORDER BY legacy_account_key
-            """
+            FROM accounts WHERE user_id = CAST(? AS UUID)
+            ORDER BY legacy_account_key
+            """,
+            [user_id],
         ).fetchall()
     )
 
 
-def _ledger_context(connection: Any, account_id: str) -> tuple[int, frozenset[str]]:
+def _ledger_context(
+    connection: Any, user_id: str, account_id: str
+) -> tuple[int, frozenset[str]]:
     """读取目标账户的账本基准版本与已有交易哈希。
 
-    @returns ``(基准版本, 已有哈希)``；空账本的基准版本为 0。
+    **基准版本按当前用户取**：``ledger_versions`` 的版本号来自全局序列，但「用户当前
+    账本版本」的定义是 ``max(version) WHERE user_id = ?``（契约 §3.3）。用全局
+    ``max(version)`` 会让 B 的一次导入把 A 的预览基准抬高，A 提交时被判
+    ``LEDGER_VERSION_CONFLICT``——B 的写入作废了 A 的预览（V05 明确禁止）。
+
+    @returns ``(基准版本, 已有哈希)``；该用户空账本的基准版本为 0。
     """
     version_row = connection.execute(
-        "SELECT coalesce(max(version), 0) FROM ledger_versions"
+        "SELECT coalesce(max(version), 0) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [user_id],
     ).fetchone()
     base_version = int(version_row[0]) if version_row is not None else 0
     existing = frozenset(
@@ -458,9 +504,14 @@ def _iso(value: datetime) -> str:
     )
 
 
-def _device(request: Request) -> Any:
-    """取出已认证设备。"""
-    return getattr(request.state, "device", None)
+def _device_id(request: Request) -> str:
+    """取出已认证设备的 UUID 文本。
+
+    **来源是 ``request.state.auth``**：P2 已删除 ``request.state.device``（契约 §3.8），
+    继续读旧属性会静默拿到 ``None``，而 ``None`` 会让下面的幂等判定直接返回 ``None``
+    ——幂等键就此形同虚设，且不会有任何报错。设备字段只用于幂等与审计，不参与归属。
+    """
+    return request.state.auth.device_id
 
 
 def _request_fingerprint(import_id: str, token: str) -> str:
@@ -475,22 +526,23 @@ def _request_fingerprint(import_id: str, token: str) -> str:
 
 
 def _plan_idempotency(
-    connection: Any, *, device: Any, key: str | None, request_hash: str, now: datetime
+    connection: Any, *, device_id: str, key: str | None, request_hash: str, now: datetime
 ) -> Any:
     """按幂等键生成计划；没有键时返回 ``None``。
 
     无键的请求**不写任何幂等记录**——那是客户端的显式选择，不该由服务端代为登记。
     """
-    if key is None or device is None:
+    if key is None:
         return None
     # 委托共享校验（见 `idempotent_mutation.validate_idempotency_key`）——
     # 另写一份会让"键是否合法"存在两个判断，迟早分叉。
     validate_idempotency_key(key)
     existing = load_mutation_idempotency_record(
-        connection, device_id=device.id, operation=IDEMPOTENCY_OPERATION, key_hash=hash_idempotency_key(key)
+        connection, device_id=device_id, operation=IDEMPOTENCY_OPERATION,
+        key_hash=hash_idempotency_key(key),
     )
     return plan_idempotent_mutation(
-        record_id=str(uuid.uuid4()), device_id=device.id,
+        record_id=str(uuid.uuid4()), device_id=device_id,
         operation=IDEMPOTENCY_OPERATION, key=key, request_hash=request_hash,
         existing_record=existing, now=now,
     )

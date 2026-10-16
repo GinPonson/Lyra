@@ -3,6 +3,7 @@ import 'package:dio/dio.dart';
 import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
 import 'auth_provider.dart';
+import 'user_profile.dart';
 
 /// 浏览器授权事务；兑换凭证只在 App 内存中保存，不进入 URL。
 class OAuthLoginStart {
@@ -41,51 +42,44 @@ class OAuthLoginStart {
 /// 登录完成后持久化的 Lyra 凭据，不包含第三方访问令牌。
 class LoginCredentials {
   const LoginCredentials({
+    required this.user,
     required this.deviceId,
     required this.displayName,
     required this.accessToken,
     required this.accessTokenExpiresAt,
     required this.refreshToken,
     required this.refreshTokenExpiresAt,
-    this.userEmail,
-    required this.provider,
-    required this.subject,
-    this.userDisplayName,
   });
 
+  /// 登录响应中的 `user` 对象；与 `GET /v1/me` 共用同一解析器与形状。
+  final LyraUserProfile user;
   final String deviceId;
   final String displayName;
   final String accessToken;
   final String accessTokenExpiresAt;
   final String refreshToken;
   final String refreshTokenExpiresAt;
-  final String? userEmail;
-  final AuthProvider provider;
-  final String subject;
-  final String? userDisplayName;
-  String? get googleSubject => provider == AuthProvider.google ? subject : null;
+
+  AuthProvider get provider => user.identity.provider;
+  String get subject => user.identity.subject;
+  String? get userEmail => user.identity.email;
+  String? get userDisplayName => user.displayName;
+  String? get googleSubject =>
+      provider == AuthProvider.google ? user.identity.subject : null;
 
   factory LoginCredentials.fromJson(Map<String, Object?> json) {
-    final user = json['user'] as Map<String, Object?>?;
-    final provider = AuthProvider.fromId(user?['provider'] as String?);
-    final subject = user?['subject'];
-    if (provider == null ||
-        subject is! String ||
-        subject.trim().isEmpty ||
-        subject.trim() != subject) {
+    final user = json['user'];
+    if (user is! Map<String, Object?>) {
       throw const FormatException('登录身份响应格式无效');
     }
     return LoginCredentials(
+      user: LyraUserProfile.fromJson(user),
       deviceId: json['deviceId'] as String,
       displayName: json['displayName'] as String,
       accessToken: json['accessToken'] as String,
       accessTokenExpiresAt: json['accessTokenExpiresAt'] as String,
       refreshToken: json['refreshToken'] as String,
       refreshTokenExpiresAt: json['refreshTokenExpiresAt'] as String,
-      userEmail: user?['email'] as String?,
-      provider: provider,
-      subject: subject,
-      userDisplayName: user?['displayName'] as String?,
     );
   }
 }

@@ -36,6 +36,7 @@ from ..domain.analytics.trade_analysis import (
 from ..domain.analytics.types import AccountScope
 from ..domain.fifo.replay import replay_fifo
 from ..infrastructure.db.ledger_repository import LedgerSnapshot
+from .app_error import ApplicationError
 from .public_projection import (
     project_allocation,
     project_attribution,
@@ -281,6 +282,26 @@ def to_jsonable_result(value: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _required_user_id(user_id: str | None) -> str:
+    """取出按用户读取所必需的用户 UUID。
+
+    **缺什么都不缺它**：账本与行情设置都按用户读取，少了用户就只能全库读取或退回
+    某个"默认 owner"，两者都是越权。因此这里明确失败，而不是构造一个空归属。
+
+    @param user_id: 调用方给出的用户 UUID；``None`` 表示未提供。
+    @returns 非空的用户 UUID 文本。
+    @raises ApplicationError: 未提供用户上下文（500）。
+    """
+    if user_id is None or user_id == "":
+        raise ApplicationError(
+            code="MARKET_POSITIONS_USER_REQUIRED",
+            message="持仓查询缺少用户上下文",
+            status_code=500,
+            retryable=False,
+        )
+    return user_id
+
+
 def handle_market_positions(
     connection: Any,
     scope: AccountScope,
@@ -289,6 +310,7 @@ def handle_market_positions(
     *,
     snapshot: Any = None,
     market_settings: Any = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """当前持仓的参考估值。
 
@@ -303,14 +325,21 @@ def handle_market_positions(
     @param underlying: 仅看某个标的。
     @param snapshot: 调用方已读取的账本快照；路由封装与数据共用同一快照。
     @param market_settings: 本次读取固定采用的路由与 revision 快照。
+    @param user_id: 当前用户 UUID 文本。**只有在需要本函数自己去读用户范围数据时才
+        用得上**：调用方若已按用户取好 ``snapshot`` 与 ``market_settings``（持仓路由
+        就是如此），这里就不再做任何用户范围的读取。缺省不是"退回全库或默认用户"
+        ——真需要读而又没有它时，这里明确失败。
     @returns 含 rows / count / pricedCount / complete / basis / marketData 的字典。
+    @raises ApplicationError: 需要按用户读取却缺少用户上下文。
     """
     from ..domain.market_data.valuation import value_position
     from ..infrastructure.db.ledger_repository import DuckDbLedgerRepository
     from .public_projection import account_id_map, project_market_positions
 
     if snapshot is None:
-        snapshot = DuckDbLedgerRepository(connection).load_snapshot(scope)
+        snapshot = DuckDbLedgerRepository(
+            connection, user_id=_required_user_id(user_id)
+        ).load_snapshot(scope)
     positions = aggregate_positions(snapshot.open_lots, scope, underlying)
     account_currencies = {
         account.legacy_account_key: account.base_currency
@@ -318,7 +347,11 @@ def handle_market_positions(
     }
     settings_snapshot = market_settings
     if market_runtime is not None and settings_snapshot is None:
-        settings_snapshot = market_runtime.settings_snapshot()
+        # 设置按用户读取，且**不做跨请求缓存**：把某个用户的设置留在运行时里等于把它
+        # 当成"当前值"，多用户下必然互相覆盖（计划 §4.4）。
+        settings_snapshot = market_runtime.settings_snapshot(
+            connection, _required_user_id(user_id)
+        )
 
     rows: list[dict[str, Any]] = []
     for position in positions:

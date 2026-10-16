@@ -32,24 +32,11 @@ def _iso_timestamp() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _attention_required(connections: Any) -> int:
-    """统计"需要处理"的 Gmail 连接数。
-
-    **只算 needs_resync 与 error 两种**：其余（含 connected）都不影响服务健康。
-
-    @param connections: 连接列表。
-    @returns 需要处理的条数。
-    """
-    return sum(
-        1 for connection in connections
-        if getattr(connection, "status", None) in ("needs_resync", "error")
-    )
-
 
 def create_health_router(
     database: LyraDatabase,
     write_coordinator_provider: Any = None,
-    gmail_connections: Any = None,
+    gmail_attention_provider: Any = None,
     agent_availability: Any = None,
 ) -> APIRouter:
     """构造健康路由。
@@ -57,9 +44,15 @@ def create_health_router(
     三个可选参数对应三段健康信息。**未提供时该段不出现**，而不是报一个假的
     ``available``——健康端点谎报可用会让故障排查建立在假信息上。
 
+    **Gmail 段只报状态，不报数量**（计划 §4.4、P0 契约 §3.4）：连接数与待处理数在
+    多用户下是**用户活动信息**，公开端点不得暴露。因此这里的入参是一个返回
+    「需要处理的连接数」的部署级聚合函数，而不是连接列表——列表会诱导调用方把
+    长度和明细一起写进响应。
+
     @param database: 已打开的账本连接。
     @param write_coordinator_provider: 返回写队列协调器的可调用对象；``None`` 表示未装配该段。
-    @param gmail_connections: 返回 Gmail 连接列表的可调用对象。
+    @param gmail_attention_provider: 返回「部署级需要处理的 Gmail 连接数」的可调用对象；
+        ``None`` 表示未装配该段。
     @param agent_availability: 返回 Agent 可用性快照的可调用对象；返回 ``None`` 表示
         运行时缺席（不知道是否可用）。``None`` 参数表示未装配该段。
     @returns 挂载 ``GET /v1/health`` 的路由器。
@@ -91,24 +84,28 @@ def create_health_router(
             }
 
         attention_required = 0
-        if gmail_connections is not None:
-            # **读 Gmail 连接失败不应让健康端点本身失败。**
+        if gmail_attention_provider is not None:
+            # **读 Gmail 状态失败不应让健康端点本身失败，也不应把整体拖成降级。**
             #
             # 数据库已关闭时这次读取会抛异常，而健康端点的职责恰恰是**报告**不可用，
             # 不是跟着一起坏掉——否则监控看到的是"健康检查 500"，而不是
             # "服务不可用"，两者的排查方向完全不同。
             #
-            # 读取失败时该段不出现（而不是填一个假的 available）。
+            # 读取失败时该段不出现（而不是填一个假的 available），且 `attention_required`
+            # 保持 0：**"读不到"不等于"有连接需要处理"**，把它算成降级会让一次探测故障
+            # 伪装成 Gmail 出问题。
+            probed: int | None
             try:
-                connections = gmail_connections()
+                probed = int(gmail_attention_provider())
             except Exception:  # noqa: BLE001 - 健康端点必须始终能回应
-                connections = None
-            if connections is not None:
-                attention_required = _attention_required(connections)
+                probed = None
+            if probed is not None:
+                attention_required = probed
+                # **只报状态**：``totalConnections`` 与 ``attentionRequired`` 在多用户下
+                # 是用户活动计数，公开端点不得暴露（计划 §4.4）。需要这些数字的运维查询
+                # 走本地库，不走公开接口。
                 snapshot["gmail"] = {
                     "status": "degraded" if attention_required > 0 else "available",
-                    "totalConnections": len(connections),
-                    "attentionRequired": attention_required,
                 }
 
 

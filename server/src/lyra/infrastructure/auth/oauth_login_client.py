@@ -78,13 +78,17 @@ OAuthProviderId = Literal["github", "linuxdo"]
 
 @dataclass(frozen=True)
 class OAuthLoginConfig:
-    """凭据只在服务端配置；每种来源都必须独立指定不可变的数字 owner ID。"""
+    """凭据只在服务端配置。
+
+    **不含 owner 白名单**：多用户下登录来源的可用性只看 OAuth 凭据是否齐备，
+    谁可以登录由 ``(provider, subject)`` 的用户解析决定（自动注册），而不是由部署
+    配置里的一份 subject 名单决定（契约 §3.10）。
+    """
 
     provider: OAuthProviderId
     client_id: str
     client_secret: str
     redirect_uri: str
-    owner_subject: str
 
 
 @dataclass(frozen=True)
@@ -141,12 +145,10 @@ def load_oauth_login_config(
     """
     definition = provider_definition(provider)
     prefix = f"LYRA_LOGIN_{definition.environment_name}"
-    owner_name = f"LYRA_OWNER_{definition.environment_name}_SUBJECT"
     names = (
         f"{prefix}_CLIENT_ID",
         f"{prefix}_CLIENT_SECRET",
         f"{prefix}_REDIRECT_URI",
-        owner_name,
     )
     if all((env.get(name) or "").strip() == "" for name in names):
         return None
@@ -162,7 +164,6 @@ def load_oauth_login_config(
         client_id=required(f"{prefix}_CLIENT_ID"),
         client_secret=required(f"{prefix}_CLIENT_SECRET"),
         redirect_uri=required(f"{prefix}_REDIRECT_URI"),
-        owner_subject=required(owner_name),
     )
     validate_oauth_login_config(config)
     return config
@@ -171,7 +172,7 @@ def load_oauth_login_config(
 def validate_oauth_login_config(config: OAuthLoginConfig) -> None:
     """校验一种来源的完整配置。
 
-    @raises ValueError: 凭据、回调地址或 owner ID 不符合约束。
+    @raises ValueError: 凭据或回调地址不符合约束。
     """
     definition = provider_definition(config.provider)
     for credential in (config.client_id, config.client_secret):
@@ -205,38 +206,16 @@ def validate_oauth_login_config(config: OAuthLoginConfig) -> None:
     ):
         raise invalid_redirect()
 
-    if not is_canonical_subject(config.owner_subject):
-        raise ValueError(
-            f"LYRA_OWNER_{definition.environment_name}_SUBJECT 必须是明确配置的正整数用户 ID，"
-            "Lyra 不开放注册"
-        )
-
 
 def is_canonical_subject(value: object) -> bool:
-    """判断 owner ID 是否是规范的正整数文本（无前导零）。"""
+    """判断来源主体标识是否是规范的正整数文本（无前导零）。
+
+    供离线管理员初始化入口校验 ``--subject`` 使用；运行时登录不再有 owner 名单。
+    """
     if not isinstance(value, str) or not _CANONICAL_SUBJECT.fullmatch(value):
         return False
     # 两侧互转必须一致，从而排除前导零与超出安全整数范围的值。
     return str(int(value)) == value
-
-
-def assert_oauth_configured_owner(
-    identity: Any,
-    config: OAuthLoginConfig,
-) -> None:
-    """只认 provider + 稳定 ID。
-
-    同名、同邮箱，以及**另一来源的相同 ID** 都不会获得权限。
-
-    @raises ApplicationError: 身份不属于配置的 owner。
-    """
-    if identity.provider != config.provider or identity.subject != config.owner_subject:
-        raise ApplicationError(
-            code="LOGIN_DENIED",
-            message=f"此 {provider_definition(config.provider).name} 账户无权访问这台 Lyra 服务",
-            status_code=403,
-            retryable=False,
-        )
 
 
 class OAuthLoginClient:
@@ -426,7 +405,8 @@ def identity_from_profile(profile: object, provider: OAuthProviderId) -> Any:
             or (silenced is not None and not isinstance(silenced, bool))
         ):
             raise ValueError("Invalid OAuth account status")
-        # silenced 是论坛禁言状态，不代表第三方登录被禁用；owner 准入只看不可变 ID。
+        # silenced 是论坛禁言状态，不代表第三方登录被禁用；账号是否可用只看上方的
+        # 状态字段与不可变 ID，不看昵称或邮箱。
 
     fallback = profile.get("login") if provider == "github" else profile.get("username")
     return LoginIdentity(

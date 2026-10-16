@@ -29,6 +29,10 @@ from lyra.infrastructure.db.mutation_idempotency_repository import (
 
 NOW = datetime(2026, 10, 13, 9, 0, 0, tzinfo=UTC)
 DEVICE_ID = "11111111-1111-1111-1111-111111111111"
+# 设备必须归属一个用户并绑定一条已验证身份（schema 16 的两列都是 NOT NULL）。
+# 多个设备共用同一个归属用户，因此下面用 ON CONFLICT DO NOTHING 让重复登记成为空操作。
+OWNER_USER_ID = "22222222-2222-2222-2222-222222222222"
+OWNER_IDENTITY_ID = "33333333-3333-3333-3333-333333333333"
 KEY_HASH = "a" * 64
 REQUEST_HASH = "b" * 64
 OPERATION = "import.commit"
@@ -50,15 +54,35 @@ def _insert_device(connection, device_id: str) -> None:
 
     **指纹按设备 ID 派生**：schema 对 ``public_key_fingerprint`` 有唯一约束，
     两台设备用同一个指纹会撞约束。
+
+    schema 16 起设备必须归属一个用户并绑定一条已验证身份（``user_id`` 与
+    ``identity_id`` 都是 ``NOT NULL``，且后者有指向 ``user_identities(user_id, id)``
+    的复合外键）。幂等记录本身经**设备**归属隔离（计划 §4.1），因此这里只需要一台
+    有明确归属的设备，用户是谁不影响被测语义。
     """
     fingerprint = device_id.replace("-", "").ljust(64, "0")[:64]
     connection.execute(
+        "INSERT INTO users (id, display_name, status, role) "
+        "VALUES (CAST(? AS UUID), 'Owner', 'active', 'member') ON CONFLICT DO NOTHING",
+        [OWNER_USER_ID],
+    )
+    connection.execute(
+        """
+        INSERT INTO user_identities (id, user_id, provider, subject)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'google', 'idem-owner')
+        ON CONFLICT DO NOTHING
+        """,
+        [OWNER_IDENTITY_ID, OWNER_USER_ID],
+    )
+    connection.execute(
         """
         INSERT INTO paired_devices
-            (id, display_name, public_key_pem, public_key_fingerprint, key_algorithm, status)
-        VALUES (CAST(? AS UUID), 'Pixel', '-----BEGIN PUBLIC KEY-----', ?, 'ec', 'active')
+            (id, user_id, identity_id, display_name, public_key_pem,
+             public_key_fingerprint, key_algorithm, status)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), CAST(? AS UUID),
+                'Pixel', '-----BEGIN PUBLIC KEY-----', ?, 'ec', 'active')
         """,
-        [device_id, fingerprint],
+        [device_id, OWNER_USER_ID, OWNER_IDENTITY_ID, fingerprint],
     )
 
 

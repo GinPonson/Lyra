@@ -273,6 +273,7 @@ void main() {
       deviceId: 'test-device',
       accessToken: 'test-only-token',
       refreshToken: 'test-only-refresh',
+      userId: 'fixture-user',
       authMethod: 'google',
     );
     final fixture = MarketFixture();

@@ -20,11 +20,17 @@ from .serialized_connection import SerializedDuckDBConnection
 
 
 class DatabaseHealthAvailable(TypedDict):
-    """数据库可用时的健康信息。"""
+    """数据库可用时的健康信息。
+
+    **只有 schema 版本，没有账本版本**：账本版本是全库 ``max(version)``，多用户下它是
+    *跨用户的活动量*。公开健康端点不得暴露它（计划 §4.4、P0 契约 §3.4）。需要账本版本
+    的客户端从**按用户的**业务响应里取 ``metadata.ledgerVersion``。
+
+    这里也**不填一个伪造的 0** 来维持旧形状——那会让客户端以为拿到了真实版本。
+    """
 
     status: Literal["available"]
     schemaVersion: int
-    ledgerVersion: int
 
 
 class DatabaseHealthUnavailable(TypedDict):
@@ -37,8 +43,7 @@ DatabaseHealth = DatabaseHealthAvailable | DatabaseHealthUnavailable
 
 _HEALTH_SQL = """
 SELECT
-  (SELECT max(version) FROM schema_migrations) AS schema_version,
-  coalesce((SELECT max(version) FROM ledger_versions), 0) AS ledger_version
+  (SELECT max(version) FROM schema_migrations) AS schema_version
 """
 
 
@@ -52,9 +57,9 @@ class LyraDatabase:
         self._closed = False
 
     def read_health(self) -> DatabaseHealth:
-        """读取健康端点需要的实际 schema 与账本版本。
+        """读取健康端点需要的实际 schema 版本。
 
-        @returns 可用时返回两个版本号，连接已关闭时返回不可用。
+        @returns 可用时返回 schema 版本，连接已关闭时返回不可用。
         @throws RuntimeError: 健康查询没有返回任何行。
         """
         if self._closed:
@@ -65,7 +70,6 @@ class LyraDatabase:
         return {
             "status": "available",
             "schemaVersion": _require_version(row[0], "schema version"),
-            "ledgerVersion": _require_version(row[1], "ledger version"),
         }
 
     def close(self) -> None:

@@ -13,6 +13,11 @@
 **这一层曾整体缺失**：早期实现直接返回领域对象，于是 Flutter 解析
 ``json["metadata"]`` 时拿到 ``null``，总览恒显示"数据未能加载"——服务端 200、
 客户端报错，而当时的测试只校验路径与状态码，看不见响应形状。
+
+**归属来自 ``request.state.auth``，路由级依赖是 :func:`require_user`**：账本快照、
+账户解析、账户清单与账本版本一律限定当前用户。``scope=all`` 的含义是「该用户的全部
+账户」，不是全库——``transactions`` / ``lots`` / ``realized`` 刻意没有 ``user_id``
+列，它们的跨用户保护完全落在这一层的查询范围上（契约 §3.2、§3.11）。
 """
 
 from __future__ import annotations
@@ -60,7 +65,7 @@ from ..domain.analytics.types import AccountScope
 from ..domain.ledger.errors import IngestError
 from ..infrastructure.db.account_lookup import resolve_legacy_account_key
 from ..infrastructure.db.ledger_repository import DuckDbLedgerRepository
-from .dependencies import parse_scope_query, require_device, to_jsonable
+from .dependencies import parse_scope_query, require_user, to_jsonable
 
 # oracle 录制分析层时使用的默认参数，与本模块的默认值保持一致。
 DEFAULT_EXPIRING_DAYS = 30
@@ -70,9 +75,9 @@ DEFAULT_EXTREMES_LIMIT = 10
 def create_ledger_router() -> APIRouter:
     """构造账本与分析路由。
 
-    @returns 已挂载只读端点的路由器；全部端点要求设备认证。
+    @returns 已挂载只读端点的路由器；全部端点要求用户认证。
     """
-    router = APIRouter(dependencies=[Depends(require_device)])
+    router = APIRouter(dependencies=[Depends(require_user)])
 
     def _invalid_cursor(error: Any) -> HTTPException:
         """把游标错误翻译成 400。
@@ -84,32 +89,49 @@ def create_ledger_router() -> APIRouter:
             detail={"code": "INVALID_CURSOR", "message": str(error)},
         )
 
+    def _user_id(request: Request) -> str:
+        """取出当前请求的用户 UUID。
+
+        **只能来自服务端认证上下文**：``AuthContext`` 在「令牌有效 → 设备未撤销 →
+        用户仍活动」三步通过后才由认证器构造，请求参数不得指定或覆盖它（契约 §3.8）。
+        账户解析、账本快照、账本版本与账户清单都从这一个值派生。
+        """
+        return request.state.auth.user_id
+
     def _resolved_scope(request: Request, scope: str | None) -> AccountScope:
         """解析 ``?scope=`` 并把它转成**账本用的账户键**。
 
         ``scope`` 参数是账户 **UUID**（与参考实现一致），而账本查询用的是**脱敏账户键**。
         两者类型相同，因此不做这一步转换**不会报错**——只会返回一个空账本。
 
+        **解析必须带当前用户**：账户 UUID 全局唯一，但"它属于谁"只能由用户条件判定；
+        不带范围的解析会把别人的账户键交回给本次查询。
+
         @raises HTTPException: 参数缺失或格式不符（400）。
-        @raises HTTPException: 账户不存在（404）——不静默返回空账本。
+        @raises HTTPException: 账户不存在或不属于当前用户（404）——不静默返回空账本。
         """
         parsed = parse_scope_query(scope)
         if parsed.kind == "all":
             return parsed
         key = resolve_legacy_account_key(
-            request.app.state.database.connection, parsed.account
+            request.app.state.database.connection, _user_id(request), parsed.account
         )
         if key is None:
-            # 账户不存在时**报错而不是返回空账本**：后者会让客户端以为"这个账户没有
-            # 交易"，而实际上是它根本不存在。
+            # 账户不存在、或存在但不属于当前用户时**报错而不是返回空账本**：后者会让
+            # 客户端以为"这个账户没有交易"，而实际上是它无权访问。
+            #
+            # **两种情形返回同一个 404**：区分它们等于给攻击者一个探测他人账户是否
+            # 存在的接口。
             raise HTTPException(
                 status_code=404, detail={"code": "ACCOUNT_NOT_FOUND"}
             )
         return AccountScope(kind="account", account=key)
 
     def _snapshot(request: Request, scope: str | None) -> Any:
-        """按账户范围读取账本快照。"""
-        repository = DuckDbLedgerRepository(request.app.state.database.connection)
+        """按账户范围读取**当前用户的**账本快照。"""
+        repository = DuckDbLedgerRepository(
+            request.app.state.database.connection, user_id=_user_id(request)
+        )
         return repository.load_snapshot(_resolved_scope(request, scope))
 
     def _scope(request: Request, scope: str | None) -> AccountScope:
@@ -136,8 +158,13 @@ def create_ledger_router() -> APIRouter:
         """
         snapshot, resolved = _resolved(request, scope)
         connection = request.app.state.database.connection
+        # **账本版本按当前用户取。** 版本号来自全局序列，但「用户当前账本版本」的契约
+        # 定义是 ``max(version) WHERE user_id = ?``，空账本为 0（契约 §3.3）。用全局
+        # ``max(version)`` 会让客户端看到别人的版本号，甚至因为别人的写入而误判自己的
+        # 预览已过期。单用户版本号因此不连续（A 可能看到 1 → 3），客户端只做等值比较。
         row = connection.execute(
-            "SELECT coalesce(max(version), 0) FROM ledger_versions"
+            "SELECT coalesce(max(version), 0) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+            [_user_id(request)],
         ).fetchone()
         ledger_version = int(row[0]) if row else 0
         fetched_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -205,7 +232,9 @@ def create_ledger_router() -> APIRouter:
             account, replayed = create_account(
                 connection,
                 body=body,
-                device_id=request.state.device.id,
+                # 归属只取自认证上下文，绝不从请求正文读取。
+                user_id=_user_id(request),
+                device_id=request.state.auth.device_id,
                 request_id=getattr(request.state, "request_id", ""),
                 idempotency_key=idempotency_key,
                 now=now,
@@ -225,18 +254,23 @@ def create_ledger_router() -> APIRouter:
 
     @router.get("/v1/ledger/accounts")
     def read_accounts(request: Request, scope: str | None = Query(default=None)) -> Any:
-        """当前设备的活跃与已归档账户；**不暴露券商账户的完整标识**。
+        """当前用户的活跃与已归档账户；**不暴露券商账户的完整标识**。
 
         ``scope`` 与其它账本端点同义：账户清单本身不受范围过滤，但**元数据里的范围
         必须来自同一个显式参数**——省略它会让"查全部账户"变成隐式默认，而本项目的
         既定方向是"忘记带参数就报错，而不是给全部数据"。
+
+        清单**必须限定当前用户**：账户键只做了用户内唯一，同一个键在不同用户下都存在，
+        不带范围会让每个用户都看到别人账户的展示名、券商与脱敏后缀。
         """
         connection = request.app.state.database.connection
         rows = connection.execute(
             """
             SELECT id, display_name, broker, masked_suffix, base_currency, status, created_at
             FROM accounts
-            """
+            WHERE user_id = CAST(? AS UUID)
+            """,
+            [_user_id(request)],
         ).fetchall()
         accounts = [
             {

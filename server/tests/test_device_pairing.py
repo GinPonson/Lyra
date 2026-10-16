@@ -32,6 +32,11 @@ FIXTURES = Path(__file__).parent / "fixtures" / "device-keys.json"
 NOW = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
 TTL_MS = 600_000
 
+# schema 16 起设备必须归属一个用户与一条登录身份（``user_id`` / ``identity_id``
+# 为 NOT NULL + 复合外键），不再是可选的单 owner 附属信息。
+USER_ID = "11111111-1111-1111-1111-111111111111"
+IDENTITY_ID = "22222222-2222-2222-2222-222222222222"
+
 GROUPED_CODE = re.compile(r"^[A-Z2-9]{5}-[A-Z2-9]{5}$")
 
 
@@ -177,13 +182,18 @@ def test_public_key_rejects_malformed_input(pem: str) -> None:
 
 
 def test_create_paired_device_record() -> None:
-    """设备记录必须保存规范化公钥与指纹，且初始为 active。"""
+    """设备记录必须保存规范化公钥、指纹与归属用户/身份，且初始为 active。"""
     case = _fixture_cases()[0]
     public_key = normalize_device_public_key(case["inputPem"])
 
-    record = create_paired_device_record("device-1", " Pixel 9 ", public_key, NOW)
+    record = create_paired_device_record(
+        "device-1", " Pixel 9 ", public_key, NOW,
+        user_id=USER_ID, identity_id=IDENTITY_ID,
+    )
 
     assert record.id == "device-1"
+    assert record.user_id == USER_ID
+    assert record.identity_id == IDENTITY_ID
     assert record.display_name == "Pixel 9"
     assert record.public_key_pem == case["normalizedPem"]
     assert record.public_key_fingerprint == case["fingerprint"]
@@ -199,7 +209,24 @@ def test_create_paired_device_rejects_blank_text(device_id: str, name: str) -> N
     """设备 ID 与名称都不能为空白。"""
     public_key = normalize_device_public_key(_fixture_cases()[0]["inputPem"])
     with pytest.raises(ValueError, match="不能为空"):
-        create_paired_device_record(device_id, name, public_key, NOW)
+        create_paired_device_record(
+            device_id, name, public_key, NOW,
+            user_id=USER_ID, identity_id=IDENTITY_ID,
+        )
+
+
+@pytest.mark.parametrize(
+    ("user_id", "identity_id"),
+    [("", IDENTITY_ID), ("   ", IDENTITY_ID), (USER_ID, ""), (USER_ID, "  ")],
+)
+def test_create_paired_device_rejects_blank_ownership(user_id: str, identity_id: str) -> None:
+    """归属用户与登录身份都不能为空白——没有归属的设备是不可表示的状态。"""
+    public_key = normalize_device_public_key(_fixture_cases()[0]["inputPem"])
+    with pytest.raises(ValueError, match="不能为空"):
+        create_paired_device_record(
+            "device-1", "Phone", public_key, NOW,
+            user_id=user_id, identity_id=identity_id,
+        )
 
 
 def test_ec_and_rsa_keys_are_distinguishable() -> None:

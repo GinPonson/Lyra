@@ -30,8 +30,9 @@ schema 15 库**」——这是切换后**唯一不能重试**的能力。若继�
 
 ## `route-manifest.json`
 
-路由契约：47 个 (方法, 路径) 对 + 1 个 WebSocket，即迁移期与 TypeScript 版逐项对账的
-结果。
+路由契约：迁移期与 TypeScript 版逐项对账为 47 个 (方法, 路径) 对 + 1 个 WebSocket（历史
+事实）；多用户账本升级新增 3 项（`GET /v1/me`、`GET /v1/admin/users`、
+`PATCH /v1/admin/users/{}`），当前合计 **50 个 (方法, 路径) 对 + 1 个 WebSocket**。
 
 **记录的是 (方法, 路径) 对而不是路径集合**——只比路径会漏掉「某条路径上少了一个方法」，
 而这正是迁移期真实发生过的误判（`POST /v1/ledger/accounts` 整块缺失）。

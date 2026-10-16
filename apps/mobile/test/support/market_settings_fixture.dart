@@ -65,6 +65,7 @@ class MarketSettingsFixture extends MarketFixture {
           deviceId: 'test-device',
           accessToken: 'test-only-token',
           refreshToken: 'test-only-refresh',
+          userId: 'fixture-user',
           authMethod: 'google',
         ),
       );

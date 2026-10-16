@@ -11,9 +11,14 @@
 | ``POST /v1/auth/{provider}/exchange`` | ✅ 同上 |
 | ``GET /v1/auth/{provider}/callback`` | ✅ 同上，返回 HTML 页面 |
 | ``POST /v1/auth/logout`` | ✅ 需要设备会话撤销 |
+| ``GET /v1/me`` | ✅ 当前设备会话的用户对象 |
+| ``GET /v1/admin/users`` | ✅ 仅 admin |
+| ``PATCH /v1/admin/users/{userId}`` | ✅ 仅 admin，首版只改状态 |
 
 **这些路由不要求设备认证**（它们本身就是获取认证的入口）；设备令牌刷新由刷新凭据
 证明身份，同样不需要访问令牌——**用过期或已撤销的访问令牌去刷新是行不通的**。
+``/v1/me`` 与两条管理路由反过来**必须**要求用户认证（管理路由还要 admin），
+它们通过端点级依赖声明，而不是路由级——路由级会把获取认证的入口一起挡住。
 """
 
 from __future__ import annotations
@@ -22,18 +27,25 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..application.app_error import ApplicationError
 from ..application.device_pairing_service import DevicePairingService
-from ..application.owner_login_providers import load_owner_login_providers
-from ..application.owner_login_service import LoginStartInput, OwnerLoginService
+from ..application.login_providers import load_login_providers
+from ..application.login_service import LoginStartInput, UserLoginService
 from ..infrastructure.auth.login_provider import (
     LOGIN_PROVIDER_IDS,
     LOGIN_PROVIDER_NAMES,
 )
 from ..infrastructure.db.device_repository import DuckDbDeviceRepository
+from ..infrastructure.db.user_repository import (
+    UserIdentityRecord,
+    UserRecord,
+    UserRepository,
+)
+from ..security.auth_context import AuthContext
+from .dependencies import require_admin, require_user
 
 # 400 的 message 与参考实现同文案。
 #
@@ -46,6 +58,11 @@ _DEVICE_TOKEN_MESSAGE = "设备令牌刷新参数无效"
 _START_TEXT_FIELDS = ("displayName", "publicKeyPem", "codeChallenge", "codeChallengeMethod")
 # 兑换正文必须齐备的字符串字段。
 _EXCHANGE_TEXT_FIELDS = ("loginId", "codeVerifier")
+
+# 管理端用户列表的默认页大小。上限由 ``UserRepository`` 把守（越界抛 400 而不是静默截断）。
+_DEFAULT_USER_PAGE_SIZE = 50
+# 首版 ``PATCH`` 只接受状态变更；出现这两个字段即明确拒绝，而不是忽略。
+_FORBIDDEN_ADMIN_PATCH_FIELDS = ("role", "identity", "identityId", "provider", "subject")
 
 
 def create_auth_router() -> APIRouter:
@@ -101,6 +118,7 @@ def create_auth_router() -> APIRouter:
         service = DevicePairingService(
             DuckDbDeviceRepository(request.app.state.database.connection),
             request.app.state.write_coordinator,
+            UserRepository(request.app.state.database.connection),
         )
         try:
             issued = await service.refresh_tokens(refresh_token=token)
@@ -219,32 +237,21 @@ def create_auth_router() -> APIRouter:
         try:
             device = request.app.state.authenticator.authenticate(token)
         except ApplicationError as error:
-            raise HTTPException(
-                status_code=error.status_code, detail={"code": error.code, "message": error.message}
-            ) from error
+            raise _http_error(error) from error
 
         pairing = DevicePairingService(
             DuckDbDeviceRepository(request.app.state.database.connection),
             request.app.state.write_coordinator,
+            UserRepository(request.app.state.database.connection),
         )
-        await pairing.revoke_device(device.id)
+        await pairing.revoke_device(device.device_id)
         # 撤销设备只表示"以后不再认这枚凭据"；**已经建立的事件流与在跑的回合必须
         # 一起终止**，否则登出后服务端仍在替它产生并保存回答，且长连接继续收到账本
         # 增量——"已登出"就只是客户端的本地状态。
         #
         # 两处都用 ``getattr`` 容错：测试会挂载未装配这两个组件的应用，缺了它们不应
         # 让一次合法登出失败（撤销本身已经完成）。
-        connections = getattr(request.app.state, "event_connections", None)
-        if connections is not None:
-            # **在这里 await 关闭**：注册表只负责"取走连接"，真正关闭是异步操作；
-            # 同步地排一个后台任务既不能保证连接被关掉，也会丢掉失败信息。
-            from .agent_events import UNAUTHORIZED_CLOSE_CODE, _close_quietly
-
-            for websocket in connections.take_device(device.id):
-                await _close_quietly(websocket, UNAUTHORIZED_CLOSE_CODE, "signed out")
-        orchestrator = getattr(request.app.state, "agent_orchestrator", None)
-        if orchestrator is not None:
-            orchestrator.cancel_device_turns(device.id, now=datetime.now(UTC))
+        await _close_device_sessions(request, (device.device_id,))
         # **204 无内容**：与参考实现一致。返回一个空 body 的 200 会让客户端以为
         # 响应里应该有内容——它可能去解析一个空字符串并因此报错。
         return None
@@ -299,19 +306,181 @@ def create_auth_router() -> APIRouter:
             "accessTokenExpiresAt": result["accessTokenExpiresAt"],
             "refreshToken": result["refreshToken"],
             "refreshTokenExpiresAt": result["refreshTokenExpiresAt"],
-            "user": {
-                "provider": result["user"].provider,
-                "subject": result["user"].subject,
-                # **email 不能省**：客户端把它展示在个人资料页；丢了它 App 会静默
-                # 显示空邮箱（参考实现整体回传登录结果，自然带上这个字段）。
-                "email": result["user"].email,
-                "displayName": result["user"].display_name,
-            },
+            # 与 ``GET /v1/me`` **同一个** user 对象（契约 §3.9）：两处各自拼装
+            # 必然会在某个字段上漂移，而客户端用同一个模型解析它们。
+            "user": user_object(result["user"], result["identity"]),
         }
         response = JSONResponse(payload, status_code=202 if pending else 200)
         # 正文含凭据，绝不能被缓存。
         response.headers["cache-control"] = "no-store"
         return response
+
+    @router.get("/v1/me")
+    def read_me(
+        request: Request, auth: AuthContext = Depends(require_user)
+    ) -> Any:
+        """当前登录用户的资料。
+
+        身份**必须**来自当前设备会话的已验证关联（``paired_devices.identity_id``），
+        不接受任何请求参数指定——那等于让调用方声明自己是谁（契约 §3.9）。
+
+        @param auth: 已认证的用户上下文（由 ``require_user`` 注入并写入 ``request.state``）。
+        @returns ``{"user": {...}}``，与登录完成响应中的 user 对象同形。
+        @raises HTTPException: 用户或身份关联读不回来（401，数据不一致或已被清理）。
+        """
+        users = UserRepository(request.app.state.database.connection)
+        devices = DuckDbDeviceRepository(request.app.state.database.connection)
+        user = users.find_user_by_id(auth.user_id)
+        identity = devices.load_device_identity(auth.device_id)
+        if user is None or identity is None:
+            # 令牌有效却读不到用户或身份：数据不一致，按未认证处理，不返回半个对象。
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "DEVICE_CREDENTIAL_INVALID", "message": "设备访问令牌无效"},
+            )
+        return {"user": user_object(user, identity)}
+
+    @router.get("/v1/admin/users")
+    def list_users(
+        request: Request,
+        limit: int = Query(default=_DEFAULT_USER_PAGE_SIZE),
+        offset: int = Query(default=0),
+        auth: AuthContext = Depends(require_admin),
+    ) -> Any:
+        """用户目录的受限分页（仅管理员）。
+
+        **不返回账本、第三方令牌或凭据**：管理端只需要识别与停用用户。
+
+        @param limit: 本页最大条数；越界由仓储抛 400，不静默截断。
+        @param offset: 跳过条数。
+        @param auth: 已认证的管理员上下文。
+        @returns ``{"users": [...], "limit": ..., "offset": ...}``。
+        """
+        _ = auth  # 只为强制依赖生效；列表本身不需要调用者的身份。
+        users = UserRepository(request.app.state.database.connection)
+        try:
+            records = users.list_users(limit=limit, offset=offset)
+        except ApplicationError as error:
+            raise _http_error(error) from error
+        return {
+            "users": [
+                {
+                    "userId": record.id,
+                    "displayName": record.display_name,
+                    "status": record.status,
+                    "role": record.role,
+                    "createdAt": record.created_at,
+                    "updatedAt": record.updated_at,
+                }
+                for record in records
+            ],
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @router.patch("/v1/admin/users/{user_id}")
+    async def update_user(
+        user_id: str,
+        request: Request,
+        auth: AuthContext = Depends(require_admin),
+    ) -> Any:
+        """修改用户状态（仅管理员）。
+
+        正文为 ``{"status": "active" | "disabled"}``。
+
+        **首版只接受状态变更**：角色与身份不在本接口的可写范围。角色变更会直接改变
+        谁能管理整个部署，把它塞进一个"改状态"的接口会让一次误调用静默提权；身份
+        归属则必须由离线入口显式确认（契约 §3.10）。出现这些字段一律 400，而不是忽略。
+
+        **不得停用最后一个活动管理员**：那会把部署锁死在无人可管理的状态，且没有
+        任何 HTTP 入口能恢复（首个管理员只能由离线入口创建）。
+
+        停用不只是改一个字段：同时撤销该用户全部设备与凭据，并关闭其事件流、终止
+        在飞回合，否则"已停用"只对下一次请求生效（计划 §4.4）。
+
+        @param user_id: 目标用户 UUID 文本。
+        @param request: 请求对象，用于读正文与取出应用组件。
+        @param auth: 已认证的管理员上下文。
+        @returns 更新后的用户对象。
+        @raises HTTPException: 正文非法（400）、用户不存在（404）、
+            最后一个活动管理员（409）。
+        """
+        _ = auth
+        try:
+            body = await request.json()
+        except Exception as error:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "用户更新参数无效"},
+            ) from error
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "用户更新参数无效"},
+            )
+        forbidden = sorted(key for key in body if key in _FORBIDDEN_ADMIN_PATCH_FIELDS)
+        if forbidden:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "INVALID_ARGUMENT",
+                    "message": f"该接口只支持修改用户状态，不能修改 {'、'.join(forbidden)}",
+                },
+            )
+        unknown = sorted(key for key in body if key != "status")
+        if unknown or set(body) != {"status"}:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "INVALID_ARGUMENT",
+                    "message": "用户更新参数无效：只接受 status 字段",
+                },
+            )
+        status = body["status"]
+        if status not in ("active", "disabled"):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "用户状态只能是 active 或 disabled"},
+            )
+
+        connection = request.app.state.database.connection
+        users = UserRepository(connection)
+        try:
+            target = users.find_user_by_id(user_id)
+            if target is None:
+                raise ApplicationError(
+                    code="USER_NOT_FOUND", message="用户不存在", status_code=404, retryable=False
+                )
+            # 判据取"当前仍是活动管理员"：已经停用的管理员再停用一次不该被拦下
+            # （否则重复调用同一请求会得到一个与首次不同的结果）。
+            if (
+                status == "disabled"
+                and target.role == "admin"
+                and target.status == "active"
+                and users.count_active_admins() <= 1
+            ):
+                raise ApplicationError(
+                    code="LAST_ADMIN_PROTECTION",
+                    message="不能停用最后一个活动管理员",
+                    status_code=409,
+                    retryable=False,
+                )
+            updated = users.set_user_status(user_id, status, now=datetime.now(UTC))
+        except ApplicationError as error:
+            raise _http_error(error) from error
+
+        if status == "disabled" and target.status == "active":
+            await _revoke_user_sessions(request, user_id)
+        return {
+            "user": {
+                "userId": updated.id,
+                "displayName": updated.display_name,
+                "status": updated.status,
+                "role": updated.role,
+                "createdAt": updated.created_at,
+                "updatedAt": updated.updated_at,
+            }
+        }
 
     return router
 
@@ -386,18 +555,93 @@ def _callback_page() -> str:
     )
 
 
-def build_owner_login_service(environment: Any, device_authorizer: Any) -> OwnerLoginService:
+def user_object(user: UserRecord, identity: UserIdentityRecord) -> dict[str, Any]:
+    """把用户与其当前身份渲染为契约 §3.9 的 ``user`` 对象。
+
+    **身份收在 ``identity`` 子对象里**，而不是与用户字段平铺：身份上的 ``display_name``
+    是第三方昵称，与用户在 Lyra 的显示名不是一回事，平铺会让两者在同一个 key 上相撞。
+
+    登录完成响应与 ``GET /v1/me`` **共用本函数**，从而不可能出现两个形状。
+
+    @param user: 用户记录。
+    @param identity: 本次已验证的身份记录；必须属于该用户。
+    @returns 可直接序列化的 ``user`` 对象。
+    """
+    return {
+        "userId": user.id,
+        "displayName": user.display_name,
+        "status": user.status,
+        "role": user.role,
+        "identity": {
+            "provider": identity.provider,
+            "subject": identity.subject,
+            # email 可以是 null：OAuth 未提供邮箱不阻止注册（计划 §4.3），客户端按可空处理。
+            "email": identity.email,
+        },
+    }
+
+
+def _http_error(error: ApplicationError) -> HTTPException:
+    """把应用错误转成同码同状态的 HTTP 错误。"""
+    return HTTPException(
+        status_code=error.status_code, detail={"code": error.code, "message": error.message}
+    )
+
+
+async def _close_device_sessions(request: Request, device_ids: Sequence[str]) -> None:
+    """关闭这些设备的事件流并终止其在飞回合。
+
+    停用用户与退出登录共用它：两者都要求"凭据不再可用"**和**"已经建立的长连接与
+    在跑回合一起收口"。只做前者会让停用后的设备继续收到账本增量（计划 §4.4）。
+
+    @param request: 请求对象，用于取出事件注册表与回合编排器。
+    @param device_ids: 要收口的设备 ID。
+    """
+    connections = getattr(request.app.state, "event_connections", None)
+    if connections is not None:
+        # **在这里 await 关闭**：注册表只负责"取走连接"，真正关闭是异步操作；
+        # 同步地排一个后台任务既不能保证连接被关掉，也会丢掉失败信息。
+        from .agent_events import UNAUTHORIZED_CLOSE_CODE, _close_quietly
+
+        for device_id in device_ids:
+            for websocket in connections.take_device(device_id):
+                await _close_quietly(websocket, UNAUTHORIZED_CLOSE_CODE, "signed out")
+    orchestrator = getattr(request.app.state, "agent_orchestrator", None)
+    if orchestrator is not None:
+        for device_id in device_ids:
+            orchestrator.cancel_device_turns(device_id, now=datetime.now(UTC))
+
+
+async def _revoke_user_sessions(request: Request, user_id: str) -> None:
+    """停用用户后的级联：撤销全部设备凭据，并关闭其事件流、终止在飞回合。
+
+    @param request: 请求对象。
+    @param user_id: 被停用的用户 UUID 文本。
+    """
+    pairing = DevicePairingService(
+        DuckDbDeviceRepository(request.app.state.database.connection),
+        request.app.state.write_coordinator,
+        UserRepository(request.app.state.database.connection),
+    )
+    device_ids = await pairing.revoke_user_devices(user_id)
+    await _close_device_sessions(request, device_ids)
+
+
+def build_login_service(environment: Any, device_authorizer: Any) -> UserLoginService:
     """按环境装配登录服务。
 
-    **部分配置会让启动失败**（见 `load_owner_login_providers`）：让服务带着
+    **部分配置会让启动失败**（见 `load_login_providers`）：让服务带着
     "看起来启用了但永远登不进去"的配置上线是最糟的选择。
 
+    来源可用性只看 OAuth 凭据是否齐全；身份到用户的映射（含自动注册）由
+    ``device_authorizer`` 在兑换成功时完成。
+
     @param environment: 环境变量映射。
-    @param device_authorizer: 登录成功后的设备签发用例。
+    @param device_authorizer: 兑换成功后的用户解析与设备签发用例。
     @returns 登录服务。
     """
-    providers = load_owner_login_providers(environment)
-    return OwnerLoginService(
+    providers = load_login_providers(environment)
+    return UserLoginService(
         providers,
         device_authorizer,
         now=lambda: datetime.now(UTC),

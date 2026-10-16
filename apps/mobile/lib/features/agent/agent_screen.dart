@@ -113,11 +113,12 @@ class AgentController extends Notifier<AgentUiState> {
   @override
   AgentUiState build() {
     // 身份变化即释放旧连接和会话，不能把前一个登录的数据带给下一个登录。
+    // userId 是稳定锚点，deviceId 覆盖同一用户在同一设备重新登录的情况。
     ref.watch(
       sessionProvider.select((value) {
         final session = value.value;
         return session is SessionAuthenticated
-            ? '${session.snapshot.serverUrl}/${session.snapshot.deviceId}'
+            ? '${session.snapshot.serverUrl}/${session.snapshot.userId}/${session.snapshot.deviceId}'
             : null;
       }),
     );
