@@ -12,8 +12,18 @@
 **两条硬约束**（计划 §9 末段）：不打印任何 token；不把「首个请求」当作管理员凭据——管理员
 身份只能来自本次命令行的显式参数。
 
+**运行前提：服务必须已停止。** DuckDB 是单进程文件锁，服务在跑时本入口会以
+``Could not set lock on file`` 失败。容器部署的正确姿势是
+``compose stop`` → ``compose run --rm --no-deps lyra python -m lyra.admin …`` →
+``compose start``（见 ``docs/deployment.md``）。
+
 用法::
 
+    # 新部署第一步：签发邀请码（不需要管理员已存在）
+    python -m lyra.admin --database /data/lyra.duckdb --create-invite-code
+    # 首个注册用户提升为管理员
+    python -m lyra.admin --database /data/lyra.duckdb --promote-user <userId>
+    # 或者离线直接登记一个管理员身份
     python -m lyra.admin --database /data/lyra.duckdb --provider google --subject 112233
     python -m lyra.admin --database /data/lyra.duckdb \
         --owner-identity google:112233 --provider google --subject 112233

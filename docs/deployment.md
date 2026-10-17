@@ -125,18 +125,25 @@ UV_CACHE_DIR=../.uv-tmp/cache UV_PYTHON_INSTALL_DIR=../.uv-tmp/python \
 **新身份注册一律需要邀请码**（单次有效、不过期、可撤销）。因此新部署的第一步是离线
 签发一枚码；这也避免了「注册要管理员、管理员要先注册」的死锁。
 
+> **必须先停服务。** DuckDB 是单进程文件锁：服务在跑时，任何离线入口都会报
+> `Could not set lock on file`。因此离线命令一律是「停 → 一次性容器执行 → 起」。
+
 ```bash
-# 1) 签发第一枚邀请码（明文只打印这一次）
-./deploy/compose.sh exec lyra \
+# 1) 停服务，签发第一枚邀请码（明文只打印这一次），再启动
+./deploy/compose.sh stop lyra
+./deploy/compose.sh run --rm --no-deps lyra \
   python -m lyra.admin --database /var/lib/lyra/lyra.duckdb \
   --create-invite-code --invite-label 'owner'
+./deploy/compose.sh start lyra
 
 # 2) 在 App 登录页填入它，用你的 Google 账号完成首次注册（角色 member）
 
-# 3) 用 /v1/me 或 App「我的」页读出你的 userId，再提升为管理员
-./deploy/compose.sh exec lyra \
+# 3) 读出你的 userId（App「我的」或 GET /v1/me），停服务 → 提升为管理员 → 起服务
+./deploy/compose.sh stop lyra
+./deploy/compose.sh run --rm --no-deps lyra \
   python -m lyra.admin --database /var/lib/lyra/lyra.duckdb \
   --promote-user '<userId>'
+./deploy/compose.sh start lyra
 
 # 之后用管理员设备签发更多码（明文只返回一次）
 curl -s -X POST https://<域名>/v1/admin/invite-codes \
