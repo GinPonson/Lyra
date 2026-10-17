@@ -25,7 +25,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from lyra.db.migrations import CURRENT_SCHEMA_VERSION  # noqa: E402
+from lyra.db.schema_version import CURRENT_SCHEMA_VERSION  # noqa: E402
 from lyra.protocol import (  # noqa: E402
     CLIENT_PROTOCOL_HEADERS,
     LYRA_PROTOCOL_VERSION,

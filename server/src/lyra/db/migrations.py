@@ -26,8 +26,8 @@ from uuid import UUID
 
 import duckdb
 
-# 当前服务端代码能够迁移并读取的最新 DuckDB schema 版本。
-CURRENT_SCHEMA_VERSION = 16
+# 版本常量住在无依赖模块里，本模块再导出，既有调用方不受影响（见该模块文档）。
+from .schema_version import CURRENT_SCHEMA_VERSION  # noqa: E402
 
 # 需要迁移上下文才能回填归属的那一条迁移。只有它读取 ``_migration_context``。
 MIGRATION_CONTEXT_VERSION = 16
