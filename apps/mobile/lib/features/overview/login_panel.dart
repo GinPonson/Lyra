@@ -375,10 +375,11 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
             ),
             const SizedBox(height: 12),
           ],
-          // 不提供独立注册表单：完成授权即自动创建账号，新用户直接进入空账本
-          // 与既有首次导入流程。这里只做说明，不新增任何输入项。
+          // 不提供独立注册表单：首次登录凭邀请码自动创建账号，新用户直接进入空账本
+          // 与既有首次导入流程。文案必须写清"需要邀请码"——注册已不再对外开放，
+          // 留着"自动创建账号"会让用户以为随便登录即可建号。
           const Text(
-            '首次登录将自动创建账号。',
+            '首次登录需要邀请码；已有账号可直接登录。',
             textAlign: TextAlign.center,
             style: TextStyle(color: LyraColors.muted, fontSize: 13, height: 1.5),
           ),

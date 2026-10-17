@@ -200,10 +200,12 @@ void main() {
     });
   }
 
-  testWidgets('登录页说明首次登录自动创建账号，不提供注册表单', (tester) async {
+  testWidgets('登录页说明首次登录需要邀请码，不提供注册表单', (tester) async {
     final fixture = LoginFixture();
     await pumpLogin(tester, fixture);
-    expect(find.text('首次登录将自动创建账号。'), findsOneWidget);
+    // 注册已改为凭邀请码，文案必须写清这一点（"自动创建账号"会被读成开放注册）。
+    expect(find.text('首次登录需要邀请码；已有账号可直接登录。'), findsOneWidget);
+    // 默认夹具的服务端未声明需要邀请码，因此不显示邀请码输入框，也没有注册表单。
     expect(find.byType(TextField), findsNothing);
     expect(
       fixture.requests.where(
