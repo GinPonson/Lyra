@@ -308,6 +308,61 @@ void main() {
     expect(find.text('暂不可用'), findsNothing);
   });
 
+  testWidgets('后台重查目录时按钮保持可点，底部不出现"正在准备登录…"', (tester) async {
+    // 回归：目录刷新期间 `asData` 为 null，曾导致整排按钮先禁用再恢复、
+    // 底部文案在"正在准备登录…"与正常状态之间来回跳。
+    // 初始目录里 github 不可用，页面会自行退避重查。
+    final fixture = LoginFixture()
+      ..available = {AuthProvider.google, AuthProvider.linuxdo};
+    await pumpLogin(tester, fixture);
+    int catalogRequests() => fixture.requests
+        .where((request) => request.uri.path == '/v1/auth/providers')
+        .length;
+    final before = catalogRequests();
+
+    // 让下一次重查挂起：模拟"刷新进行中"。
+    fixture.catalogGate = Completer<ResponseBody>();
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pump();
+    expect(catalogRequests(), greaterThan(before), reason: '应当自动重查');
+    expect(find.text('正在准备登录…'), findsNothing);
+    expect(
+      tester
+          .widget<OutlinedButton>(find.byKey(const ValueKey('login-google')))
+          .onPressed,
+      isNotNull,
+    );
+    fixture.catalogGate!.complete(LoginFixture.json(fixture.catalog()));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('自动重查会退避到停止，不会退化成每 2 秒一次的轮询', (tester) async {
+    // 回归：重查期间每帧都清零退避计数，退避表退化为固定 2 秒，形成无休止轮询。
+    final fixture = LoginFixture()..available = {AuthProvider.google};
+    await pumpLogin(tester, fixture);
+    int catalogRequests() => fixture.requests
+        .where((request) => request.uri.path == '/v1/auth/providers')
+        .length;
+
+    // 走完 2/5/10/20/30 秒的退避表（合计 67 秒）。
+    for (var i = 0; i < 70; i++) {
+      await tester.pump(const Duration(seconds: 1));
+    }
+    await tester.pumpAndSettle();
+    final settled = catalogRequests();
+    // 再等 60 秒：退避已耗尽，不应再产生任何重查。
+    for (var i = 0; i < 60; i++) {
+      await tester.pump(const Duration(seconds: 1));
+    }
+    await tester.pumpAndSettle();
+    expect(
+      catalogRequests(),
+      settled,
+      reason: '退避用尽后必须停止重查，否则就是持续轮询',
+    );
+    expect(find.text('正在准备登录…'), findsNothing);
+  });
+
   testWidgets('登录方式尚在读取时禁止登录，迟到响应不伪装成功', (tester) async {
     final fixture = LoginFixture()..catalogGate = Completer<ResponseBody>();
     await pumpLogin(tester, fixture);

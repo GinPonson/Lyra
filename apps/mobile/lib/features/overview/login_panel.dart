@@ -150,7 +150,9 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     }
     final url = ref.read(currentServerUrlProvider);
     if (url == null) return;
-    final catalog = ref.read(authProvidersProvider(url)).asData?.value;
+    // 用 `value` 而不是 `asData`：后台重查期间仍持有上一份目录，用户点下去
+    // 应当照常发起登录，而不是静默无响应。
+    final catalog = ref.read(authProvidersProvider(url)).value;
     if (catalog == null ||
         !catalog.providers.any(
           (item) => item.provider == provider && item.available,
@@ -285,14 +287,18 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     final catalog = url == null || authenticated != null
         ? null
         : ref.watch(authProvidersProvider(url));
-    final catalogData = catalog?.asData?.value;
+    // 刷新期间保留上一份目录：`asData` 在 AsyncLoading 时是 null，若用它判断
+    // 可用性，每次后台重查都会让整排按钮先禁用再恢复，看起来像"按钮在闪"。
+    final catalogData = catalog?.value;
     final entries = catalogData?.providers;
     final registrationRequiresInvite =
         catalogData?.registrationRequiresInvite ?? false;
+    // 只有**还没有任何目录**才算"准备中"。已有目录时后台重查属于静默刷新，
+    // 不能挡住用户点登录，也不能把底部文案切成"正在准备登录…"。
     final preparing =
         state.isLoading ||
         (url == null && preferences.isLoading) ||
-        catalog?.isLoading == true;
+        (catalog?.isLoading == true && catalogData == null);
     final busy = _submitting || _clearingLogin || preparing;
     final requiresLogoutRetry =
         session is SessionSignedOut && session.retrySignOut;
@@ -318,7 +324,9 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
         (allUnavailable || entries.any((item) => !item.available));
     if (needsRefresh) {
       _scheduleAvailabilityRetry(url);
-    } else {
+    } else if (!preparing) {
+      // 只有真正读到"全部可用"才清零退避；重查进行中不算恢复，否则每次重查都会
+      // 把计数重置回 2 秒，退避退化成永不停止的轮询。
       _cancelAvailabilityRetry();
     }
     final content = Column(
