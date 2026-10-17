@@ -19,6 +19,7 @@ abstract final class LyraIcons {
   static const IconData expand = Icons.expand_more_outlined;
 
   static const IconData accountCenter = Icons.manage_accounts_outlined;
+  static const IconData addAccount = Icons.add_card_outlined;
   static const IconData accountScope = Icons.layers_outlined;
   static const IconData ledgerVersion = Icons.storage_outlined;
   static const IconData dataCutoff = Icons.schedule_outlined;
@@ -30,6 +31,15 @@ abstract final class LyraIcons {
   static const IconData gmail = Icons.alternate_email_outlined;
   static const IconData security = Icons.shield_outlined;
   static const IconData disclosure = Icons.chevron_right;
+  static const IconData showAmounts = Icons.visibility_outlined;
+  static const IconData hideAmounts = Icons.visibility_off_outlined;
+  static const IconData profile = Icons.person_outline;
+  static const IconData connection = Icons.dns_outlined;
+  static const IconData about = Icons.info_outline;
+  static const IconData openLink = Icons.open_in_new_outlined;
+  static const IconData logout = Icons.logout_outlined;
+  static const IconData profitColors = Icons.palette_outlined;
+  static const IconData unselectedChoice = Icons.radio_button_unchecked;
 
   // 动作语义:发送走发送箭头,取消走关闭,不复用导航类图标。
   static const IconData send = Icons.arrow_upward;

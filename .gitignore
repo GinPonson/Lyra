@@ -1,7 +1,8 @@
-# Node.js / TypeScript build output
-node_modules/
-dist/
-coverage/
+# Python 字节码
+# **必须忽略**：不同 Python 版本与平台产出的 .pyc 不同，提交它们会造成大量假变更，
+# 还会把构建路径写进仓库。
+__pycache__/
+*.py[cod]
 
 # Flutter / Dart generated output
 .dart_tool/
@@ -16,11 +17,35 @@ uploads/
 *.duckdb
 *.duckdb.wal
 
+# **例外：测试夹具必须进仓库。**
+#
+# `*.duckdb` 会连它一起忽略，而它是"Python 能打开既有 schema 15 库"的唯一证据——
+# 不进仓库的话，别人克隆后那条测试会失败（且失败原因看起来像环境问题）。
+# 该夹具无任何账户/交易/设备数据，因此可以安全提交。
+!server/tests/fixtures/*.duckdb
+
+# uv 的缓存、解释器与虚拟环境落点（见各脚本的 UV_* 变量）。
+.uv-tmp/
+
+# 服务端虚拟环境
+server/.venv/
+
+# Node 依赖（仅遗留的本机目录）
+# **必须忽略**：服务端已迁移到 Python，根 `package.json`/`package-lock.json` 已删除，
+# 这个目录里是迁移前残留的依赖；它不再有任何构建用途，但若不忽略，
+# `git add -A` 会把 1 万多个文件带进提交。
+node_modules/
+
 # Local secrets and machine-specific configuration
 .env
 .env.*
 !.env.example
 application-gin.yml
+# 通配后缀，避免 `cp server.env server.env.bak` 之类的手工轮换把主密钥带进提交。
+# 该通配同时匹配已跟踪的 `deploy/server.env.example`，但 ignore 对已跟踪文件无效，
+# 配置模板照常进仓库——收窄成 `deploy/server.env` 反而会漏掉 `.bak` / `.old` 轮换副本。
+deploy/server.env*
+deploy/backups/
 
 # IDE and operating-system files
 .DS_Store

@@ -7,7 +7,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/session.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_date.dart';
+import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
+import '../../core/security/credential_store.dart';
+import '../ledger/ledger_workspace.dart';
 import '../agent/agent_live_events.dart';
 import '../agent/agent_repository.dart';
 import '../agent/agent_session_store.dart';
@@ -23,11 +27,16 @@ class AgentIdle extends AgentUiState {
 }
 
 /// 会话进行中：包含可用性、当前会话与回合运行标记。
+class AgentCreating extends AgentUiState {
+  const AgentCreating();
+}
+
 class AgentSessionActive extends AgentUiState {
   const AgentSessionActive({
     required this.availability,
     required this.session,
     required this.turnInProgress,
+    this.accountLabel,
     this.pendingMessage,
     this.streamingText,
     this.errorMessage,
@@ -37,6 +46,7 @@ class AgentSessionActive extends AgentUiState {
   final AgentAvailabilitySnapshotView availability;
   final AgentSessionView session;
   final bool turnInProgress;
+  final String? accountLabel;
 
   /// 回合运行中已上屏的乐观用户消息；终态快照到达后被规范消息替代。
   final String? pendingMessage;
@@ -61,6 +71,7 @@ class AgentSessionActive extends AgentUiState {
   }) {
     return AgentSessionActive(
       availability: availability,
+      accountLabel: accountLabel,
       session: session ?? this.session,
       turnInProgress: turnInProgress ?? this.turnInProgress,
       pendingMessage: clearPendingMessage
@@ -101,23 +112,59 @@ class AgentController extends Notifier<AgentUiState> {
 
   @override
   AgentUiState build() {
+    // 身份变化即释放旧连接和会话，不能把前一个登录的数据带给下一个登录。
+    // userId 是稳定锚点，deviceId 覆盖同一用户在同一设备重新登录的情况。
+    ref.watch(
+      sessionProvider.select((value) {
+        final session = value.value;
+        return session is SessionAuthenticated
+            ? '${session.snapshot.serverUrl}/${session.snapshot.userId}/${session.snapshot.deviceId}'
+            : null;
+      }),
+    );
+    _repository = null;
+    _live?.dispose();
+    _live = null;
+    ref.listen(sessionProvider, (previous, next) {
+      final current = next.value;
+      if (current is SessionAuthenticated) {
+        _live?.updateAccessToken(current.snapshot.accessToken);
+      }
+    });
     ref.onDispose(() {
       _live?.dispose();
       _live = null;
     });
-    // 进入 Agent 页时尝试恢复上次活跃会话；失败静默回到创建视图。
-    Future<void>.microtask(_restoreLastSession);
+    // 进入 Agent 页时尝试恢复上次活跃会话；失败由控制器显式进入可重试错误态。
+    // 用 microtask 推迟到 build 返回之后，避免在构建中改写自身状态。
+    unawaited(Future<void>.microtask(_restoreLastSession));
     return const AgentIdle();
   }
 
   /// 读取本地会话 ID 并用服务端权威快照恢复会话视图。
+  ///
+  /// 任何异常都在此收口：本方法是无人 await 的异步入口，异常逃逸会变成
+  /// 未处理异步错误并让界面停在旧状态。协议错误按既有语义处理，其它错误
+  /// （响应形态不匹配、安全存储失败等）显式进入可重试错误态。
   Future<void> _restoreLastSession() async {
+    try {
+      await _restoreLastSessionInternal();
+    } on Object catch (error) {
+      // 本方法由 microtask 触发、无人 await；异常必须在此收口，否则会变成
+      // 未处理异步错误，界面仍停在创建视图且用户看不到失败原因。
+      if (!ref.mounted || state is! AgentIdle) return;
+      state = AgentError(_unexpectedMessage(error));
+    }
+  }
+
+  /// 恢复的实际流程；异常统一由 [_restoreLastSession] 收口处理。
+  Future<void> _restoreLastSessionInternal() async {
     if (state is! AgentIdle) {
       return;
     }
-    // 等待会话控制器完成配对恢复；未配对则无从恢复。
+    // 等待会话控制器完成登录恢复；未登录则无从恢复。
     final sessionState = await ref.read(sessionProvider.future);
-    if (sessionState is! SessionPaired) {
+    if (sessionState is! SessionAuthenticated) {
       return;
     }
     if (state is! AgentIdle) {
@@ -128,7 +175,10 @@ class AgentController extends Notifier<AgentUiState> {
       return;
     }
     final store = ref.read(agentSessionStoreProvider);
-    final sessionId = await store.read();
+    final credentialStore = ref
+        .read(sessionDependenciesProvider)
+        .credentialStore;
+    final sessionId = await withCredentialMutation(credentialStore, store.read);
     if (sessionId == null || sessionId.isEmpty || state is! AgentIdle) {
       return;
     }
@@ -137,21 +187,24 @@ class AgentController extends Notifier<AgentUiState> {
       session = await repository.getSession(sessionId);
     } on LyraApiError {
       // 会话已关闭或不存在：清掉本地 ID，回到创建视图。
-      await store.clear();
+      await withCredentialMutation(credentialStore, () async {
+        if (ref.mounted && _repository == repository) await store.clear();
+      });
       return;
     }
-    if (!ref.mounted || state is! AgentIdle) {
+    if (!ref.mounted || _repository != repository || state is! AgentIdle) {
       return;
     }
     try {
       final availability = await repository.availability();
-      if (!ref.mounted || state is! AgentIdle) {
+      if (!ref.mounted || _repository != repository || state is! AgentIdle) {
         return;
       }
       state = AgentSessionActive(
         availability: availability,
         session: session,
-        turnInProgress: false,
+        turnInProgress:
+            session.status == 'running' || session.status == 'cancelling',
       );
       _subscribeLive(session.id);
       await _refreshToolCalls();
@@ -167,7 +220,7 @@ class AgentController extends Notifier<AgentUiState> {
     _live = null;
     final sessionState = ref.read(sessionProvider);
     final paired = sessionState.value;
-    if (paired is! SessionPaired) {
+    if (paired is! SessionAuthenticated) {
       return;
     }
     _lastSequence = 0;
@@ -191,11 +244,12 @@ class AgentController extends Notifier<AgentUiState> {
     }
     switch (frame) {
       case AgentEventFrame(:final event):
+        if (event.sessionId != current.session.id) return;
         if (event.sequence <= _lastSequence) {
           return; // 重复事件：忽略。
         }
         if (event.sequence > _lastSequence + 1) {
-          _refreshSnapshot('sequence-gap');
+          unawaited(_refreshSnapshot('sequence-gap'));
           return;
         }
         _lastSequence = event.sequence;
@@ -206,19 +260,26 @@ class AgentController extends Notifier<AgentUiState> {
               streamingText: (current.streamingText ?? '') + text,
             );
           }
-        } else if (event.type == 'message.completed'
-            || event.type == 'message.failed'
-            || event.type == 'session.completed') {
+        } else if (event.type == 'message.completed' ||
+            event.type == 'message.failed' ||
+            event.type == 'session.completed') {
           state = current.copyWith(clearStreamingText: true);
-          _refreshSnapshot('terminal-${event.type}');
+          unawaited(_refreshSnapshot('terminal-${event.type}'));
         }
       case AgentSubscribedFrame(:final mode):
         if (mode == 'snapshot_required') {
-          _refreshSnapshot('subscribed-snapshot');
+          unawaited(_refreshSnapshot('subscribed-snapshot'));
         }
       case AgentErrorFrame():
         state = current.copyWith(
-          errorMessage: '${frame.message}（${frame.code}）',
+          errorMessage: lyraErrorMessage(
+            LyraApiError(
+              code: frame.code,
+              message: '',
+              statusCode: 500,
+              retryable: true,
+            ),
+          ),
         );
       case AgentUnknownFrame():
         break;
@@ -226,6 +287,9 @@ class AgentController extends Notifier<AgentUiState> {
   }
 
   /// 从服务端重取权威会话快照；事件流只负责提示，快照永远是唯一事实。
+  ///
+  /// 由事件帧触发、无人 await：失败必须在会话内可见，不能逃逸成未处理
+  /// 异步异常；提示型错误不改变回合进行状态，用户仍可继续输入。
   Future<void> _refreshSnapshot(String reason) async {
     final repository = _resolve();
     final current = state;
@@ -234,25 +298,30 @@ class AgentController extends Notifier<AgentUiState> {
     }
     try {
       final session = await repository.getSession(current.session.id);
-      if (!ref.mounted) {
+      if (!ref.mounted || _repository != repository) {
         return;
       }
       final latest = state;
-      if (latest is! AgentSessionActive) {
+      if (latest is! AgentSessionActive ||
+          latest.session.id != current.session.id) {
         return;
       }
+      final running =
+          session.status == 'running' || session.status == 'cancelling';
       state = latest.copyWith(
         session: session,
+        turnInProgress: running,
+        clearPendingMessage: !running,
         clearStreamingText: true,
       );
       // 权威快照变化后同步工具调用列表。
       unawaited(_refreshToolCalls());
-    } on LyraApiError {
-      // 快照刷新失败保持现有状态；下一帧或下次回合会再触发。
+    } on Object catch (error) {
+      _surfaceSessionError(repository, current.session.id, error);
     }
   }
 
-  /// 加载供应商可用性；未配对时保持 idle。
+  /// 加载供应商可用性；未登录时保持 idle。
   Future<void> loadAvailability() async {
     final repository = _resolve();
     if (repository == null) {
@@ -260,42 +329,68 @@ class AgentController extends Notifier<AgentUiState> {
     }
     try {
       await repository.availability();
+      if (!ref.mounted || _repository != repository) return;
       // 成功则从错误态回到创建视图;可用性只决定创建按钮。
       if (state is AgentError) {
         state = const AgentIdle();
       }
-    } on LyraApiError catch (error) {
-      state = AgentError('${error.message}（${error.code}）');
+    } on Object catch (error) {
+      if (!ref.mounted || _repository != repository) return;
+      state = AgentError(_unexpectedMessage(error));
     }
   }
 
-  /// 创建新会话（scope=all）；供应商不可用或账本冲突以稳定错误码显示。
-  Future<void> createSession(String provider) async {
-    final repository = _resolve();
-    if (repository == null) {
-      state = const AgentError('请先完成设备配对');
+  /// 新对话读取当前页面账户范围；已有对话始终沿用自己的范围。
+  Future<void> createSession() async {
+    final current = state;
+    if (current is AgentCreating ||
+        (current is AgentSessionActive && current.turnInProgress)) {
       return;
     }
+    final repository = _resolve();
+    if (repository == null) {
+      state = const AgentError('请先登录 Lyra');
+      return;
+    }
+    final scope = ref.read(accountScopeProvider);
+    state = const AgentCreating();
     try {
       final availability = await repository.availability();
       final session = await repository.createSession(
-        provider: provider,
-        accountScopeKind: 'all',
+        accountScopeKind: scope.id == 'all' ? 'all' : 'account',
+        accountId: scope.id == 'all' ? null : scope.id,
       );
+      if (!ref.mounted || _repository != repository) return;
       state = AgentSessionActive(
         availability: availability,
+        accountLabel: scope.label,
         session: session,
         turnInProgress: false,
       );
-      await ref.read(agentSessionStoreProvider).write(session.id);
+      await withCredentialMutation(
+        ref.read(sessionDependenciesProvider).credentialStore,
+        () async {
+          if (_isCurrentSession(repository, session.id) &&
+              ref.read(sessionProvider).value is SessionAuthenticated) {
+            await ref.read(agentSessionStoreProvider).write(session.id);
+          }
+        },
+      );
+      if (!ref.mounted || _repository != repository) return;
       _subscribeLive(session.id);
       await _refreshToolCalls();
-    } on LyraApiError catch (error) {
-      state = AgentError('${error.message}（${error.code}）');
+    } on Object catch (error) {
+      // 覆盖整段创建流程（可用性、创建会话、本机会话 ID 写入）；任何异常都必须
+      // 解除 AgentCreating 锁定并给出可重试的错误态，不能卡在“正在创建…”。
+      if (!ref.mounted || _repository != repository) return;
+      state = AgentError(_unexpectedMessage(error));
     }
   }
 
-  /// 拉取会话工具调用公开列表；失败不阻塞会话流。
+  /// 拉取会话工具调用公开列表；失败不阻塞会话流，但必须在会话内可见。
+  ///
+  /// 该方法既被 await 也被 unawaited 调用，异常逃逸会在创建/发送流程里
+  /// 变成未处理异步错误，所以在此收口。
   Future<void> _refreshToolCalls() async {
     final repository = _repository;
     final current = state;
@@ -304,69 +399,51 @@ class AgentController extends Notifier<AgentUiState> {
     }
     try {
       final calls = await repository.toolCalls(current.session.id);
-      if (!ref.mounted) {
+      if (!ref.mounted || _repository != repository) {
         return;
       }
       final latest = state;
-      if (latest is! AgentSessionActive) {
+      if (latest is! AgentSessionActive ||
+          latest.session.id != current.session.id) {
         return;
       }
       state = latest.copyWith(toolCalls: calls);
-    } on LyraApiError {
-      // 工具调用列表是增强信息；拉取失败保持现状。
-    }
-  }
-
-  /// 在回合边界把会话切换到目标供应商；运行中或目标不可用返回稳定 409。
-  Future<void> switchProvider(String targetProvider) async {
-    final current = state;
-    if (current is! AgentSessionActive || current.turnInProgress) {
-      return;
-    }
-    if (current.session.provider == targetProvider) {
-      return;
-    }
-    try {
-      final session = await _repository!.switchSession(
-        sessionId: current.session.id,
-        targetProvider: targetProvider,
-      );
-      state = current.copyWith(
-        session: session,
-        clearError: true,
-      );
-    } on LyraApiError catch (error) {
-      state = current.copyWith(
-        errorMessage: '${error.message}（${error.code}）',
-      );
+    } on Object catch (error) {
+      _surfaceSessionError(repository, current.session.id, error);
     }
   }
 
   /// 发送用户回合；乐观上屏用户消息，终态快照替换为规范消息。
   Future<void> sendTurn(String content) async {
     final current = state;
-    if (current is! AgentSessionActive || current.turnInProgress) {
+    final repository = _repository;
+    if (repository == null ||
+        current is! AgentSessionActive ||
+        current.turnInProgress ||
+        current.session.status != 'idle') {
       return;
     }
-    // 回合窗口重连事件流，保证本回合增量不缺。
-    if (_live == null) {
-      _subscribeLive(current.session.id);
-    } else {
-      _live!.subscribe(
-        sessionId: current.session.id,
-        afterSequence: _lastSequence,
-      );
-    }
-    state = current.copyWith(
-      turnInProgress: true,
-      pendingMessage: content,
-      clearError: true,
-    );
+    // 事件流订阅也在 try 内：订阅失败同样要解除回合锁，不能只停在“回合中”。
     try {
-      final result = await _repository!.sendTurn(
+      // 回合窗口重连事件流，保证本回合增量不缺。
+      if (_live == null) {
+        _subscribeLive(current.session.id);
+      } else {
+        _live!.subscribe(
+          sessionId: current.session.id,
+          afterSequence: _lastSequence,
+        );
+      }
+      state = current.copyWith(
+        turnInProgress: true,
+        pendingMessage: content,
+        clearError: true,
+      );
+      final result = await repository.sendTurn(
         sessionId: current.session.id,
         content: content,
       );
+      if (!_isCurrentSession(repository, current.session.id)) return;
       final maxSequence = result.events.isEmpty
           ? _lastSequence
           : result.events.map((event) => event.sequence).reduce(math.max);
@@ -376,56 +453,94 @@ class AgentController extends Notifier<AgentUiState> {
         turnInProgress: false,
         clearPendingMessage: true,
         clearStreamingText: true,
+        // 上一次回合的错误不能留在成功回合的快照上。
+        clearError: true,
       );
       await _refreshToolCalls();
-    } on LyraApiError catch (error) {
+    } on Object catch (error) {
+      // 回合已置为进行中；任何异常（协议错误、响应形态不匹配、解析失败）
+      // 都必须清除该标记，否则输入框会永久禁用且无法重试。
+      if (!_isCurrentSession(repository, current.session.id)) return;
       state = current.copyWith(
         turnInProgress: false,
         clearPendingMessage: true,
         clearStreamingText: true,
-        errorMessage: '${error.message}（${error.code}）',
+        errorMessage: _unexpectedMessage(error),
       );
     }
   }
 
-  /// 取消运行中的回合。
+  /// 取消运行中的回合；取消失败保持会话内可见提示。
+  ///
+  /// 取消请求失败时回合可能仍在服务端运行，因此保留 turnInProgress：
+  /// 事件流与快照会给出权威状态，用户也可再次取消。
   Future<void> cancelTurn() async {
     final current = state;
-    if (current is! AgentSessionActive || !current.turnInProgress) {
+    final repository = _repository;
+    if (repository == null ||
+        current is! AgentSessionActive ||
+        !current.turnInProgress) {
       return;
     }
     try {
-      final session = await _repository!.cancelTurn(current.session.id);
+      final session = await repository.cancelTurn(current.session.id);
+      if (!_isCurrentSession(repository, current.session.id)) return;
       state = current.copyWith(
         session: session,
         turnInProgress: false,
         clearPendingMessage: true,
         clearStreamingText: true,
+        // 取消成功即回合已结束，之前的回合错误不再适用。
+        clearError: true,
       );
-    } on LyraApiError catch (error) {
-      state = current.copyWith(
-        errorMessage: '${error.message}（${error.code}）',
-      );
+    } on Object catch (error) {
+      if (!_isCurrentSession(repository, current.session.id)) return;
+      state = current.copyWith(errorMessage: _unexpectedMessage(error));
+      // 取消失败不能靠本地猜测回合状态：重取权威快照决定是否仍在运行。
+      unawaited(_refreshSnapshot('cancel-failed'));
     }
   }
+
+  /// 在会话内显示非致命错误；会话已切换或销毁时丢弃过期错误。
+  void _surfaceSessionError(
+    AgentRepository repository,
+    String sessionId,
+    Object error,
+  ) {
+    final current = state;
+    if (!_isCurrentSession(repository, sessionId) ||
+        current is! AgentSessionActive) {
+      return;
+    }
+    state = current.copyWith(errorMessage: _unexpectedMessage(error));
+  }
+
+  bool _isCurrentSession(AgentRepository repository, String sessionId) {
+    if (!ref.mounted || _repository != repository) return false;
+    final current = state;
+    return current is AgentSessionActive && current.session.id == sessionId;
+  }
 }
+
+/// 失败仍然可见且可重试，协议码和原始诊断仅用于内部处理。
+String _unexpectedMessage(Object error) => lyraErrorMessage(error);
 
 /// Agent 页 Provider（进入页面时创建，离开销毁）。
 final agentControllerProvider =
     NotifierProvider.autoDispose<AgentController, AgentUiState>(
-  AgentController.new,
-);
+      AgentController.new,
+    );
 
 /// Agent 活跃会话 ID 持久化；由会话依赖注入，测试可覆盖。
 final Provider<AgentSessionStore> agentSessionStoreProvider =
     Provider<AgentSessionStore>((ref) {
-  return ref.watch(sessionDependenciesProvider).agentSessionStore ??
-      const SecureAgentSessionStore();
-});
+      return ref.watch(sessionDependenciesProvider).agentSessionStore ??
+          const SecureAgentSessionStore();
+    });
 
 /// Agent 页：供应商可用状态、会话消息流与回合输入。
 ///
-/// 未配对或加载失败不伪造金融内容；回合运行中显示乐观用户消息与思考标记。
+/// 未登录或加载失败不伪造金融内容；回合运行中显示乐观用户消息与思考标记。
 class AgentScreen extends ConsumerStatefulWidget {
   const AgentScreen({super.key});
 
@@ -438,7 +553,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
   Widget build(BuildContext context) {
     final state = ref.watch(agentControllerProvider);
     final sessionState = ref.watch(sessionProvider);
-    final paired = sessionState.value is SessionPaired;
+    final paired = sessionState.value is SessionAuthenticated;
 
     // 作为推入的二级页运行,需要自备 Scaffold 提供 Material 上下文。
     return Scaffold(
@@ -463,25 +578,26 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
     if (!paired) {
       return _InfoCard(
         icon: LyraIcons.agent,
-        title: '未连接服务端',
-        description: '完成设备配对后即可与只读金融 Agent 对话。',
+        title: '请先登录 Lyra',
+        description: '登录后即可查询仓位、绩效与压力分析。',
         accent: LyraColors.accent,
       );
     }
     if (state is AgentError) {
       return _InfoCard(
         icon: LyraIcons.agent,
-        title: 'Agent 暂不可用',
+        title: 'AI 助手暂不可用',
         description: state.message,
         accent: LyraColors.accent,
         actionLabel: '重试',
-        onAction: () => ref.read(agentControllerProvider.notifier).loadAvailability(),
+        onAction: () =>
+            ref.read(agentControllerProvider.notifier).loadAvailability(),
       );
     }
     if (state is AgentSessionActive) {
       return _SessionView(state: state);
     }
-    return const _CreateView();
+    return _CreateView(creating: state is AgentCreating);
   }
 }
 
@@ -505,6 +621,9 @@ class _SessionViewState extends ConsumerState<_SessionView> {
   }
 
   void _send() {
+    if (widget.state.turnInProgress || widget.state.session.status != 'idle') {
+      return;
+    }
     final content = _inputController.text.trim();
     if (content.isEmpty) {
       return;
@@ -517,11 +636,21 @@ class _SessionViewState extends ConsumerState<_SessionView> {
   Widget build(BuildContext context) {
     final state = widget.state;
     final session = state.session;
+    final canSend = !state.turnInProgress && session.status == 'idle';
     final controller = ref.read(agentControllerProvider.notifier);
+    final selectedScope = ref.watch(accountScopeProvider);
+    final scopeId = session.accountScopeKind == 'all'
+        ? 'all'
+        : session.accountId;
+    final scopeLabel = session.accountScopeKind == 'all'
+        ? '全部账号'
+        : state.accountLabel ??
+              (selectedScope.id == scopeId ? selectedScope.label : '指定账户');
+    final asOf = lyraDateTime(session.asOf);
     return Column(
       children: <Widget>[
         Padding(
-          padding: const EdgeInsets.fromLTRB(8, 12, 20, 12),
+          padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
@@ -530,20 +659,55 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                   const BackButton(),
                   Expanded(
                     child: Text(
-                      'Agent · ${_providerLabel(session.provider)}',
-                      style: Theme.of(context).textTheme.headlineSmall,
+                      'Lyra 助手',
+                      style: Theme.of(context).textTheme.headlineSmall
+                          ?.copyWith(fontSize: 22, fontWeight: FontWeight.w500),
                     ),
                   ),
-                  _StatusChip(session: session),
-                  const SizedBox(width: 8),
-                  _SwitchMenu(state: state),
+                  IconButton(
+                    tooltip: '新对话',
+                    onPressed: state.turnInProgress
+                        ? null
+                        : controller.createSession,
+                    icon: const Icon(Icons.add_comment_outlined),
+                  ),
                 ],
               ),
               const SizedBox(height: 4),
-              Text(
-                '账本版本 ${session.ledgerVersion} · 截止 ${session.asOf}',
-                style: Theme.of(context).textTheme.bodySmall
-                    ?.copyWith(color: LyraColors.muted),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(
+                          '本次对话：$scopeLabel',
+                          key: const ValueKey('agent-session-scope'),
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        _StatusChip(session: session),
+                      ],
+                    ),
+                    if (selectedScope.id != scopeId) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        '页面已选择${selectedScope.label}；新对话将使用该范围。',
+                        style: Theme.of(context).textTheme.bodySmall
+                            ?.copyWith(color: LyraColors.muted),
+                      ),
+                    ],
+                    const SizedBox(height: 4),
+                    Text(
+                      asOf == '时间未知' ? '数据时间未知' : '数据截至 $asOf',
+                      style: Theme.of(context).textTheme.bodySmall
+                          ?.copyWith(color: LyraColors.muted),
+                    ),
+                  ],
+                ),
               ),
             ],
           ),
@@ -568,6 +732,7 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                   role: message.role,
                   content: message.content,
                   isFailed: message.status == 'failed',
+                  isCancelled: message.status == 'cancelled',
                 ),
               if (state.pendingMessage != null)
                 _MessageBubble(role: 'user', content: state.pendingMessage!),
@@ -587,18 +752,16 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                   padding: const EdgeInsets.symmetric(vertical: 8),
                   child: Text(
                     state.errorMessage!,
-                    style: TextStyle(color: Theme.of(context).colorScheme.error),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
                   ),
                 ),
               if (state.toolCalls.isNotEmpty) ...<Widget>[
                 const SizedBox(height: 8),
-                Text(
-                  '工具调用',
-                  style: Theme.of(context).textTheme.titleSmall,
-                ),
+                Text('分析进度', style: Theme.of(context).textTheme.titleSmall),
                 const SizedBox(height: 6),
-                for (final call in state.toolCalls)
-                  _ToolCallTile(call: call),
+                for (final call in state.toolCalls) _ToolCallTile(call: call),
               ],
               const SizedBox(height: 12),
             ],
@@ -613,14 +776,16 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                 Expanded(
                   child: TextField(
                     controller: _inputController,
-                    enabled: !state.turnInProgress,
+                    enabled: canSend,
                     minLines: 1,
                     maxLines: 4,
                     textInputAction: TextInputAction.send,
                     onSubmitted: (String value) => _send(),
-                    decoration: const InputDecoration(
-                      hintText: '询问持仓、绩效或风险…',
-                      border: OutlineInputBorder(),
+                    decoration: InputDecoration(
+                      hintText: session.status == 'closed'
+                          ? '请新建对话继续分析'
+                          : '询问持仓、绩效或风险…',
+                      fillColor: LyraColors.surface,
                       isDense: true,
                     ),
                   ),
@@ -630,21 +795,20 @@ class _SessionViewState extends ConsumerState<_SessionView> {
                     ? IconButton(
                         onPressed: () => controller.cancelTurn(),
                         icon: const Icon(LyraIcons.dismiss),
-                        tooltip: '取消回合',
+                        tooltip: '停止分析',
                       )
                     : ValueListenableBuilder<TextEditingValue>(
                         valueListenable: _inputController,
-                        builder: (
-                          BuildContext context,
-                          TextEditingValue value,
-                          _,
-                        ) {
-                          final bool hasInput = value.text.trim().isNotEmpty;
-                          return _SendButton(
-                            enabled: hasInput,
-                            onTap: hasInput ? _send : null,
-                          );
-                        },
+                        builder:
+                            (BuildContext context, TextEditingValue value, _) {
+                              final bool hasInput = value.text
+                                  .trim()
+                                  .isNotEmpty;
+                              return _SendButton(
+                                enabled: canSend && hasInput,
+                                onTap: canSend && hasInput ? _send : null,
+                              );
+                            },
                       ),
               ],
             ),
@@ -655,32 +819,28 @@ class _SessionViewState extends ConsumerState<_SessionView> {
   }
 }
 
-/// 会话创建视图：固定展示三个供应商入口（与设计一致的固定顺序）。
+/// 一个 Lyra 助手；模型和运行方式由服务端统一配置。
 class _CreateView extends ConsumerWidget {
-  const _CreateView();
-
-  static const List<(String, String)> _providers = <(String, String)>[
-    ('claude', 'Claude'),
-    ('pi', 'Pi'),
-    ('opencode', 'OpenCode'),
-  ];
+  const _CreateView({required this.creating});
+  final bool creating;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final scope = ref.watch(accountScopeProvider);
     return ListView(
       padding: const EdgeInsets.fromLTRB(8, 4, 20, 40),
       children: <Widget>[
-        // 二级页头部:返回键 + 紧凑标题。
         Row(
           children: <Widget>[
             const BackButton(),
             const SizedBox(width: 4),
             Expanded(
               child: Text(
-                'AI 分析',
+                'Lyra 助手',
                 style: Theme.of(context).textTheme.headlineLarge?.copyWith(
                   fontSize: 22,
-                  letterSpacing: -0.3,
+                  fontWeight: FontWeight.w500,
+                  letterSpacing: 0,
                 ),
               ),
             ),
@@ -688,80 +848,49 @@ class _CreateView extends ConsumerWidget {
         ),
         const Padding(
           padding: EdgeInsets.only(left: 60),
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              '从记录中，发现值得追问的细节。',
-              style: TextStyle(color: LyraColors.muted, fontSize: 14),
-            ),
+          child: Text(
+            '从记录中，发现值得追问的细节。',
+            style: TextStyle(color: LyraColors.muted, fontSize: 14),
           ),
         ),
-        const SizedBox(height: 20),
-        // Coinbase 式分组:白底行 + 发丝线,无外框。
-        Column(
-          children: <Widget>[
-            for (final (int index, (String provider, String label))
-                in _providers.indexed)
-              InkWell(
-                onTap: () => ref
-                    .read(agentControllerProvider.notifier)
-                    .createSession(provider),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 0,
-                    vertical: 14,
-                  ),
-                  decoration: BoxDecoration(
-                    border: index == _providers.length - 1
-                        ? null
-                        : const Border(
-                            bottom: BorderSide(color: LyraColors.hairline),
-                          ),
-                  ),
-                  child: Row(
-                    children: <Widget>[
-                      Container(
-                        width: 38,
-                        height: 38,
-                        alignment: Alignment.center,
-                        decoration: const BoxDecoration(
-                          color: LyraColors.accentTint,
-                          shape: BoxShape.circle,
-                        ),
-                        child: const Icon(
-                          LyraIcons.agent,
-                          size: 19,
-                          color: LyraColors.accent,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          '开始 $label 会话',
-                          style: const TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w600,
-                            color: LyraColors.ink,
-                          ),
-                        ),
-                      ),
-                      const Icon(
-                        LyraIcons.disclosure,
-                        size: 18,
-                        color: LyraColors.mutedSoft,
-                      ),
-                    ],
-                  ),
-                ),
+        const SizedBox(height: 24),
+        Padding(
+          padding: const EdgeInsets.only(left: 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Text(
+                '分析范围：${scope.label}',
+                style: Theme.of(context).textTheme.bodyMedium,
               ),
-          ],
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: creating
+                    ? null
+                    : () => ref
+                          .read(agentControllerProvider.notifier)
+                          .createSession(),
+                icon: creating
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: LyraColors.inkSecondary,
+                        ),
+                      )
+                    : const Icon(LyraIcons.agent, size: 20),
+                label: Text(creating ? '正在创建…' : '开始分析'),
+              ),
+            ],
+          ),
         ),
       ],
     );
   }
 }
 
-/// 未配对与错误态共用的信息卡片。
+/// 未登录与错误态共用的信息卡片。
 class _InfoCard extends StatelessWidget {
   const _InfoCard({
     required this.icon,
@@ -784,7 +913,7 @@ class _InfoCard extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
       children: <Widget>[
-        // Coinbase 式空状态:居中内容直接铺在画布上,无卡片边框。
+        // 空状态只展示当前状态与下一步操作。
         Padding(
           padding: const EdgeInsets.only(top: 96),
           child: Column(
@@ -815,10 +944,7 @@ class _InfoCard extends StatelessWidget {
               ),
               if (actionLabel != null) ...<Widget>[
                 const SizedBox(height: 20),
-                FilledButton(
-                  onPressed: onAction,
-                  child: Text(actionLabel!),
-                ),
+                FilledButton(onPressed: onAction, child: Text(actionLabel!)),
               ],
             ],
           ),
@@ -864,7 +990,7 @@ class _SessionEmptyState extends StatelessWidget {
           Text('开始提问', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 6),
           Text(
-            'Agent 只能查询当前账户范围与账本版本内的数据。',
+            '助手根据本次对话的账户范围查询和分析账本。',
             textAlign: TextAlign.center,
             style: Theme.of(context).textTheme.bodySmall
                 ?.copyWith(color: LyraColors.muted),
@@ -912,17 +1038,21 @@ class _MessageBubble extends StatelessWidget {
     required this.role,
     required this.content,
     this.isFailed = false,
+    this.isCancelled = false,
     this.isStreaming = false,
   });
 
   final String role;
   final String content;
   final bool isFailed;
+  final bool isCancelled;
   final bool isStreaming;
 
   @override
   Widget build(BuildContext context) {
     final isUser = role == 'user';
+    final hasContent = content.trim().isNotEmpty;
+    final cancelledNotice = hasContent ? '分析已停止，以上为已完成的内容。' : '分析已停止。';
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -930,15 +1060,31 @@ class _MessageBubble extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         constraints: const BoxConstraints(maxWidth: 560),
         decoration: BoxDecoration(
-          color: isUser ? LyraColors.accent : LyraColors.surfaceSubtle,
-          borderRadius: BorderRadius.circular(18),
+          color: isUser ? LyraColors.accent : LyraColors.surface,
+          borderRadius: BorderRadius.circular(16),
+          border: isUser ? null : Border.all(color: LyraColors.hairline),
         ),
-        child: Text(
-          isStreaming ? '$content▍' : content,
-          style: TextStyle(
-            color: isUser ? LyraColors.surface : LyraColors.ink,
-            height: 1.5,
-          ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (hasContent || isStreaming)
+              Text(
+                isStreaming ? '$content▍' : content,
+                style: TextStyle(
+                  color: isUser ? LyraColors.onAccent : LyraColors.ink,
+                  height: 1.6,
+                ),
+              ),
+            if (!isUser && (isFailed || isCancelled)) ...[
+              if (hasContent) const SizedBox(height: 8),
+              Text(
+                isCancelled ? cancelledNotice : '本次分析未完成，请重试。',
+                style: Theme.of(context).textTheme.bodySmall
+                    ?.copyWith(color: LyraColors.muted, height: 1.6),
+              ),
+            ],
+          ],
         ),
       ),
     );
@@ -971,7 +1117,7 @@ class _SendButton extends StatelessWidget {
           child: Icon(
             LyraIcons.send,
             size: 20,
-            color: enabled ? LyraColors.surface : LyraColors.mutedSoft,
+            color: enabled ? LyraColors.onAccent : LyraColors.mutedSoft,
           ),
         ),
       ),
@@ -1006,9 +1152,7 @@ class _ThinkingDotsState extends State<_ThinkingDots>
       children: <Widget>[
         Text(
           '正在思考',
-          style: Theme.of(context)
-              .textTheme
-              .bodyMedium
+          style: Theme.of(context).textTheme.bodyMedium
               ?.copyWith(color: LyraColors.muted),
         ),
         const SizedBox(width: 6),
@@ -1039,41 +1183,6 @@ class _ThinkingDotsState extends State<_ThinkingDots>
   }
 }
 
-/// 回合边界切换菜单：仅 idle 且目标为其他供应商时可用。
-class _SwitchMenu extends ConsumerWidget {
-  const _SwitchMenu({required this.state});
-
-  final AgentSessionActive state;
-
-  static const List<(String, String)> _providers = <(String, String)>[
-    ('claude', 'Claude'),
-    ('pi', 'Pi'),
-    ('opencode', 'OpenCode'),
-  ];
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final canSwitch = !state.turnInProgress
-        && state.session.status == 'idle';
-    return PopupMenuButton<String>(
-      tooltip: '切换 Agent',
-      enabled: canSwitch,
-      icon: const Icon(LyraIcons.disclosure),
-      onSelected: (String target) => ref
-          .read(agentControllerProvider.notifier)
-          .switchProvider(target),
-      itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
-        for (final (provider, label) in _providers)
-          if (provider != state.session.provider)
-            PopupMenuItem<String>(
-              value: provider,
-              child: Text('切换到 $label'),
-            ),
-      ],
-    );
-  }
-}
-
 /// 会话状态芯片：idle / running / closed / cancelling。
 class _StatusChip extends StatelessWidget {
   const _StatusChip({required this.session});
@@ -1083,15 +1192,17 @@ class _StatusChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final label = switch (session.status) {
-      'running' => '回合中',
-      'cancelling' => '取消中',
-      'closed' => '已关闭',
-      _ => '空闲',
+      'running' => '分析中',
+      'cancelling' => '正在停止',
+      'closed' => '已结束',
+      'idle' => '可提问',
+      _ => '状态待更新',
     };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: LyraColors.surfaceStrong,
+        color: LyraColors.surface,
+        border: Border.all(color: LyraColors.hairlineStrong),
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(
@@ -1103,7 +1214,43 @@ class _StatusChip extends StatelessWidget {
   }
 }
 
-/// 单条工具调用的折叠卡片；只显示公开摘要，不伪造结果。
+/// 固定的业务任务名，不把内部命令或未知工具名作为用户文案。
+String _analysisTaskLabel(String toolName) => switch (toolName) {
+  'accounts' => '读取证券账户',
+  'summary' => '汇总账户概况',
+  'positions' => '查询当前持仓',
+  'expiring' => '查看期权到期',
+  'trades' => '查询交易记录',
+  'realized' => '分析已实现损益',
+  'cashflow' => '分析现金流',
+  'monthly' => '分析每月表现',
+  'allocation' => '分析资产配置',
+  'attribution' => '分析收益来源',
+  'drawdown' => '分析已实现损益回撤',
+  'risk' => '分析期权风险',
+  'holding-period' => '分析持有时长',
+  'extremes' => '查看交易盈亏',
+  'streaks' => '分析连续盈亏',
+  'stress' => '进行压力分析',
+  'audit' => '核对账本记录',
+  'market-positions' => '查询参考估值',
+  _ => '分析任务',
+};
+
+/// 仅展示已知业务含义的整数计数，任意参数和结果摘要不直接进入界面。
+String? _analysisResultLabel(AgentToolCallView call) {
+  if (call.status != 'completed') return null;
+  final count = call.resultSummary?['count'];
+  if (count is! int || count < 0) return null;
+  return switch (call.toolName) {
+    'accounts' => '已读取 $count 个账户',
+    'positions' || 'market-positions' => '已读取 $count 项持仓',
+    'expiring' || 'trades' || 'realized' || 'cashflow' => '已读取 $count 条记录',
+    _ => null,
+  };
+}
+
+/// 分析进度卡片；保留任务状态和有意义的结果计数。
 class _ToolCallTile extends StatelessWidget {
   const _ToolCallTile({required this.call});
 
@@ -1112,25 +1259,22 @@ class _ToolCallTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final statusLabel = switch (call.status) {
-      'started' => '运行中',
-      'completed' => '完成',
-      'failed' => '失败',
+      'started' => '进行中',
+      'completed' => '已完成',
+      'failed' => '未完成',
       'cancelled' => '已取消',
-      'rejected' => '被拒绝',
-      _ => call.status,
+      'rejected' => '暂不可用',
+      _ => '状态待更新',
     };
-    final arguments = call.argumentsSummary.entries
-        .map((entry) => '${entry.key}: ${entry.value}')
-        .join('，');
-    final result = call.resultSummary?.entries
-        .map((entry) => '${entry.key}: ${entry.value}')
-        .join('，');
+    final result = _analysisResultLabel(call);
+    final failed = call.status == 'failed' || call.status == 'rejected';
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: LyraColors.surfaceSubtle,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: LyraColors.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1139,39 +1283,37 @@ class _ToolCallTile extends StatelessWidget {
             children: <Widget>[
               Expanded(
                 child: Text(
-                  call.toolName,
+                  _analysisTaskLabel(call.toolName),
                   style: const TextStyle(fontWeight: FontWeight.w600),
                 ),
               ),
               Text(
-                call.durationMs == null
-                    ? statusLabel
-                    : '$statusLabel · ${call.durationMs}ms',
+                statusLabel,
                 style: Theme.of(context).textTheme.labelSmall
                     ?.copyWith(color: LyraColors.muted),
               ),
             ],
           ),
-          if (arguments.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 4),
+          if (result != null) ...<Widget>[
+            const SizedBox(height: 2),
             Text(
-              '参数：$arguments',
+              result,
               style: Theme.of(context).textTheme.bodySmall
                   ?.copyWith(color: LyraColors.muted),
             ),
           ],
-          if (result != null && result.isNotEmpty) ...<Widget>[
+          if (failed) ...<Widget>[
             const SizedBox(height: 2),
             Text(
-              '结果：$result',
-              style: Theme.of(context).textTheme.bodySmall
-                  ?.copyWith(color: LyraColors.muted),
-            ),
-          ],
-          if (call.errorCode != null) ...<Widget>[
-            const SizedBox(height: 2),
-            Text(
-              call.errorCode!,
+              lyraErrorMessage(
+                LyraApiError(
+                  code: call.errorCode ?? 'AGENT_TOOL_EXECUTION_FAILED',
+                  message: '',
+                  statusCode: 500,
+                  retryable: true,
+                ),
+                fallback: '这一步未能完成，可以重新提问。',
+              ),
               style: TextStyle(color: Theme.of(context).colorScheme.error),
             ),
           ],
@@ -1179,14 +1321,4 @@ class _ToolCallTile extends StatelessWidget {
       ),
     );
   }
-}
-
-/// 供应商显示名映射。
-String _providerLabel(String provider) {
-  return switch (provider) {
-    'claude' => 'Claude',
-    'pi' => 'Pi',
-    'opencode' => 'OpenCode',
-    _ => provider,
-  };
 }

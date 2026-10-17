@@ -17,7 +17,7 @@ enum LedgerView {
   realized(
     '已实现损益',
     'realized',
-    'FIFO 已实现损益 · 扣除分摊费用',
+    '先进先出计算的已实现损益 · 扣除分摊费用',
     LyraIcons.analytics,
     'pnl',
   ),
@@ -25,7 +25,7 @@ enum LedgerView {
   monthly(
     '月度表现',
     'monthly',
-    '按平仓月份汇总的 FIFO 已实现损益',
+    '按平仓月份汇总的已实现损益 · 先进先出口径',
     LyraIcons.analytics,
     'netPnl',
     analytics: true,
@@ -65,7 +65,7 @@ enum LedgerView {
   holdingPeriod(
     '持有周期',
     'holding-period',
-    '按 FIFO lot 的实际持有天数分组',
+    '按开仓批次的实际持有天数分组 · 先进先出',
     LyraIcons.dataCutoff,
     'netPnl',
     analytics: true,
@@ -94,7 +94,7 @@ enum LedgerView {
     'lossIfZero',
     analytics: true,
   ),
-  audit('账本检查', 'audit', '只读检查账本字段及 FIFO 覆盖情况', LyraIcons.security, 'count');
+  audit('账本检查', 'audit', '核对交易、持仓与已实现损益的一致性', LyraIcons.security, 'count');
 
   const LedgerView(
     this.title,
@@ -216,6 +216,104 @@ const ledgerLabels = <String, String>{
   'recoveryDate': '恢复日期',
 };
 
+/// 字段性质由公开账本协议定义，不能把数量、日期或百分比当作金额遮挡。
+const ledgerAmountFields = <String>{
+  'cost',
+  'premiumDollars',
+  'amount',
+  'price',
+  'fees',
+  'pnl',
+  'netPnl',
+  'costBasis',
+  'drawdown',
+  'longPremiumPaid',
+  'shortPremiumReceived',
+  'lossIfZero',
+  'totalPnl',
+  'totalFees',
+  'total',
+  'totalCostBasis',
+  'endingCumulativePnl',
+  'maxDrawdown',
+  'totalLongPremiumPaid',
+  'totalShortPremiumReceived',
+  'allLongOptionsLossIfZero',
+  'topThreeLossIfZero',
+  'strike',
+  'openPrice',
+  'closePrice',
+  'openFees',
+  'closeFees',
+  'grossProfit',
+  'grossLoss',
+  'dailyPnl',
+  'cumulativePnl',
+  'runningPeak',
+  'averageLotPnl',
+  'premiumAtRisk',
+};
+
+/// 正负方向表达收益或现金流；成本、费用和假设损失的正数仍使用中性色。
+const ledgerSignedAmountFields = <String>{
+  'amount',
+  'pnl',
+  'netPnl',
+  'totalPnl',
+  'total',
+  'endingCumulativePnl',
+  'grossProfit',
+  'grossLoss',
+  'dailyPnl',
+  'cumulativePnl',
+  'averageLotPnl',
+};
+
+bool _isOptionRecord(Map<String, Object?> record) =>
+    record['assetType'] == 'option' ||
+    record['strike'] != null ||
+    record['optionType'] != null;
+
+/// 期权完整代码可能包含行权价；隐藏金额时标题与头像只读取独立标的字段。
+String ledgerSecurityText(
+  Map<String, Object?> record, {
+  required bool amountsHidden,
+}) {
+  if (amountsHidden && _isOptionRecord(record)) {
+    return ledgerText(record['underlying'] ?? '期权合约');
+  }
+  return ledgerText(
+    record['underlying'] ??
+        record['symbol'] ??
+        record['symbolKey'] ??
+        record['action'],
+  );
+}
+
+/// 原文说明和完整期权代码可能含金额；结构化数量、日期及比例仍正常展示。
+String ledgerFieldText(
+  String field,
+  Map<String, Object?> record, {
+  required bool amountsHidden,
+}) {
+  final value = record[field];
+  if (field == 'status' && record.containsKey('check')) {
+    return ledgerAuditStatusText(value);
+  }
+  if (amountsHidden && value != null) {
+    if (field == 'description') return '说明已隐藏';
+    if ((field == 'symbol' || field == 'symbolKey') &&
+        _isOptionRecord(record)) {
+      return [
+        ledgerSecurityText(record, amountsHidden: true),
+        if (record['expiry'] != null) ledgerText(record['expiry']),
+        if (record['optionType'] != null) ledgerText(record['optionType']),
+      ].join(' · ');
+    }
+  }
+  return ledgerText(value);
+}
+
 /// 枚举值翻译保持金融语义；未知券商动作仍保留原文供核对。
 String ledgerText(Object? value) => switch (value) {
   null => '—',
@@ -245,5 +343,40 @@ String ledgerText(Object? value) => switch (value) {
   'loss' => '连续亏损',
   'pass' => '通过',
   'fail' => '未通过',
-  _ => value.toString(),
+  true => '是',
+  false => '否',
+  String() => value,
+  num() when value.isFinite => value.toString(),
+  _ => '暂无法显示',
+};
+
+/// 天数区间沿用账本返回的边界，只把内部区间名称转换为易读文字。
+String ledgerDayRangeText(Object? value) => switch (value) {
+  'expired' => '已到期',
+  '0-7d' => '0–7 天',
+  '0-30d' => '0–30 天',
+  '8-30d' => '8–30 天',
+  '31-60d' => '31–60 天',
+  '31-90d' => '31–90 天',
+  '61-90d' => '61–90 天',
+  '90d+' => '超过 90 天',
+  _ => '时间范围待确认',
+};
+
+/// 新增检查也保留实际结果，不把内部检查名称当作用户说明。
+String ledgerAuditTitle(Object? check) => switch (check) {
+  'transactions_present' => '原始交易记录',
+  'invalid_trade_fields' => '交易关键信息是否齐全',
+  'unreflected_fifo_transactions' => '交易是否计入持仓与损益',
+  'orphan_open_lots' => '持仓来源记录是否齐全',
+  'orphan_realized_rows' => '损益来源记录是否齐全',
+  'invalid_lot_quantities' => '持仓数量是否有效',
+  'fifo_derivatives_present' => '持仓与损益记录是否已生成',
+  _ => '其他账本检查',
+};
+
+String ledgerAuditStatusText(Object? status) => switch (status) {
+  'pass' => '通过',
+  'fail' => '未通过',
+  _ => '结果待确认',
 };

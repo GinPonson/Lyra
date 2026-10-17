@@ -1,0 +1,63 @@
+[project]
+name = "lyra-server"
+version = "0.1.0"
+description = "Lyra 服务端（Python/FastAPI）：私有账本、分析与 Agent"
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=43,<46",
+    "duckdb>=1.1,<2",
+    "fastapi>=0.115,<1",
+    "google-auth>=2.30,<3",
+    "httpx>=0.27,<1",
+    "jsonschema>=4.23,<5",
+    # DuckDB 的 Python 驱动读取 TIMESTAMPTZ 需要 pytz；缺失时**写正常、读报错**，
+    # 属于很难排查的失败模式，因此显式声明而不是依赖环境自带。
+    "pytz>=2024.1",
+    "pydantic-settings>=2.5,<3",
+    "uvicorn[standard]>=0.30,<1",
+    "openpyxl>=3.1.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.17.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lyra"]
+
+[project.scripts]
+# **正式入口**。没有它时只能靠 `python -m lyra.main` 启动——容器与 systemd 都能处理，
+# 但一个具名命令让部署配置更清晰（"启动 lyra-serve"比"启动一个带 -m 的 python"好读）。
+#
+# 它同时是运行手册阶段 2 的可执行依据：**启动方式与部署形态无关**，
+# systemd / 容器 / 裸进程都只是调用这条命令。
+lyra-serve = "lyra.main:run"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+# 行宽与既有代码风格一致（避免制造大量无关的换行改动）。
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# **只启用错误类规则。**
+#
+# 风格类规则（导入排序、`datetime.UTC` 现代化、类型注解写法等）会触及大量文件却
+# 不影响行为；把它们与错误类混在一起会让"检查是否通过"这个信号失去意义——
+# 真正该拦住的未定义名字会被淹没在几十条格式提示里。
+#
+# 风格清理是独立的、可验证的任务，见计划文档 §147.6。
+select = [
+    "F821",  # 未定义的名字——会在运行时抛 NameError
+    "F811",  # 重复定义
+    "F841",  # 未使用的局部变量——通常是重构留下的死代码
+]

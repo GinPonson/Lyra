@@ -2,11 +2,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/session.dart';
+import '../../features/accounts/account_sheet.dart';
+import '../../features/accounts/account_workspace.dart';
 import '../../features/ledger/ledger_workspace.dart';
-import '../api/lyra_api_error.dart';
+import '../preferences/app_preferences.dart';
 import 'lyra_colors.dart';
+import 'lyra_error_message.dart';
 import 'lyra_icons.dart';
 import 'lyra_number.dart';
+import 'lyra_primary_icon.dart';
 import 'lyra_theme.dart';
 
 /// 自适应金融页面：宽屏有边界，窄屏保留阅读留白与可滚动内容。
@@ -29,7 +33,7 @@ class LyraPage extends StatelessWidget {
               key: PageStorageKey<String>(storageKey),
               slivers: [
                 SliverPadding(
-                  padding: EdgeInsets.fromLTRB(gutter, 16, gutter, 32),
+                  padding: EdgeInsets.fromLTRB(gutter, 24, gutter, 32),
                   sliver: SliverToBoxAdapter(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -77,22 +81,33 @@ class LyraPageTitle extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Padding(
     padding: const EdgeInsets.only(bottom: 16),
-    child: Row(
-      children: [
-        Expanded(
-          child: Text(
-            title,
-            style: const TextStyle(
-              fontSize: 25,
-              height: 1.2,
-              fontWeight: FontWeight.w600,
-              letterSpacing: -.6,
-              color: LyraColors.ink,
-            ),
+    child: LayoutBuilder(
+      builder: (context, constraints) {
+        final heading = Text(
+          title,
+          style: const TextStyle(
+            fontSize: 22,
+            height: 1.2,
+            fontWeight: FontWeight.w500,
+            letterSpacing: -.2,
+            color: LyraColors.ink,
           ),
-        ),
-        ?trailing,
-      ],
+        );
+        if (trailing != null &&
+            constraints.maxWidth < 360 &&
+            MediaQuery.textScalerOf(context).scale(22) > 26) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [heading, const SizedBox(height: 8), trailing!],
+          );
+        }
+        return Row(
+          children: [
+            Expanded(child: heading),
+            ?trailing,
+          ],
+        );
+      },
     ),
   );
 }
@@ -176,7 +191,7 @@ class LyraEmpty extends StatelessWidget {
   );
 }
 
-/// 错误不是空数据：保留错误代码与可见重试动作。
+/// 数据读取失败时说明下一步操作，诊断信息留在错误对象中。
 class LyraLoadError extends StatelessWidget {
   const LyraLoadError({super.key, required this.error, required this.onRetry});
   final Object error;
@@ -185,9 +200,7 @@ class LyraLoadError extends StatelessWidget {
   Widget build(BuildContext context) => LyraEmpty(
     icon: LyraIcons.error,
     title: '数据未能加载',
-    message: error is LyraApiError
-        ? '${(error as LyraApiError).message} · ${(error as LyraApiError).code}'
-        : '响应处理失败：$error',
+    message: lyraErrorMessage(error, fallback: '暂时无法读取数据，请重新加载。'),
     action: OutlinedButton.icon(
       onPressed: onRetry,
       icon: const Icon(LyraIcons.sync, size: 18),
@@ -218,8 +231,20 @@ class LyraSkeleton extends StatelessWidget {
   );
 }
 
-/// 金额按展示精度排版；长按或悬停查看原始值，辅助阅读同样保留精度。
-class LyraAmount extends StatelessWidget {
+/// 只为盈亏等带方向的金融数值选色；品牌和成功状态不读取此规则。
+Color lyraProfitColor(String value, ProfitColorScheme scheme) {
+  if (!RegExp(r'^-?\d+(?:\.\d+)?$').hasMatch(value) ||
+      !RegExp(r'[1-9]').hasMatch(value)) {
+    return LyraColors.ink;
+  }
+  final positive = !value.startsWith('-');
+  final green = positive == (scheme == ProfitColorScheme.greenUp);
+  return green ? LyraColors.positive : LyraColors.negative;
+}
+
+/// 金额按展示精度排版；隐藏时同时移除原始值提示与辅助阅读内容。
+/// 股数、笔数等复用数字排版时须显式设置 [isMonetary] 为 false。
+class LyraAmount extends ConsumerWidget {
   const LyraAmount(
     this.value, {
     super.key,
@@ -227,39 +252,87 @@ class LyraAmount extends StatelessWidget {
     this.color,
     this.currency,
     this.decimals = 2,
+    this.isMonetary = true,
+    this.colorBySign = false,
+    this.showPositiveSign = false,
+    this.exact = false,
+    this.textAlign,
   });
   final String value;
   final double size;
   final Color? color;
   final String? currency;
   final int decimals;
+  final bool isMonetary;
+  final bool colorBySign;
+
+  /// 只在方向本身有意义的汇总盈亏上显示正号；不改变服务端数值。
+  final bool showPositiveSign;
+
+  /// 明细沿用服务端原始精度，列表仍使用 [decimals] 进行展示舍入。
+  final bool exact;
+  final TextAlign? textAlign;
   @override
-  Widget build(BuildContext context) => Tooltip(
-    message: '原始值：$value${currency == null ? '' : ' $currency'}',
-    child: Text(
-      '${LyraNumber.amount(value, decimals: decimals)}${currency == null ? '' : ' $currency'}',
+  Widget build(BuildContext context, WidgetRef ref) {
+    final hidden =
+        isMonetary && value != '—' && ref.watch(amountsHiddenProvider);
+    final suffix = currency == null ? '' : ' $currency';
+    final amountColor = hidden
+        ? LyraColors.ink
+        : color ??
+              (colorBySign
+                  ? lyraProfitColor(value, ref.watch(profitColorSchemeProvider))
+                  : LyraColors.ink);
+    var display = hidden
+        ? '••••'
+        : (exact ? value : LyraNumber.amount(value, decimals: decimals));
+    if (!hidden &&
+        showPositiveSign &&
+        !value.startsWith('-') &&
+        RegExp(r'[1-9]').hasMatch(value) &&
+        RegExp(r'^\d').hasMatch(display)) {
+      display = '+$display';
+    }
+    final text = Text(
+      '$display$suffix',
+      textAlign: textAlign,
       style: LyraTheme.numeric.copyWith(
         fontSize: size,
-        color: color ?? LyraColors.ink,
-        letterSpacing: -size * .025,
+        color: amountColor,
+        letterSpacing: -size * .015,
         height: 1.2,
         fontWeight: FontWeight.w500,
       ),
-    ),
-  );
+    );
+    if (hidden) {
+      return Semantics(
+        label: '金额已隐藏${currency == null ? '' : '，$currency'}',
+        excludeSemantics: true,
+        child: text,
+      );
+    }
+    return Tooltip(message: '原始值：$value$suffix', child: text);
+  }
 }
 
 /// 范围选择器按需读取获授权账户，所有页面共用同一个选择状态。
 class AccountScopeButton extends ConsumerWidget {
-  const AccountScopeButton({super.key, this.prominent = false});
+  const AccountScopeButton({
+    super.key,
+    this.prominent = false,
+    this.compact = false,
+  });
 
   /// 账号首页可直接使用范围选择器作为页头，其余页面保持紧凑按钮。
   final bool prominent;
+
+  /// 总览单行页头使用短胶囊；长账户名省略但仍可通过提示完整读取。
+  final bool compact;
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final scope = ref.watch(accountScopeProvider);
-    final paired = ref.watch(sessionProvider).value is SessionPaired;
-    return TextButton.icon(
+    final paired = ref.watch(sessionProvider).value is SessionAuthenticated;
+    final button = TextButton.icon(
       onPressed: paired
           ? () => showModalBottomSheet<void>(
               context: context,
@@ -268,7 +341,9 @@ class AccountScopeButton extends ConsumerWidget {
               builder: (context) => const _AccountPicker(),
             )
           : null,
-      icon: prominent ? null : const Icon(LyraIcons.accountScope, size: 17),
+      icon: prominent || compact
+          ? null
+          : const LyraPrimaryIcon(LyraPrimaryGlyph.accountScope, size: 17),
       label: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: prominent ? 230 : 150),
         child: Row(
@@ -277,23 +352,35 @@ class AccountScopeButton extends ConsumerWidget {
             Flexible(
               child: Text(
                 scope.label,
-                style: prominent
-                    ? const TextStyle(fontSize: 19, fontWeight: FontWeight.w600)
-                    : null,
+                style: TextStyle(
+                  fontSize: compact ? 13 : (prominent ? 18 : 14),
+                  fontWeight: FontWeight.w500,
+                ),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
             ),
-            const SizedBox(width: 6),
-            const Icon(LyraIcons.expand, size: 16),
+            SizedBox(width: compact ? 3 : 6),
+            Icon(LyraIcons.expand, size: compact ? 14 : 16),
           ],
         ),
       ),
       style: TextButton.styleFrom(
         foregroundColor: LyraColors.ink,
-        padding: EdgeInsets.symmetric(horizontal: prominent ? 0 : 12),
+        backgroundColor: compact ? LyraColors.surface : null,
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 10 : (prominent ? 0 : 12),
+        ),
+        minimumSize: compact ? const Size(0, 34) : null,
+        shape: compact
+            ? RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+                side: const BorderSide(color: LyraColors.hairline),
+              )
+            : null,
       ),
     );
+    return compact ? Tooltip(message: scope.label, child: button) : button;
   }
 }
 
@@ -301,8 +388,7 @@ class _AccountPicker extends ConsumerWidget {
   const _AccountPicker();
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    const query = (path: '/v1/ledger/accounts', parameters: '', scope: 'all');
-    final accounts = ref.watch(ledgerReadProvider(query));
+    final accounts = ref.watch(brokerageAccountsProvider);
     final scope = ref.watch(accountScopeProvider);
     void select(String id, String label) {
       ref.read(accountScopeProvider.notifier).select(id, label);
@@ -315,19 +401,19 @@ class _AccountPicker extends ConsumerWidget {
           maxHeight: MediaQuery.sizeOf(context).height * .75,
         ),
         child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const Text(
-                '选择账号',
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+                '选择证券账户',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w500),
               ),
               const SizedBox(height: 16),
               ListTile(
                 title: const Text('全部账号'),
                 subtitle: const Text('不同币种分别展示'),
-                leading: const Icon(LyraIcons.accountScope),
+                leading: const LyraPrimaryIcon(LyraPrimaryGlyph.accountScope),
                 trailing: scope.id == 'all'
                     ? const Icon(LyraIcons.confirm)
                     : null,
@@ -337,34 +423,50 @@ class _AccountPicker extends ConsumerWidget {
                 loading: () => const LyraSkeleton(),
                 error: (e, _) => LyraLoadError(
                   error: e,
-                  onRetry: () => ref.invalidate(ledgerReadProvider(query)),
+                  onRetry: () => ref.invalidate(brokerageAccountsProvider),
                 ),
-                data: (read) {
-                  final rows = read.data['rows'] as List<Object?>;
+                data: (rows) {
                   return Column(
                     children: [
-                      for (final item in rows)
-                        Builder(
-                          builder: (context) {
-                            final account = item as Map<String, Object?>;
-                            final id = account['id'] as String;
-                            final label = account['displayName'] as String;
-                            return ListTile(
-                              title: Text(label),
-                              subtitle: Text(
-                                '${account['maskedSuffix']} · ${account['baseCurrency']}',
-                              ),
-                              leading: const Icon(LyraIcons.cash),
-                              trailing: scope.id == id
-                                  ? const Icon(LyraIcons.confirm)
-                                  : null,
-                              onTap: () => select(id, label),
-                            );
-                          },
+                      if (rows.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 20),
+                          child: Text('尚无证券账户，添加后即可导入交易。'),
+                        ),
+                      for (final account in rows)
+                        ListTile(
+                          title: Text(account.displayName),
+                          subtitle: Text(
+                            '${account.maskedSuffix} · ${account.baseCurrency}',
+                          ),
+                          leading: const LyraPrimaryIcon(
+                            LyraPrimaryGlyph.brokerage,
+                          ),
+                          trailing: scope.id == account.id
+                              ? const Icon(LyraIcons.confirm)
+                              : null,
+                          onTap: () => select(account.id, account.displayName),
                         ),
                     ],
                   );
                 },
+              ),
+              const SizedBox(height: 16),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  final client = ref.read(sessionProvider.notifier).client;
+                  final account = await showCreateAccountSheet(context);
+                  if (account != null &&
+                      context.mounted &&
+                      identical(
+                        client,
+                        ref.read(sessionProvider.notifier).client,
+                      )) {
+                    Navigator.pop(context);
+                  }
+                },
+                icon: const Icon(LyraIcons.addAccount, size: 18),
+                label: const Text('新增证券账户'),
               ),
             ],
           ),

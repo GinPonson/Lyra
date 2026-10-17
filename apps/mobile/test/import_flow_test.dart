@@ -104,6 +104,8 @@ const CredentialSnapshot _snapshot = CredentialSnapshot(
   deviceId: 'd1000000-0000-4000-8000-000000000001',
   accessToken: 'access-token-1',
   refreshToken: 'refresh-token-1',
+  userId: 'import-user',
+  authMethod: 'google',
 );
 
 Future<ResponseBody> _routeImportRequest(RequestOptions options) async {
@@ -144,6 +146,7 @@ Future<ResponseBody> _routeImportRequest(RequestOptions options) async {
 Future<XFile?> _openPresetCsvFile(List<XTypeGroup> acceptedTypes) async {
   return XFile.fromData(
     Uint8List.fromList(utf8.encode('Date,Action\n')),
+    path: 'Individual_TST276_Transactions_20260902-080000.csv',
     name: 'Individual_TST276_Transactions_20260902-080000.csv',
     mimeType: 'text/csv',
   );
@@ -161,17 +164,65 @@ class _SessionProbe extends ConsumerWidget {
       state.when(
         loading: () => 'session:loading',
         error: (Object error, StackTrace stackTrace) => 'session:error',
-        data: (SessionState value) =>
-            value is SessionPaired ? 'session:paired' : 'session:unpaired',
+        data: (SessionState value) => value is SessionAuthenticated
+            ? 'session:paired'
+            : 'session:unpaired',
       ),
     );
   }
+}
+
+Future<void> _pumpImportSheet(
+  WidgetTester tester,
+  Future<ResponseBody> Function(RequestOptions) route, {
+  ImportFilePicker? picker,
+}) async {
+  tester.view.physicalSize = const Size(390, 844);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
+  final store = MemoryCredentialStore();
+  await store.write(_snapshot);
+  await tester.pumpWidget(
+    ProviderScope(
+      overrides: [
+        sessionDependenciesProvider.overrideWithValue(
+          SessionDependencies(
+            credentialStore: store,
+            clientFactory: (url) =>
+                Dio(BaseOptions(baseUrl: url))
+                  ..httpClientAdapter = FakeImportAdapter(route),
+          ),
+        ),
+      ],
+      child: MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: Column(
+              children: [
+                const _SessionProbe(),
+                ImportSheet(openFileOverride: picker ?? _openPresetCsvFile),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
+Future<void> _tapImport(WidgetTester tester, Finder target) async {
+  await tester.ensureVisible(target);
+  await tester.tap(target);
+  await tester.pumpAndSettle();
 }
 
 void main() {
   test('ImportRepository 读取账户列表并解析上传预览与确认提交', () async {
     final requestedPaths = <String>[];
     final store = MemoryCredentialStore();
+    await store.write(_snapshot);
     final dio = Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3141'))
       ..httpClientAdapter = FakeImportAdapter((RequestOptions options) async {
         requestedPaths.add(options.uri.path);
@@ -180,6 +231,7 @@ void main() {
     final repository = ImportRepository(
       client: LyraApiClient(
         serverUrl: 'http://127.0.0.1:3141',
+        deviceId: _snapshot.deviceId,
         credentialStore: store,
         tokenRefresher: () async => null,
         dio: dio,
@@ -303,7 +355,8 @@ void main() {
     await tester.pumpAndSettle();
 
     // 服务端要求显式账户映射后，面板展示候选账户按钮。
-    expect(find.textContaining('ACCOUNT_MAPPING_REQUIRED'), findsOneWidget);
+    expect(find.text('请选择文件对应的证券账户。'), findsOneWidget);
+    expect(find.textContaining('ACCOUNT_MAPPING_REQUIRED'), findsNothing);
     expect(find.textContaining('请选择该文件对应的账户'), findsOneWidget);
     expect(find.text('Individual（TST276）'), findsOneWidget);
     // 归档账户不进入候选。
@@ -314,23 +367,118 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('总行数 2 · 可新增 2 · 已存在 0'), findsOneWidget);
-    expect(find.textContaining('Buy × 1'), findsOneWidget);
+    expect(find.textContaining('买入 × 1'), findsOneWidget);
 
     await tester.tap(find.textContaining('确认写入账本'));
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('已写入账本'), findsOneWidget);
-    expect(find.textContaining('账本版本 2'), findsOneWidget);
+    expect(find.text('导入完成：新增 2 条交易。'), findsOneWidget);
+    expect(find.textContaining('账本版本'), findsNothing);
     expect(summaryReads, 2);
     final state =
         ProviderScope.containerOf(tester.element(find.byType(ImportSheet)))
                 .read(sessionProvider)
                 .requireValue
-            as SessionPaired;
+            as SessionAuthenticated;
     expect(state.summary!.metadata.ledgerVersion, 2);
   });
 
-  testWidgets('未配对时导入面板提示先配对', (WidgetTester tester) async {
+  testWidgets('预览失效给出恢复动作，重用所选文件生成新预览后提交', (tester) async {
+    var previews = 0;
+    var filePicks = 0;
+    final commitKeys = <String>[];
+    await _pumpImportSheet(
+      tester,
+      (options) async {
+        if (options.uri.path == '/v1/imports/preview') {
+          previews++;
+          final body = jsonDecode(_previewResponse) as Map<String, dynamic>;
+          body['importId'] = 'i1000000-0000-4000-8000-00000000000$previews';
+          body['confirmToken'] = 'preview-confirmation-$previews';
+          return _jsonResponse(jsonEncode(body), 201);
+        }
+        if (options.uri.path.endsWith('/commit')) {
+          commitKeys.add(options.headers['idempotency-key'] as String);
+          if (commitKeys.length == 1) {
+            return _jsonResponse(
+              jsonEncode({
+                'code': 'IMPORT_PREVIEW_STALE',
+                'message': 'ledgerVersion=93 confirm_token=internal-only',
+                'retryable': false,
+              }),
+              409,
+            );
+          }
+          expect(
+            options.uri.path,
+            '/v1/imports/i1000000-0000-4000-8000-000000000002/commit',
+          );
+          return _jsonResponse(_commitResponse, 200);
+        }
+        return _routeImportRequest(options);
+      },
+      picker: (types) {
+        filePicks++;
+        return _openPresetCsvFile(types);
+      },
+    );
+    await _tapImport(tester, find.text('选择文件并预览'));
+    await _tapImport(tester, find.textContaining('确认写入账本'));
+    expect(find.text('当前预览已失效，请重新预览后再确认导入。'), findsOneWidget);
+    expect(find.textContaining('IMPORT_PREVIEW_STALE'), findsNothing);
+    expect(find.textContaining('confirm_token'), findsNothing);
+    expect(find.textContaining('确认写入账本'), findsNothing);
+    await _tapImport(tester, find.text('重试当前文件'));
+    expect(filePicks, 1);
+    expect(previews, 2);
+    await _tapImport(tester, find.textContaining('确认写入账本'));
+    expect(commitKeys, [
+      'commit-i1000000-0000-4000-8000-000000000001',
+      'commit-i1000000-0000-4000-8000-000000000002',
+    ]);
+    expect(find.text('导入完成：新增 2 条交易。'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final skipped in [0, 2]) {
+    testWidgets('无新增导入准确区分空文件和已有交易：skipped=$skipped', (tester) async {
+      await _pumpImportSheet(tester, (options) async {
+        if (options.uri.path == '/v1/imports/preview') {
+          final body = jsonDecode(_previewResponse) as Map<String, dynamic>;
+          final preview = body['preview'] as Map<String, dynamic>;
+          preview['totalRows'] = skipped;
+          preview['insertableRows'] = 0;
+          preview['existingRows'] = skipped;
+          preview['byAction'] = skipped == 0
+              ? <String, int>{}
+              : {'Buy': skipped};
+          return _jsonResponse(jsonEncode(body), 201);
+        }
+        if (options.uri.path.endsWith('/commit')) {
+          return _jsonResponse(
+            jsonEncode({
+              'changed': false,
+              'ledgerVersion': 72,
+              'insertedRows': 0,
+              'skippedRows': skipped,
+            }),
+            200,
+          );
+        }
+        return _routeImportRequest(options);
+      });
+      await _tapImport(tester, find.text('选择文件并预览'));
+      await _tapImport(tester, find.text('无新增交易，仍确认提交'));
+      expect(
+        find.text(skipped == 0 ? '文件中没有可导入的交易。' : '这些交易已在账本中，无需重复导入。'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('账本版本'), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('未登录时导入面板提示先登录', (WidgetTester tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -352,6 +500,6 @@ void main() {
     await tester.tap(find.text('选择文件并预览'));
     await tester.pumpAndSettle();
 
-    expect(find.text('请先完成设备配对'), findsOneWidget);
+    expect(find.text('请先完成登录'), findsOneWidget);
   });
 }

@@ -1,8 +1,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 关闭 Android Auto Backup（含 Android 12+ 的设备间迁移）：
+         登录令牌、刷新令牌与设备私钥都保存在 EncryptedSharedPreferences 中，
+         其 Keystore 主密钥不可备份。只备份 shared_prefs 会在恢复后产生无法
+         解密的密文，既恢复不了登录，又可能触发安全存储的损坏处理；本机也
+         没有其它需要备份的持久数据，因此整体关闭最安全。 -->
     <application
         android:label="Lyra"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false">
         <activity
             android:name=".MainActivity"
             android:exported="true"

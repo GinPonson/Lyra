@@ -77,4 +77,69 @@ void main() {
     expect(read.metadata.aggregateCurrency, isNull);
     expect(read.entries, isEmpty);
   });
+
+  /// 用 [mutate] 改写单币种数据块，构造服务端协议违例响应。
+  Map<String, Object?> summaryWith(
+    void Function(Map<String, Object?> entry) mutate,
+  ) {
+    final groups =
+        (summaryJson['data'] as Map<String, Object?>)['groups'] as List<Object?>;
+    final group = groups.first as Map<String, Object?>;
+    final entry = Map<String, Object?>.from(
+      group['data'] as Map<String, Object?>,
+    );
+    mutate(entry);
+    return <String, Object?>{
+      ...summaryJson,
+      'data': <String, Object?>{
+        'aggregateCurrency': 'USD',
+        'groups': <Object?>[
+          <String, Object?>{'currency': 'USD', 'data': entry},
+        ],
+      },
+    };
+  }
+
+  test('必填汇总金额缺失时解析失败，绝不伪造 0', () {
+    for (final field in <String>[
+      'netDeposits',
+      'realizedPnlTotal',
+      'realizedPnlStock',
+      'realizedPnlOption',
+      'totalFees',
+      'dividends',
+      'interest',
+      'taxes',
+      'cashBalance',
+      'openPositions',
+      'transactionCount',
+    ]) {
+      expect(
+        () => LedgerSummaryRead.fromJson(summaryWith((entry) => entry.remove(field))),
+        throwsFormatException,
+        reason: '$field 缺失必须在解析边界失败',
+      );
+    }
+  });
+
+  test('汇总金额非十进制文本时解析失败，不进入展示层', () {
+    for (final value in <Object?>[null, 0, 12.5, '', 'NaN', '1e3', '1,000.00']) {
+      expect(
+        () => LedgerSummaryRead.fromJson(
+          summaryWith((entry) => entry['cashBalance'] = value),
+        ),
+        throwsFormatException,
+        reason: 'cashBalance=$value 必须在解析边界失败',
+      );
+    }
+    for (final value in <Object?>[null, '3', 1.5]) {
+      expect(
+        () => LedgerSummaryRead.fromJson(
+          summaryWith((entry) => entry['transactionCount'] = value),
+        ),
+        throwsFormatException,
+        reason: 'transactionCount=$value 必须在解析边界失败',
+      );
+    }
+  });
 }

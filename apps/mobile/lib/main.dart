@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'app/lyra_app.dart';
+import 'core/preferences/app_preferences.dart';
 
 /// Lyra Android 应用入口。
 ///
@@ -20,5 +21,14 @@ void main() {
       systemNavigationBarContrastEnforced: false,
     ),
   );
-  runApp(const ProviderScope(child: LyraApp()));
+  runApp(
+    ProviderScope(
+      overrides: [
+        appPreferencesStoreProvider.overrideWithValue(
+          const SecureAppPreferencesStore(),
+        ),
+      ],
+      child: const LyraApp(),
+    ),
+  );
 }

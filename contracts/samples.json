@@ -1,0 +1,232 @@
+{
+  "generatedBy": "server/scripts/export_contract_samples.py",
+  "note": "由服务端真实端点产出的合成响应样本，供 Flutter 的生产解析器回归使用。**不要手工编辑**：改协议时重跑生成器。样本只含合成数据。",
+  "cases": [
+    {
+      "name": "login",
+      "method": "POST",
+      "path": "/v1/auth/github/exchange",
+      "status": 200,
+      "body": {
+        "status": "complete",
+        "deviceId": "493019ec-6171-4894-be03-74528334ca4e",
+        "displayName": "样例设备",
+        "accessToken": "PGVK6O42YA7U08Ie8L8eK0wmwLu0gSKK-v4eMxSVo_I",
+        "accessTokenExpiresAt": "2026-10-17T02:39:55.959Z",
+        "refreshToken": "qHXGZjw2OulLmO291qdC2kKGncDep3bTNNGmnNBCsyA",
+        "refreshTokenExpiresAt": "2026-11-16T02:24:55.959Z",
+        "user": {
+          "userId": "6844993d-f78f-4023-9a3a-e4da72b4c3aa",
+          "displayName": "样例用户",
+          "status": "active",
+          "role": "member",
+          "identity": {
+            "provider": "github",
+            "subject": "9001",
+            "email": "sample@example.com"
+          }
+        }
+      }
+    },
+    {
+      "name": "me",
+      "method": "GET",
+      "path": "/v1/me",
+      "status": 200,
+      "body": {
+        "user": {
+          "userId": "6844993d-f78f-4023-9a3a-e4da72b4c3aa",
+          "displayName": "样例用户",
+          "status": "active",
+          "role": "member",
+          "identity": {
+            "provider": "github",
+            "subject": "9001",
+            "email": "sample@example.com"
+          }
+        }
+      }
+    },
+    {
+      "name": "createAccount",
+      "method": "POST",
+      "path": "/v1/ledger/accounts",
+      "status": 201,
+      "body": {
+        "account": {
+          "id": "35660a0c-4347-42e4-af31-2605fd3bb161",
+          "displayName": "样例账户",
+          "broker": "schwab",
+          "maskedSuffix": "001",
+          "baseCurrency": "USD",
+          "status": "active",
+          "createdAt": "2026-10-17T02:24:55.977Z"
+        }
+      }
+    },
+    {
+      "name": "ledgerAccounts",
+      "method": "GET",
+      "path": "/v1/ledger/accounts?scope=all",
+      "status": 200,
+      "body": {
+        "metadata": {
+          "accountScope": {
+            "kind": "all"
+          },
+          "accountIds": [
+            "35660a0c-4347-42e4-af31-2605fd3bb161"
+          ],
+          "currencyGroups": [
+            {
+              "currency": "USD",
+              "accountIds": [
+                "35660a0c-4347-42e4-af31-2605fd3bb161"
+              ]
+            }
+          ],
+          "aggregateCurrency": "USD",
+          "ledgerVersion": 0,
+          "asOf": "2026-10-17T02:24:55.985Z",
+          "fetchedAt": "2026-10-17T02:24:55.985Z"
+        },
+        "data": {
+          "rows": [
+            {
+              "id": "35660a0c-4347-42e4-af31-2605fd3bb161",
+              "displayName": "样例账户",
+              "broker": "schwab",
+              "maskedSuffix": "001",
+              "baseCurrency": "USD",
+              "status": "active",
+              "createdAt": "2026-10-17T02:24:55.977Z"
+            }
+          ],
+          "count": 1
+        }
+      }
+    },
+    {
+      "name": "ledgerSummary",
+      "method": "GET",
+      "path": "/v1/ledger/summary?scope=all",
+      "status": 200,
+      "body": {
+        "metadata": {
+          "accountScope": {
+            "kind": "all"
+          },
+          "accountIds": [
+            "35660a0c-4347-42e4-af31-2605fd3bb161"
+          ],
+          "currencyGroups": [
+            {
+              "currency": "USD",
+              "accountIds": [
+                "35660a0c-4347-42e4-af31-2605fd3bb161"
+              ]
+            }
+          ],
+          "aggregateCurrency": "USD",
+          "ledgerVersion": 0,
+          "asOf": "2026-10-17T02:24:55.991Z",
+          "fetchedAt": "2026-10-17T02:24:55.991Z"
+        },
+        "data": {
+          "aggregateCurrency": "USD",
+          "groups": [
+            {
+              "currency": "USD",
+              "accountIds": [
+                "35660a0c-4347-42e4-af31-2605fd3bb161"
+              ],
+              "data": {
+                "netDeposits": "0.0000",
+                "realizedPnlStock": "0.0000",
+                "realizedPnlOption": "0.0000",
+                "realizedPnlTotal": "0.0000",
+                "openPositions": 0,
+                "totalFees": "0.000000",
+                "dividends": "0.0000",
+                "interest": "0.0000",
+                "taxes": "0.0000",
+                "cashBalance": "0.0000",
+                "transactionCount": 0,
+                "dateRange": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "importPreview",
+      "method": "POST",
+      "path": "/v1/imports/preview?accountId=<上传的 CSV>",
+      "status": 201,
+      "body": {
+        "importId": "83bf997b-665f-4edf-b851-b74bbf24f33e",
+        "confirmToken": "dz5zvfjr3F0vyLmJ7ILd_8LDwMX1kJSjeWDqvyMBmf8",
+        "preview": {
+          "fileName": "Individual_TST001_Transactions_20260105.csv",
+          "accountId": "35660a0c-4347-42e4-af31-2605fd3bb161",
+          "baseLedgerVersion": 0,
+          "totalRows": 1,
+          "insertableRows": 1,
+          "existingRows": 0,
+          "byAction": {
+            "Buy": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "marketSettings",
+      "method": "GET",
+      "path": "/v1/market/settings",
+      "status": 200,
+      "body": {
+        "revision": 0,
+        "routes": {
+          "stock": [],
+          "option": []
+        },
+        "effectiveRoutes": {
+          "stock": [],
+          "option": []
+        },
+        "providers": [
+          {
+            "id": "alpaca",
+            "displayName": "Alpaca",
+            "assetTypes": [
+              "stock",
+              "option"
+            ],
+            "configured": false,
+            "timing": {
+              "kind": "delayed",
+              "delayMinutes": 16
+            },
+            "cacheTtlSeconds": 900
+          },
+          {
+            "id": "marketdata",
+            "displayName": "MarketData.app",
+            "assetTypes": [
+              "stock",
+              "option"
+            ],
+            "configured": false,
+            "timing": {
+              "kind": "end_of_day",
+              "delayMinutes": null
+            },
+            "cacheTtlSeconds": 86400
+          }
+        ],
+        "updatedAt": null
+      }
+    }
+  ]
+}

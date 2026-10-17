@@ -64,6 +64,28 @@ class _GroupedPositionFixture extends LedgerFixture {
   }
 }
 
+/// 把持仓成本替换为非法形态，验证畸形金额在数据边界失败而不是进入 build。
+class _MalformedPositionFixture extends LedgerFixture {
+  /// 打开后 positions 行的 cost 不再是十进制字符串。
+  bool malformed = true;
+
+  @override
+  Map<String, Object?> payload(String command, Map<String, dynamic> query) {
+    final data = super.payload(command, query);
+    if (malformed && command == 'positions') {
+      final rows = (data['rows'] as List).cast<Map<String, Object?>>();
+      data['rows'] = <Map<String, Object?>>[
+        <String, Object?>{
+          ...rows.first,
+          'cost': <String, Object?>{'x': 1},
+        },
+        ...rows.skip(1),
+      ];
+    }
+    return data;
+  }
+}
+
 /// 可选生成真实 Flutter 渲染截图；普通测试不依赖系统字体或文件输出。
 Future<void> _capture(WidgetTester tester, String name) async {
   if (_reviewDir == null) return;
@@ -134,7 +156,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.text('2,846.72'), findsOneWidget);
+      expect(find.text('+2,846.72'), findsOneWidget);
       // 汇总集中在一张卡内，导入由页头提供，不再重复底部导航功能。
       expect(
         find.byKey(const ValueKey('overview-summary-card')),
@@ -142,6 +164,9 @@ void main() {
       );
       expect(find.text('查看持仓'), findsNothing);
       expect(find.text('交易记录'), findsNothing);
+      expect(find.text('数据截至 2026年9月8日 08:00:00 UTC'), findsOneWidget);
+      expect(find.textContaining('账本 v'), findsNothing);
+      expect(find.textContaining(LedgerFixture.timestamp), findsNothing);
       expect(find.byTooltip('导入文件'), findsOneWidget);
       final preview = find.byKey(const ValueKey('overview-holdings-preview'));
       expect(
@@ -232,13 +257,14 @@ void main() {
     await tester.pumpAndSettle();
     expect(fixture.requests.last.uri.path, LedgerView.drawdown.path);
     expect(fixture.requests.last.queryParameters['scope'], 'all');
-    expect(find.text('2,846.72'), findsOneWidget);
-    expect(find.textContaining('QUERY_FAILED'), findsOneWidget);
+    expect(find.text('+2,846.72'), findsOneWidget);
+    expect(find.text('暂时无法读取数据，请重新加载。'), findsOneWidget);
+    expect(find.textContaining('QUERY_FAILED'), findsNothing);
     fixture.failures.clear();
     await tester.ensureVisible(find.text('重新加载'));
     await tester.tap(find.text('重新加载'));
     await tester.pumpAndSettle();
-    expect(find.textContaining('QUERY_FAILED'), findsNothing);
+    expect(find.text('暂时无法读取数据，请重新加载。'), findsNothing);
     expect(find.textContaining('/ 累计损益'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
@@ -323,7 +349,8 @@ void main() {
     await tester.tap(find.byTooltip('刷新数据'));
     await tester.pumpAndSettle();
     expect(find.text('数据未能加载'), findsOneWidget);
-    expect(find.textContaining('QUERY_FAILED'), findsOneWidget);
+    expect(find.text('暂时无法读取数据，请重新加载。'), findsOneWidget);
+    expect(find.textContaining('QUERY_FAILED'), findsNothing);
     expect(find.text('暂无持仓记录'), findsNothing);
     fixture.failures.clear();
     await tester.ensureVisible(find.text('重新加载'));
@@ -384,7 +411,7 @@ void main() {
             key: _captureKey,
             child: MaterialApp(
               debugShowCheckedModeBanner: false,
-              theme: LyraTheme.light,
+              theme: LyraTheme.dark,
               home: ReportScreen(view: view),
             ),
           ),
@@ -393,6 +420,12 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('数据未能加载'), findsNothing);
       expect(fixture.requests.any((r) => r.uri.path == view.path), isTrue);
+      expect(
+        find.textContaining('数据截至 2026年9月8日 08:00:00 UTC'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('账本 v'), findsNothing);
+      expect(find.textContaining(LedgerFixture.timestamp), findsNothing);
       if (view == LedgerView.monthly || view == LedgerView.allocation) {
         await _capture(tester, '${view.command}-390-fixture');
       }
@@ -429,13 +462,19 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
-      await tester.tap(find.text('股票'));
+      if (paired) {
+        await tester.tap(find.text('股票'));
+      } else {
+        expect(find.byKey(const ValueKey('login-screen')), findsOneWidget);
+        expect(find.byType(NavigationBar), findsNothing);
+        await tester.ensureVisible(find.byKey(const ValueKey('login-google')));
+      }
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
     });
   }
 
-  testWidgets('未配对首屏提供直接连接入口', (tester) async {
+  testWidgets('未登录首屏进入独立登录页并提供三种身份入口', (tester) async {
     viewport(tester, const Size(390, 844));
     final fixture = LedgerFixture();
     final dependencies = await fixture.dependencies(paired: false);
@@ -449,7 +488,11 @@ void main() {
     );
     await tester.pumpAndSettle();
     await _capture(tester, 'welcome-390');
-    expect(find.text('连接我的账户'), findsOneWidget);
+    expect(find.byKey(const ValueKey('login-screen')), findsOneWidget);
+    expect(find.text('使用 Google 登录'), findsOneWidget);
+    expect(find.text('使用 Linux.do 登录'), findsOneWidget);
+    expect(find.text('使用 GitHub 登录'), findsOneWidget);
+    expect(find.byType(NavigationBar), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -504,5 +547,91 @@ void main() {
     });
     expect(read.currencyFor({'accountId': 'b'}), 'EUR');
     expect(read.sections.map((section) => section.currency), ['USD', 'EUR']);
+  });
+
+  test('金额与标识字段在数据边界校验，畸形取值不进入 build', () {
+    for (final row in <Map<String, Object?>>[
+      {
+        'cost': <String, Object?>{'nested': true},
+      },
+      {'cost': 'abc'},
+      {'price': 12.5},
+      {'amount': '1e3'},
+      {'fees': '1.2.3'},
+      {'openPrice': ''},
+      {'closePrice': '--'},
+      {'strike': '1,000'},
+      {'quantity': '很多'},
+      {'underlying': 42},
+      {'symbol': ''},
+      {'symbolKey': '   '},
+      {'check': 7},
+      {'count': 'x'},
+      {'count': 1.5},
+      {'trade': 'invalid'},
+      {'trade': null},
+    ]) {
+      expect(
+        () => LedgerRead.fromJson({
+          'metadata': <String, Object?>{},
+          'data': {
+            'rows': [row],
+          },
+        }),
+        throwsFormatException,
+        reason: '$row 必须在数据边界被拒绝',
+      );
+    }
+  });
+
+  test('extremes 嵌套 trade 记录同样在数据边界校验', () {
+    expect(
+      () => LedgerRead.fromJson({
+        'metadata': <String, Object?>{},
+        'data': {
+          'rows': [
+            {
+              'trade': {'underlying': 'AAPL', 'pnl': 'oops'},
+            },
+          ],
+        },
+      }),
+      throwsFormatException,
+    );
+  });
+
+  testWidgets('畸形明细金额显示可重试错误态而不是红屏', (tester) async {
+    viewport(tester, const Size(390, 844));
+    final fixture = _MalformedPositionFixture();
+    final dependencies = await fixture.dependencies();
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          sessionDependenciesProvider.overrideWithValue(dependencies),
+        ],
+        child: RepaintBoundary(
+          key: _captureKey,
+          child: MaterialApp(
+            debugShowCheckedModeBanner: false,
+            theme: LyraTheme.dark,
+            home: const ReportScreen(view: LedgerView.positions),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // 解析错误在异步边界被捕获，页面进入设计的错误态并给出重试入口。
+    expect(find.text('数据未能加载'), findsOneWidget);
+    expect(find.text('暂时无法读取数据，请重新加载。'), findsOneWidget);
+    expect(find.textContaining('账本字段 cost'), findsNothing);
+    expect(find.text('重新加载'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    fixture.malformed = false;
+    await tester.tap(find.text('重新加载'));
+    await tester.pumpAndSettle();
+    expect(find.text('AAPL'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }

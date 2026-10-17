@@ -3,17 +3,21 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/session.dart';
 import '../../core/design/lyra_colors.dart';
+import '../../core/design/lyra_date.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
 import '../../core/design/lyra_widgets.dart';
+import '../../core/preferences/app_preferences.dart';
+import '../accounts/account_sheet.dart';
+import '../accounts/account_workspace.dart';
 import '../import/import_sheet.dart';
 import '../ledger/ledger_models.dart';
 import '../ledger/ledger_screen.dart';
 import '../ledger/ledger_view.dart';
 import '../ledger/ledger_workspace.dart';
-import 'pairing_panel.dart';
+import 'login_panel.dart';
 
-/// 账号优先的投资工作台。保留配对、导入及原始精确汇总；AI 为次级入口。
+/// 账号优先的投资工作台。保留登录、导入及原始精确汇总；AI 为次级入口。
 class OverviewScreen extends ConsumerStatefulWidget {
   const OverviewScreen({
     super.key,
@@ -29,11 +33,11 @@ class OverviewScreen extends ConsumerStatefulWidget {
 }
 
 class _OverviewScreenState extends ConsumerState<OverviewScreen> {
-  final _pairingKey = GlobalKey();
+  final _loginKey = GlobalKey();
 
-  /// 保留原有内联配对流程，主按钮把表单滚入视口并保留已填写字段。
-  void _revealPairing() {
-    final target = _pairingKey.currentContext;
+  /// 保留原有内联登录流程，主按钮把登录方式滚入视口。
+  void _revealLogin() {
+    final target = _loginKey.currentContext;
     if (target != null) {
       Scrollable.ensureVisible(
         target,
@@ -47,93 +51,66 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
     context: context,
     isScrollControlled: true,
     useSafeArea: true,
+    showDragHandle: true,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
     ),
     builder: (context) => Padding(
       padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
-      child: const ImportSheet(),
+      child: const SingleChildScrollView(child: ImportSheet()),
     ),
   );
 
-  /// 连接管理复用已验证表单，不创建另一套凭据或配对实现。
-  void _openConnection() => showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    showDragHandle: true,
-    useSafeArea: true,
-    builder: (context) => SingleChildScrollView(
-      padding: EdgeInsets.fromLTRB(
-        16,
-        0,
-        16,
-        MediaQuery.viewInsetsOf(context).bottom + 24,
-      ),
-      child: const PairingPanel(),
-    ),
-  );
+  Future<void> _createAccount() async {
+    final client = ref.read(sessionProvider.notifier).client;
+    final account = await showCreateAccountSheet(context);
+    if (account != null &&
+        mounted &&
+        identical(client, ref.read(sessionProvider.notifier).client)) {
+      _openImport();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final session = ref.watch(sessionProvider);
-    final paired = session.value is SessionPaired;
+    final paired = session.value is SessionAuthenticated;
+    final amountsHidden = ref.watch(amountsHiddenProvider);
     final summary = ref.watch(scopedSummaryProvider);
+    final accounts = paired ? ref.watch(brokerageAccountsProvider) : null;
     return LyraPage(
       storageKey: 'overview-scroll',
       children: [
         if (paired) ...[
-          Row(
-            children: [
-              const Expanded(
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: AccountScopeButton(prominent: true),
-                ),
-              ),
-              IconButton(
-                tooltip: '导入文件',
-                onPressed: _openImport,
-                icon: const LyraPrimaryIcon(
-                  LyraPrimaryGlyph.importFile,
-                  size: 22,
-                ),
-              ),
-              IconButton(
-                tooltip: '连接管理',
-                onPressed: _openConnection,
-                icon: const LyraPrimaryIcon(
-                  LyraPrimaryGlyph.connection,
-                  size: 22,
-                ),
-              ),
-            ],
+          const SizedBox(height: 8),
+          _OverviewHeader(
+            amountsHidden: amountsHidden,
+            onToggleAmounts: () =>
+                ref.read(amountsHiddenProvider.notifier).toggle(),
+            onImport: _openImport,
           ),
-          const SizedBox(height: 18),
+          const SizedBox(height: 14),
         ] else ...[
           LyraPageTitle(
-            title: '我的账号',
+            title: '总览',
             trailing: LyraIconButton(
               icon: LyraIcons.accountCenter,
-              label: '连接管理',
-              onPressed: paired ? _openConnection : _revealPairing,
+              label: '登录',
+              onPressed: _revealLogin,
             ),
           ),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               const AccountScopeButton(),
-              Row(
+              const Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(
-                    paired ? LyraIcons.confirm : LyraIcons.security,
-                    size: 13,
-                    color: LyraColors.accent,
-                  ),
-                  const SizedBox(width: 5),
+                  Icon(LyraIcons.security, size: 13, color: LyraColors.accent),
+                  SizedBox(width: 5),
                   Text(
-                    paired ? '已配对' : '等待连接',
-                    style: const TextStyle(
+                    '尚未登录',
+                    style: TextStyle(
                       fontSize: 11,
                       color: LyraColors.inkSecondary,
                     ),
@@ -152,7 +129,25 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
         else if (session.isLoading)
           const LyraSkeleton()
         else if (!paired)
-          LyraReveal(child: _WelcomeHero(onConnect: _revealPairing))
+          LyraReveal(child: _WelcomeHero(onLogin: _revealLogin))
+        else if (accounts!.isLoading)
+          const LyraSkeleton()
+        else if (accounts.hasError)
+          LyraLoadError(
+            error: accounts.error!,
+            onRetry: () => ref.invalidate(brokerageAccountsProvider),
+          )
+        else if (accounts.value!.isEmpty)
+          LyraEmpty(
+            title: '先创建一个证券账户',
+            message: '你已登录 Lyra。添加 Schwab 账户后，即可导入交易并查看持仓。',
+            icon: LyraIcons.cash,
+            action: FilledButton.icon(
+              onPressed: _createAccount,
+              icon: const Icon(LyraIcons.addAccount, size: 18),
+              label: const Text('创建第一个证券账户'),
+            ),
+          )
         else
           summary.when(
             loading: () => const LyraSkeleton(),
@@ -160,9 +155,12 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
               error: error,
               onRetry: () => ref.invalidate(scopedSummaryProvider),
             ),
-            data: (read) => read == null || read.entries.isEmpty
+            data: (read) =>
+                read == null ||
+                    read.entries.isEmpty ||
+                    read.entries.every((entry) => entry.transactionCount == 0)
                 ? LyraEmpty(
-                    title: '账号已连接，等待第一笔记录',
+                    title: '证券账户已准备好，等待第一笔记录',
                     message: '导入官方交易文件后，已实现损益、现金流与持仓会自动呈现。',
                     action: FilledButton.icon(
                       onPressed: _openImport,
@@ -221,7 +219,7 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
         const SizedBox(height: 28),
         _AssistantNote(onOpen: widget.onOpenAgent),
         const SizedBox(height: 32),
-        if (!paired && !session.isLoading) PairingPanel(key: _pairingKey),
+        if (!paired && !session.isLoading) LoginPanel(key: _loginKey),
         if (paired) ...[
           Row(
             children: [
@@ -230,8 +228,8 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
                   '收益与报告',
                   style: TextStyle(
                     fontSize: 20,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: -.5,
+                    fontWeight: FontWeight.w500,
+                    letterSpacing: -.2,
                   ),
                 ),
               ),
@@ -261,9 +259,9 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
         const SizedBox(height: 24),
         if (summary.value != null)
           Text(
-            '账本 v${summary.value!.metadata.ledgerVersion} · 截止 ${summary.value!.metadata.asOf}',
+            '数据截至 ${lyraDateTime(summary.value!.metadata.asOf)}',
             style: const TextStyle(
-              fontSize: 10,
+              fontSize: 11,
               height: 1.8,
               color: LyraColors.muted,
             ),
@@ -275,8 +273,8 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
             SizedBox(width: 6),
             Expanded(
               child: Text(
-                '基于已导入交易记录 · 不含实时行情',
-                style: TextStyle(fontSize: 10, color: LyraColors.muted),
+                '已实现损益来自交易记录 · 参考估值另列报价时间',
+                style: TextStyle(fontSize: 11, color: LyraColors.muted),
               ),
             ),
           ],
@@ -286,10 +284,113 @@ class _OverviewScreenState extends ConsumerState<OverviewScreen> {
   }
 }
 
-/// 未连接时直接说明可用功能，主按钮继续使用原有配对表单。
+/// 常规手机保持一行；窄屏和大字时把账户范围放到下一行。
+class _OverviewHeader extends StatelessWidget {
+  const _OverviewHeader({
+    required this.amountsHidden,
+    required this.onToggleAmounts,
+    required this.onImport,
+  });
+  final bool amountsHidden;
+  final VoidCallback onToggleAmounts;
+  final VoidCallback onImport;
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      const title = Text(
+        '总览',
+        style: TextStyle(
+          fontSize: 22,
+          height: 1.2,
+          fontWeight: FontWeight.w500,
+          letterSpacing: -.2,
+        ),
+      );
+      final actions = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Semantics(
+            toggled: !amountsHidden,
+            child: IconButton(
+              key: const ValueKey('toggle-amounts'),
+              tooltip: amountsHidden ? '显示金额' : '隐藏金额',
+              onPressed: onToggleAmounts,
+              icon: LyraPrimaryIcon(
+                amountsHidden
+                    ? LyraPrimaryGlyph.hideAmounts
+                    : LyraPrimaryGlyph.showAmounts,
+                size: 22,
+              ),
+            ),
+          ),
+          IconButton(
+            tooltip: '导入文件',
+            onPressed: onImport,
+            icon: Container(
+              padding: const EdgeInsets.all(7),
+              decoration: const BoxDecoration(
+                color: LyraColors.accentTint,
+                shape: BoxShape.circle,
+              ),
+              child: const LyraPrimaryIcon(
+                LyraPrimaryGlyph.importFile,
+                size: 22,
+                color: LyraColors.accent,
+              ),
+            ),
+          ),
+        ],
+      );
+      final controls = IconButtonTheme(
+        data: IconButtonThemeData(
+          style: IconButton.styleFrom(
+            fixedSize: const Size(44, 44),
+            minimumSize: const Size(44, 44),
+            padding: EdgeInsets.zero,
+            foregroundColor: LyraColors.inkSecondary,
+          ),
+        ),
+        child: actions,
+      );
+      if (constraints.maxWidth < 310 ||
+          MediaQuery.textScalerOf(context).scale(13) > 16) {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(child: title),
+                controls,
+              ],
+            ),
+            const SizedBox(height: 8),
+            const AccountScopeButton(compact: true),
+          ],
+        );
+      }
+      return Row(
+        children: [
+          title,
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: AccountScopeButton(compact: true),
+            ),
+          ),
+          const SizedBox(width: 8),
+          controls,
+        ],
+      );
+    },
+  );
+}
+
+/// 未登录时直接说明可用功能，主按钮继续使用原有登录方式。
 class _WelcomeHero extends StatelessWidget {
-  const _WelcomeHero({required this.onConnect});
-  final VoidCallback onConnect;
+  const _WelcomeHero({required this.onLogin});
+  final VoidCallback onLogin;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -304,7 +405,7 @@ class _WelcomeHero extends StatelessWidget {
         const Icon(LyraIcons.accountCenter, size: 30, color: LyraColors.accent),
         const SizedBox(height: 20),
         const Text(
-          '连接你的投资账号',
+          '登录 Lyra',
           style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
         ),
         const SizedBox(height: 10),
@@ -320,9 +421,9 @@ class _WelcomeHero extends StatelessWidget {
         SizedBox(
           width: double.infinity,
           child: FilledButton.icon(
-            onPressed: onConnect,
+            onPressed: onLogin,
             icon: const Icon(LyraIcons.accountCenter, size: 18),
-            label: const Text('连接我的账户'),
+            label: const Text('登录'),
           ),
         ),
       ],
@@ -341,15 +442,11 @@ class _AccountSummary extends StatelessWidget {
   Widget build(BuildContext context) => LyraReveal(
     child: Container(
       key: primary ? const ValueKey('overview-summary-card') : null,
-      padding: const EdgeInsets.all(18),
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xFFE9F7F0), Color(0xFFF4F8F6), Color(0xFFFAF9F5)],
-          stops: [0, .58, 1],
-        ),
+        color: LyraColors.surface,
+        border: Border.all(color: LyraColors.hairlineStrong, width: .75),
+        borderRadius: BorderRadius.circular(20),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -360,7 +457,8 @@ class _AccountSummary extends StatelessWidget {
                 child: Text(
                   '已实现损益',
                   style: TextStyle(
-                    fontSize: 13,
+                    fontSize: 14,
+                    height: 1.4,
                     color: LyraColors.inkSecondary,
                   ),
                 ),
@@ -368,8 +466,8 @@ class _AccountSummary extends StatelessWidget {
               Text(
                 entry.currency,
                 style: const TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
                   color: LyraColors.inkSecondary,
                 ),
               ),
@@ -384,18 +482,23 @@ class _AccountSummary extends StatelessWidget {
               key: primary
                   ? const ValueKey<String>('overview-hero-value')
                   : null,
-              size: 34,
-              color: entry.realizedPnlTotal.startsWith('-')
-                  ? LyraColors.negative
-                  : LyraColors.ink,
+              size: 42,
+              colorBySign: true,
+              showPositiveSign: true,
             ),
           ),
-          const SizedBox(height: 5),
+          const SizedBox(height: 8),
           const Text(
             '全部记录 · 已扣除分摊费用',
-            style: TextStyle(fontSize: 10, color: LyraColors.muted),
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.5,
+              color: LyraColors.muted,
+            ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 14),
+          const Divider(height: 1, thickness: .75),
+          const SizedBox(height: 14),
           _MetricStrip(entry: entry),
         ],
       ),
@@ -404,7 +507,7 @@ class _AccountSummary extends StatelessWidget {
 }
 
 /// 汇总指标通常为三列两行；小屏或放大字体改为两列，避免压缩阅读空间。
-/// 未连接时保留原有三个缺失金额占位，不生成模拟数据。
+/// 未登录时保留原有三个缺失金额占位，不生成模拟数据。
 class _MetricStrip extends StatelessWidget {
   const _MetricStrip({this.entry});
   final LedgerSummaryEntry? entry;
@@ -412,14 +515,14 @@ class _MetricStrip extends StatelessWidget {
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, constraints) {
-      final metrics = <(String, String, int)>[
-        ('净入金', entry?.netDeposits ?? '—', 2),
-        ('现金余额', entry?.cashBalance ?? '—', 2),
-        ('股息收入', entry?.dividends ?? '—', 2),
+      final metrics = <(String, String, int, bool)>[
+        ('净入金', entry?.netDeposits ?? '—', 2, true),
+        ('现金余额', entry?.cashBalance ?? '—', 2, true),
+        ('股息收入', entry?.dividends ?? '—', 2, true),
         if (entry != null) ...[
-          ('累计费用', entry!.totalFees, 2),
-          ('持仓条目', '${entry!.openPositions}', 0),
-          ('交易笔数', '${entry!.transactionCount}', 0),
+          ('累计费用', entry!.totalFees, 2, true),
+          ('持仓条目', '${entry!.openPositions}', 0, false),
+          ('交易笔数', '${entry!.transactionCount}', 0, false),
         ],
       ];
       final columns =
@@ -449,17 +552,19 @@ class _MetricStrip extends StatelessWidget {
                                   Text(
                                     metrics[start + offset].$1,
                                     style: const TextStyle(
-                                      fontSize: 11,
+                                      fontSize: 12,
+                                      height: 1.4,
                                       color: LyraColors.inkSecondary,
                                     ),
                                   ),
-                                  const SizedBox(height: 5),
+                                  const SizedBox(height: 8),
                                   FittedBox(
                                     fit: BoxFit.scaleDown,
                                     child: LyraAmount(
                                       metrics[start + offset].$2,
                                       size: 18,
                                       decimals: metrics[start + offset].$3,
+                                      isMonetary: metrics[start + offset].$4,
                                     ),
                                   ),
                                 ],
@@ -501,12 +606,12 @@ class _AssistantNote extends StatelessWidget {
                 children: [
                   Text(
                     'AI 账本分析',
-                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
                   ),
                   SizedBox(height: 5),
                   Text(
                     '解读持仓与交易记录',
-                    style: TextStyle(fontSize: 10, color: LyraColors.muted),
+                    style: TextStyle(fontSize: 12, color: LyraColors.muted),
                   ),
                 ],
               ),

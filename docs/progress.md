@@ -1,7 +1,270 @@
 # Lyra 实现进度
 
 > 本表只记录已经落盘的实现和实际验证结果。未通过验证的功能不得标记为完成。  
-> 总体方案见 [Lyra 移动资产账本与 AI Agent 应用完整方案](plans/lyra-product-technical-design.md)。
+> 当前架构见 [Genkit 与多来源登录](genkit-oauth.md)，容器部署见 [VPS 部署指南](deployment.md)。早期总体方案见 [Lyra 移动资产账本与 AI Agent 应用完整方案](plans/lyra-product-technical-design.md)。
+
+## 当前迁移：Genkit、独立登录页、深色界面与界面切换行情源
+
+本节记录当前分支状态。下方历史进度保留当时的实现与验证；其中 MCP、多 CLI、助手供应商切换和匿名配对设计已被本次迁移替代。
+
+| 功能 | 状态 | 实际验证与边界 |
+| --- | --- | --- |
+| 单一 Genkit 助手 | 已完成 | 一个 `genkit` provider，界面名称 Lyra；官方兼容插件、真实 Genkit 工具循环、DuckDB 和本机 HTTP/SSE 模型测试通过；保留 17 个既有账本工具，新增独立外部只读 `market-positions`，共 18 个 |
+| 删除 MCP 与多 CLI 接入 | 已完成 | 移除项目 MCP HTTP 服务、凭据/配置/进程适配、Claude/Pi/OpenCode 运行时及切换入口；实际进程测试确认 `/mcp` 返回 404；构建先清理 `dist`，旧产物不会残留 |
+| Google、LINUX DO、GitHub 登录与设备凭据 | 已完成 | 统一提供方目录、授权事务、App PKCE、共享来源限流、一次性兑换与设备凭据；保留原 Google OIDC 接口。GitHub / LINUX DO 使用固定端点验证稳定数字 ID，不要求邮箱；每方明确配置 owner 并在数据库固定 subject，同一私有账本，不按邮箱或昵称自动关联 |
+| 协议 2 / schema 15 迁移 | 已完成 | v15 支持每个来源固定一个 owner subject；真实已填充 v14 文件库重开升级后逐表核对原 Google 身份、全部设备凭据、财务数据、持仓与行情选择不变，已有 access / refresh 继续有效。旧版本升级仍保留 v12/v13/v14 的原迁移规则 |
+| 回合取消与重启恢复 | 已完成 | 测试覆盖退出发生于回合启动等待期间、取消持久化与模型完成交错、工具调用取消、迟到输出抑制、重启恢复及重复恢复幂等 |
+| 证券账户创建接口 | 已完成 | 新增已鉴权 `POST /v1/ledger/accounts`；复用领域账户模型、共享写队列和公开脱敏投影；账户、审计与幂等结果同事务，空建账户不增加交易或账本版本；测试覆盖请求重放、并发重复、注销排队和失败回滚 |
+| 首次导入与账户标识一致性 | 已完成 | 真实空库经受控 Google 登录签发设备后，创建账户、上传 CSV、预览、确认并读取持仓/已实现；账户匹配规范化后，交易和哈希沿用数据库原账户键；不同大小写文件名重传仍识别为既有交易。导入解析器版本为 2，财务数据继续沿用既有表与口径 |
+| 服务端完整回归 | 已完成 | **Python 服务端**：HEAD（`ed522c7`）实测 `cd server && uv run --frozen pytest -q` **2307 项通过 / 4 项跳过**，`uv run --frozen ruff check .` 无错误类发现；服务端已由 TypeScript/Fastify 全量迁移到 Python/FastAPI，TS 侧只存在于 git 历史（最后一个 TS 提交 `6887bec`）。下节保留 2026-10-11 修复轮对历史不可复现统计的纠正及 368 项通过记录 |
+| Flutter 登录、单助手与首次账户界面 | 已完成 | 空账户首页与账户选择器提供创建入口；导入保留原文件、创建后继续预览；创建重试、重复账户、预览失败恢复、取消、身份切换和组件卸载均有通过的回归；空库账本版本保持 0，首次财务导入才变为 1 |
+| Flutter 凭据队列与汇总刷新 | 已完成 | 按凭据存储归属排队，所有生产 SecureCredentialStore 实例保持共享队列；独立内存存储互不阻塞，队列失败/空闲后正确释放；登录、刷新、退出及助手会话 ID 保持串行。汇总刷新有身份与请求代次检查，旧成功/失败不能覆盖较新的结果 |
+| Flutter 用户页面与账户管理 | 已完成 | 登录后四个主入口为总览、股票、交易、我的；用户页显示可用的邮箱或昵称与登录方式，提供证券账户列表和新增、偏好、行情、关于和确认退出。未登录进入独立登录页，只选择账号；已移除普通页面的连接配置入口，退出或身份变化清除财务二级路由 |
+| 金额隐私与金融配色 | 已完成 | 启动隐藏与本次眼睛按钮分离；财务金额、价格/费用/行权价、期权代码、Tooltip、读屏语义及金额图表同步处理；数量/日期/比例保留，AI 对话文字不处理。20 项隐私与 5 项配色回归通过，包含 14 类报告展开明细与图表像素检查 |
+| 本机偏好与启动账户 | 已完成 | 独立安全存储键、串行读改写、失败保留最后成功值；按服务端、登录来源和稳定 subject 隔离账户偏好，保留原 Google 偏好键。恢复验证活跃账户，失效回 all，迟到恢复不覆盖主动选择；失败后手选单账户或 all 均可恢复查询 |
+| 后台自动配置与应用版本 | 已完成 | 新安装自动使用发布时注入地址，保留历史地址与旧凭据绑定；偏好恢复完成前不请求另一个后台。登录页不展示地址或配置状态，总览 / 我的移除连接管理，关于只读取 App 版本；公开系统接口保留为内部部署诊断 |
+| Flutter 依赖、分析与测试 | 已完成 | Flutter 3.47.2 / Dart 3.13.2；本轮全页面技术文案检查后，静态分析零问题，**完整 262 项 Flutter 测试通过**，5 个截图入口按默认跳过；另显式运行本轮 4 个截图文件，**15 个场景全部通过**。依赖版本与锁文件未改变；历史统计见对应阶段 |
+| Flutter 深色界面 | 已完成 | 按用户批准的 Ticket assistant 风格精修稿，统一石墨灰 / 冰蓝主题、总览、持仓 / 交易、报告、我的、登录 / 导入与助手；金额隐私和多币种逻辑通过既有回归，Android 启动及系统栏同步深色 |
+| Flutter 界面渲染检查 | 已完成 | 本轮核对实际 Flutter 总览、股票 / 交易、助手、导入、账本检查、持有周期、行情设置及我的页；保存 15 张当前截图，含失败、未知状态与 320 px / 1.6 倍字体。金额、来源、报价时点与真实核对结果仍保留，内部错误 / 版本 / UUID / 参数不再展示；使用合成数据 |
+| Android 调试 APK | 本轮未构建 | 历史深色版和后续修复版均曾使用 1.0.0+3，具体产物及模拟机验证见下方历史记录；本轮独立登录页 / 新来源尚未打包，新体验需要从当前源码构建，并在正式分发前处理版本号与签名 |
+| 可替换行情与参考估值 | 实现与受控验证完成 | 统一契约、按资产选源、Alpaca / MarketData 适配、缓存 / 请求预算 / 显式备用源、标准接口与 Genkit 工具已接入；USD 股票和标准期权按多空及乘数估值，缺价 / 过期不补零或合计；默认关闭，真实提供方权限未联调 |
+| Flutter 行情面板 | 已完成 | 总览 / 股票增加参考估值和可展开报价明细，我的提供按需入口；价格保持十进制字符串，完整合约与账户匹配，金额隐私、启动范围恢复、迟到响应、账本版本变化、320 px 大字体均有回归；新增 16 项通过 |
+| 界面切换行情源 | 已完成 | 「我的 → 行情与估值」分别选择股票 / 期权主源、备用或关闭；选择后自动提交并在服务端确认后生效，无保存 / 取消按钮；显示切换状态，失败恢复界面确认值，可重试或冲突后重载。schema 14 持久化，App / Genkit 共用；20 项设置回归覆盖关闭重开、逐项修复失效源、同会话刷新及迟到报价隔离 |
+| 部署配置检查与服务探测 | 已完成 | 新增启动前 CLI、一次性配置生成、账本健康检查和公开探测；19 项新增测试通过。实际临时 DuckDB 经容器启动脚本启动、迁移至 schema 13、通过协议/鉴权/旧 MCP 探测并以 SIGTERM 正常退出；不代表容器或第三方联调 |
+| Docker / Compose / Caddy 部署模板 | 进行中 | 多阶段构建、非 root 单进程、持久数据卷、临时上传目录、11 分钟退出宽限和可选 HTTPS 已落盘；Compose 通过官方 JSON Schema 静态校验。当前环境无 Docker Engine，镜像构建、Compose 启停及 Caddy 证书待实际验证 |
+| 真实第三方登录 / 模型 / 行情 / 手机联调 | 待开始 | 本轮未配置真实 Google / LINUX DO / GitHub OAuth 应用和公开回调，也未新增模型 / 行情凭据；外部登录使用受控响应，完整真实系统浏览器往返仍需部署后验收 |
+| GitHub 草稿 PR 交付 | 已完成 | 独立登录页、三种 OAuth、schema15 与后续用户流程精简继续交付至[草稿 PR #1](https://github.com/GinPonson/Lyra/pull/1)；本轮基于 7d72c1c 继续清理其它页面的技术文案并更新截图。真实第三方登录 / 模型 / 行情 / 手机完整联调待验，本轮未合并、部署或构建 APK |
+
+配置模板在 [`deploy/server.env.example`](../deploy/server.env.example)，启动、升级和待验步骤见 [迁移说明](genkit-oauth.md)。界面切源需要更新 App 与服务端；迁移前备份数据库并保留原加密主密钥。v14/v15 保留 v13 的 OAuth 凭据；从 v12 或更早版本升级时，重新登录并新建 Lyra 会话。真实第三方登录 / 模型 / 手机联调完成前，迁移 PR 保持草稿。
+
+### 其它页面技术文案检查（2026-10-11）
+
+继续检查普通页面、展开明细、导入弹窗及失败状态。基线实际截图确认交易页存在账本版本与原始 ISO 时间，导入说明使用“原子写入”；助手还会展示内部命令、参数摘要、毫秒耗时、错误码和账户 UUID。代码复核进一步覆盖证券账户、行情设置、登录恢复与共享错误组件。
+
+以下按查看流程记录本轮结果。截图来自本轮实际 Flutter 渲染，使用合成账本与行情状态；图片未做内容编辑。
+
+| 步骤 | 页面与原问题 | 当前结果 | 当前截图 |
+| --- | --- | --- | --- |
+| 1 | 总览 / 股票 / 交易：账本内部版本、原始 ISO 时间 | 已修正；只保留账户范围及易读、明确时区的数据日期。股票、金额隐私和多币种行为保留 | [交易页](plans/assets/user-ui-20261011-ledger-390.png)、[320 px 股票页](plans/assets/user-ui-20261011-stocks-320-large.png) |
+| 2 | 分析报表与账本检查：FIFO lot、英文天数区间、内部检查名 / 未知状态回退 | 已修正；口径改为先进先出与开仓批次，区间边界不变。新增检查保留真实通过 / 未通过；未知状态明确待确认，不误报通过 | [持有周期](plans/assets/user-ui-20261011-ledger-holding-period-390.png)、[大字体](plans/assets/user-ui-20261011-ledger-holding-period-320-large.png)、[账本检查](plans/assets/user-ui-20261011-ledger-audit-390.png)、[未知结果](plans/assets/user-ui-20261011-ledger-audit-unknown-status-390.png) |
+| 3 | Lyra 助手：内部工具、参数 / 结果键值、耗时、错误码、账户 UUID | 已修正；展示业务任务名、进度和受控计数。保留财务正文、未完成提示、继续提问与停止分析；无法恢复账户名时不展示内部 ID | [结果与失败步骤](plans/assets/user-ui-20261011-agent-390-complete.png)、[分析中](plans/assets/user-ui-20261011-agent-390-progress.png)、[大字体进度](plans/assets/user-ui-20261011-agent-320-large.png)、[失败页](plans/assets/user-ui-20261011-agent-390-failure.png) |
+| 4 | 文件导入：“原子写入”、导入后的账本版本、原始异常正文 | 已修正；说明先预览再确认，展示新增与跳过的记录。预览失效时保留文件、移除旧确认入口，直接重试生成新预览；空文件与全部重复分别提示 | [预览](plans/assets/user-ui-20261011-import-preview-390.png)、[导入完成](plans/assets/user-ui-20261011-import-complete-390.png) |
+| 5 | 我的 / 证券账户 / 通用错误：原始错误码与后台正文，“登录凭据”术语 | 已修正；创建 / 读取失败使用任务提示，重新加载恢复账户列表。登录恢复失败只要求重新登录。App 版本、项目链接、文件账户编号、尾号与币种仍是可用信息 | [我的页](plans/assets/user-ui-20261011-profile-390.png)、[读取失败与重试](plans/assets/user-ui-20261011-load-error-390.png) |
+| 6 | 行情与估值：“在服务端配置凭据”“未配置”“缓存” | 已修正；不可用来源禁用并给出用户提示。主 / 备用来源继续在界面切换、选择即提交，无保存按钮；真实来源名称、延迟 / 日终 / 过期与报价时点保留 | [不可用来源](plans/assets/user-ui-20261011-market-unavailable-390.png) |
+
+展示边界统一放在 `lyraErrorMessage`：稳定错误码用于选择用户可操作的提示，原始消息、异常 `toString()`、请求标识和响应详情不直接进入页面。账本明细继续使用字段白名单；未知嵌套对象 / 列表显示“暂无法显示”，券商原始交易动作和精确金额继续供核对。内部错误对象、协议字段、账户身份隔离、账本计算与行情路由契约没有因文案清理而删除。
+
+**实际验证**：
+
+- `flutter analyze --no-pub`：零问题。
+- `flutter test --no-pub --reporter expanded --timeout 60s --concurrency=2`：**完整 262 项通过，0 失败**；5 个 opt-in 截图入口按默认跳过。
+- 显式运行 `design_capture_test.dart`、`agent_ui_capture_test.dart`、`ledger_ui_capture_test.dart`、`market_settings_capture_test.dart`：**15 个实际截图场景全部通过**；选择并目视核对上述 15 张图片，包含窄屏 / 大字体、不可用、失败与未知结果，无布局溢出。320 px 助手图已滚动至进度区域。
+- 行为回归覆盖原始错误不显示、重新加载成功、过期预览重用同一文件并以新预览提交、空文件与重复记录区分、助手失败 / 停止保留部分财务内容、空取消正文、未知检查结果、金额精度与隐藏，以及原有登录、账户和即时切源流程。
+- 截图与受控响应不能证明真实第三方 OAuth、模型、行情或 Android 真机流程，也不代表完整无障碍合规认证。本轮未改服务端或依赖，未重复服务端套件，未构建 APK、合并或部署。
+
+### 登录与设置移除技术配置（2026-10-11）
+
+在图标补齐提交 `92f30dd` 上按用户反馈移除登录页「服务端连接」卡片、地址输入 / 保存 / 更换，以及总览和「我的」的连接管理入口。「关于」仅保留 App 版本与项目链接，不显示服务端版本或自动请求健康检测。登录内容按可用高度居中，大字体仍可滚动。
+
+后台地址由发布构建的 `LYRA_SERVER_URL` 注入，保留凭据绑定地址和历史 `rememberedServerUrl` 的兼容；等本机偏好恢复完成再读取登录方式，配置缺失 / 无效时不发请求。原本需要用户处理的「未配置」「检查服务端地址」「更新服务端」等提示改为「暂不可用」与可重试的登录提示；登录异常按稳定错误码映射用户文案，不直接透传后台消息。行情来源切换入口继续保留，其连接失败提示也不再要求用户管理服务器。
+
+旧凭据自动过期时，先撤销本机认证状态并清除凭据，再尽力记住原账本地址；地址写入失败仍保留本轮重新登录需要的原地址。这样既不会把旧令牌发给构建配置中的另一后台，也不会因取消地址输入而使旧安装失去登录入口。本机清理重试独立于登录目录加载，不等待网络请求完成。
+
+**实际验证**：
+
+- `flutter analyze --no-pub` 零问题。
+- `flutter test --no-pub --reporter expanded --timeout 60s --concurrency=2`，聚焦 `login_screen_test.dart`、`profile_screen_test.dart`、`session_flow_test.dart`、`widget_test.dart`、`preferences_test.dart`、`system_repository_test.dart`、`market_settings_test.dart`、`market_widgets_test.dart`，**108 项全部通过**。覆盖首次安装自动配置、缺失 / 非法地址、偏好延迟读取、启动 / 刷新 401、原地址持久化与重启、偏好写失败不阻塞凭据清理、取消 / 退出、版本重试、无健康检测及既有行情切源。
+- 显式运行 `login_capture_test.dart`，**5 个实际 Flutter 截图场景全部通过**，逐张目视检查无溢出：[390 px 登录](plans/assets/login-20261011-390.png)、[320 px / 1.6 倍字体](plans/assets/login-20261011-320-large.png)、[部分方式不可用](plans/assets/login-20261011-390-unavailable.png)、[我的](plans/assets/login-20261011-profile-390.png)、[关于](plans/assets/login-20261011-about-390.png)。全部为合成配置；关于截图中的版本为测试注入。
+- 本轮未改服务端、依赖版本或锁文件；未重复运行服务端全量套件或 Flutter 全量套件。下方服务端 400 项、Flutter 236 项和图标修正 21 项保留为对应提交的历史结果。
+
+### 登录按钮图标补齐（2026-10-11）
+
+在独立登录页提交 `9ee4e0d` 上补齐 Linux.do 与 GitHub 图标。三种登录方式均使用官方原始 PNG，统一为 20 × 20 逻辑像素图标占位、12 逻辑像素文字间距；图片排除重复读屏语义。品牌资产来源与校验值见[资产说明](../apps/mobile/assets/auth/README.md)。
+
+**本次验证**：`flutter analyze --no-pub` 零问题；既有 18 项登录组件回归与 3 个真实 Flutter 截图场景合计 **21 项全部通过**。逐张检查 390 px、320 px / 1.6 倍字体、部分来源未配置三种页面，图标清楚、对齐一致、无溢出；测试打包的 Linux.do 资产与最终源码文件 SHA-256 一致。下节 400 项服务端与 236 项 Flutter 完整回归为 `9ee4e0d` 实现轮的历史验证，本次静态图标修正未重复运行全量套件。
+
+已更新现有三张[登录页截图](plans/assets/login-20261011-390.png)，登录流程、依赖版本及锁文件未改动。
+
+### 独立登录页与 Google / Linux.do / GitHub（2026-10-11）
+
+本轮在 `76e0002` 的修复后代码上实现独立登录入口。未登录、凭据失效或退出时回到完整登录页；成功后进入原四 Tab 工作台。页面提供三种方式和服务端地址管理，等待授权可取消；未配置、目录读取失败和旧服务器缺少目录均有明确状态和重试入口。更换服务器需确认，保存新地址后退出原登录，再到新地址选择方式。
+
+服务端新增 `LoginProviderClient` 与统一 `OwnerLoginService`，公开 `/v1/auth/providers`，共用 `/v1/auth/{google|linuxdo|github}/start`、`callback`、`exchange`。原 Google URL 与设备凭据契约保留。三种方式共享来源限流与容量、App PKCE 和一次性消费；Google 保留 OIDC 校验，GitHub / Linux.do 使用固定用户 API 核对显式允许的稳定数字 ID。上游 token 不返回 App，公开目录不含密钥或 owner ID。
+
+每个来源独立固定所有者身份，经服务器明确配置的各来源进入同一私有账本，不按邮箱或昵称自动合并。schema15 迁入原 Google owner 行并允许新来源无邮箱；真实 v14 文件库升级测试逐表核对 owner、设备凭据、账本、持仓和行情选择完全保留，旧 access / refresh 可继续使用。当前协议仍为 2。
+
+移动端保留旧 Google 安全存储和偏好键，新增来源用 provider + subject 隔离偏好；令牌刷新不清导航，退出 / 身份变化清除旧二级页。退出本机清理失败可在登录页重试，迟到的远端撤销失败提示不会覆盖新登录。市场来源的选择即生效行为继续通过原回归。
+
+**最终验证**：
+
+- Node **24.19.0**，`npm run check` 退出码 0，干净构建后 **132 套件 / 400 项全部通过**，0 失败、0 取消、0 跳过；包括 15 项 OAuth client 边界、14 项统一服务 / 路由 / 实库迁移测试及部署配置和真实启动。
+- Flutter **3.47.2** / Dart **3.13.2**，`flutter analyze --no-pub` 零问题；`flutter test --no-pub --reporter expanded --timeout 60s --concurrency=2` **236 项通过 / 3 个截图入口按默认跳过**。独立登录页、三种浏览器入口、无邮箱、取消 / 退出、身份切换、旧 Google 恢复和导航均有回归；旧测试中未登录仍显示财务导航的预期已按本次产品行为更新。
+- 显式运行 `login_capture_test.dart` 的 **3 个实际 Flutter 渲染场景通过**，逐张目视检查标题、三按钮、服务端地址、不可用状态及大字体，无溢出。图中域名与来源可用性为演示配置；未用真实账号授权。
+- 未升级依赖版本，Node / Flutter 锁文件不变；仅增加 Google 官方 G 图片资产及其来源说明。未重建 APK、未部署，真实三方 OAuth 往返仍需对应应用凭据和正式回调。既有浏览器授权者与发起设备的协议边界继续记录在[登录说明](genkit-oauth.md#app-登录过程)。
+
+截图：[390 px 登录页](plans/assets/login-20261011-390.png) · [320 px / 1.6 倍字体](plans/assets/login-20261011-320-large.png) · [部分来源未配置](plans/assets/login-20261011-390-unavailable.png)。复现命令见[移动端说明](../apps/mobile/README.md)。
+
+### 缺陷修复轮（2026-10-11）
+
+对 `feat/genkit-oauth` 做了一轮完整代码审查后的修复，所有结论均以实测为准。
+
+**先纠正不可复现的验证结论**：在干净检出（`npm ci` 后）上运行 `npm run check`，得到的是 **127 套件 / 364 项：360 通过、1 失败、3 取消**，与先前记录的「全部通过」不符。两个根因：
+
+- `genkit-runtime.ts` 的回合超时定时器调用了 `timer.unref()`。模型调用若只是挂起的 Promise 且进程内无其它 handle，事件循环会在 100ms 截止时间之前就判空，超时**永不触发**；`genkit-runtime.test.ts` 的超时用例因此挂起，并连带取消后续 2 项。移除 `unref()` 后该套件 8/8 通过。
+- `deployment-config.test.ts` 断言子进程 `stderr` 严格为空，而 `check-config` 的导入链（genkit → compat-oai → openai → node-fetch@2 → whatwg-url@5 → 内建 punycode）会在 Node ≥ 21 打印 `DEP0040`。断言改为忽略 Node 对第三方依赖的运行时警告，仍要求 CLI 自身零诊断输出。
+
+**其余已修复缺陷**：
+
+- 流式契约错位：服务端发 `payload.delta`，App 读 `payload.text`，导致 AI 回复**永不流式显示**，只在终态快照时一次性出现；服务端改为发 `text` 并新增契约断言（该错位在 `main` 上已存在）。
+- 结算落库失败会永久占用内存中的活跃回合，使 start/cancel/close 全部 409、只能重启恢复；改为失败时也释放回合并丢弃缓存运行时，错误照常上抛。
+- 供应商未返回 token 用量时被上报为 `0`（与「未知不估算为零」矛盾）；改为无法确定时不发用量事件。
+- 启动顺序：信号处理器与暂存目录创建移到打开数据库（含不可逆迁移）之前；实测暂存目录不可创建时启动失败且**不会**创建/迁移数据库。
+- 登录 `/start` 无凭据：改为按来源滚动窗口限流，容量被占满时淘汰最早事务而非对所有人 429，终态事务短暂保留后立即释放容量。
+- 行情层：单证券 `invalid_response` 不再冷却整个来源；单行坏账本数据降级为无法估值而非整体 500；「形状合法但无可用参考价」改报 `no_data`；HTTP 403 不再误报为密钥被拒；重复查询参数不再静默忽略（返回 400）；零买价不再参与中间价。
+- 部署：`.gitignore` 覆盖 `deploy/server.env*`（原先 `server.env.bak` 等含主密钥的文件不被忽略）；预检与运行时对 loopback HTTP 回调的判定统一；DuckDB 溢出目录固定到数据目录同级 `tmp/`（支持只读根文件系统）；Caddy 关闭管理 API；健康检查 `start-period` 与文档化的 `--wait-timeout` 对齐。
+- Flutter：Agent 页非协议异常不再被吞并锁死（可重试错误态）；汇总缺失金额不再伪造成 `0`；畸形金额/标识字段在异步数据边界拦截而非渲染期崩溃；WebSocket 保留部署子路径；Android 安全存储改用 EncryptedSharedPreferences 并关闭 Auto Backup。
+
+**验证**：`npm run check` 退出码 0，**128 套件 / 368 项全部通过**；`flutter analyze --no-pub` 零问题，`flutter test --no-pub` **212 项通过 / 2 项跳过**（修复前 198 / 2）；端到端 smoke 复验协议 2、schema 14、`/mcp` 404、未认证 401、SIGTERM 干净退出，并新增「暂存目录不可创建即失败且不迁移」的实测。
+
+**本轮刻意未修**：登录事务绑定的是发起方而非浏览器授权方，未认证者可通过钓鱼链接取得所有者凭据（详见 [genkit-oauth.md 的安全边界](genkit-oauth.md#app-登录过程)）；补齐需要人类共享秘密，属协议与交互改动，待明确方案后再实施。另有一批低危清理项（删除 MCP/CLI 后的死代码与相关域函数）未做，避免为纯卫生问题牵动多个测试套件。
+
+### Android 模拟机启动测试（2026-10-11）
+
+对本轮修复后的代码做真机（模拟器）启动与连通性验收。AVD `Medium_Phone`（`emulator-5554`，Android 17）在测试前已在运行，未新建模拟器。
+
+- **构建**：环境中 `JAVA_HOME` 指向不存在的 `/opt/homebrew/opt/openjdk@21/...`，Gradle 直接拒绝启动；改用本机已装的 Amazon Corretto 21（`/Users/Gin/Library/Java/JavaVirtualMachines/corretto-21.0.12.1/Contents/Home`）后构建成功。`flutter build apk --debug` **57.4s**，使用默认 `~/.gradle`（全局镜像可直接用于 Flutter 构建）。仅有既有的 `package_info_plus` KGP 提示与 SDK XML 版本提示，不影响产物。
+- **产物**：`apps/mobile/build/app/outputs/flutter-apk/app-debug.apk`，**167,108,575 字节**，SHA-256 `b296ec5d2ef3d338344f50792757cdf689daf26d0cadc9166ee7109cbfcd071a`；`aapt2 dump badging` 确认 `com.lyrafinance.lyra_mobile`、versionCode **3**、versionName 1.0.0、minSdk 24 / targetSdk 36。注意该 APK 与先前交付的 `1.0.0+3` 版本号相同，但已包含后来的行情面板与本轮修复，发布前应递增 versionCode。
+- **安装与启动**：`android install` 成功；`am start` 后进程存活，`logcat` crash buffer 为空、无 Flutter 异常，四个主 Tab（总览 / 股票 / 交易 / 我的）均正常渲染。
+- **修复项实测**：未登录总览的「净入金 / 现金余额 / 股息收入」显示 **`—`**，不再是伪造的 `0.00`（对应本轮「缺失金额不再编造为零」）；「我的」页展示 Google 登录入口、证券账户、启动时隐藏金额、启动账户、涨跌配色等分区；金额隐私开关可正常交互。
+- **连通性（`adb reverse` + 本地服务端）**：在 App 内保存服务端地址 `http://127.0.0.1:3141` 后，`POST /v1/auth/google/start` 返回 201（协议 2 / schema 14），App 随即调起系统浏览器打开 `accounts.google.com` 授权页；服务端日志同时出现 `/v1/system/info` 与 `/v1/health` 探测。
+- **边界**：使用合成 `client_id`，未完成真实 Google 授权，因此未签发设备凭据、未进入账本页面；本次只验证启动、渲染与 App↔服务端链路，不代表真实 OAuth、模型或行情联调完成。登录事务被放弃后 App 仍按约 2 秒间隔轮询 `/v1/auth/google/exchange`，直至事务十分钟过期，属既有设计行为。
+- 截图：[未登录总览（金额显示 `—`）](plans/assets/android-smoke-20261011-overview.png)、[我的与偏好](plans/assets/android-smoke-20261011-profile.png)。
+
+### 选源即时生效验证（2026-10-11）
+
+- 移除行情设置的「保存 / 取消」按钮及未提交草稿。股票、期权的主来源、备用来源或关闭每次选择后立即提交；服务端确认后持久化并刷新全部行情查询。重复选择当前值不发请求。
+- 请求期间显示「正在切换…」并禁用来源控件，关闭后重开仍可看到待确认状态。同一登录会话中关闭面板不打断已提交请求；换服务器或登录后旧响应不能影响新会话。
+- 失败时界面恢复最后确认的选择；重试沿用原目标和原 `expectedRevision`，服务端已提交但响应丢失时仍可幂等确认。网络失败不代表服务端回滚。配置变化或 409 冲突要求显式重新加载后再选择，避免覆盖其他设备的新值。
+- 服务端允许在原资产、原位置保留已失效的旧来源，支持逐项修复多个失效设置；有效路由继续过滤这些失效来源。新增或移动来源仍需通过目录、资产支持与凭据校验，版本冲突先于变更校验处理。协议 2、schema 14 保持不变。
+- 服务端 `npm run check`：Node 24.19.0，干净 TypeScript 构建，**127 套件 / 364 项全部通过**，0 失败、0 跳过。较手动保存版新增 3 项回归，覆盖跨资产 / 同资产多失效来源逐项修复、保留原位置的幂等重试，以及新增 / 移动失效来源与陈旧版本拒绝。（注：该轮记录的「全部通过」在干净检出上不可复现，见[缺陷修复轮](progress.md)。）
+- Flutter `analyze --no-pub` 零问题；`test --no-pub --reporter expanded --timeout 60s --concurrency=2` **198 项全部通过**，默认图片捕获入口 2 项跳过。20 项设置测试已更新为即时提交，包含失败恢复、已提交但响应丢失后的重试、关闭重开时的等待状态、冲突和迟到报价隔离；另显式启用 2 个截图用例，与设置测试合计 **22 项通过**。
+- 生成并目视核对 3 张实际 Flutter 新截图，使用合成 HTTP 响应并显示“演示配置”：普通手机完整设置页、打开来源下拉，以及 320 px / 1.6 倍字体期权来源区。依赖版本和锁文件未改变；未使用真实行情凭据、部署服务或重新构建 APK。
+
+当前截图：[390 px 设置页](plans/assets/market-settings-instant-20261011-390.png)、[来源下拉菜单](plans/assets/market-settings-instant-20261011-390-picker.png)、[320 px / 1.6 倍字体期权来源区](plans/assets/market-settings-instant-20261011-320-large.png)。从 `apps/mobile` 复现：
+
+```bash
+flutter test --no-pub test/market_settings_capture_test.dart \
+  --dart-define=LYRA_REVIEW_DIR=/absolute/output \
+  --dart-define=LYRA_CJK_FONT=/absolute/NotoSansCJKsc-Regular.otf \
+  --dart-define=LYRA_FLUTTER_ROOT=/absolute/flutter \
+  --reporter expanded
+```
+
+### 界面切换行情源验证（2026-10-11，手动保存版历史记录）
+
+以下记录首次实现时的保存 / 取消交互与当时验证结果；当前行为已由上节即时生效交互替代。
+
+- 「我的 → 行情与估值」增加独立的行情来源设置：股票、期权分别选择主来源和一个可选备用来源，支持关闭和取消未保存的修改。来源名称、支持资产及凭据配置状态来自服务端目录，Flutter 不写死供应商名单。未配置来源不可选，合法但已移除的旧来源保留显示，供用户修复。
+- 新增已鉴权 `GET / PUT /v1/market/settings`，使用 `expectedRevision` 检测并发冲突；保存走既有写队列，在队列中重新鉴权、重读当前版本并提交事务，成功后同步热切换。schema 14 保存全局来源顺序、版本和更新时间；真实 DuckDB 重开测试验证恢复，账本版本及财务记录不变。env 来源值只在没有保存记录时作为默认，模板继续为 `none`。
+- 每次持仓估值在外部请求前固定来源快照，所有批次和最终 `settingsRevision` 一致。热切源不重建供应商，不清空已有缓存、预算或故障冷却；切回原来源仍受原请求额度约束。App 成功后刷新全部行情查询，切源前的迟到报价不能覆盖新结果。
+- 设置与持仓读取独立，空持仓和账本失败不阻止选择。失败保留草稿，409 提供显式重新加载，快速 GET 也会正确替换旧草稿；旧服务端 404 明确提示升级。保存时关闭面板仍完成同会话结果刷新，令牌或账本刷新不打断保存；真正更换服务器或登录时，旧响应被丢弃。
+- 服务端 `npm run check`：Node 24.19.0，干净 TypeScript 构建，**127 套件 / 361 项全部通过**，0 失败、0 跳过。较行情抽象阶段新增 16 项，包含设置持久化、事务失败回滚、重启、冲突、排队注销、配置目录、缓存保留与多批次快照；实际 `main.js` 启动检查新增设置 GET / PUT 未登录拒绝断言。
+- Flutter `analyze --no-pub` 零问题；`test --no-pub --reporter expanded --timeout 60s --concurrency=2` **198 项全部通过**，图片捕获入口 2 项按默认跳过。包含新增设置测试 **20 项**；另显式启用实际 Flutter 截图用例，**2 项通过、3 张 PNG**。图片使用合成 HTTP 响应并显示“演示配置”，不调用行情商。已目视核对普通手机、打开下拉以及窄屏放大字体的选择与保存操作。未修改依赖版本或锁文件。
+- 本次未使用真实供应商凭据，未部署服务或重新构建 APK。此前 `1.0.0+3` APK 不包含行情面板与来源设置；实际权限、VPS 和手机联调仍待执行。说明与 API 见[行情接入与换源](market-data.md)。
+
+该阶段历史截图：[390 px 设置页](plans/assets/market-settings-20261011-390.png)、[来源下拉菜单](plans/assets/market-settings-20261011-390-picker.png)、[320 px / 1.6 倍字体保存区](plans/assets/market-settings-20261011-320-large.png)。当前截图复现命令见上节。
+
+### 行情抽象与参考估值验证（2026-10-11）
+
+- 新增供应商无关的 `MarketInstrument`、`MarketQuote`、`MarketDataProvider` / `MarketDataReader`，由独立报价服务处理按资产路由、显式备用顺序、并发合并、有界缓存、请求预算与超时。缓存仅保存公开行情；归一化剥离额外字段并复制对象，未知错误文本不出现在响应中。
+- Alpaca 使用截止当前时间前 16 分钟的历史 SIP 股票买卖价和 OPRA 期权一分钟 K 线；期权 close 时间使用区间结束。MarketData 的股票 / 期权请求显式使用 `mode=historical` 或 `mode=delayed`，防止账户升级后默认模式变为 live 而标签不变。代码使用最近可得数据，不传历史日期，不提供历史组合净值或对齐到同一天的全组合估值。
+- App 路由 `GET /v1/market/positions` 和 Genkit 的第 18 个工具 `market-positions` 共用授权持仓与估值层。原有成本及 17 个账本工具口径保持；新估值统一选价、多空方向、标准期权 100 倍乘数和费用排除规则。非 USD、无法准确识别的合约返回明确缺失状态；缺价 / 过期的币种组不输出完整合计。
+- 服务端 `npm run check`：干净 TypeScript 构建通过，**125 套件 / 345 项全部通过**，0 失败、0 跳过。相对部署阶段增加 47 项，覆盖适配器、配置、缓存 / 并发 / 预算 / 超时、完整证券身份、金额精度与真实 DuckDB 持仓到市场估值的集成；既有路由与配置进程测试同步扩展。
+- Flutter `analyze --no-pub` 零问题；`test --no-pub --reporter expanded --timeout 60s --concurrency=2`：**178 项全部通过**，默认截图入口 1 项跳过。新增 16 项覆盖标准响应解析、账户和完整合约匹配、缺价 / 过期、隐私及辅助阅读、启动恢复、范围切换和 ledgerVersion 变化；320 px 放大字体与常规手机尺寸没有测试报告的溢出。依赖由现有缓存离线恢复，锁文件未改变。
+- 没有真实 API Key 或外部行情请求；没有注册供应商账户、开通付费计划、部署服务或重建 APK。缓存 / 预算是进程内状态，重启清空，TTL 只在按需读取时触发刷新，不是后台每日定时任务。当前协议 2、schema 13 不变。
+- 配置、换源步骤、价格时间语义与未来新增适配器的最小改动范围见[行情接入与换源](market-data.md)。
+
+### 部署准备验证（2026-10-11）
+
+- 新增 `Dockerfile`、只包含服务构建输入的 `.dockerignore`、`deploy/compose.yaml` 与可选 Caddy HTTPS 配置。服务端口只发布到主机回环地址，容器内监听 `0.0.0.0`；账本目录持久化，上传暂存使用 256 MiB tmpfs，退出宽限覆盖 600 秒回合上限。Caddy 默认运行日志删除请求 URI，访问日志保持关闭。
+- `check-config` 复用正式入口的基础环境、Google 和 Genkit 配置解析，在打开数据库之前拒绝占位值、部分模型配置、缺少 owner 和不匹配的 HTTPS 回调；输出固定文案与变量名。新配置生成使用独占创建和 `0600` 权限，保留已有文件与主密钥；不会读取或执行 env 文件中的 shell 内容。
+- `npm run check`：干净 TypeScript 构建通过，**119 套件 / 298 项全部通过**，0 失败、0 跳过。新增 10 项配置 CLI 测试与 9 项部署工具测试，包含进程级网络阻断、现有数据库不被打开、日志不泄露配置、初始化幂等、降级健康状态、鉴权与协议门禁、禁止跟随重定向及 GET / POST 旧 MCP 入口检查。
+- 使用临时数据库和合成 Google 配置实际运行 `server/scripts/start-container.sh`：配置检查通过，数据库创建至 schema 13、协议为 2，健康脚本与公开探测全部通过；发送 SIGTERM 后退出码为 0。没有访问正式账本、Google 或模型服务。
+- Compose YAML 通过官方 `compose-spec` JSON Schema（blob `c9db4d1cd27cd0353d679b58ab83fa8dfd442aaf`）与 Ajv 2020 静态校验；shell 语法和差异空白检查通过。当前环境没有 Docker Engine，不能声称已构建镜像、运行 Compose、验证 Caddy 配置或获取真实证书。
+- 新工作目录离线安装因锁文件中的腾讯镜像 tarball 未缓存而未完成；随后复用同一锁文件下已存在的依赖完成构建与测试，没有修改锁文件。VPS 构建需能访问 npm 与腾讯镜像，尚未验证从零安装。
+- 本次未改移动端，也未重建 APK。重新计算既有 `1.0.0+3` APK 的 SHA-256，与下方深色界面交付记录一致。真实域名、Google OAuth、兼容模型和手机联调继续待验，PR 保持草稿；操作顺序和停服备份见 [部署指南](deployment.md)。
+
+### 深色界面交付验证（2026-10-11）
+
+- 按批准的精修图落地现有 Flutter 应用；共享 Material 暗色状态、系统栏、总览和列表层级、设置与各弹层均已实现。保留已有 PNG 标识、字体、四 Tab、展开明细、账户范围及金融数据语义。
+- `flutter analyze --no-pub`：零问题。
+- `flutter test --no-pub --reporter expanded --timeout 60s`：**162 项全部通过**；另有 1 个需显式启用的截图入口按设计跳过。扩大正盈亏显示检查，不放宽原精度、隐私、账户或身份断言。
+- 单独启用 `test/design_capture_test.dart`：**4 个场景通过，15 张 PNG**。在实际 MaterialApp 内断言 1.6 倍文字缩放，截图前等待证券图解码；目视核对精修图和实际画面的并排对照。最后修复的小屏标题、分组头和导入把手经独立目视复核通过。
+- `flutter build apk --debug --no-pub`：退出码 0，Gradle 56.1 秒；保留当前依赖与构建配置。构建输出有现有 KGP 兼容性和 SDK XML 版本提示，不影响本次成功产物。
+- APK：`1.0.0` / versionCode `3`，`com.lyrafinance.lyra_mobile`；min SDK 24、target SDK 36，arm64-v8a / armeabi-v7a / x86_64；**167,049,415 字节**。`aapt dump badging` 与 `apksigner verify --verbose --print-certs` 通过，Android Debug / v2 签名。
+- APK SHA-256：`c349c256af67d97dfc9b815681a91d3901585488ff3e35f0f2de8db9e1dab7d1`。
+- 构建前后核对 114 个移动端源码、Android 配置、依赖锁文件和资产；内容清单 SHA-256 为 `1263a9f1aef9acd695a55d3df89243cd58967835f038e9b18877fdb189b54865`，交付副本与原构建 APK 哈希一致。
+- 视觉依据和差异说明见 [design-qa.md](../design-qa.md)。本轮无服务端变更；服务端 117 套件 / 279 项为此前通过记录，未重新声称真实 Google、模型或 Android 真机联调已完成。
+
+### 用户页面交付验证（2026-10-11，先前 versionCode 2）
+
+- `flutter analyze --no-pub`：零问题。
+- `flutter test --no-pub --reporter expanded --timeout 60s`：**162 项全部通过**；原有 91 项 + 新增 71 项，没有放宽既有财务或身份断言。
+- 实际 Flutter 渲染检查：390 px 手机、320 px / 1.6 倍字体、1440 px 宽屏，以及未登录、连接、配色、关于与隐藏金额总览；均使用合成数据，未连接真实账户。
+- `flutter build apk --debug --no-pub`：最终退出码 0。首次打包因原生库合并目录残留临时文件导致符号处理失败；仅清理对应生成中间产物后重建成功，没有修改 SDK、签名规则或应用源码。
+- APK：`1.0.0` / versionCode `2`，`com.lyrafinance.lyra_mobile`；min SDK 24、target SDK 36，arm64-v8a / armeabi-v7a / x86_64；**167,030,491 字节**。`aapt dump badging` 与 `apksigner verify --verbose --print-certs` 通过，Android Debug / v2 签名。
+- APK SHA-256：`d1409d9e5ac9e0f5ea25734e1c4b77e4b090e7f9211cea0866f3f0b26f957596`。
+- 构建前后核对 112 个移动端源码、Android 配置、依赖锁文件和资产；内容清单 SHA-256 为 `d79078a11b7a2f5a264fe415e531ab525540ace8e534cb57ae01731ca7be93bf`，交付副本与原构建 APK 哈希一致。
+- 本轮没有服务端改动；117 套件 / 279 项是上一轮服务端完整回归的通过结果。本轮仍未进行真实 Google、真实模型或 Android 真机验收。
+
+## 多用户独立账本（2026-10-16）
+
+计划与执行记录见 [多用户独立账本执行计划](plans/lyra-multi-user-ledger-20261015.md) 与 [P0 冻结契约](plans/lyra-multi-user-ledger-p0-contract-20261016.md)。
+
+同一个 Server 现在支持少量用户各自拥有独立账本，沿用既有 Google / Linux DO / GitHub OAuth，**首次登录自动注册普通用户**。固定决策：不建共享账本与成员关系模型（现有账户汇总就是该用户的账本）；不新增密码登录；不做自助绑定与管理后台；角色只有 `admin`/`member`，且管理员调用账本接口时也只能访问自己的数据。目标版本：schema **15 → 16**、协议 **2 → 3**（最低支持版本同步抬到 3，协议 2 客户端返回 426）。
+
+### 关键实现
+
+- **数据模型**：新增 `users` / `user_identities`；设备、账户、导入作业、Agent 会话、Gmail 连接、行情设置全部带 `user_id`。`accounts.legacy_account_key` 与 `gmail_connections.google_subject` 的唯一键改为**用户内唯一**。`transactions` / `lots` / `realized` 等子表**刻意不加** `user_id`（经 account 间接归属），其跨用户保护完全落在应用层查询范围上——这一点在契约 §3.2 明确记录，验收也据此逐个场景撞。
+- **迁移 16 是整库重建**：实测 DuckDB 1.5.6 **不支持**给已有表加 `NOT NULL` 列、不支持 `ADD/DROP CONSTRAINT`、且被外键引用的父表不能改名。因此只能"CTAS 到无外键暂存表 → 拆旧图 → 以最终名字重建 → 回填归属"，全部在一个事务内。
+- **身份与设备**：身份键恒为已验证的 `(provider, subject)`。`paired_devices` 增 `user_id` 与 `identity_id`，并加复合外键 `(user_id, identity_id) → user_identities(user_id, id)`，由数据库保证"设备绑定的身份与设备同属一个用户"。
+- **停用级联**：`revoke_user_devices` 撤销该用户**全部**设备与凭据并走写协调器排队；关闭其事件流、取消在飞回合；恢复后需重新登录，**旧令牌不复活**（凭据是真撤销，不是只改标志位）。
+- **从运行时状态里拿出来的全局值**：行情来源设置不再存于 `MarketDataRuntime` 实例（原设计下"谁最后保存谁覆盖所有人"），改为每次请求按 `user_id` 读库；`ReadQuote` 把路由变成调用参数。**公开报价缓存与供应商预算保持部署级共享**——按用户复制预算会把上游请求量放大到用户数倍，限流形同虚设。
+- **公开健康接口收口**：移除 `gmail.totalConnections` / `attentionRequired`（用户活动计数）与 `database.ledgerVersion`（全库 `max(version)`），只保留部署可用性与 schema 版本。**没有填伪造的 0 维持旧形状**。
+- **离线入口**：`python -m lyra.admin` 显式指定首个管理员的 `(provider, subject)`；旧库升级用 `--owner-identity` 逐条确认归属，**未确认的历史身份不关联原用户**（它们之后按自动注册规则各自得到独立空账本），非空库无法确定归属时明确失败。旧设备凭据在迁移中一并撤销，所有人需重新登录。
+
+### 过程中发现并修复的既有缺陷
+
+这些都是**基线里就存在**、因为缺少端到端覆盖而长期未被发现的路径；其中三条只有在本次改造把它们接通之后才真正可达或显形：
+
+| 位置 | 症状 | 触发条件 |
+| --- | --- | --- |
+| `main.py` `login_provider_ids` | 启动即崩（`AttributeError`） | 配齐任一 OAuth 来源——测试环境从不配置，空字典让循环体不执行，因此一直未暴露 |
+| `import_routes._device()` | **提交幂等被静默关闭** | 读已删除的 `request.state.device`，恒返回 `None` 使 `_plan_idempotency` 返回 `None`；不崩溃，只是重复提交会真的再执行一次 |
+| `gmail_routes` 的 `.sync` | 每次同步 500 | 路由调用的 `GmailService.sync` 在生产中根本不存在 |
+| `service_factory.fetch_initial` | 首次同步 500 | 从**不存在的** `domain.gmail.search_query` 导入；此前是死代码，`GmailService.sync` 实现后才可达 |
+| `GET .../agent/sessions/{id}/tool-calls` | 越权探测 | 连会话 ID 校验都没有就直接返回空列表——用空结果掩盖失败 |
+
+另修正两处与计划的偏差：迁移 16 原先不删旧 owner 身份表（离线入口只覆盖升级路径，新库会留空表导致两条路径表集合不一致），以及迁移原先**原样保留**旧设备凭据（计划 §1.8/§9.4 要求撤销）。
+
+### 验证（全部为实测）
+
+| 命令 | 结果 |
+| --- | --- |
+| 服务端 `uv run pytest -q` | **2663 passed, 4 skipped, 0 failed**（退出码 0） |
+| 服务端 `uv run ruff check .` | All checks passed |
+| Flutter `flutter analyze --no-pub` | No issues found |
+| Flutter `flutter test ...` | **282 passed, 5 skipped, 0 failed** |
+
+改造过程中一度出现 **444 个失败/错误横跨 30 个测试文件**（根因单一：`NOT NULL constraint failed: accounts.user_id`），随各模块迁移调用方逐步收敛到 0。相对本次改造前的基线（服务端 2453 / Flutter 262），净增 **211 + 20** 个测试。
+
+**契约漂移防护**：新增 `server/scripts/export_contract_samples.py` 与 `apps/mobile/test/contract_samples_test.dart`，用服务端**真实端点**（登录、`/me`、建账户、账户清单、账本汇总、导入预览、行情设置）产出 [contracts/samples.json](../contracts/README.md)，再由 Flutter 的**生产解析器**逐条解析（9 条断言）。样本缺失时**明确失败而不是跳过**。过程中这套断言抓到两处真实分歧：创建类端点返回 201 而非 200，以及 `createAccount` 的正文是 `{account}` 而**不带** `{metadata,data}` 信封。
+
+**发布门槛**：预检脚本四项关键检查通过（协议 3、模式版本自洽 16、能无损打开冻结的 schema 15 夹具、50 条路由与契约一致）。
+
+### 未执行 / 待联调
+
+生产 OAuth 的真实第三方授权、真实 Gmail 账号同步、真实模型调用、Android 真机与生产部署**均未执行**，因此不能声称已上线。合成库与测试夹具上的迁移、隔离与回归已按验收矩阵验证。
 
 ## 进度状态
 
@@ -383,6 +646,14 @@
 | 2026-09-05 | `GRADLE_USER_HOME=/private/tmp/lyra-gradle-home-20260831 flutter build apk --debug` | 通过 | `file_selector_android` 钉回 0.5.1+9 后 Android 构建恢复（52.6s）；修复配对协议头与刷新解析后再次构建成功 |
 | 2026-09-05 | Medium_Phone 模拟器端到端 smoke | 通过 | `com.lyrafinance.lyra_mobile` 安装启动无崩溃；配对真实服务端（127.0.0.1:3141 经 adb reverse）成功并显示空账本权威语境（账本版本 0、已同步）；导入面板经系统文件选择器上传 Schwab CSV，服务端正确返回 `ACCOUNT_MAPPING_REQUIRED` 且 App 显示稳定错误码；Agent 页三供应商入口渲染正常；401 刷新路径暴露的响应解析缺陷已修复并复验配对成功 |
 | 2026-09-01 | `LYRA_PORT=3143 LYRA_DATABASE_PATH=<临时文件> npm start` + loopback smoke | 通过 | 单服务入口完成 v1–v11 迁移并监听本机端口；健康端点返回 200 与 schema 11；`GET /mcp` 明确 405；无凭据与未知凭据的 `tools/list` 均返回 401 稳定 JSON-RPC 错误；SIGTERM 后写队列关闭、进程干净退出 |
+| 2026-10-13 | 文档校对 + `cd server && UV_CACHE_DIR=/tmp/uv-cache uv run --frozen pytest -q tests/test_preflight_script.py`（5 项通过）/ `uv run --frozen pytest -q --collect-only`（2311 项可收集）/ `uv run --frozen ruff check .` | 通过（有边界，见备注） | **文档与构建上下文同步到 Python 服务端现状**：切流运行手册（`server/` 路径、预检七项与 `preflight_cutover.py` 的 `CHECKS` 逐项一致、阶段 3 探针改为 `verify_running_service.py`、阶段 6 回退改为可执行并把 TS 定位到 git 历史 `6887bec`、阶段 7 不再含删除 `server/` 的命令）、`docs/deployment.md`（`python3 deploy/init-env.py`、`verify_running_service.py`、`python:3.12-slim-bookworm`、PyPI 依赖、`lyra`/10001 属主、删除 Node 时代的工具与端点（旧探针脚本、配置检查 CLI、`/mcp`）用法、去掉已不再注入且服务端从不读取的 `LYRA_PUBLIC_ORIGIN` 描述）、`.dockerignore`（放行 `server/pyproject.toml`、`uv.lock`、`src/**`、`scripts/verify_running_service.py`；排除 `server/tests`、`server/.venv`、`__pycache__`）、`README.md`、`server/README.md`、`docs/genkit-oauth.md`。`preflight_cutover.py`：静态检查改项目级 `ruff check .`、接管既有账本改在当前解释器内只读打开夹具（不再 spawn `uv run`）、主密钥检查加加解密往返并对夹具密文只作提示、检查清单提为模块级 `CHECKS` 常量；`test_preflight_script.py` 改为断言清单（名称/条数/函数）而非仅断言函数存在；`verify_running_service.py` 文档串端口 8080 → 3141（无逻辑改动）。**边界**：本环境无 Docker Engine，镜像构建与 `.dockerignore` 的实际过滤未实测；`ruff check .` 当前仍有 1 处错误类发现位于并行修改中的 `server/tests/test_device_repository.py`；`docs/plans/lyra-python-migration-20261012.md`（历史迁移计划，74 处旧目录名）与上方历史条目中的旧脚本引用按历史记录保留，未改写 |
+
+| 2026-10-14 | Medium_Phone 模拟器端到端验收（Python 服务端）+ `pytest -q` / `ruff check .` / `preflight_cutover.py` | 通过（修复 1 处阻断缺陷） | **模拟机实测发现并修复：账本只读响应缺少 `{metadata, data}` 信封**。此前 `/v1/ledger/*` 与 `/v1/analytics/*` 直接返回数据段，Flutter 解析 `body["metadata"]` 得到 `null`，总览恒显示"数据未能加载"——服务端 200、客户端报错，而既有测试只校验路径与状态码，看不见响应形状（`ledger_routes.py` 的模块 docstring 早已把它记成 M4 待办，切流前未补齐）。现在 17 条只读端点统一返回参考实现的信封：`accountScope`/`accountIds`/`currencyGroups`/`aggregateCurrency`/`ledgerVersion`/`asOf`/`fetchedAt` 全部由服务端生成；`/v1/ledger/accounts` 同时补齐 `?scope=` 必填（与参考实现一致，"查全部账户"必须显式）。**验收过程**：Python 服务端跑在 3141（账本为 `data/lyra.duckdb` 的副本，迁移 11→15），模拟机经 `adb reverse` 连接；用 parity 夹具里一份真实 Schwab CSV 走完 `POST /v1/ledger/accounts` → `/v1/imports/preview` → `/v1/imports/{id}/commit`（6 行入库、`ledgerVersion=1`），App 随后正确渲染总览（已实现损益 -34.00、现金余额 -336.00、6 笔交易、2 项持仓）、股票页（期权行权价显示 `50`/`60`，无尾随零）、交易页（6 条 USD 明细）与我的页；访问令牌过期后 `POST /v1/devices/tokens` 刷新链路亦实测通过（轮换返回新 refresh）。**边界**：本机没有第三方登录凭据，登录页只能验证到"三种方式均不可用"的如实提示，已认证路径通过临时调试入口（验收后已删除，未进入提交）注入服务端签发的设备凭据；Agent 回合未跑真实模型（`LYRA_GENKIT_*` 未配置）。|
+
+| 2026-10-16 | 服务端 `uv run pytest -q` / `uv run ruff check .`；Flutter `flutter analyze --no-pub` / `flutter test --no-pub`；`preflight_cutover.py` 四项关键检查 | 通过（修复 5 处既有缺陷） | **多用户独立账本改造完成**（schema 15→16、协议 2→3）。服务端 **2664 passed / 4 skipped / 0 failed**（改造前基线 2453，净增 211）；Flutter **282 passed / 5 skipped**（基线 262，净增 20）；`ruff check .` 与 `flutter analyze` 均无问题。改造中途一度出现 444 个失败/错误横跨 30 个文件（根因单一：`NOT NULL constraint failed: accounts.user_id`），随各模块迁移调用方收敛到 0。**过程中修复 5 处既有缺陷**，全部是基线里就存在、因缺少端到端覆盖而未被发现的路径：`main.py` 的 `login_provider_ids` 迭代字典得到字符串（配齐任一 OAuth 来源即启动崩溃，测试环境从不配置故从未暴露）；`import_routes._device()` 读已删除的 `request.state.device` 致**提交幂等被静默关闭**；`gmail_routes` 调用的 `GmailService.sync` 在生产中不存在（每次同步 500）；`service_factory.fetch_initial` 从不存在的 `domain.gmail.search_query` 导入（首次同步 500）；`GET .../tool-calls` 无任何校验即返回空列表（越权探测）。另修正两处与计划的偏差（迁移 16 未删旧 owner 身份表、未撤销旧设备凭据）。**预检四项**：协议版本为 3、模式版本自洽 16、能无损打开冻结的 schema 15 夹具、50 条路由与契约一致。**边界**：生产 OAuth 真实授权、真实 Gmail 账号、真实模型、Android 真机与生产部署均未执行 |
+| 2026-10-16 | `server/scripts/export_contract_samples.py` + `flutter test test/contract_samples_test.dart` | 通过 | **新增契约漂移防护**：生成器在临时空库上装配真实应用（只替换 OAuth 来源客户端），走**真实端点**采集 7 条样本（登录、`/me`、建账户、账户清单、账本汇总、导入预览、行情设置）写入 `contracts/samples.json`；Flutter 用**生产解析器**（`LyraUserProfile`/`BrokerageAccount`/`LedgerSummaryRead`/`ImportPreviewView`/`MarketSettings`）逐条解析，**9 条断言全绿**。样本缺失时明确失败而非跳过。该防护当场抓到两处真实分歧：创建类端点返回 201 而非 200；`createAccount` 正文是 `{account}` 而**不带** `{metadata,data}` 信封 |
+
+| 2026-10-17 | 服务端 `pytest -q` / `ruff check .` / `preflight_cutover.py` + `flutter analyze` / `flutter test` | 通过 | **邀请码机制（schema 17）**：新身份注册必须凭一枚单次有效、不过期、可撤销的邀请码；已有用户登录不受影响且不消耗码。服务端：新增 `invite_codes` 表（只存 SHA-256 哈希，明文仅创建时返回一次）、`InviteCodeRepository`（核销是 `WHERE status='active'` 条件更新）、`/start` 接受可选 `inviteCode`（格式非法 400、不可用 403 `INVITE_CODE_INVALID`）、`/v1/auth/providers` 新增公开能力位 `registrationRequiresInvite`、三条管理员路由（`POST/GET /v1/admin/invite-codes`、`DELETE .../{id}`）、离线入口新增 `--create-invite-code` 与 `--promote-user`（解决「注册要管理员、管理员要先注册」的死锁）。注册门禁装在 `main._authorize_user_device`（登录兑换唯一入口）：核销与建用户在同一事务，核销失败整体回滚，因此不存在「没凭码却拿到账号」的中间态。客户端：登录页按能力位显示邀请码输入框（三入口共用、trim、大小写敏感），新增两个错误码中文文案。测试 +14（门禁三态、已有身份不烧码、管理接口权限与明文只返回一次、providers 能力位）。**边界**：邀请码不可用于已有用户的「换绑身份」；撤销不返还已用码；协议仍为 3（本次为新增可选字段与响应字段，不是破坏性变更）。|
 
 ## 当前环境事项
 
@@ -396,5 +667,5 @@
 | file_selector_android 构建兼容性 | 已钉版、待上游 | 0.5.2+10 的 Kotlin DSL 构建脚本在 Flutter 3.47.2（AGP 9.1.0 / Gradle 9.3.1）下 `kotlin{}`/`android{}` 访问器无法解析,全新模板项目同样复现,与项目配置无关;`pubspec.yaml` dependency_overrides 钉回 0.5.1+9(groovy 构建,平台接口不变),上游发布修复后移除钉版 |
 | Flutter 3.47.2 模板 Gradle 标志 | 保持默认 | `android.newDsl=false` 与 `android.builtInKotlin=false` 必须同时保留:单独开启 builtInKotlin 会让 `:app` 的 Kotlin DSL 访问器失效,开启 newDsl 会让 flutter-gradle-plugin 转型 `AbstractAppExtension` 失败 |
 | Gradle 全局镜像 | 需隔离 | `/Users/Gin/.gradle/init.d/aliyun-mirror.gradle.kts` 会清空 Flutter 官方 Maven 仓库；Flutter 构建使用独立 `GRADLE_USER_HOME`，不修改用户全局配置 |
-| 服务端外部依赖 | TypeScript、Node 类型、Decimal、Fastify、Zod、DuckDB Node API、csv-parse、ExcelJS、mailparser 与官方 MCP SDK 已安装 | Pi 扩展 SDK 尚未安装；代理已恢复，可按后续功能点逐项引入并验证 |
+| 服务端外部依赖 | TypeScript、Node 类型、Decimal、Fastify、Zod、DuckDB Node API、csv-parse、ExcelJS、mailparser 与 genkit / @genkit-ai/compat-oai / google-auth-library 已安装 | MCP SDK、Claude/Pi/OpenCode CLI 相关依赖已随本次迁移移除；Pi 扩展 SDK 不再计划引入，可按后续功能点逐项评估并验证 |
 | ExcelJS 上游审计项 | 已评估、待上游修复 | uuid advisory 不命中 Lyra 的 XLSX 只读路径；保留 ExcelJS 4.4.0 精确锁定并跟踪升级，不用 `npm audit fix --force` 降级主依赖 |

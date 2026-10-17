@@ -61,17 +61,17 @@ class LedgerSummaryEntry {
   ) {
     return LedgerSummaryEntry(
       currency: currency,
-      netDeposits: json['netDeposits'] as String? ?? '0',
-      realizedPnlTotal: json['realizedPnlTotal'] as String? ?? '0',
-      realizedPnlStock: json['realizedPnlStock'] as String? ?? '0',
-      realizedPnlOption: json['realizedPnlOption'] as String? ?? '0',
-      totalFees: json['totalFees'] as String? ?? '0',
-      dividends: json['dividends'] as String? ?? '0',
-      interest: json['interest'] as String? ?? '0',
-      taxes: json['taxes'] as String? ?? '0',
-      cashBalance: json['cashBalance'] as String? ?? '0',
-      openPositions: (json['openPositions'] as num?)?.toInt() ?? 0,
-      transactionCount: (json['transactionCount'] as num?)?.toInt() ?? 0,
+      netDeposits: requiredDecimalAmount(json, 'netDeposits'),
+      realizedPnlTotal: requiredDecimalAmount(json, 'realizedPnlTotal'),
+      realizedPnlStock: requiredDecimalAmount(json, 'realizedPnlStock'),
+      realizedPnlOption: requiredDecimalAmount(json, 'realizedPnlOption'),
+      totalFees: requiredDecimalAmount(json, 'totalFees'),
+      dividends: requiredDecimalAmount(json, 'dividends'),
+      interest: requiredDecimalAmount(json, 'interest'),
+      taxes: requiredDecimalAmount(json, 'taxes'),
+      cashBalance: requiredDecimalAmount(json, 'cashBalance'),
+      openPositions: requiredCount(json, 'openPositions'),
+      transactionCount: requiredCount(json, 'transactionCount'),
     );
   }
 }
@@ -101,4 +101,35 @@ class LedgerSummaryRead {
           .toList(growable: false),
     );
   }
+}
+
+/// 服务端公开协议的定点十进制文本；金额与数量只接受此形态。
+final RegExp _decimalAmountText = RegExp(r'^-?\d+(?:\.\d+)?$');
+
+/// 判定任意值是否为十进制金额文本；图表坐标与明细字段共用同一形态约束。
+bool isDecimalAmountText(Object? value) =>
+    value is String && _decimalAmountText.hasMatch(value);
+
+/// 读取必填的十进制金额字符串。
+///
+/// 字段名 [field] 用于定位协议违例。服务端协议中这些汇总金额均为必填：
+/// 缺失或形态不符时在解析边界抛出 [FormatException]，由上层进入可重试的
+/// 错误态，绝不伪造 0 假装是真实金融读数。
+String requiredDecimalAmount(Map<String, Object?> json, String field) {
+  final value = json[field];
+  if (value is! String || !_decimalAmountText.hasMatch(value)) {
+    throw FormatException('字段 $field 必须是十进制金额字符串', value);
+  }
+  return value;
+}
+
+/// 读取必填的有限整数计数字段（仓位数、交易笔数）。
+///
+/// 非数值、非有限或带小数的计数都是协议违例；同样在解析边界失败。
+int requiredCount(Map<String, Object?> json, String field) {
+  final value = json[field];
+  if (value is! num || !value.isFinite || value != value.truncate()) {
+    throw FormatException('字段 $field 必须是整数', value);
+  }
+  return value.toInt();
 }
