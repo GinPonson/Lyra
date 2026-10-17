@@ -292,6 +292,14 @@ class SessionController extends AsyncNotifier<SessionState> {
       final deadline = login.expiresAt.isBefore(maximumDeadline)
           ? login.expiresAt
           : maximumDeadline;
+      // 轮询期间的**瞬时失败不判定登录失败**。
+      //
+      // 浏览器授权可能已经成功、服务端事务正在等待兑换（10 分钟 TTL），此时一次
+      // 网络抖动就放弃会让用户白跑一趟授权、还得多试一次。这里只容忍"再试可能
+      // 成功"的错误（网络层失败与服务端 5xx），连续失败超过预算仍然如实失败——
+      // 不能把真实故障伪装成"还在等待"。
+      const transientBudget = 5;
+      var transientFailures = 0;
       while (active()) {
         if (!DateTime.now().isBefore(deadline)) {
           throw const LyraApiError(
@@ -301,12 +309,22 @@ class SessionController extends AsyncNotifier<SessionState> {
             retryable: true,
           );
         }
-        final credentials = await repository.exchangeLogin(
-          provider: provider,
-          loginId: login.loginId,
-          codeVerifier: verifier,
-          cancelToken: cancel,
-        );
+        LoginCredentials? credentials;
+        try {
+          credentials = await repository.exchangeLogin(
+            provider: provider,
+            loginId: login.loginId,
+            codeVerifier: verifier,
+            cancelToken: cancel,
+          );
+          transientFailures = 0;
+        } on LyraApiError catch (error) {
+          if (!_isTransientPollFailure(error)) rethrow;
+          transientFailures++;
+          if (transientFailures >= transientBudget) rethrow;
+          await _waitForPoll(login.pollInterval);
+          continue;
+        }
         if (!active()) return false;
         if (credentials != null) {
           // 停用账号只能得到明确的不可重试错误；即便服务端返回 200 也不建立会话。
@@ -374,6 +392,12 @@ class SessionController extends AsyncNotifier<SessionState> {
     _loginCancel = null;
     _cancelPoll();
   }
+
+  /// 轮询期间值得再试的错误：**仅限网络层失败**（没有拿到任何响应）。
+  ///
+  /// 服务端给出的 4xx/5xx 都是明确结论，重试只会让用户多等：403 是停用或邀请码，
+  /// 409 是已兑换，410 是已过期，5xx 是服务端自己坏了——这些立刻如实报错。
+  bool _isTransientPollFailure(LyraApiError error) => error.statusCode == 0;
 
   Future<void> _waitForPoll(Duration interval) {
     final wake = _pollWake = Completer<void>();

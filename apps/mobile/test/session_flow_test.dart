@@ -270,6 +270,39 @@ void main() {
     expect(openedUrls.single.host, 'accounts.google.com');
     expect(exchangeCount, 2);
   });
+  test('轮询期间一次网络失败不会判定登录失败', () async {
+    // 浏览器授权成功后，兑换请求可能因为网络抖动失败一次。此时服务端事务仍然
+    // 有效（10 分钟 TTL），立刻报错会让用户白跑一趟授权——必须再试一次。
+    final store = MemoryCredentialStore();
+    var exchangeCount = 0;
+    final container = _sessionContainer(store, (options) async {
+      if (options.uri.path.endsWith('/start')) {
+        return _response(_startResponse(), 201);
+      }
+      exchangeCount++;
+      if (exchangeCount == 1) {
+        // 没有响应体的连接失败：客户端会转成 statusCode 0 的 LyraApiError。
+        throw DioException.connectionError(
+          requestOptions: options,
+          reason: 'network down',
+        );
+      }
+      return _response(_loginResponse, 200);
+    });
+    addTearDown(container.dispose);
+    await container.read(sessionProvider.future);
+    final controller = container.read(sessionProvider.notifier);
+
+    final ok = await controller.signInWithGoogle(
+      serverUrl: 'https://lyra.example.com',
+      displayName: 'Test',
+    );
+
+    expect(ok, isTrue);
+    expect(exchangeCount, 2, reason: '一次瞬时失败后应当继续轮询，而不是放弃');
+    expect((await store.read())?.accessToken, 'access-token-1');
+  });
+
   test('取消授权停止轮询且不保存任何凭据', () async {
     final store = MemoryCredentialStore();
     final exchanged = Completer<void>();
