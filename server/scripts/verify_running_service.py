@@ -25,10 +25,20 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from lyra.protocol import CLIENT_PROTOCOL_HEADERS  # noqa: E402
+from lyra.db.migrations import CURRENT_SCHEMA_VERSION  # noqa: E402
+from lyra.protocol import (  # noqa: E402
+    CLIENT_PROTOCOL_HEADERS,
+    LYRA_PROTOCOL_VERSION,
+)
 
-EXPECTED_PROTOCOL_VERSION = 2
-EXPECTED_SCHEMA_VERSION = 15
+#: **期望值必须与生产代码同源，不能在这里写第二份字面量。**
+#:
+#: 这两行曾是硬编码的 ``2`` 与 ``15``。协议升到 3、schema 升到 16 之后没有任何
+#: 东西提醒更新它们，结果是一个**完全正确**的部署被自检判为未通过：
+#: "schema_version=16（期望 15）/ protocol_version=3（期望 2）"，并打印
+#: 「不要继续切换」。部署当天最不该出现的信号，就是把成功报成失败。
+EXPECTED_PROTOCOL_VERSION = LYRA_PROTOCOL_VERSION
+EXPECTED_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
 
 
 #: 客户端必须随每个 ``/v1`` 请求带的协议版本头。**与生产代码同源**，
