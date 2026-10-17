@@ -97,6 +97,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         "per-user ledger ownership and login identities",
         "multi-user-schema.sql",
     ),
+    Migration(
+        17,
+        "single-use invite codes gating new registrations",
+        "invite-code-schema.sql",
+    ),
 )
 
 

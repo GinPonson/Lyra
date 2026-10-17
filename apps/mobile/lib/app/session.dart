@@ -239,6 +239,7 @@ class SessionController extends AsyncNotifier<SessionState> {
     required AuthProvider provider,
     required String serverUrl,
     required String displayName,
+    String? inviteCode,
   }) async {
     cancelSignIn();
     final generation = _loginGeneration;
@@ -272,6 +273,7 @@ class SessionController extends AsyncNotifier<SessionState> {
         displayName: displayName,
         publicKeyPem: _spkiPem(publicKey.bytes),
         codeChallenge: challenge,
+        inviteCode: inviteCode,
         cancelToken: cancel,
       );
       if (!active()) return false;

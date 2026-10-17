@@ -350,6 +350,40 @@ class UserRepository:
                 )
         return updated
 
+    def promote_to_admin(self, user_id: str, *, now: datetime) -> UserRecord:
+        """把已注册用户提升为管理员（幂等）。
+
+        **只影响用户管理与邀请码签发，不改变账本可见范围**：管理员调用账本接口时
+        仍然只能读自己的数据，因此这个操作不是"授权升级"。
+
+        幂等是刻意的：离线入口重复执行同一条命令应当得到同样的结果，而不是报错让
+        操作者以为第一次没生效。
+
+        @param user_id: 用户 UUID 文本。
+        @param now: 本次操作时间。
+        @returns 更新后的用户记录。
+        @raises ApplicationError: id 格式非法（400）或用户不存在（404）。
+        """
+        _require_uuid(user_id, "user_id")
+        with self.transaction():
+            self._connection.execute(
+                """
+                UPDATE users
+                SET role = 'admin', updated_at = greatest(updated_at, CAST(? AS TIMESTAMPTZ))
+                WHERE id = CAST(? AS UUID)
+                """,
+                [_iso(now), user_id],
+            )
+            updated = self._load_user(user_id)
+            if updated is None:
+                raise ApplicationError(
+                    code="USER_NOT_FOUND",
+                    message="用户不存在",
+                    status_code=404,
+                    retryable=False,
+                )
+        return updated
+
     def list_users(self, *, limit: int, offset: int) -> tuple[UserRecord, ...]:
         """按创建时间分页读取用户。
 

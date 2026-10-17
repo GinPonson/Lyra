@@ -23,6 +23,7 @@ import pytest
 from lyra.admin import main
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
+from lyra.db.schema_version import CURRENT_SCHEMA_VERSION
 
 # **冻结夹具**：迁移前由 TypeScript 服务端创建，schema 15、28 个对象、无数据。
 FIXTURE_DATABASE = (
@@ -160,7 +161,7 @@ def test_new_install_creates_the_first_admin(tmp_path: Path) -> None:
         database, "SELECT provider, subject FROM user_identities"
     )
     assert identities == [("google", "112233")]
-    assert _schema_version(database) == 16
+    assert _schema_version(database) == CURRENT_SCHEMA_VERSION
 
 
 def test_new_install_requires_provider_and_subject(tmp_path: Path) -> None:
@@ -437,7 +438,7 @@ def test_upgraded_database_can_be_opened_by_the_server_path(tmp_path: Path) -> N
 
     server = open_lyra_database(str(database))
     try:
-        assert server.read_health()["schemaVersion"] == 16
+        assert server.read_health()["schemaVersion"] == CURRENT_SCHEMA_VERSION
     finally:
         server.close()
 

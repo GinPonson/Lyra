@@ -20,6 +20,7 @@ from .api.gmail_routes import create_gmail_router
 from .api.health import create_health_router
 from .application.agent_availability import create_agent_availability_snapshot
 from .application.write_coordinator import WriteCoordinator
+from .infrastructure.db.invite_code_repository import InviteCodeRepository
 from .infrastructure.db.gmail_connection_repository import (
     count_gmail_connections_needing_attention,
 )
@@ -36,6 +37,7 @@ async def _authorize_user_device(
     identity: object,
     public_key_pem: str,
     display_name: str,
+    invite_code_hash: str | None,
     database: object,
     write_coordinator: object,
 ) -> object:
@@ -53,7 +55,26 @@ async def _authorize_user_device(
     """
     from .application.device_pairing_service import DevicePairingService
     from .infrastructure.db.device_repository import DuckDbDeviceRepository
+    from .infrastructure.db.invite_code_repository import (
+        InviteCodeRepository,
+        invite_required_error,
+        registration_blocked_error,
+    )
     from .infrastructure.db.user_repository import UserRepository
+
+    invites = InviteCodeRepository(database.connection)
+
+    def consume_invite(user_id: str) -> None:
+        """注册门禁：新用户必须核销一枚邀请码，否则整体回滚。
+
+        **这里断言"新用户必然带码"是刻意的**：调用方即便漏传，注册也不会被放行。
+        """
+        if invite_code_hash is None:
+            raise invite_required_error()
+        if not invites.consume(
+            code_hash=invite_code_hash, used_by=user_id, now=datetime.now(UTC)
+        ):
+            raise registration_blocked_error()
 
     service = DevicePairingService(
         DuckDbDeviceRepository(database.connection),
@@ -61,7 +82,10 @@ async def _authorize_user_device(
         UserRepository(database.connection),
     )
     issued = await service.authorize_user_device(
-        identity=identity, display_name=display_name, public_key_pem=public_key_pem
+        identity=identity,
+        display_name=display_name,
+        public_key_pem=public_key_pem,
+        on_new_user=consume_invite,
     )
     return {
         "deviceId": issued.device_id,
@@ -132,6 +156,8 @@ def create_app(settings: Settings, database: LyraDatabase) -> FastAPI:
             write_coordinator=app.state.write_coordinator,
             **kwargs,
         ),
+        # ``/start`` 的提前校验与注册时的核销共用同一个仓储。
+        InviteCodeRepository(database.connection),
     )
     # ``_providers`` 是 ``dict[provider_id, ConfiguredLoginProvider]``，因此**迭代它得到的是
     # 字符串 key**。原先写成 ``provider.id for provider in ...`` 会对字符串取 ``.id`` 抛

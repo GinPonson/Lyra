@@ -46,11 +46,11 @@ void main() {
           'available': provider != AuthProvider.linuxdo,
         },
     ];
-    final catalog = AuthProviderAvailability.parseCatalog({
-      'providers': entries,
-    });
-    expect(catalog.map((item) => item.provider), AuthProvider.values);
-    expect(catalog[1].available, isFalse);
+    final catalog = AuthProviderCatalog.parse({'providers': entries});
+    expect(catalog.providers.map((item) => item.provider), AuthProvider.values);
+    expect(catalog.providers[1].available, isFalse);
+    // 旧服务端不带该字段：按不需要邀请码处理。
+    expect(catalog.registrationRequiresInvite, isFalse);
     for (final invalid in [
       entries.take(2).toList(),
       [entries[0], entries[0], entries[2]],
@@ -61,9 +61,25 @@ void main() {
       ],
     ]) {
       expect(
-        () => AuthProviderAvailability.parseCatalog({'providers': invalid}),
+        () => AuthProviderCatalog.parse({'providers': invalid}),
         throwsFormatException,
       );
+    }
+  });
+
+  test('目录解析邀请码声明，缺失或非法值不猜测', () {
+    final entries = [
+      for (final provider in AuthProvider.values)
+        {'id': provider.id, 'name': provider.label, 'available': true},
+    ];
+    bool requiresInvite(Object? value) => AuthProviderCatalog.parse({
+      'providers': entries,
+      'registrationRequiresInvite': value,
+    }).registrationRequiresInvite;
+    expect(requiresInvite(true), isTrue);
+    expect(requiresInvite(false), isFalse);
+    for (final invalid in ['true', 1, <String, Object?>{}]) {
+      expect(() => requiresInvite(invalid), throwsFormatException);
     }
   });
 

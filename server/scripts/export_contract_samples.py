@@ -34,6 +34,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
 
+from datetime import UTC, datetime
+
 from lyra.application.device_pairing_service import DevicePairingService
 from lyra.application.login_service import UserLoginService
 from lyra.application.login_service import pkce_challenge
@@ -44,6 +46,7 @@ from lyra.infrastructure.auth.login_provider import (
     LoginIdentity,
 )
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.invite_code_repository import InviteCodeRepository
 from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import create_app
 
@@ -119,6 +122,10 @@ def _capture(test_client: TestClient) -> list[dict[str, Any]]:
     """
     cases: list[dict[str, Any]] = []
 
+    # 新身份注册必须凭邀请码：样本也要按客户端的真实流程拿一枚。
+    _, invite_code = InviteCodeRepository(
+        test_client.app.state.database.connection
+    ).create(created_by=None, label="契约样本", now=datetime.now(UTC))
     started = test_client.post(
         "/v1/auth/github/start",
         json={
@@ -126,6 +133,7 @@ def _capture(test_client: TestClient) -> list[dict[str, Any]]:
             "publicKeyPem": PUBLIC_KEY_PEM,
             "codeChallenge": _CHALLENGE,
             "codeChallengeMethod": "S256",
+            "inviteCode": invite_code,
         },
     )
     assert started.status_code == 200, started.text
@@ -221,31 +229,17 @@ def build() -> dict[str, Any]:
             )
             application = create_app(settings, database)
             connection = database.connection
-            pairing = DevicePairingService(
-                DuckDbDeviceRepository(connection),
-                application.state.write_coordinator,
-                UserRepository(connection),
-            )
+            # 注册门禁（邀请码）装在生产的签发函数里；样本生成必须走同一条路径，
+            # 否则"样本产得出来"并不能说明客户端面对的真实契约。
+            from lyra.main import _authorize_user_device
 
-            async def authorize(
-                *, identity: LoginIdentity, public_key_pem: str, display_name: str
-            ) -> dict[str, Any]:
-                """兑换成功后的用户解析与设备签发（与 ``main.py`` 同形）。"""
-                issued = await pairing.authorize_user_device(
-                    identity=identity,
-                    public_key_pem=public_key_pem,
-                    display_name=display_name,
+            async def authorize(**kwargs: Any) -> dict[str, Any]:
+                """兑换成功后的用户解析与设备签发（直接复用生产装配）。"""
+                return await _authorize_user_device(
+                    database=database,
+                    write_coordinator=application.state.write_coordinator,
+                    **kwargs,
                 )
-                return {
-                    "deviceId": issued.device_id,
-                    "displayName": issued.display_name,
-                    "accessToken": issued.access_token,
-                    "accessTokenExpiresAt": issued.access_token_expires_at,
-                    "refreshToken": issued.refresh_token,
-                    "refreshTokenExpiresAt": issued.refresh_token_expires_at,
-                    "user": issued.user,
-                    "identity": issued.identity,
-                }
 
             application.state.login_service = UserLoginService(
                 [
@@ -256,6 +250,7 @@ def build() -> dict[str, Any]:
                     )
                 ],
                 authorize,
+                InviteCodeRepository(connection),
             )
             with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
                 cases = _capture(client)

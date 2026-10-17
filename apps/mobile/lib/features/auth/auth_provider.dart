@@ -40,12 +40,28 @@ class AuthProviderAvailability {
 
   final AuthProvider provider;
   final bool available;
+}
 
-  static List<AuthProviderAvailability> parseCatalog(
-    Map<String, Object?> json,
-  ) {
+/// 登录方式目录；`registrationRequiresInvite` 决定登录页是否展示邀请码输入框。
+class AuthProviderCatalog {
+  const AuthProviderCatalog({
+    required this.providers,
+    required this.registrationRequiresInvite,
+  });
+
+  final List<AuthProviderAvailability> providers;
+
+  /// 旧服务端不带该字段：缺省按不需要邀请码处理，否则旧版本会无法注册。
+  final bool registrationRequiresInvite;
+
+  factory AuthProviderCatalog.parse(Map<String, Object?> json) {
     final entries = json['providers'];
     if (entries is! List || entries.length != AuthProvider.values.length) {
+      throw const FormatException('登录方式响应格式无效');
+    }
+    final requiresInvite = json['registrationRequiresInvite'];
+    // 字段存在但类型不对时按契约失败，不猜测其含义。
+    if (requiresInvite != null && requiresInvite is! bool) {
       throw const FormatException('登录方式响应格式无效');
     }
     final result = <AuthProvider, AuthProviderAvailability>{};
@@ -65,8 +81,11 @@ class AuthProviderAvailability {
         available: entry['available'] as bool,
       );
     }
-    return List.unmodifiable(
-      AuthProvider.values.map((provider) => result[provider]!),
+    return AuthProviderCatalog(
+      providers: List.unmodifiable(
+        AuthProvider.values.map((provider) => result[provider]!),
+      ),
+      registrationRequiresInvite: requiresInvite == true,
     );
   }
 }

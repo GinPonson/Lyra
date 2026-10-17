@@ -444,7 +444,7 @@ def _seed_schema15(path: Path) -> None:
 def test_schema_version_is_sixteen(schema16: duckdb.DuckDBPyConnection) -> None:
     """全新库必须停在 schema 16，且没有留下任何重建残留。"""
     row = schema16.execute("SELECT max(version) FROM schema_migrations").fetchone()
-    assert row is not None and int(row[0]) == CURRENT_SCHEMA_VERSION == 16
+    assert row is not None and int(row[0]) == CURRENT_SCHEMA_VERSION == 17
     leftovers = {
         str(row[0])
         for row in schema16.execute(
@@ -897,7 +897,7 @@ def test_empty_database_needs_no_context(tmp_path: Path) -> None:
     """全新空库不需要上下文即可迁移：这是删掉默认 owner 之后的正常冷启动。"""
     database = open_lyra_database(str(tmp_path / "empty.duckdb"))
     try:
-        assert database.read_health()["schemaVersion"] == 16
+        assert database.read_health()["schemaVersion"] == CURRENT_SCHEMA_VERSION
         assert _count(database.connection, "users") == 0
     finally:
         database.close()

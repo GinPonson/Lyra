@@ -3,11 +3,19 @@
   "pairs": [
     {
       "method": "DELETE",
+      "path": "/v1/admin/invite-codes/{}"
+    },
+    {
+      "method": "DELETE",
       "path": "/v1/agent/sessions/{}"
     },
     {
       "method": "DELETE",
       "path": "/v1/google/connections/{}"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/admin/invite-codes"
     },
     {
       "method": "GET",
@@ -136,6 +144,10 @@
     {
       "method": "PATCH",
       "path": "/v1/admin/users/{}"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/admin/invite-codes"
     },
     {
       "method": "POST",

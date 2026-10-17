@@ -8,6 +8,8 @@ String lyraErrorMessage(Object? error, {String fallback = '暂时无法完成操
     'CLIENT_VERSION_INCOMPATIBLE' => '请更新 Lyra 后重试。',
     'AUTH_REQUIRED' => '请先登录 Lyra。',
     'AUTH_SESSION_CHANGED' => '登录状态已变化，请重新打开当前页面。',
+    'INVITE_CODE_REQUIRED' => '首次使用需要邀请码，请填写后重试。',
+    'INVITE_CODE_INVALID' => '邀请码无效或已被使用，请确认后重试。',
     'DEVICE_CREDENTIAL_INVALID' ||
     'DEVICE_CREDENTIAL_EXPIRED' ||
     'DEVICE_CREDENTIAL_REUSED' ||

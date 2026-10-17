@@ -9,14 +9,14 @@
       "status": 200,
       "body": {
         "status": "complete",
-        "deviceId": "066bf3a3-992d-4799-943c-d937cdb4bcdf",
+        "deviceId": "493019ec-6171-4894-be03-74528334ca4e",
         "displayName": "样例设备",
-        "accessToken": "miZJs6Ba4u5e5YA7HPhobUInjO-pvIPXTuVQvEe8Xbc",
-        "accessTokenExpiresAt": "2026-10-16T10:35:19.254Z",
-        "refreshToken": "8ST4U49Fsz1C-GV8MMhszNv5KfCb2DgJbcRwyithCVQ",
-        "refreshTokenExpiresAt": "2026-11-15T10:20:19.254Z",
+        "accessToken": "PGVK6O42YA7U08Ie8L8eK0wmwLu0gSKK-v4eMxSVo_I",
+        "accessTokenExpiresAt": "2026-10-17T02:39:55.959Z",
+        "refreshToken": "qHXGZjw2OulLmO291qdC2kKGncDep3bTNNGmnNBCsyA",
+        "refreshTokenExpiresAt": "2026-11-16T02:24:55.959Z",
         "user": {
-          "userId": "cb89cb83-9180-4724-8026-50e5ed38a071",
+          "userId": "6844993d-f78f-4023-9a3a-e4da72b4c3aa",
           "displayName": "样例用户",
           "status": "active",
           "role": "member",
@@ -35,7 +35,7 @@
       "status": 200,
       "body": {
         "user": {
-          "userId": "cb89cb83-9180-4724-8026-50e5ed38a071",
+          "userId": "6844993d-f78f-4023-9a3a-e4da72b4c3aa",
           "displayName": "样例用户",
           "status": "active",
           "role": "member",
@@ -54,13 +54,13 @@
       "status": 201,
       "body": {
         "account": {
-          "id": "1da9dcb8-8c25-4b8d-8838-36e7bfca436a",
+          "id": "35660a0c-4347-42e4-af31-2605fd3bb161",
           "displayName": "样例账户",
           "broker": "schwab",
           "maskedSuffix": "001",
           "baseCurrency": "USD",
           "status": "active",
-          "createdAt": "2026-10-16T10:20:19.389Z"
+          "createdAt": "2026-10-17T02:24:55.977Z"
         }
       }
     },
@@ -75,31 +75,31 @@
             "kind": "all"
           },
           "accountIds": [
-            "1da9dcb8-8c25-4b8d-8838-36e7bfca436a"
+            "35660a0c-4347-42e4-af31-2605fd3bb161"
           ],
           "currencyGroups": [
             {
               "currency": "USD",
               "accountIds": [
-                "1da9dcb8-8c25-4b8d-8838-36e7bfca436a"
+                "35660a0c-4347-42e4-af31-2605fd3bb161"
               ]
             }
           ],
           "aggregateCurrency": "USD",
           "ledgerVersion": 0,
-          "asOf": "2026-10-16T10:20:19.416Z",
-          "fetchedAt": "2026-10-16T10:20:19.416Z"
+          "asOf": "2026-10-17T02:24:55.985Z",
+          "fetchedAt": "2026-10-17T02:24:55.985Z"
         },
         "data": {
           "rows": [
             {
-              "id": "1da9dcb8-8c25-4b8d-8838-36e7bfca436a",
+              "id": "35660a0c-4347-42e4-af31-2605fd3bb161",
               "displayName": "样例账户",
               "broker": "schwab",
               "maskedSuffix": "001",
               "baseCurrency": "USD",
               "status": "active",
-              "createdAt": "2026-10-16T10:20:19.389Z"
+              "createdAt": "2026-10-17T02:24:55.977Z"
             }
           ],
           "count": 1
@@ -117,20 +117,20 @@
             "kind": "all"
           },
           "accountIds": [
-            "1da9dcb8-8c25-4b8d-8838-36e7bfca436a"
+            "35660a0c-4347-42e4-af31-2605fd3bb161"
           ],
           "currencyGroups": [
             {
               "currency": "USD",
               "accountIds": [
-                "1da9dcb8-8c25-4b8d-8838-36e7bfca436a"
+                "35660a0c-4347-42e4-af31-2605fd3bb161"
               ]
             }
           ],
           "aggregateCurrency": "USD",
           "ledgerVersion": 0,
-          "asOf": "2026-10-16T10:20:19.432Z",
-          "fetchedAt": "2026-10-16T10:20:19.432Z"
+          "asOf": "2026-10-17T02:24:55.991Z",
+          "fetchedAt": "2026-10-17T02:24:55.991Z"
         },
         "data": {
           "aggregateCurrency": "USD",
@@ -138,7 +138,7 @@
             {
               "currency": "USD",
               "accountIds": [
-                "1da9dcb8-8c25-4b8d-8838-36e7bfca436a"
+                "35660a0c-4347-42e4-af31-2605fd3bb161"
               ],
               "data": {
                 "netDeposits": "0.0000",
@@ -165,11 +165,11 @@
       "path": "/v1/imports/preview?accountId=<上传的 CSV>",
       "status": 201,
       "body": {
-        "importId": "f786f100-e8ec-4ca9-ac41-f256f919bbb3",
-        "confirmToken": "VLQwU7sg25BFYyFJVgA2rejzlt4jWt_g-7TcTmBgsL0",
+        "importId": "83bf997b-665f-4edf-b851-b74bbf24f33e",
+        "confirmToken": "dz5zvfjr3F0vyLmJ7ILd_8LDwMX1kJSjeWDqvyMBmf8",
         "preview": {
           "fileName": "Individual_TST001_Transactions_20260105.csv",
-          "accountId": "1da9dcb8-8c25-4b8d-8838-36e7bfca436a",
+          "accountId": "35660a0c-4347-42e4-af31-2605fd3bb161",
           "baseLedgerVersion": 0,
           "totalRows": 1,
           "insertableRows": 1,

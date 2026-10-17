@@ -58,6 +58,7 @@ class LoginFixture extends LedgerFixture {
   String? loginError;
   int loginErrorStatus = 403;
   int? catalogStatus;
+  bool registrationRequiresInvite = false;
   AuthProvider? exchangedProvider;
   String? authorizationUrlOverride;
   Completer<ResponseBody>? catalogGate;
@@ -189,6 +190,7 @@ class LoginFixture extends LedgerFixture {
           'available': available.contains(provider),
         },
     ],
+    'registrationRequiresInvite': registrationRequiresInvite,
   };
 
   static ResponseBody json(Object data, [int status = 200]) =>

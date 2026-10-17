@@ -32,6 +32,11 @@ from ..infrastructure.auth.login_provider import (
     ConfiguredLoginProvider,
     LoginIdentity,
 )
+from ..infrastructure.db.invite_code_repository import (
+    InviteCodeRepository,
+    hash_invite_code,
+    registration_blocked_error,
+)
 from ..security.device_auth import normalize_device_public_key
 from .app_error import ApplicationError
 
@@ -45,16 +50,23 @@ MAX_STARTS_PER_SOURCE_WINDOW = 20
 
 _CODE_CHALLENGE = re.compile(r"^[A-Za-z\d_-]{43}$")
 _CODE_VERIFIER = re.compile(r"^[A-Za-z\d._~-]{43,128}$")
+# 邀请码是 base64url 文本；长度留出余量，签发端当前是 32 字符。格式不符直接 400，
+# 而不是拿去查库——否则每个畸形输入都会打一次数据库。
+_INVITE_CODE = re.compile(r"^[A-Za-z\d_-]{16,128}$")
 
 
 @dataclass(frozen=True)
 class LoginStartInput:
-    """发起登录所需的 App 侧参数。"""
+    """发起登录所需的 App 侧参数。
+
+    ``invite_code`` 是**新身份注册**的凭据；已有身份登录时它被忽略且不会被消耗。
+    """
 
     display_name: str
     public_key_pem: str
     code_challenge: str
     code_challenge_method: str
+    invite_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +91,8 @@ class LoginAttempt:
     app_code_challenge: str
     public_key_pem: str
     display_name: str
+    #: 邀请码明文的哈希；``None`` 表示本次登录未提供。明文不出现在事务状态里。
+    invite_code_hash: str | None
     expires_at: float
     terminated_at: float | None = None
     status: str = "pending"
@@ -93,24 +107,34 @@ class UserLoginService:
         self,
         providers: Sequence[ConfiguredLoginProvider],
         device_authorizer: Callable[..., Mapping[str, Any]],
+        invites: InviteCodeRepository,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        """@param providers: 已装配的来源。@param device_authorizer: 签发设备凭据的用例。"""
+        """@param providers: 已装配的来源。@param device_authorizer: 签发设备凭据的用例。
+        @param invites: 邀请码仓储；``/start`` 用它提前校验，注册时由签发用例核销。
+        """
         self._providers: dict[str, ConfiguredLoginProvider] = {}
         for provider in providers:
             if provider.id not in LOGIN_PROVIDER_IDS or provider.id in self._providers:
                 raise ValueError("登录提供方重复或无效")
             self._providers[provider.id] = provider
         self._devices = device_authorizer
+        self._invites = invites
         self._now = now
         self._attempts: dict[str, LoginAttempt] = {}
         self._states: dict[str, str] = {}
         # 三种登录共享来源限流与容量，切换来源不能绕过预算。
         self._source_starts: dict[str, list[float]] = {}
 
-    def catalog(self) -> dict[str, list[dict[str, Any]]]:
-        """返回公开的登录来源目录（只含名称与可用性）。"""
+    def catalog(self) -> dict[str, Any]:
+        """返回公开的登录来源目录（只含名称与可用性）。
+
+        ``registrationRequiresInvite`` 让客户端知道**要不要显示邀请码输入框**。
+        它是公开信息：邀请码的存在本身不是秘密，码的值才是。
+        """
         return {
+            # 新身份注册一律需要邀请码（见 :meth:`UserLoginService.start` 的校验）。
+            "registrationRequiresInvite": True,
             "providers": [
                 {
                     "id": provider_id,
@@ -147,6 +171,10 @@ class UserLoginService:
             or not _CODE_CHALLENGE.fullmatch(start_input.code_challenge)
             or not 1 <= len(start_input.display_name.strip()) <= 64
             or len(start_input.public_key_pem) > 4096
+            or (
+                start_input.invite_code is not None
+                and not _INVITE_CODE.fullmatch(start_input.invite_code)
+            )
         ):
             raise ApplicationError(
                 code="INVALID_ARGUMENT", message="登录参数无效", status_code=400, retryable=False
@@ -161,6 +189,14 @@ class UserLoginService:
                 status_code=400,
                 retryable=False,
             ) from error
+
+        # **提前校验但不核销**：让用户在跳浏览器之前就知道码不对，避免"走完 OAuth
+        # 才发现白跑一趟"。真正的核销发生在注册那一刻（且必须是原子的条件更新）。
+        invite_code_hash: str | None = None
+        if start_input.invite_code is not None:
+            invite_code_hash = hash_invite_code(start_input.invite_code)
+            if not self._invites.is_active(invite_code_hash):
+                raise registration_blocked_error()
 
         self._prune_expired()
         self._assert_source_budget(source_key)
@@ -185,6 +221,7 @@ class UserLoginService:
             app_code_challenge=start_input.code_challenge,
             public_key_pem=public_key_pem,
             display_name=start_input.display_name.strip(),
+            invite_code_hash=invite_code_hash,
             expires_at=now + LOGIN_TTL_MILLISECONDS,
         )
         authorization_url = provider.client.authorization_url(
@@ -309,6 +346,7 @@ class UserLoginService:
                 identity=identity,
                 public_key_pem=attempt.public_key_pem,
                 display_name=attempt.display_name,
+                invite_code_hash=attempt.invite_code_hash,
             )
             attempt.status = "consumed"
             attempt.terminated_at = self._now_ms()

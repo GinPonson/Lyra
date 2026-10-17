@@ -728,6 +728,112 @@ void main() {
     await tapLogin(tester, find.byKey(const ValueKey('login-github')));
     expect(find.byType(LoginScreen), findsNothing);
   });
+
+  testWidgets('服务端未声明或声明不需要邀请码时不展示输入框', (tester) async {
+    final fixture = LoginFixture()..catalogGate = Completer<ResponseBody>();
+    await pumpLogin(tester, fixture);
+    // 旧服务端响应没有该字段：按不需要邀请码处理。
+    fixture.catalogGate!.complete(
+      LoginFixture.json({
+        'providers': [
+          for (final provider in AuthProvider.values)
+            {'id': provider.id, 'name': provider.label, 'available': true},
+        ],
+      }),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('login-invite-code')), findsNothing);
+    // 新服务端显式声明 false：同样不展示。
+    final explicit = LoginFixture();
+    await pumpLogin(tester, explicit);
+    expect(find.byKey(const ValueKey('login-invite-code')), findsNothing);
+    expect(find.byType(TextField), findsNothing);
+  });
+
+  for (final scenario in [
+    (size: const Size(320, 740), scale: 1.6),
+    (size: const Size(390, 844), scale: 1.0),
+  ]) {
+    testWidgets(
+      '服务端要求邀请码时 ${scenario.size.width} / ${scenario.scale} 展示输入框且无溢出',
+      (tester) async {
+        final fixture = LoginFixture()..registrationRequiresInvite = true;
+        await pumpLogin(
+          tester,
+          fixture,
+          size: scenario.size,
+          scale: scenario.scale,
+        );
+        final field = find.byKey(const ValueKey('login-invite-code'));
+        expect(field, findsOneWidget);
+        final decoration = tester.widget<TextField>(field).decoration;
+        expect(decoration?.labelText, '邀请码');
+        expect(decoration?.hintText, '首次注册需要邀请码');
+        expect(find.text('邀请码'), findsOneWidget);
+        // 输入框位于三个登录入口上方。
+        expect(
+          tester.getTopLeft(field).dy,
+          lessThan(
+            tester.getTopLeft(find.byKey(const ValueKey('login-google'))).dy,
+          ),
+        );
+        for (final provider in AuthProvider.values) {
+          final button = find.byKey(ValueKey('login-${provider.id}'));
+          await tester.ensureVisible(button);
+          expect(tester.widget<OutlinedButton>(button).onPressed, isNotNull);
+        }
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets('填写邀请码时三种入口的 /start 请求都携带去空格后的邀请码', (tester) async {
+    for (final provider in AuthProvider.values) {
+      final fixture = LoginFixture()..registrationRequiresInvite = true;
+      await pumpLogin(tester, fixture);
+      await tester.enterText(
+        find.byKey(const ValueKey('login-invite-code')),
+        '  INVITE-CODE-${provider.id}  ',
+      );
+      await tapLogin(tester, find.byKey(ValueKey('login-${provider.id}')));
+      final start = fixture.requests.singleWhere(
+        (request) => request.uri.path == '/v1/auth/${provider.id}/start',
+      );
+      expect((start.data as Map)['inviteCode'], 'INVITE-CODE-${provider.id}');
+    }
+  });
+
+  testWidgets('未填写邀请码时 /start 请求不带该键', (tester) async {
+    final fixture = LoginFixture()..registrationRequiresInvite = true;
+    await pumpLogin(tester, fixture);
+    await tapLogin(tester, find.byKey(const ValueKey('login-google')));
+    final start = fixture.requests.singleWhere(
+      (request) => request.uri.path == '/v1/auth/google/start',
+    );
+    expect((start.data as Map).containsKey('inviteCode'), isFalse);
+  });
+
+  for (final scenario in [
+    (code: 'INVITE_CODE_REQUIRED', message: '首次使用需要邀请码，请填写后重试。'),
+    (code: 'INVITE_CODE_INVALID', message: '邀请码无效或已被使用，请确认后重试。'),
+  ]) {
+    testWidgets('${scenario.code} 显示邀请码专属文案，不透传后台原始消息', (tester) async {
+      final fixture = LoginFixture()
+        ..registrationRequiresInvite = true
+        ..loginError = scenario.code
+        ..loginErrorStatus = 403;
+      await pumpLogin(tester, fixture);
+      await tester.enterText(
+        find.byKey(const ValueKey('login-invite-code')),
+        'used-or-unknown',
+      );
+      await tapLogin(tester, find.byKey(const ValueKey('login-google')));
+      expect(find.text(scenario.message), findsOneWidget);
+      expect(find.textContaining('此账号尚未获准访问这个服务端。'), findsNothing);
+      expect(find.byType(LoginScreen), findsOneWidget);
+      expect(await fixture.store.read(), isNull);
+    });
+  }
 }
 
 class _DelayedPreferencesStore extends MemoryAppPreferencesStore {

@@ -36,6 +36,7 @@ from lyra.infrastructure.auth.login_provider import (
     LoginIdentity,
 )
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
+from lyra.infrastructure.db.invite_code_repository import InviteCodeRepository
 from lyra.infrastructure.db.user_repository import (
     UserIdentityRecord,
     UserRecord,
@@ -585,6 +586,7 @@ def configured_client(client):
             )
         ],
         lambda **kwargs: None,
+        InviteCodeRepository(test_client.app.state.database.connection),
     )
     return test_client, issued
 
@@ -843,28 +845,22 @@ def _wired_login_client(test_client: Any, identity: LoginIdentity, provider: str
 
     只把来源客户端换成脚本替身，因此自动注册、设备归属与凭据签发走的都是生产代码。
     """
-    connection = test_client.app.state.database.connection
-    pairing = DevicePairingService(
-        DuckDbDeviceRepository(connection),
-        test_client.app.state.write_coordinator,
-        UserRepository(connection),
-    )
+    application = test_client.app
 
-    async def authorize(*, identity: LoginIdentity, public_key_pem: str, display_name: str):
-        """兑换成功后的用户解析与设备签发。"""
-        issued = await pairing.authorize_user_device(
-            identity=identity, public_key_pem=public_key_pem, display_name=display_name
+    async def authorize(**kwargs: Any):
+        """兑换成功后的用户解析与设备签发。
+
+        **直接复用生产装配的那个函数**（``main._authorize_user_device``）：邀请码门禁
+        就装在里面。测试若自己拼一份等价实现，就会在"门禁忘了注入"时不报警——而
+        那正是这类安全边界最典型的失效方式。
+        """
+        from lyra.main import _authorize_user_device
+
+        return await _authorize_user_device(
+            database=application.state.database,
+            write_coordinator=application.state.write_coordinator,
+            **kwargs,
         )
-        return {
-            "deviceId": issued.device_id,
-            "displayName": issued.display_name,
-            "accessToken": issued.access_token,
-            "accessTokenExpiresAt": issued.access_token_expires_at,
-            "refreshToken": issued.refresh_token,
-            "refreshTokenExpiresAt": issued.refresh_token_expires_at,
-            "user": issued.user,
-            "identity": issued.identity,
-        }
 
     test_client.app.state.login_service = UserLoginService(
         [
@@ -875,21 +871,40 @@ def _wired_login_client(test_client: Any, identity: LoginIdentity, provider: str
             )
         ],
         authorize,
+        InviteCodeRepository(test_client.app.state.database.connection),
     )
     return test_client
 
 
-def _start_login(test_client: Any, provider: str = "github", pem: str = PUBLIC_KEY_PEM) -> dict:
+def _mint_invite(test_client: Any, *, label: str | None = None) -> str:
+    """铸造一枚邀请码并返回明文（测试用）。
+
+    **新身份注册必须凭码**，所以凡是"走完整登录流程注册一个新用户"的测试都得先拿
+    一枚；这也顺带保证测试走的是与生产相同的门禁路径。
+    """
+    invite, code = InviteCodeRepository(
+        test_client.app.state.database.connection
+    ).create(created_by=None, label=label, now=datetime.now(UTC))
+    assert invite.status == "active"
+    return code
+
+
+def _start_login(
+    test_client: Any,
+    provider: str = "github",
+    pem: str = PUBLIC_KEY_PEM,
+    invite_code: str | None = None,
+) -> dict:
     """发起一次登录并返回 start 响应正文。"""
-    response = test_client.post(
-        f"/v1/auth/{provider}/start",
-        json={
-            "displayName": "Pixel 9",
-            "publicKeyPem": pem,
-            "codeChallenge": _CHALLENGE,
-            "codeChallengeMethod": "S256",
-        },
-    )
+    body: dict[str, Any] = {
+        "displayName": "Pixel 9",
+        "publicKeyPem": pem,
+        "codeChallenge": _CHALLENGE,
+        "codeChallengeMethod": "S256",
+    }
+    if invite_code is not None:
+        body["inviteCode"] = invite_code
+    response = test_client.post(f"/v1/auth/{provider}/start", json=body)
     # 处理器返回显式构造的 ``JSONResponse``，它的默认状态码是 200——装饰器上的
     # ``status_code=201`` 只在返回普通 dict 时生效。这里固定**实际**行为。
     assert response.status_code == 200, response.text
@@ -942,7 +957,8 @@ def test_a_new_identity_registers_as_a_member_with_an_empty_ledger(
     _wired_login_client(test_client, identity, provider)
     connection = test_client.app.state.database.connection
 
-    started = _start_login(test_client, provider)
+    invite = _mint_invite(test_client, label="注册测试")
+    started = _start_login(test_client, provider, invite_code=invite)
     _complete_callback(test_client, started, provider)
     response = _exchange(test_client, started, provider)
 
@@ -982,9 +998,17 @@ def test_the_same_identity_logs_in_as_the_same_user(fresh_client) -> None:
     assert _count(connection, "user_identities") == 1
 
 
-def _after_callback(test_client: Any, provider: str = "github") -> dict:
-    """发起登录并完成回调，返回 start 响应正文。"""
-    started = _start_login(test_client, provider)
+def _after_callback(
+    test_client: Any, provider: str = "github", invite_code: str | None = None
+) -> dict:
+    """发起登录并完成回调，返回 start 响应正文。
+
+    默认**自动铸造一枚邀请码**：本文件多数用例只关心"登录流程是否走得通"，注册门禁
+    本身由专门用例覆盖。已有身份的登录不会消耗它（服务端只在新建用户时核销）。
+    """
+    if invite_code is None:
+        invite_code = _mint_invite(test_client)
+    started = _start_login(test_client, provider, invite_code=invite_code or None)
     _complete_callback(test_client, started, provider)
     return started
 

@@ -44,6 +44,8 @@ String _loginFailureMessage(LyraApiError error) => switch (error.code) {
   'LOGIN_EXPIRED' => '登录已超时，请重新开始。',
   'LOGIN_STATE_INVALID' || 'LOGIN_ALREADY_REDEEMED' => '此次登录已失效，请重新开始。',
   'AUTH_FORBIDDEN' => '此账号暂时无法登录 Lyra，请换一个账号。',
+  'INVITE_CODE_REQUIRED' => '首次使用需要邀请码，请填写后重试。',
+  'INVITE_CODE_INVALID' => '邀请码无效或已被使用，请确认后重试。',
   'LOGIN_DENIED' => '未能完成授权，请重试或换一个账号。',
   'AUTH_NOT_CONFIGURED' => '此登录方式暂不可用，请选择其他方式。',
   'LOGIN_RATE_LIMITED' => '尝试次数较多，请稍后重试。',
@@ -103,6 +105,8 @@ class LoginPanel extends ConsumerStatefulWidget {
 class _LoginPanelState extends ConsumerState<LoginPanel> {
   Object? _currentOwner;
   late final _LoginPanelOwner _loginOwner;
+  /// 邀请码由三种入口共用；输入框只在服务端声明需要邀请码时展示。
+  final _inviteCodeController = TextEditingController();
   bool _submitting = false;
   bool _clearingLogin = false;
   int _attempt = 0;
@@ -125,6 +129,7 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
   void dispose() {
     _attempt++;
     _availabilityRetry?.cancel();
+    _inviteCodeController.dispose();
     final owner = _currentOwner;
     if (_submitting && owner != null) _loginOwner.cancel(owner);
     super.dispose();
@@ -147,9 +152,15 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     if (url == null) return;
     final catalog = ref.read(authProvidersProvider(url)).asData?.value;
     if (catalog == null ||
-        !catalog.any((item) => item.provider == provider && item.available)) {
+        !catalog.providers.any(
+          (item) => item.provider == provider && item.available,
+        )) {
       return;
     }
+    // 只在服务端要求时携带邀请码；未填写就不发该键，由服务端给出所需错误。
+    final inviteCode = catalog.registrationRequiresInvite
+        ? _inviteCodeController.text.trim()
+        : '';
     final controller = ref.read(sessionProvider.notifier);
     final originalClient = controller.client;
     final attempt = ++_attempt;
@@ -175,6 +186,7 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
         provider: provider,
         serverUrl: url,
         displayName: 'Lyra Mobile',
+        inviteCode: inviteCode.isEmpty ? null : inviteCode,
       );
     } on LyraApiError catch (error) {
       if (!_active(attempt, owner)) return;
@@ -273,7 +285,10 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     final catalog = url == null || authenticated != null
         ? null
         : ref.watch(authProvidersProvider(url));
-    final entries = catalog?.asData?.value;
+    final catalogData = catalog?.asData?.value;
+    final entries = catalogData?.providers;
+    final registrationRequiresInvite =
+        catalogData?.registrationRequiresInvite ?? false;
     final preparing =
         state.isLoading ||
         (url == null && preferences.isLoading) ||
@@ -328,6 +343,24 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
             child: const Text('退出登录'),
           ),
         ] else ...[
+          // 邀请码是大小写敏感的 base64url：关掉自动大写、纠错与联想，
+          // 避免手机键盘把用户粘贴的码改坏。
+          if (registrationRequiresInvite) ...[
+            TextField(
+              key: const ValueKey('login-invite-code'),
+              controller: _inviteCodeController,
+              enabled: !busy && !requiresLogoutRetry,
+              keyboardType: TextInputType.visiblePassword,
+              textCapitalization: TextCapitalization.none,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(
+                labelText: '邀请码',
+                hintText: '首次注册需要邀请码',
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           for (final provider in AuthProvider.values) ...[
             _ProviderSignInButton(
               provider: provider,

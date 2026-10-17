@@ -22,6 +22,9 @@ void main() {
     for (final scenario in [
       ('CLIENT_VERSION_INCOMPATIBLE', 426, '请更新 Lyra 后重试。'),
       ('DEVICE_CREDENTIAL_EXPIRED', 401, '登录已失效，请重新登录。'),
+      // 邀请码错误必须落在专属文案上，而不是 403 的通用兜底。
+      ('INVITE_CODE_REQUIRED', 403, '首次使用需要邀请码，请填写后重试。'),
+      ('INVITE_CODE_INVALID', 403, '邀请码无效或已被使用，请确认后重试。'),
       ('UNKNOWN_THROTTLE', 429, '操作较频繁，请稍后重试。'),
     ]) {
       expect(

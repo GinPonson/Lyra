@@ -120,23 +120,39 @@ UV_CACHE_DIR=../.uv-tmp/cache UV_PYTHON_INSTALL_DIR=../.uv-tmp/python \
 
 健康检查接受账本可用的 `degraded` 状态；可选 AI 未配置不应阻止账本服务启动。Genkit 的本地 `available` 仅表示配置完整，不能据此判断模型额度、API key、工具调用或任何登录来源的真实授权已经验证。
 
-### 新安装：显式创建首个管理员
+### 新安装：签发邀请码 → 注册 → 提升管理员
 
-多用户账本**没有**「第一位访问者自动成为管理员」这条路径，也不会因为你配了某个来源就把它当管理员。首个管理员必须由离线入口**显式指定** `(provider, subject)`：
+**新身份注册一律需要邀请码**（单次有效、不过期、可撤销）。因此新部署的第一步是离线
+签发一枚码；这也避免了「注册要管理员、管理员要先注册」的死锁。
 
 ```bash
+# 1) 签发第一枚邀请码（明文只打印这一次）
 ./deploy/compose.sh exec lyra \
   python -m lyra.admin --database /var/lib/lyra/lyra.duckdb \
-  --provider google --subject '<你的不可变 Google subject>' \
-  --display-name '<显示名>'
+  --create-invite-code --invite-label 'owner'
+
+# 2) 在 App 登录页填入它，用你的 Google 账号完成首次注册（角色 member）
+
+# 3) 用 /v1/me 或 App「我的」页读出你的 userId，再提升为管理员
+./deploy/compose.sh exec lyra \
+  python -m lyra.admin --database /var/lib/lyra/lyra.duckdb \
+  --promote-user '<userId>'
+
+# 之后用管理员设备签发更多码（明文只返回一次）
+curl -s -X POST https://<域名>/v1/admin/invite-codes \
+  -H "Authorization: Bearer <管理员 accessToken>" \
+  -H "x-lyra-protocol-version: 3" \
+  -H 'content-type: application/json' -d '{"label":"给谁"}'
 ```
 
-- 该身份由第三方 OAuth 在**首次登录时**验证，入口只负责登记，不验证它真的属于你。
-- **不要**用邮箱或用户名充当 subject：身份键始终是已验证的 `(provider, subject)`。
-- 入口不打印任何 token，也不读取「首个请求」当凭据。
-- 重复执行会明确失败并报出既有 userId，不会静默改绑。
+- 邀请码**只存哈希**，创建响应是唯一一次能拿到明文的地方；丢了只能重签。
+- `--create-invite-code` 不需要管理员已存在（`created_by` 记为空，表示来自服务器终端）。
+- 管理接口：`POST/GET /v1/admin/invite-codes`、`DELETE /v1/admin/invite-codes/{id}`（仅 admin）。
+- 撤销只对未使用的码生效；已用与已撤销对客户端返回**同一个** `INVITE_CODE_INVALID`，
+  避免靠错误码枚举别人的码状态。
 
-除管理员以外的身份首次 OAuth 登录时**自动注册为普通用户**并获得自己的空账本，无需审批。管理员调用账本接口时也只能访问自己的数据——角色只影响用户管理功能。
+**已有用户登录不受影响**：邀请码只在新建用户时核销，老用户既不需要它、也不会消耗它。
+管理员调用账本接口时同样只能访问自己的数据——角色只影响用户管理与邀请码签发。
 
 ### 已有 Nginx、Caddy 或其他 HTTPS 入口
 

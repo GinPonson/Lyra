@@ -16,4 +16,4 @@
 from __future__ import annotations
 
 # 当前服务端代码能够迁移并读取的最新 DuckDB schema 版本。
-CURRENT_SCHEMA_VERSION = 16
+CURRENT_SCHEMA_VERSION = 17

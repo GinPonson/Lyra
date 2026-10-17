@@ -13,7 +13,7 @@ final configuredServerUrlProvider = Provider<String>(
 
 /// 登录方式发现只发送公开请求；与携带设备令牌的账本客户端独立。
 final authProvidersProvider = FutureProvider.autoDispose
-    .family<List<AuthProviderAvailability>, String>((ref, rawUrl) async {
+    .family<AuthProviderCatalog, String>((ref, rawUrl) async {
       final url = normalizeLyraServerUrl(rawUrl);
       final dependencies = ref.watch(sessionDependenciesProvider);
       final dio =

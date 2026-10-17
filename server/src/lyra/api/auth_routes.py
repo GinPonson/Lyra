@@ -39,12 +39,14 @@ from ..infrastructure.auth.login_provider import (
     LOGIN_PROVIDER_NAMES,
 )
 from ..infrastructure.db.device_repository import DuckDbDeviceRepository
+from ..infrastructure.db.invite_code_repository import InviteCodeRepository
 from ..infrastructure.db.user_repository import (
     UserIdentityRecord,
     UserRecord,
     UserRepository,
 )
 from ..security.auth_context import AuthContext
+from .dependencies import _UUID_PATTERN
 from .dependencies import require_admin, require_user
 
 # 400 的 message 与参考实现同文案。
@@ -80,6 +82,9 @@ def create_auth_router() -> APIRouter:
         """
         configured = getattr(request.app.state, "login_provider_ids", frozenset())
         return {
+            # 新身份注册一律凭邀请码（见 ``UserLoginService.start``）。这是公开信息：
+            # 客户端据此决定是否显示邀请码输入框；码的值才是秘密。
+            "registrationRequiresInvite": True,
             "providers": [
                 {
                     "id": provider_id,
@@ -163,6 +168,19 @@ def create_auth_router() -> APIRouter:
                 detail={"code": "INVALID_ARGUMENT", "message": _LOGIN_ARGUMENT_MESSAGE},
             )
 
+        # **``inviteCode`` 可选，但一旦出现必须是字符串。**
+        #
+        # "类型不对"是请求错误（400），"没带码"是业务状态（新身份注册时由服务层回
+        # 403 INVITE_CODE_REQUIRED）。把两者混在一起，客户端就无法区分"我写错了"
+        # 与"我需要一个邀请码"。
+        invite_code = body.get("inviteCode")
+        if invite_code is not None and not isinstance(invite_code, str):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": _LOGIN_ARGUMENT_MESSAGE},
+            )
+        invite_code = invite_code.strip() if isinstance(invite_code, str) else None
+
         service = request.app.state.login_service
         try:
             started = service.start(
@@ -172,6 +190,7 @@ def create_auth_router() -> APIRouter:
                     public_key_pem=fields["publicKeyPem"],
                     code_challenge=fields["codeChallenge"],
                     code_challenge_method=fields["codeChallengeMethod"],
+                    invite_code=invite_code or None,
                 ),
                 _source_key(request),
             )
@@ -482,7 +501,113 @@ def create_auth_router() -> APIRouter:
             }
         }
 
+    # ------------------------------------------------------------------
+    # 邀请码（仅管理员）：新身份注册的唯一入口
+    # ------------------------------------------------------------------
+
+    @router.post("/v1/admin/invite-codes", status_code=201)
+    def create_invite_code(
+        request: Request,
+        body: dict | None = None,
+        auth: AuthContext = Depends(require_admin),
+    ) -> Any:
+        """签发一枚邀请码。
+
+        **明文只在这一个响应里出现一次**：库里存哈希，之后没有任何接口能读回来，
+        丢了只能重新签发。能反复读出的码等于永久有效的明文凭据。
+
+        正文可选 ``{"label": "给谁"}``；label 只作运维备注，不参与任何判定。
+        """
+        label = None
+        if isinstance(body, dict):
+            raw = body.get("label")
+            if raw is not None and not isinstance(raw, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "INVALID_ARGUMENT", "message": "邀请码备注必须是文本"},
+                )
+            label = (raw or "").strip() or None
+            if label is not None and len(label) > 128:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "INVALID_ARGUMENT", "message": "邀请码备注最多 128 字符"},
+                )
+        invites = InviteCodeRepository(request.app.state.database.connection)
+        record, code = invites.create(created_by=auth.user_id, label=label, now=_now())
+        return {"inviteCode": _invite_code_object(record, code=code)}
+
+    @router.get("/v1/admin/invite-codes")
+    def list_invite_codes(
+        request: Request,
+        limit: int = Query(default=_DEFAULT_USER_PAGE_SIZE),
+        offset: int = Query(default=0),
+        auth: AuthContext = Depends(require_admin),
+    ) -> Any:
+        """邀请码列表（仅管理员）。
+
+        **永不返回明文或哈希**：列表只回答"哪枚码还在、谁用掉的、什么时候"。
+        """
+        _ = auth
+        invites = InviteCodeRepository(request.app.state.database.connection)
+        records = invites.list_codes(limit=limit, offset=offset)
+        return {
+            "inviteCodes": [_invite_code_object(record) for record in records],
+            "count": invites.count(),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @router.delete("/v1/admin/invite-codes/{invite_id}")
+    def revoke_invite_code(
+        request: Request,
+        invite_id: str,
+        auth: AuthContext = Depends(require_admin),
+    ) -> Any:
+        """撤销一枚尚未使用的邀请码。
+
+        已使用的码不能撤销（它已经产生了用户）；重复撤销返回 409 而不是静默成功，
+        否则调用方无法区分"撤掉了"与"本来就不在"。
+        """
+        _ = auth
+        if not _UUID_PATTERN.fullmatch(invite_id):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "邀请码 ID 格式非法"},
+            )
+        invites = InviteCodeRepository(request.app.state.database.connection)
+        record = invites.revoke(invite_id, now=_now())
+        if record is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "INVITE_CODE_STATE_CONFLICT",
+                    "message": "邀请码不存在或已不是可用状态",
+                },
+            )
+        return {"inviteCode": _invite_code_object(record)}
+
     return router
+
+
+def _invite_code_object(record: Any, *, code: str | None = None) -> dict[str, Any]:
+    """把邀请码记录投影为管理端对象。
+
+    ``code`` 只在创建响应里出现；其余路径**不输出该键**——空字符串与"没有明文"
+    是两件事，用缺席表达后者比用空值更不容易被误读。
+    """
+    payload = {
+        "id": record.id,
+        "label": record.label,
+        "status": record.status,
+        "createdBy": record.created_by,
+        "createdAt": record.created_at,
+        "usedBy": record.used_by,
+        "usedAt": record.used_at,
+        "revokedAt": record.revoked_at,
+    }
+    if code is not None:
+        payload["code"] = code
+    return payload
 
 
 def _required_text_fields(body: Mapping[str, Any], keys: Sequence[str]) -> dict[str, str] | None:
@@ -627,7 +752,11 @@ async def _revoke_user_sessions(request: Request, user_id: str) -> None:
     await _close_device_sessions(request, device_ids)
 
 
-def build_login_service(environment: Any, device_authorizer: Any) -> UserLoginService:
+def build_login_service(
+    environment: Any,
+    device_authorizer: Any,
+    invites: InviteCodeRepository,
+) -> UserLoginService:
     """按环境装配登录服务。
 
     **部分配置会让启动失败**（见 `load_login_providers`）：让服务带着
@@ -638,12 +767,14 @@ def build_login_service(environment: Any, device_authorizer: Any) -> UserLoginSe
 
     @param environment: 环境变量映射。
     @param device_authorizer: 兑换成功后的用户解析与设备签发用例。
+    @param invites: 邀请码仓储；``/start`` 用它提前校验，注册时的核销由签发用例完成。
     @returns 登录服务。
     """
     providers = load_login_providers(environment)
     return UserLoginService(
         providers,
         device_authorizer,
+        invites,
         now=lambda: datetime.now(UTC),
     )
 

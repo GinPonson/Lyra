@@ -77,10 +77,19 @@ def test_every_migration_has_a_sql_file() -> None:
 
 
 def test_migration_sixteen_is_the_owner_context_migration() -> None:
-    """多用户迁移必须是清单最后一条，且被标记为需要显式归属确认的那一条。"""
-    assert MIGRATION_CONTEXT_VERSION == CURRENT_SCHEMA_VERSION == 16
-    assert MIGRATIONS[-1].version == MIGRATION_CONTEXT_VERSION
-    assert MIGRATIONS[-1].file_name == "multi-user-schema.sql"
+    """v16 是**唯一**需要显式归属确认的迁移，但它不必是清单最后一条。
+
+    这条测试原先断言"需要上下文的迁移就是最后一条"。v17（邀请码）出现后那个等式
+    不再成立，而**要保护的意图没变**：需要上下文的是且仅是 v16——新增迁移不该顺手
+    要求归属输入，否则每加一张表都会强迫操作者在升级时重新确认一遍 owner。
+    """
+    assert MIGRATION_CONTEXT_VERSION == 16
+    context_migrations = [m for m in MIGRATIONS if m.version == MIGRATION_CONTEXT_VERSION]
+    assert len(context_migrations) == 1
+    assert context_migrations[0].file_name == "multi-user-schema.sql"
+    assert [m.version for m in MIGRATIONS] == list(range(1, CURRENT_SCHEMA_VERSION + 1))
+    assert MIGRATIONS[-1].version == CURRENT_SCHEMA_VERSION == 17
+    assert MIGRATIONS[-1].file_name == "invite-code-schema.sql"
 
 
 def _populated_schema15_database(destination: Path) -> None:
@@ -157,7 +166,9 @@ def test_owner_context_is_consumed_and_not_left_behind(tmp_path: Path) -> None:
             "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
             [MIGRATION_CONTEXT_TABLE],
         ).fetchone() == (0,)
-        assert connection.execute("SELECT max(version) FROM schema_migrations").fetchone() == (16,)
+        assert connection.execute(
+            "SELECT max(version) FROM schema_migrations"
+        ).fetchone() == (CURRENT_SCHEMA_VERSION,)
         owner = connection.execute("SELECT id, role FROM users").fetchall()
         assert len(owner) == 1 and owner[0][1] == "admin"
         # 再次调用（模拟重启）不得重复迁移或新建用户。
@@ -228,8 +239,8 @@ def test_takes_over_typescript_created_database(tmp_path: Path) -> None:
         )
         assert after_tables == sorted(
             [table for table in before_tables if table != "server_owner_identity"]
-            + ["user_identities", "users"]
-        ), "接管后表集合与「原表 − 旧 owner 身份表 + users/user_identities」不一致"
+            + ["invite_codes", "user_identities", "users"]
+        ), "接管后表集合与「原表 − 旧 owner 身份表 + v16/v17 新表」不一致"
         # 没有业务数据的旧库不需要归属输入，也不得被凭空分配一个默认用户。
         for table in ("users", "user_identities"):
             assert database.connection.execute(

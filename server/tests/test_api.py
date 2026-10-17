@@ -147,7 +147,7 @@ def test_system_info_reports_the_compiled_schema_version(client) -> None:
 
     body = client.get("/v1/system/info").json()
 
-    assert body["schema_version"] == CURRENT_SCHEMA_VERSION == 16
+    assert body["schema_version"] == CURRENT_SCHEMA_VERSION == 17
 
 
 def test_system_info_reports_the_protocol_window(client) -> None:

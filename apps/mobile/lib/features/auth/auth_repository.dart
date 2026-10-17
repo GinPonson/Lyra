@@ -113,9 +113,7 @@ class AuthRepository {
 
   final Dio _dio;
 
-  Future<List<AuthProviderAvailability>> providers({
-    CancelToken? cancelToken,
-  }) async {
+  Future<AuthProviderCatalog> providers({CancelToken? cancelToken}) async {
     try {
       final response = await _dio.get<dynamic>(
         '/v1/auth/providers',
@@ -125,7 +123,7 @@ class AuthRepository {
           headers: const {'x-lyra-protocol-version': kLyraProtocolVersion},
         ),
       );
-      return AuthProviderAvailability.parseCatalog(_body(response));
+      return AuthProviderCatalog.parse(_body(response));
     } on DioException catch (error) {
       if (CancelToken.isCancel(error)) rethrow;
       throw LyraApiError.fromResponseBody(
@@ -153,6 +151,7 @@ class AuthRepository {
     required String displayName,
     required String publicKeyPem,
     required String codeChallenge,
+    String? inviteCode,
     CancelToken? cancelToken,
   }) async {
     final response = await _post(
@@ -162,6 +161,9 @@ class AuthRepository {
         'publicKeyPem': publicKeyPem,
         'codeChallenge': codeChallenge,
         'codeChallengeMethod': 'S256',
+        // 旧服务端不认该键，空邀请码按"未填写"处理，不发空字符串。
+        if (inviteCode != null && inviteCode.isNotEmpty)
+          'inviteCode': inviteCode,
       },
       cancelToken: cancelToken,
     );

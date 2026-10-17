@@ -45,6 +45,7 @@ from .db.migrations import (
     apply_migrations,
 )
 from .infrastructure.auth.login_provider import LOGIN_PROVIDER_IDS, LoginIdentity
+from .infrastructure.db.invite_code_repository import InviteCodeRepository
 from .infrastructure.db.user_repository import UserRepository
 
 # 旧运行时记录「部署唯一 owner 曾用哪些身份登录过」的表。schema 16 起归属落在
@@ -70,6 +71,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             subject=options.subject,
             owner_identities=tuple(options.owner_identity),
             display_name=options.display_name,
+            create_invite_code=options.create_invite_code,
+            invite_label=options.invite_label,
+            promote_user=options.promote_user,
         )
     except AdminError as error:
         print(f"错误: {error}", file=sys.stderr)
@@ -136,6 +140,26 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         metavar="NAME",
         help="可选显示名；旧库升级时作为原用户的显示名",
     )
+    parser.add_argument(
+        "--create-invite-code",
+        action="store_true",
+        help=(
+            "签发一枚邀请码并打印（只打印一次）。不需要任何管理员已存在——"
+            "这正是新部署的第一步：先拿码注册，再由 --promote-user 提升为管理员"
+        ),
+    )
+    parser.add_argument(
+        "--invite-label",
+        default=None,
+        metavar="LABEL",
+        help="邀请码备注（发给谁），仅作运维记录",
+    )
+    parser.add_argument(
+        "--promote-user",
+        default=None,
+        metavar="USER_ID",
+        help="把已注册用户提升为管理员（停用/恢复仍走管理 API）",
+    )
     return parser.parse_args(argv)
 
 
@@ -146,6 +170,9 @@ def _run(
     subject: str | None,
     owner_identities: tuple[str, ...],
     display_name: str | None,
+    create_invite_code: bool = False,
+    invite_label: str | None = None,
+    promote_user: str | None = None,
 ) -> str:
     """按「是否给出 ``--owner-identity``」分流到旧库升级或新安装。
 
@@ -154,18 +181,79 @@ def _run(
     @param subject: ``--subject``。
     @param owner_identities: ``--owner-identity`` 的原始取值。
     @param display_name: ``--display-name``。
-    @returns 供操作者核对的结果摘要；**不含任何凭据**。
+    @param create_invite_code: ``--create-invite-code``。
+    @param invite_label: ``--invite-label``。
+    @param promote_user: ``--promote-user``。
+    @returns 供操作者核对的结果摘要；**不含任何凭据**（邀请码是唯一例外：
+        它必须交给操作者，且只出现这一次）。
     @raises AdminError: 参数组合非法、目标库状态不允许本次操作。
     @raises MigrationError: 迁移失败。
     @raises ApplicationError: 仓储层明确失败（如目标身份已有用户）。
     """
     database_path = _resolve_database_path(database)
+    if create_invite_code:
+        return _issue_invite_code(database_path, invite_label)
+    if promote_user is not None:
+        return _promote_user(database_path, promote_user)
     confirmed_identities = _parse_owner_identities(owner_identities)
     if confirmed_identities:
         return _upgrade_legacy_database(
             database_path, confirmed_identities, provider, subject, display_name
         )
     return _create_first_admin(database_path, provider, subject, display_name)
+
+
+def _issue_invite_code(database_path: str, label: str | None) -> str:
+    """签发一枚邀请码并返回给操作者。
+
+    **这是新部署的第一步**：邀请码是新身份注册的唯一入口，而管理员只能由已存在的
+    用户提升——两者互相等待就永远起不来。因此这里允许 ``created_by=None``（表示
+    这枚码来自服务器终端而不是某个管理员账号），可审计且不需要先有人。
+
+    @param database_path: 目标库路径。
+    @param label: 备注。
+    @returns 操作者可见的摘要，**含明文邀请码（只此一次）**。
+    @raises AdminError: 目标库尚未迁移到含邀请码的版本。
+    """
+    database = open_lyra_database(database_path)
+    try:
+        invites = InviteCodeRepository(database.connection)
+        try:
+            record, code = invites.create(created_by=None, label=label, now=datetime.now(UTC))
+        except duckdb.CatalogException as error:
+            raise AdminError(
+                "目标库还没有 invite_codes 表：请先用当前版本启动一次服务完成迁移"
+            ) from error
+        return (
+            f"已签发邀请码（只显示这一次，请立即保存）：\n\n    {code}\n\n"
+            f"id: {record.id}\n备注: {record.label or '（无）'}\n"
+            "下一步：在 App 登录页填入它完成首次注册，然后用 --promote-user <userId> 提升为管理员。"
+        )
+    finally:
+        database.close()
+
+
+def _promote_user(database_path: str, user_id: str) -> str:
+    """把已注册用户提升为管理员。
+
+    角色只影响用户管理与邀请码签发，**不改变任何账本可见范围**——管理员也只能读
+    自己的账本（契约 §4.1）。
+
+    @param database_path: 目标库路径。
+    @param user_id: 用户 UUID。
+    @returns 操作者可见的摘要。
+    @raises AdminError: id 非法或用户不存在。
+    """
+    database = open_lyra_database(database_path)
+    try:
+        users = UserRepository(database.connection)
+        try:
+            promoted = users.promote_to_admin(user_id, now=datetime.now(UTC))
+        except ApplicationError as error:
+            raise AdminError(f"{error.code}: {error.message}") from error
+        return f"已提升为管理员：{promoted.id}（{promoted.display_name}）"
+    finally:
+        database.close()
 
 
 def _resolve_database_path(explicit: str | None) -> str:

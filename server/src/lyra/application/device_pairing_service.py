@@ -175,6 +175,7 @@ class DevicePairingService:
         identity: LoginIdentity,
         display_name: str,
         public_key_pem: str,
+        on_new_user: Callable[[str], None] | None = None,
     ) -> DevicePairingHttpResponse:
         """为已验证的身份签发设备凭据；新身份在此自动注册。
 
@@ -188,12 +189,17 @@ class DevicePairingService:
         @param identity: 已验证的来源身份。
         @param display_name: 用户可识别的设备名称。
         @param public_key_pem: 设备公钥 PEM。
+        @param on_new_user: **注册门禁**。仅当本次调用**新建**了用户时，在事务内以新
+            用户 ID 调用它；抛错即整体回滚（用户、身份、设备与凭据都不落库）。生产
+            唯一入口（登录兑换）注入"核销邀请码"，因此新身份没有可用码就注册不成；
+            测试夹具直接签发既有身份/预置用户时不注入它，这是刻意的：门禁属于
+            "注册"这条业务路径，不属于"给已有用户签发设备"这个动作。
         @returns 设备 ID、名称、一对新凭据，以及本次解析出的用户与身份。
         @raises ApplicationError: 公钥无效（400）或该身份的用户已停用（403）。
         """
         public_key = normalize_device_public_key(public_key_pem)
         return await self._writes.enqueue(lambda: self._authorize(
-            identity, display_name, public_key
+            identity, display_name, public_key, on_new_user
         ))
 
     async def _authorize(
@@ -201,6 +207,7 @@ class DevicePairingService:
         identity: LoginIdentity,
         display_name: str,
         public_key: Any,
+        on_new_user: Callable[[str], None] | None,
     ) -> DevicePairingHttpResponse:
         """在单写队列内完成一次签发。
 
@@ -221,6 +228,10 @@ class DevicePairingService:
             # 自动注册发生在这里，也就是**完整 OAuth 验证与客户端 verifier 校验都已
             # 通过之后**；回调未完成、授权取消或 verifier 不对时根本走不到这一步。
             resolved = self._users.find_or_create_user_for_identity(identity, now=now)
+            if resolved.created and on_new_user is not None:
+                # **注册门禁在事务内执行**：核销失败会连带回滚刚建好的用户与身份，
+                # 因此不存在"没凭邀请码却拿到了账号"的中间态。
+                on_new_user(resolved.user.id)
             if resolved.user.status != "active":
                 # 已停用的身份**保留原映射**、拒绝登录，而不是新建一个用户绕开停用。
                 raise user_disabled_error()
