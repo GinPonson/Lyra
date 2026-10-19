@@ -51,13 +51,20 @@ class SectionScreen extends StatelessWidget {
                         title,
                         key: ValueKey<String>('section-title-$title'),
                         style: Theme.of(context).textTheme.headlineLarge
-                            ?.copyWith(fontSize: 22, letterSpacing: -0.3),
+                            ?.copyWith(
+                              fontSize: 22,
+                              letterSpacing: -0.3,
+                              fontWeight: FontWeight.w500,
+                            ),
                       ),
                       const SizedBox(height: 6),
                       Text(
                         '账本数据接入后,这里提供可筛选的明细与分组视图。',
-                        style: Theme.of(context).textTheme.bodyMedium
-                            ?.copyWith(color: LyraColors.muted),
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          fontSize: 13,
+                          height: 1.5,
+                          color: LyraColors.inkSecondary,
+                        ),
                       ),
                       const SizedBox(height: 20),
                       // 分组直接铺在画布上,行间发丝线,无外框。
@@ -98,60 +105,79 @@ class _EntryRow extends StatelessWidget {
             ? null
             : const Border(bottom: BorderSide(color: LyraColors.hairline)),
       ),
-      child: Row(
-        children: <Widget>[
-          Container(
-            width: 38,
-            height: 38,
-            alignment: Alignment.center,
-            decoration: const BoxDecoration(
-              color: LyraColors.accentTint,
-              shape: BoxShape.circle,
-            ),
-            child: Icon(entry.icon, size: 19, color: LyraColors.accent),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(
-                  entry.title,
-                  style: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
-                    color: LyraColors.ink,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final textScale = MediaQuery.textScalerOf(context).scale(15) / 15;
+          final inlineStatus = constraints.maxWidth / textScale >= 340;
+          final status = entry.status == null
+              ? null
+              : Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
                   ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  entry.subtitle,
-                  style: const TextStyle(
-                    fontSize: 12.5,
-                    color: LyraColors.muted,
+                  decoration: BoxDecoration(
+                    color: LyraColors.surfaceStrong,
+                    borderRadius: BorderRadius.circular(8),
                   ),
+                  child: Text(
+                    entry.status!,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w500,
+                      color: LyraColors.inkSecondary,
+                    ),
+                  ),
+                );
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Container(
+                width: 38,
+                height: 38,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: LyraColors.accentTint,
+                  borderRadius: BorderRadius.circular(12),
                 ),
+                child: Icon(entry.icon, size: 19, color: LyraColors.accent),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      entry.title,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w500,
+                        color: LyraColors.ink,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      entry.subtitle,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        height: 1.5,
+                        color: LyraColors.inkSecondary,
+                      ),
+                    ),
+                    if (!inlineStatus && status != null) ...[
+                      const SizedBox(height: 8),
+                      status,
+                    ],
+                  ],
+                ),
+              ),
+              if (inlineStatus && status != null) ...[
+                const SizedBox(width: 12),
+                Flexible(child: status),
               ],
-            ),
-          ),
-          const SizedBox(width: 12),
-          if (entry.status != null)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: LyraColors.surfaceStrong,
-                borderRadius: BorderRadius.circular(999),
-              ),
-              child: Text(
-                entry.status!,
-                style: const TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w500,
-                  color: LyraColors.muted,
-                ),
-              ),
-            ),
-        ],
+            ],
+          );
+        },
       ),
     );
   }

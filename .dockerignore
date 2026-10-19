@@ -1,0 +1,25 @@
+# Only the Python server's locked build inputs enter the Docker context.
+#
+# **逐条显式放行**：任何一条漏掉都会在 `COPY` 时立刻报错，而不是靠一条目录级例外
+# 意外放行整个子树——`!server/` 这类规则会把 `server/.venv`、`server/tests` 连同
+# `__pycache__` 一起带进构建上下文。规则列在这里，意图是"上下文里有什么"可读。
+**
+!server/
+!server/pyproject.toml
+!server/uv.lock
+!server/src/
+!server/src/**
+!server/scripts/
+!server/scripts/verify_running_service.py
+
+# 依赖不随源码进上下文：镜像里由 `uv sync --frozen` 依 uv.lock 重建。
+server/tests/
+server/.venv/
+**/__pycache__/
+
+# 本地配置、账本与上传文件不进镜像。
+**/.env
+**/.env.*
+**/*.duckdb
+**/*.duckdb.wal
+**/*.upload

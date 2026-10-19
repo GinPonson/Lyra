@@ -4,50 +4,11 @@ import 'package:dio/dio.dart';
 
 import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
+import '../accounts/account_repository.dart';
 
 /// 导入账户选择器使用的最小账户公开视图；与 `/v1/ledger/accounts` 投影一致，
 /// 不包含完整账户号码或服务端旧账户键。
-class ImportAccountView {
-  const ImportAccountView({
-    required this.id,
-    required this.displayName,
-    required this.maskedSuffix,
-    required this.status,
-  });
-
-  final String id;
-  final String displayName;
-  final String maskedSuffix;
-
-  /// 服务端闭域状态：`active` 或 `archived`。
-  final String status;
-
-  bool get isActive => status == 'active';
-
-  factory ImportAccountView.fromJson(Map<String, Object?> json) {
-    final id = json['id'];
-    final displayName = json['displayName'];
-    final maskedSuffix = json['maskedSuffix'];
-    final status = json['status'];
-    if (id is! String
-        || displayName is! String
-        || maskedSuffix is! String
-        || status is! String) {
-      throw const LyraApiError(
-        code: 'CLIENT_REQUEST_FAILED',
-        message: '账户列表字段无效',
-        statusCode: 0,
-        retryable: false,
-      );
-    }
-    return ImportAccountView(
-      id: id,
-      displayName: displayName,
-      maskedSuffix: maskedSuffix,
-      status: status,
-    );
-  }
-}
+typedef ImportAccountView = BrokerageAccount;
 
 /// `GET /v1/ledger/accounts` 数据载荷中的账户行集合。
 ///
@@ -62,9 +23,7 @@ class ImportAccountsPage {
     final rows = json['rows'] as List<Object?>? ?? const <Object?>[];
     return ImportAccountsPage(
       rows: rows
-          .map(
-            (row) => ImportAccountView.fromJson(row as Map<String, Object?>),
-          )
+          .map((row) => ImportAccountView.fromJson(row as Map<String, Object?>))
           .where((account) => account.isActive)
           .toList(growable: false),
     );
@@ -97,7 +56,8 @@ class ImportPreviewView {
 
   factory ImportPreviewView.fromJson(Map<String, Object?> json) {
     final preview = json['preview'] as Map<String, Object?>;
-    final byActionRaw = preview['byAction'] as Map<String, Object?>? ?? const {};
+    final byActionRaw =
+        preview['byAction'] as Map<String, Object?>? ?? const {};
     return ImportPreviewView(
       importId: json['importId'] as String,
       confirmToken: json['confirmToken'] as String,
@@ -147,8 +107,6 @@ class ImportRepository {
 
   final LyraApiClient _client;
 
-  Dio get _dio => _client.dio;
-
   /// 读取服务端公开账户列表；选择器只把活跃账户作为导入目标。
   Future<ImportAccountsPage> accounts() async {
     final response = await _client.get<Map<String, Object?>>(
@@ -177,15 +135,17 @@ class ImportRepository {
     String? accountId,
   }) async {
     try {
-      final response = await _dio.post<dynamic>(
-        '/v1/imports/preview',
-        data: Stream<List<int>>.fromIterable(<List<int>>[bytes]),
-        queryParameters: <String, String>{'accountId': ?accountId},
-        options: Options(
-          headers: <String, Object?>{
-            'content-type': 'application/octet-stream',
-            'x-lyra-file-name': fileName,
-          },
+      final response = await _client.execute<dynamic>(
+        (dio) => dio.post<dynamic>(
+          '/v1/imports/preview',
+          data: Stream<List<int>>.fromIterable(<List<int>>[bytes]),
+          queryParameters: <String, String>{'accountId': ?accountId},
+          options: Options(
+            headers: <String, Object?>{
+              'content-type': 'application/octet-stream',
+              'x-lyra-file-name': fileName,
+            },
+          ),
         ),
       );
       final data = response.data;
@@ -216,14 +176,16 @@ class ImportRepository {
     required String confirmToken,
     String? idempotencyKey,
   }) async {
-    final response = await _dio.post<Map<String, Object?>>(
-      '/v1/imports/$importId/commit',
-      data: <String, Object?>{'confirmToken': confirmToken},
-      options: idempotencyKey == null
-          ? null
-          : Options(headers: <String, Object?>{
-              'idempotency-key': idempotencyKey,
-            }),
+    final response = await _client.execute<Map<String, Object?>>(
+      (dio) => dio.post<Map<String, Object?>>(
+        '/v1/imports/$importId/commit',
+        data: <String, Object?>{'confirmToken': confirmToken},
+        options: idempotencyKey == null
+            ? null
+            : Options(
+                headers: <String, Object?>{'idempotency-key': idempotencyKey},
+              ),
+      ),
     );
     final data = response.data;
     if (data is! Map<String, Object?>) {

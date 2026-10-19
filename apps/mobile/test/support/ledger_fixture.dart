@@ -10,7 +10,11 @@ import '../session_flow_test.dart' show FakeLyraAdapter;
 class LedgerFixture {
   final requests = <RequestOptions>[];
   final failures = <String>{};
+  final failOnce = <String>{};
+  final ledgerVersionsByCursor = <String, int>{};
+  Future<void> Function(RequestOptions options)? beforeResponse;
   static const account = 'a2000000-0000-4000-8000-000000000001';
+  static const euroAccount = 'a2000000-0000-4000-8000-000000000002';
   static const timestamp = '2026-09-08T08:00:00.000Z';
 
   Future<SessionDependencies> dependencies({bool paired = true}) async {
@@ -22,40 +26,67 @@ class LedgerFixture {
           deviceId: 'test-device',
           accessToken: 'test-only-token',
           refreshToken: 'test-only-refresh',
+          userId: 'fixture-user',
+          authMethod: 'google',
         ),
       );
     }
     return SessionDependencies(
       credentialStore: store,
-      clientFactory: (url) =>
-          Dio(BaseOptions(baseUrl: url))
-            ..httpClientAdapter = FakeLyraAdapter((options) async {
-              requests.add(options);
-              final command = options.uri.path.split('/').last;
-              return ResponseBody.fromString(
-                jsonEncode(
-                  failures.contains(command)
-                      ? {
-                          'code': 'QUERY_FAILED',
-                          'message': '测试连接中断',
-                          'retryable': true,
-                        }
-                      : response(command, options.queryParameters),
-                ),
-                failures.contains(command) ? 503 : 200,
-                headers: {
-                  Headers.contentTypeHeader: [Headers.jsonContentType],
-                },
-              );
-            }),
+      clientFactory: (url) => Dio(BaseOptions(baseUrl: url))
+        ..httpClientAdapter = FakeLyraAdapter((options) async {
+          requests.add(options);
+          // Tests can hold one response in flight to verify stale query
+          // results are ignored after filters or account scope change.
+          await beforeResponse?.call(options);
+          final market = options.uri.path == '/v1/market/positions';
+          final settings = options.uri.path == '/v1/market/settings';
+          final command = settings
+              ? 'market-settings'
+              : market
+              ? 'market-positions'
+              : options.uri.path.split('/').last;
+          final cursor = options.queryParameters['cursor']?.toString();
+          final failKey = '$command:${cursor ?? 'first'}';
+          final failed = failures.contains(command) || failOnce.remove(failKey);
+          return ResponseBody.fromString(
+            jsonEncode(
+              failed
+                  ? {
+                      'code': 'QUERY_FAILED',
+                      'message': '测试连接中断',
+                      'retryable': true,
+                    }
+                  : settings
+                  ? marketSettingsResponse()
+                  : market
+                  ? marketResponse(options.queryParameters)
+                  : response(command, options.queryParameters),
+            ),
+            failed ? 503 : 200,
+            headers: {
+              Headers.contentTypeHeader: [Headers.jsonContentType],
+            },
+          );
+        }),
     );
   }
 
+  Map<String, Object?> marketSettingsResponse() => {
+    'revision': 0,
+    'routes': {'stock': <String>[], 'option': <String>[]},
+    'effectiveRoutes': {'stock': <String>[], 'option': <String>[]},
+    'providers': <Object?>[],
+    'updatedAt': null,
+  };
+
   Map<String, Object?> response(String command, Map<String, dynamic> query) {
+    if (command == 'underlying-quote') return underlyingQuoteResponse(query);
     final data = payload(command, query);
     return {
       'metadata': {
-        'ledgerVersion': 12,
+        'ledgerVersion':
+            ledgerVersionsByCursor[query['cursor'] as String?] ?? 12,
         'asOf': timestamp,
         'fetchedAt': timestamp,
         'aggregateCurrency': 'USD',
@@ -67,6 +98,105 @@ class LedgerFixture {
         ],
       },
       'data': data,
+    };
+  }
+
+  /// 模拟独立正股摘要；默认来源关闭，不把现有账本价格当成行情。
+  ///
+  /// [query] 使用真实持仓锚点及版本，返回与线上新接口一致的明确缺价响应。
+  Map<String, Object?> underlyingQuoteResponse(Map<String, dynamic> query) {
+    final rows = (payload('positions', const {})['rows'] as List)
+        .cast<Map<String, Object?>>();
+    final anchor = rows.firstWhere(
+      (row) => row['symbolKey'] == query['symbol_key'],
+    );
+    return {
+      'metadata': {
+        'accountScope': {'kind': 'account', 'account': query['scope']},
+        'ledgerVersion': int.parse(query['ledger_version'].toString()),
+        'settingsRevision': int.parse(query['settings_revision'].toString()),
+        'fetchedAt': timestamp,
+      },
+      'data': {
+        'accountId': query['scope'],
+        'symbolKey': anchor['symbolKey'],
+        'direction': anchor['direction'],
+        'positionAssetType': anchor['assetType'],
+        'assetType': 'stock',
+        'instrumentKey':
+            'US:stock:${anchor['underlying'] ?? anchor['symbolKey']}',
+        'currency': 'USD',
+        'status': 'unavailable',
+        'issue': 'not_configured',
+        'cached': false,
+        'providerId': null,
+        'feed': null,
+        'timing': {'kind': 'delayed', 'delayMinutes': 15},
+        'fetchedAt': null,
+        'price': null,
+        'previousClose': null,
+        'changePercent': null,
+        'changeIssue': null,
+        'comparisonBasis': 'previous_session_close',
+        'adjustment': 'split',
+      },
+    };
+  }
+
+  /// Market data is optional in existing ledger tests. A separate response
+  /// keeps the standard ledger payload and all historical costs untouched.
+  Map<String, Object?> marketResponse(Map<String, dynamic> query) {
+    final ledger = response('positions', query);
+    final positions = ((ledger['data'] as Map<String, Object?>)['rows'] as List)
+        .cast<Map<String, Object?>>();
+    return {
+      'metadata': ledger['metadata'],
+      'data': {
+        'rows': [
+          for (final position in positions)
+            {
+              ...position,
+              'currency': 'USD',
+              'instrumentKey': null,
+              'quote': {
+                'status': 'unavailable',
+                'quote': null,
+                'referencePrice': null,
+                'issue': 'not_configured',
+                'cached': false,
+              },
+              'valuation': {
+                'marketValue': null,
+                'unrealizedPnl': null,
+                'multiplier': null,
+                'basis': 'reference_price_excluding_fees',
+              },
+            },
+        ],
+        'count': positions.length,
+        'pricedCount': 0,
+        'complete': positions.isEmpty,
+        'basis': 'current_positions_at_quote_times_excluding_fees',
+        'marketData': {
+          'enabled': false,
+          'routes': {'stock': <String>[], 'option': <String>[]},
+          'providers': <Object?>[],
+        },
+        'currencyGroups': [
+          if (positions.isNotEmpty)
+            {
+              'currency': 'USD',
+              'accountIds': [account],
+              'positions': positions.length,
+              'pricedPositions': 0,
+              'complete': false,
+              'marketValue': null,
+              'unrealizedPnl': null,
+              'asOfFrom': null,
+              'asOfTo': null,
+            },
+        ],
+      },
     };
   }
 
@@ -97,6 +227,7 @@ class LedgerFixture {
           'direction': 'long',
           'quantity': item.$2,
           'cost': item.$3,
+          'costBasis': item.$3,
           'firstOpenDate': '2026-05-12',
           'expiry': null,
           'strike': null,
@@ -167,6 +298,7 @@ class LedgerFixture {
               'optionType': 'C',
               'quantity': '2',
               'cost': '6.20',
+              'costBasis': '620.00',
               'premiumDollars': '620.00',
               'daysRemaining': 10,
               'status': 'upcoming',
@@ -175,22 +307,29 @@ class LedgerFixture {
           'count': 1,
         };
       case 'trades':
+        final rows = query['cursor'] == null
+            ? [
+                trade,
+                {
+                  ...trade,
+                  'symbol': 'NVDA',
+                  'underlying': 'NVDA',
+                  'amount': '1084.38',
+                  'action': 'Sell',
+                  'transactionDate': '2026-09-03',
+                },
+              ]
+            : [
+                {...trade, 'symbol': 'MSFT', 'underlying': 'MSFT'},
+              ];
         return {
-          'rows': query['cursor'] == null
-              ? [
-                  trade,
-                  {
-                    ...trade,
-                    'symbol': 'NVDA',
-                    'underlying': 'NVDA',
-                    'amount': '1084.38',
-                    'action': 'Sell',
-                    'transactionDate': '2026-09-03',
-                  },
-                ]
-              : [
-                  {...trade, 'symbol': 'MSFT', 'underlying': 'MSFT'},
-                ],
+          'rows': rows
+              .where(
+                (row) =>
+                    query['symbol'] == null ||
+                    row['underlying'] == query['symbol'],
+              )
+              .toList(growable: false),
           'count': 2,
           'nextCursor': query['cursor'] == null ? 'next-page' : null,
         };

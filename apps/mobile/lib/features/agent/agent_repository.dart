@@ -35,7 +35,7 @@ class AgentAvailabilityView {
   }
 }
 
-/// `GET /v1/agents` 可用性快照：固定输出 Claude、Pi、OpenCode。
+/// `GET /v1/agents` 可用性快照：输出 Lyra 助手的服务端可用状态。
 class AgentAvailabilitySnapshotView {
   const AgentAvailabilitySnapshotView({required this.items});
 
@@ -121,8 +121,10 @@ class AgentSessionView {
       asOf: json['asOf'] as String,
       revision: (json['revision'] as num).toInt(),
       messages: rawMessages
-          .map((message) =>
-              AgentMessageView.fromJson(message as Map<String, Object?>))
+          .map(
+            (message) =>
+                AgentMessageView.fromJson(message as Map<String, Object?>),
+          )
           .toList(growable: false),
     );
   }
@@ -195,7 +197,7 @@ class AgentRepository {
 
   final LyraApiClient _client;
 
-  /// 读取三个供应商的可用状态快照。
+  /// 读取 Lyra 助手的可用状态快照。
   Future<AgentAvailabilitySnapshotView> availability() async {
     final response = await _client.get<Map<String, Object?>>(
       '/v1/agents',
@@ -206,14 +208,13 @@ class AgentRepository {
 
   /// 创建新会话；供应商不可用或账本冲突时抛出稳定错误。
   Future<AgentSessionView> createSession({
-    required String provider,
     required String accountScopeKind,
     String? accountId,
   }) async {
     final response = await _client.post<Map<String, Object?>>(
       '/v1/agent/sessions',
       <String, Object?>{
-        'provider': provider,
+        'provider': 'genkit',
         'accountScope': <String, Object?>{
           'kind': accountScopeKind,
           if (accountScopeKind == 'account') 'account': accountId,
@@ -241,9 +242,13 @@ class AgentRepository {
     required String sessionId,
     required String content,
   }) async {
-    final response = await _client.post<Map<String, Object?>>(
-      '/v1/agent/sessions/$sessionId/messages',
-      <String, Object?>{'content': content},
+    // 服务端回合上限可配置到 10 分钟；事件流期间仍允许用户主动取消。
+    final response = await _client.execute<Map<String, Object?>>(
+      (dio) => dio.post<Map<String, Object?>>(
+        '/v1/agent/sessions/$sessionId/messages',
+        data: <String, Object?>{'content': content},
+        options: Options(receiveTimeout: const Duration(minutes: 11)),
+      ),
     );
     final body = _data(response);
     final rawEvents = body['events'] as List<Object?>? ?? const <Object?>[];
@@ -252,8 +257,9 @@ class AgentRepository {
         body['session'] as Map<String, Object?>,
       ),
       events: rawEvents
-          .map((event) =>
-              AgentEventView.fromJson(event as Map<String, Object?>))
+          .map(
+            (event) => AgentEventView.fromJson(event as Map<String, Object?>),
+          )
           .toList(growable: false),
     );
   }
@@ -275,26 +281,11 @@ class AgentRepository {
       '/v1/agent/sessions/$sessionId/tool-calls',
       const <String, String>{},
     );
-    final raw = _data(response)['toolCalls'] as List<Object?>? ??
-        const <Object?>[];
+    final raw =
+        _data(response)['toolCalls'] as List<Object?>? ?? const <Object?>[];
     return raw
-        .map((call) =>
-            AgentToolCallView.fromJson(call as Map<String, Object?>))
+        .map((call) => AgentToolCallView.fromJson(call as Map<String, Object?>))
         .toList(growable: false);
-  }
-
-  /// 在 idle 回合边界把会话切换到目标供应商；409 时带可用供应商候选。
-  Future<AgentSessionView> switchSession({
-    required String sessionId,
-    required String targetProvider,
-  }) async {
-    final response = await _client.post<Map<String, Object?>>(
-      '/v1/agent/sessions/$sessionId/switch',
-      <String, Object?>{'provider': targetProvider},
-    );
-    return AgentSessionView.fromJson(
-      _data(response)['session'] as Map<String, Object?>,
-    );
   }
 
   Map<String, Object?> _data(Response<Map<String, Object?>> response) {
@@ -341,7 +332,9 @@ class AgentEventView {
       sessionId: json['sessionId'] as String,
       messageId: json['messageId'] as String?,
       sequence: (json['sequence'] as num).toInt(),
-      payload: (json['payload'] as Map<String, Object?>? ?? const <String, Object?>{}),
+      payload:
+          (json['payload'] as Map<String, Object?>? ??
+          const <String, Object?>{}),
     );
   }
 }

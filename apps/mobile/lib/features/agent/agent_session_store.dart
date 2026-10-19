@@ -1,5 +1,7 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import '../../core/security/secure_storage.dart';
+
 /// Agent 活跃会话 ID 的本地持久化抽象。
 abstract class AgentSessionStore {
   Future<String?> read();
@@ -13,7 +15,7 @@ abstract class AgentSessionStore {
 /// 金融数据；恢复时经 `GET /v1/agent/sessions/:id` 重新校验。
 class SecureAgentSessionStore implements AgentSessionStore {
   const SecureAgentSessionStore({FlutterSecureStorage? storage})
-    : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? kLyraSecureStorage;
 
   final FlutterSecureStorage _storage;
 

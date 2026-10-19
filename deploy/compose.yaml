@@ -1,0 +1,72 @@
+name: lyra
+
+services:
+  lyra:
+    image: lyra-server:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        # 镜像基座与 uv 版本都可覆盖：不同环境的镜像仓库与网络策略不同。
+        PYTHON_IMAGE: ${LYRA_PYTHON_IMAGE:-python:3.12-slim-bookworm}
+        UV_VERSION: ${LYRA_UV_VERSION:-0.9}
+    env_file:
+      - path: ./server.env
+        format: raw
+    environment:
+      # **没有 NODE_ENV**：服务端已是 Python，Node 相关变量留着只会误导后来的人以为
+      # 还有一个 Node 运行时参与其中。
+      LYRA_HOST: 0.0.0.0
+      LYRA_PORT: "3141"
+      LYRA_DATABASE_PATH: /var/lib/lyra/lyra.duckdb
+      LYRA_IMPORT_STAGING_DIR: /tmp/lyra-import-staging
+      # **没有 LYRA_PUBLIC_ORIGIN**：服务端从不读取它（Python 与 TS 运行时都没有引用，
+      # 只有已删除的 check-config CLI 用过）。留着只会让人以为它对回调地址生效。
+    ports:
+      - "127.0.0.1:3141:3141"
+    volumes:
+      - ledger_data:/var/lib/lyra
+    tmpfs:
+      - /tmp:mode=1777,size=268435456
+    read_only: true
+    init: true
+    restart: unless-stopped
+    # Covers the allowed 600s turn timeout plus shutdown/write-queue overhead.
+    stop_grace_period: 11m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: ${LYRA_CADDY_IMAGE:-caddy:2-alpine}
+    profiles: [https]
+    environment:
+      LYRA_DOMAIN: ${LYRA_DOMAIN:?Set LYRA_DOMAIN in deploy/.env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      lyra:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ledger_data:
+  caddy_data:
+  caddy_config:

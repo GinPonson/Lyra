@@ -1,5 +1,45 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'secure_storage.dart';
+
+// 同一底层凭据存储跨 SessionController 生命周期共用队列。所有生产安全存储
+// 实例操作同一组键，必须全局串行；独立内存存储互不阻塞。
+final _secureCredentialIdentity = Object();
+final _credentialQueues = Expando<_CredentialQueue>();
+
+Future<T> withCredentialMutation<T>(
+  CredentialStore store,
+  Future<T> Function() operation,
+) {
+  final identity = store is SecureCredentialStore
+      ? _secureCredentialIdentity
+      : store;
+  final queue = _credentialQueues[identity] ??= _CredentialQueue();
+  return queue.run(operation);
+}
+
+class _CredentialQueue {
+  Future<void>? _tail;
+
+  Future<T> run<T>(Future<T> Function() operation) {
+    final previous = _tail;
+    final result = previous == null
+        ? Future<T>.microtask(operation)
+        : previous.then((_) => operation());
+    late final Future<void> tail;
+    void release() {
+      if (identical(_tail, tail)) _tail = null;
+    }
+
+    tail = result.then<void>(
+      (_) => release(),
+      onError: (Object error, StackTrace stack) => release(),
+    );
+    _tail = tail;
+    return result;
+  }
+}
+
 /// 凭据安全存储抽象；实现负责把令牌放进系统安全存储（Android Keystore）。
 abstract class CredentialStore {
   Future<CredentialSnapshot?> read();
@@ -7,14 +47,20 @@ abstract class CredentialStore {
   Future<void> clear();
 }
 
-/// 一组已配对设备的服务端身份、令牌与设备私钥。
+/// OAuth 登录后获得的服务端身份、令牌与设备私钥。
 class CredentialSnapshot {
   const CredentialSnapshot({
     required this.serverUrl,
     required this.deviceId,
     required this.accessToken,
     required this.refreshToken,
+    this.userId,
     this.devicePrivateKey,
+    this.authMethod,
+    this.userEmail,
+    this.googleSubject,
+    this.providerSubject,
+    this.userDisplayName,
   });
 
   final String serverUrl;
@@ -22,14 +68,36 @@ class CredentialSnapshot {
   final String accessToken;
   final String refreshToken;
 
+  /// 服务端稳定用户 ID；登录响应的 `user.userId` 是唯一身份锚点。
+  ///
+  /// 缺失表示协议 2 时期的旧凭据：会话层必须清理并要求重新登录，绝不能按
+  /// 邮箱或第三方 subject 猜测归属。
+  final String? userId;
+
+  /// 缺失表示旧版配对凭据，迁移后必须重新登录。
+  final String? authMethod;
+  final String? userEmail;
+  final String? userDisplayName;
+
+  /// 与 authMethod 成对的稳定主体；Google 旧凭据仍可从历史字段恢复。
+  final String? providerSubject;
+  String? get subject =>
+      providerSubject ?? (authMethod == 'google' ? googleSubject : null);
+
+  /// Google OIDC 稳定主体；仅用于同一服务端内的本机偏好隔离。
+  final String? googleSubject;
+
   /// 设备 Ed25519 私钥（base64）；留在系统安全存储，不进入日志或缓存。
   final String? devicePrivateKey;
 }
 
 /// 基于 flutter_secure_storage 的实现；密钥材料交给系统安全存储。
+///
+/// Android 上使用 [kLyraSecureStorage] 的 EncryptedSharedPreferences 参数，
+/// 不沿用插件的历史默认加密方案。
 class SecureCredentialStore implements CredentialStore {
   const SecureCredentialStore({FlutterSecureStorage? storage})
-    : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? kLyraSecureStorage;
 
   final FlutterSecureStorage _storage;
 
@@ -55,7 +123,13 @@ class SecureCredentialStore implements CredentialStore {
       deviceId: deviceId,
       accessToken: accessToken,
       refreshToken: refreshToken,
+      userId: await _storage.read(key: _keyUserId),
       devicePrivateKey: await _storage.read(key: _keyDevicePrivateKey),
+      authMethod: await _storage.read(key: _keyAuthMethod),
+      userEmail: await _storage.read(key: _keyUserEmail),
+      googleSubject: await _storage.read(key: _keyGoogleSubject),
+      providerSubject: await _storage.read(key: _keyProviderSubject),
+      userDisplayName: await _storage.read(key: _keyUserDisplayName),
     );
   }
 
@@ -65,9 +139,20 @@ class SecureCredentialStore implements CredentialStore {
     await _storage.write(key: _keyDeviceId, value: snapshot.deviceId);
     await _storage.write(key: _keyAccessToken, value: snapshot.accessToken);
     await _storage.write(key: _keyRefreshToken, value: snapshot.refreshToken);
+    await _storage.write(key: _keyUserId, value: snapshot.userId);
+    await _storage.write(key: _keyAuthMethod, value: snapshot.authMethod);
+    await _storage.write(key: _keyUserEmail, value: snapshot.userEmail);
+    await _storage.write(key: _keyGoogleSubject, value: snapshot.googleSubject);
+    await _storage.write(key: _keyProviderSubject, value: snapshot.subject);
+    await _storage.write(
+      key: _keyUserDisplayName,
+      value: snapshot.userDisplayName,
+    );
     final privateKey = snapshot.devicePrivateKey;
     if (privateKey != null) {
       await _storage.write(key: _keyDevicePrivateKey, value: privateKey);
+    } else {
+      await _storage.delete(key: _keyDevicePrivateKey);
     }
   }
 
@@ -77,13 +162,25 @@ class SecureCredentialStore implements CredentialStore {
     await _storage.delete(key: _keyDeviceId);
     await _storage.delete(key: _keyAccessToken);
     await _storage.delete(key: _keyRefreshToken);
+    await _storage.delete(key: _keyUserId);
     await _storage.delete(key: _keyDevicePrivateKey);
+    await _storage.delete(key: _keyAuthMethod);
+    await _storage.delete(key: _keyUserEmail);
+    await _storage.delete(key: _keyGoogleSubject);
+    await _storage.delete(key: _keyProviderSubject);
+    await _storage.delete(key: _keyUserDisplayName);
   }
 
   static const String _keyDevicePrivateKey = 'lyra.devicePrivateKey';
+  static const String _keyUserId = 'lyra.userId';
+  static const String _keyAuthMethod = 'lyra.authMethod';
+  static const String _keyUserEmail = 'lyra.userEmail';
+  static const String _keyGoogleSubject = 'lyra.googleSubject';
+  static const String _keyProviderSubject = 'lyra.providerSubject';
+  static const String _keyUserDisplayName = 'lyra.userDisplayName';
 }
 
-/// 测试与未配对状态使用的内存实现；不落盘。
+/// 测试与未登录状态使用的内存实现；不落盘。
 class MemoryCredentialStore implements CredentialStore {
   CredentialSnapshot? _snapshot;
 
