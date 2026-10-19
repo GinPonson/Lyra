@@ -167,7 +167,10 @@ String preferencesIdentityKey(CredentialSnapshot snapshot) {
   if (userId == null || userId.isEmpty) {
     throw StateError('登录凭据缺少稳定用户标识，请重新登录');
   }
-  return jsonEncode([normalizePreferencesServerUrl(snapshot.serverUrl), userId]);
+  return jsonEncode([
+    normalizePreferencesServerUrl(snapshot.serverUrl),
+    userId,
+  ]);
 }
 
 String normalizePreferencesServerUrl(String value) {
@@ -324,6 +327,8 @@ class AppPreferencesController extends AsyncNotifier<AppPreferences> {
     await future;
   }
 
+  /// 保存眼睛开关的最近选择，供下次启动时恢复；写入失败向调用方抛出。
+  /// [value] 为 true 时，下次启动继续隐藏金额。
   Future<void> setHideAmountsOnStartup(bool value) =>
       _update((current) => current.copyWith(hideAmountsOnStartup: value));
 
@@ -424,7 +429,8 @@ final profitColorSchemeProvider = Provider<ProfitColorScheme>((ref) {
   return preferences?.profitColorScheme ?? ProfitColorScheme.greenUp;
 });
 
-/// 金额显隐是本次 App 会话的临时状态，只在首次读到设置时应用启动默认值。
+/// 财务页共用的金额显隐状态；启动时恢复最近一次成功保存的眼睛选择。
+/// 首次读取完成前保持隐藏，迟到的偏好不会覆盖用户已作出的当前选择。
 class AmountsHiddenController extends Notifier<bool> {
   bool _startupApplied = false;
   bool _manuallyChanged = false;
@@ -445,8 +451,18 @@ class AmountsHiddenController extends Notifier<bool> {
     return _startupApplied ? initial.requireValue.hideAmountsOnStartup : true;
   }
 
-  void toggle() => setHidden(!state);
+  /// 立即切换本次显隐，并串行保存选择；返回保存完成的 Future。
+  /// 保存失败仍保留用户要求的本次状态并抛出异常，由眼睛按钮明确提示。
+  Future<void> toggle() async {
+    final hidden = !state;
+    setHidden(hidden);
+    await ref
+        .read(appPreferencesProvider.notifier)
+        .setHideAmountsOnStartup(hidden);
+  }
 
+  /// 设置当前会话状态，不写存储；[value] 为 true 时遮住财务金额。
+  /// 用于初始保护与受控状态切换，用户操作通过 [toggle] 同步保存选择。
   void setHidden(bool value) {
     _manuallyChanged = true;
     state = value;

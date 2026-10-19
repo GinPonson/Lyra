@@ -6,10 +6,11 @@ import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
+import '../../core/design/lyra_widgets.dart';
 import 'market_settings.dart';
 import 'market_workspace.dart';
 
-/// Settings do not depend on the ledger or the presence of a priced position.
+/// Shows server-backed market routes without depending on a ledger read.
 class MarketSettingsPanel extends ConsumerWidget {
   const MarketSettingsPanel({super.key});
 
@@ -17,59 +18,80 @@ class MarketSettingsPanel extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final session = ref.watch(sessionProvider);
     final client = ref.watch(marketAuthenticatedClientProvider);
+    final settings = client == null ? null : ref.watch(marketSettingsProvider);
+    final settingsPending = ref.watch(marketSettingsPendingProvider);
+    final canRefresh =
+        client != null &&
+        !session.isLoading &&
+        settings?.isLoading != true &&
+        settingsPending == null;
     return Column(
       key: const ValueKey('market-source-settings'),
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Text(
-          '行情来源',
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                '行情来源',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+              ),
+            ),
+            IconButton(
+              key: const ValueKey('market-settings-refresh'),
+              tooltip: '刷新行情来源',
+              onPressed: canRefresh ? () => _refreshMarketSettings(ref) : null,
+              icon: const Icon(LyraIcons.sync, size: 18),
+            ),
+          ],
         ),
         const SizedBox(height: 6),
-        const _Hint('选择后自动生效，对所有账户与设备同步。'),
+        const _Hint('选择后自动生效，并同步到所有账户与设备。'),
         const SizedBox(height: 14),
         if (session.isLoading && client == null)
           const LinearProgressIndicator(minHeight: 2)
         else if (client == null)
           const _Hint('登录后可以切换行情来源。')
         else
-          ref
-              .watch(marketSettingsProvider)
-              .when(
-                skipLoadingOnRefresh: false,
-                loading: () => const Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    LinearProgressIndicator(minHeight: 2),
-                    SizedBox(height: 8),
-                    _Hint('正在读取行情来源…'),
-                  ],
+          settings!.when(
+            skipLoadingOnRefresh: false,
+            loading: () => const Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                LinearProgressIndicator(minHeight: 2),
+                SizedBox(height: 8),
+                _Hint('正在读取行情来源…'),
+              ],
+            ),
+            error: (error, _) => Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _Hint(
+                  error is LyraApiError && error.statusCode == 404
+                      ? '暂时无法切换行情来源，请稍后重试。'
+                      : lyraErrorMessage(error, fallback: '暂时无法读取行情来源，请稍后重试。'),
                 ),
-                error: (error, _) => Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _Hint(
-                      error is LyraApiError && error.statusCode == 404
-                          ? '暂时无法切换行情来源，请稍后重试。'
-                          : lyraErrorMessage(
-                              error,
-                              fallback: '暂时无法读取行情来源，请稍后重试。',
-                            ),
-                    ),
-                    TextButton(
-                      key: const ValueKey('market-settings-retry'),
-                      onPressed: () => ref.invalidate(marketSettingsProvider),
-                      child: const Text('重试'),
-                    ),
-                  ],
+                TextButton(
+                  key: const ValueKey('market-settings-retry'),
+                  onPressed: () => ref.invalidate(marketSettingsProvider),
+                  child: const Text('重试'),
                 ),
-                data: (settings) => _MarketSettingsEditor(
-                  key: ValueKey(client),
-                  settings: settings,
-                ),
-              ),
+              ],
+            ),
+            data: (settings) => _MarketSettingsEditor(
+              key: ValueKey(client),
+              settings: settings,
+            ),
+          ),
       ],
     );
+  }
+
+  /// Re-reads server settings and quotes without changing saved routes.
+  /// [ref] belongs to the current widget and authenticated provider scope.
+  void _refreshMarketSettings(WidgetRef ref) {
+    ref.invalidate(marketSettingsProvider);
+    ref.invalidate(marketPositionsProvider);
   }
 }
 
@@ -185,12 +207,12 @@ class _MarketSettingsEditorState extends ConsumerState<_MarketSettingsEditor> {
           ),
           const SizedBox(height: 12),
         ],
-        if (settings.routes != settings.effectiveRoutes) ...[
-          const _Hint('部分已选来源当前不可用，请选择其他来源或关闭。'),
-          const SizedBox(height: 10),
-        ],
-        if (settings.providers.any((source) => !source.configured)) ...[
-          const _Hint('暂不可用的来源无法选择，请稍后再试。'),
+        if (!settings.providers.any(
+          (source) =>
+              source.configured &&
+              (source.supports('stock') || source.supports('option')),
+        )) ...[
+          const _Hint('服务端尚未配置行情源。'),
           const SizedBox(height: 10),
         ],
         if (busy) ...[
@@ -201,7 +223,7 @@ class _MarketSettingsEditorState extends ConsumerState<_MarketSettingsEditor> {
             liveRegion: true,
             child: _Hint(switch (error.code) {
               'MARKET_SETTINGS_CHANGED' => '其他设备已修改行情来源。请重新加载后再选择。',
-              'MARKET_PROVIDER_NOT_CONFIGURED' => '所选来源暂不可用，已恢复原选择。请重新加载后再选择。',
+              'MARKET_PROVIDER_NOT_CONFIGURED' => '所选来源未配置，已恢复原选择。请重新加载后再选择。',
               'INVALID_ARGUMENT' => '来源状态已变化。请重新加载后再选择。',
               _ =>
                 '未能确认切换，界面已恢复原选择。'
@@ -238,6 +260,7 @@ class _MarketSettingsEditorState extends ConsumerState<_MarketSettingsEditor> {
   }
 }
 
+/// Groups an asset's primary and backup routes in one responsive settings card.
 class _RouteCard extends StatelessWidget {
   const _RouteCard({
     required this.assetType,
@@ -257,13 +280,32 @@ class _RouteCard extends StatelessWidget {
     final primary = route.isEmpty ? '' : route.first;
     final backup = route.length < 2 ? '' : route.last;
     final source = settings.source(primary);
-    return Container(
+    final effective = settings.effectiveRoutes.forAsset(assetType);
+    final routeUnavailable =
+        !saving &&
+        (route.length != effective.length ||
+            !List<int>.generate(
+              route.length,
+              (index) => index,
+            ).every((index) => route[index] == effective[index]));
+    final String currentState;
+    if (primary.isEmpty) {
+      currentState = '已关闭';
+    } else if (source == null) {
+      currentState = '原来源已不可用';
+    } else if (!source.supports(assetType)) {
+      currentState = '当前来源不支持此类资产';
+    } else if (!source.configured) {
+      currentState = '当前来源未配置';
+    } else if (routeUnavailable) {
+      currentState = effective.isNotEmpty && effective.first == primary
+          ? '备用来源暂不可用'
+          : '当前来源暂不可用';
+    } else {
+      currentState = source.timingLabel;
+    }
+    return LyraCard(
       padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: LyraColors.surfaceSubtle,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: LyraColors.hairlineStrong),
-      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -285,36 +327,70 @@ class _RouteCard extends StatelessWidget {
                   ),
                 ),
               ),
-              if (primary.isEmpty) const _Hint('已关闭'),
+              Flexible(
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: Text(
+                    currentState,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.right,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: LyraColors.inkSecondary,
+                    ),
+                  ),
+                ),
+              ),
             ],
           ),
-          const SizedBox(height: 14),
-          _SourceSelector(
-            assetType: assetType,
-            backup: false,
-            selected: primary,
-            excluded: '',
-            settings: settings,
-            enabled: !saving,
-            onChanged: (id) => onChoose(false, id),
+          const SizedBox(height: 12),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final stacked =
+                  constraints.maxWidth < 300 ||
+                  MediaQuery.textScalerOf(context).scale(14) > 18;
+              final primarySelector = _SourceSelector(
+                assetType: assetType,
+                backup: false,
+                selected: primary,
+                excluded: '',
+                settings: settings,
+                enabled: !saving,
+                onChanged: (id) => onChoose(false, id),
+              );
+              final backupSelector = _SourceSelector(
+                assetType: assetType,
+                backup: true,
+                selected: backup,
+                excluded: primary,
+                settings: settings,
+                enabled: !saving && primary.isNotEmpty,
+                onChanged: (id) => onChoose(true, id),
+              );
+              if (stacked) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    primarySelector,
+                    const SizedBox(height: 10),
+                    backupSelector,
+                  ],
+                );
+              }
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(child: primarySelector),
+                  const SizedBox(width: 12),
+                  Expanded(child: backupSelector),
+                ],
+              );
+            },
           ),
-          const SizedBox(height: 14),
-          _SourceSelector(
-            assetType: assetType,
-            backup: true,
-            selected: backup,
-            excluded: primary,
-            settings: settings,
-            enabled: !saving && primary.isNotEmpty,
-            onChanged: (id) => onChoose(true, id),
-          ),
-          if (source != null &&
-              source.configured &&
-              source.supports(assetType)) ...[
+          if (backup.isNotEmpty) ...[
             const SizedBox(height: 8),
-            _Hint(
-              '${source.timingLabel}${backup.isEmpty ? '' : ' · 主来源无可用报价时尝试备用'}',
-            ),
+            const _Hint('主来源无可用报价时尝试备用。'),
           ],
         ],
       ),
@@ -354,7 +430,7 @@ class _SourceSelector extends StatelessWidget {
       if (id.isEmpty) return backup ? '不使用备用' : '关闭';
       final source = settings.source(id);
       if (source == null || !source.supports(assetType)) return '原来源已不可用';
-      return '${source.displayName}${source.configured ? '' : ' · 暂不可用'}';
+      return '${source.displayName}${source.configured ? '' : ' · 未配置'}';
     }
 
     return DropdownButtonFormField<String>(

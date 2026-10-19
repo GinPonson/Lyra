@@ -151,7 +151,6 @@ class AuthRepository {
     required String displayName,
     required String publicKeyPem,
     required String codeChallenge,
-    String? inviteCode,
     CancelToken? cancelToken,
   }) async {
     final response = await _post(
@@ -161,9 +160,6 @@ class AuthRepository {
         'publicKeyPem': publicKeyPem,
         'codeChallenge': codeChallenge,
         'codeChallengeMethod': 'S256',
-        // 旧服务端不认该键，空邀请码按"未填写"处理，不发空字符串。
-        if (inviteCode != null && inviteCode.isNotEmpty)
-          'inviteCode': inviteCode,
       },
       cancelToken: cancelToken,
     );
@@ -182,15 +178,24 @@ class AuthRepository {
     cancelToken: cancelToken,
   );
 
+  /// 使用本次 PKCE 证明兑换身份；只有已授权的新用户才需要补交 [inviteCode]。
+  ///
+  /// 未授权返回 null；错码/缺码保留服务端事务供更正，其他失败按协议错误抛出。
   Future<LoginCredentials?> exchangeLogin({
     required AuthProvider provider,
     required String loginId,
     required String codeVerifier,
+    String? inviteCode,
     CancelToken? cancelToken,
   }) async {
     final response = await _post(
       '/v1/auth/${provider.id}/exchange',
-      <String, Object?>{'loginId': loginId, 'codeVerifier': codeVerifier},
+      <String, Object?>{
+        'loginId': loginId,
+        'codeVerifier': codeVerifier,
+        if (inviteCode != null && inviteCode.trim().isNotEmpty)
+          'inviteCode': inviteCode.trim(),
+      },
       cancelToken: cancelToken,
     );
     final body = _body(response);

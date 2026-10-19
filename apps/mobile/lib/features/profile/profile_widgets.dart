@@ -3,45 +3,44 @@ import 'package:flutter/material.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
+import '../../core/design/lyra_widgets.dart';
 
-/// 设置以安静的表面分组，行高由内容和文字大小决定。
+/// 用统一卡片承载连续的设置行。
+///
+/// [title] 是可空的 `String`，可省略以适配紧凑总览页，二级页面仍可显示分组
+/// 标题；[children] 是 `List<Widget>`，按传入顺序显示。
 class ProfileSection extends StatelessWidget {
-  const ProfileSection({
-    super.key,
-    required this.title,
-    required this.children,
-  });
+  const ProfileSection({super.key, this.title, required this.children});
 
-  final String title;
+  final String? title;
   final List<Widget> children;
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.only(top: 24),
+    padding: const EdgeInsets.only(top: 16),
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Padding(
-          padding: const EdgeInsets.only(left: 2, bottom: 8),
-          child: Text(
-            title,
-            style: Theme.of(context).textTheme.labelMedium?.copyWith(
-              color: LyraColors.muted,
-              fontWeight: FontWeight.w500,
-              letterSpacing: 0,
+        if (title != null) ...[
+          Padding(
+            padding: const EdgeInsets.only(left: 2, bottom: 8),
+            child: Text(
+              title!,
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: LyraColors.muted,
+                fontWeight: FontWeight.w500,
+                letterSpacing: 0,
+              ),
             ),
           ),
-        ),
-        Material(
-          color: LyraColors.surface,
-          borderRadius: BorderRadius.circular(16),
-          clipBehavior: Clip.antiAlias,
+        ],
+        LyraCard(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               for (final (index, child) in children.indexed) ...[
-                if (index > 0)
-                  const Divider(height: 1, indent: 48, endIndent: 14),
+                if (index > 0) const Divider(height: 1),
                 child,
               ],
             ],
@@ -52,6 +51,12 @@ class ProfileSection extends StatelessWidget {
   );
 }
 
+/// 显示设置名称、当前值和可选的跳转操作。
+///
+/// [title] 是必填 `String` 设置名称；[glyph] 是统一 Hugeicons 名称，[icon] 是
+/// 现有二级页 `IconData`，二者至少提供一个；[subtitle] 与 [value] 是可空
+/// `String`，分别提供补充说明和当前状态；[onTap] 是可空 `VoidCallback`；
+/// [trailing] 是可空 `Widget`，可替换默认箭头；[enabled] 是布尔值，控制交互和文字颜色。
 class ProfileSettingRow extends StatelessWidget {
   const ProfileSettingRow({
     super.key,
@@ -80,7 +85,7 @@ class ProfileSettingRow extends StatelessWidget {
     child: InkWell(
       onTap: enabled ? onTap : null,
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 14),
+        padding: const EdgeInsets.symmetric(vertical: 18),
         child: Row(
           children: [
             ExcludeSemantics(
@@ -100,33 +105,57 @@ class ProfileSettingRow extends StatelessWidget {
                           : LyraColors.mutedSoft,
                     ),
             ),
-            const SizedBox(width: 12),
+            const SizedBox(width: 20),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Wrap(
-                    alignment: WrapAlignment.spaceBetween,
-                    spacing: 12,
-                    runSpacing: 4,
-                    children: [
-                      Text(
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final name = Text(
                         title,
                         style: Theme.of(context).textTheme.titleSmall?.copyWith(
                           color: enabled ? LyraColors.ink : LyraColors.muted,
                           fontWeight: FontWeight.w500,
                         ),
-                      ),
-                      if (value != null)
-                        Text(
-                          value!,
-                          style: Theme.of(context).textTheme.bodySmall
-                              ?.copyWith(
-                                color: LyraColors.inkSecondary,
-                                height: 1.5,
-                              ),
-                        ),
-                    ],
+                      );
+                      final stacked =
+                          constraints.maxWidth < 240 &&
+                          MediaQuery.textScalerOf(context).scale(14) > 18;
+                      final currentValue = value == null
+                          ? null
+                          : Text(
+                              value!,
+                              textAlign: stacked
+                                  ? TextAlign.left
+                                  : TextAlign.right,
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(
+                                    color: LyraColors.inkSecondary,
+                                    height: 1.5,
+                                  ),
+                            );
+                      // 大字时让设置名称完整占行，避免“行情与估值”出现单字孤行。
+                      if (stacked && currentValue != null) {
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            name,
+                            const SizedBox(height: 4),
+                            currentValue,
+                          ],
+                        );
+                      }
+                      return Row(
+                        children: [
+                          Expanded(child: name),
+                          if (currentValue != null) ...[
+                            const SizedBox(width: 8),
+                            Expanded(child: currentValue),
+                          ],
+                        ],
+                      );
+                    },
                   ),
                   if (subtitle != null) ...[
                     const SizedBox(height: 4),
@@ -192,7 +221,10 @@ class ProfileNotice extends StatelessWidget {
   );
 }
 
-/// 二级设置页保留返回路径，并限制宽屏文字行长。
+/// 二级设置页延续主页面的标题、卡片留白，并保留系统返回路径。
+///
+/// [title] 是非空页面名称；[child] 是可纵向滚动的内容。内容宽度限制为 720px，
+/// 窄屏保留 14px 外边距，大字标题可在工具栏内换行。
 class ProfileSubpage extends StatelessWidget {
   const ProfileSubpage({super.key, required this.title, required this.child});
 
@@ -201,11 +233,24 @@ class ProfileSubpage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: Text(title)),
+    appBar: AppBar(
+      toolbarHeight: MediaQuery.textScalerOf(context).scale(24) > 32 ? 88 : 68,
+      titleSpacing: 0,
+      leadingWidth: 58,
+      title: Text(
+        title,
+        style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+          fontSize: 24,
+          fontWeight: FontWeight.w600,
+          height: 1.25,
+          letterSpacing: -.4,
+        ),
+      ),
+    ),
     body: SafeArea(
       top: false,
       child: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(20, 12, 20, 32),
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 32),
         child: Align(
           alignment: Alignment.topCenter,
           child: ConstrainedBox(
@@ -215,25 +260,5 @@ class ProfileSubpage extends StatelessWidget {
         ),
       ),
     ),
-  );
-}
-
-class ProfileSheetHeader extends StatelessWidget {
-  const ProfileSheetHeader({super.key, required this.title});
-
-  final String title;
-
-  @override
-  Widget build(BuildContext context) => Row(
-    children: [
-      Expanded(
-        child: Text(title, style: Theme.of(context).textTheme.titleLarge),
-      ),
-      IconButton(
-        tooltip: '关闭',
-        onPressed: () => Navigator.pop(context),
-        icon: const Icon(LyraIcons.dismiss),
-      ),
-    ],
   );
 }

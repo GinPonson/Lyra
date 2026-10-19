@@ -41,8 +41,10 @@ void main() {
       // 手机选择底栏，宽屏选择顶栏；两个入口使用同一导航状态。
       await tester.tap(find.text('股票'));
       await tester.pumpAndSettle();
-      expect(find.text('我的股票'), findsOneWidget);
       expect(find.byKey(const ValueKey('stocks-screen')), findsOneWidget);
+      expect(find.text('股票'), findsNWidgets(2));
+      expect(find.text('持仓'), findsOneWidget);
+      expect(find.byTooltip('搜索证券'), findsOneWidget);
       await tester.tap(find.text('期权到期').first);
       await tester.pumpAndSettle();
       expect(find.text('期权到期'), findsWidgets);
@@ -50,16 +52,20 @@ void main() {
 
       await tester.tap(find.text('交易'));
       await tester.pumpAndSettle();
-      expect(find.text('交易记录'), findsOneWidget);
-      expect(find.text('全部交易'), findsOneWidget);
+      expect(find.text('交易'), findsNWidgets(2));
+      expect(find.text('全部'), findsOneWidget);
+      expect(find.byTooltip('筛选'), findsOneWidget);
+      expect(find.text('上一页'), findsNothing);
+      expect(find.text('下一页'), findsNothing);
       expect(tester.takeException(), isNull);
 
       await tester.tap(find.text('我的'));
       await tester.pumpAndSettle();
-      expect(find.text('使用偏好'), findsOneWidget);
-      expect(find.text('启动时隐藏金额'), findsOneWidget);
-      expect(find.text('应用'), findsOneWidget);
-      expect(find.text('Google 已登录'), findsOneWidget);
+      expect(find.text('启动账户'), findsOneWidget);
+      expect(find.text('启动时隐藏金额'), findsNothing);
+      expect(find.byType(Switch), findsNothing);
+      expect(find.text('行情与估值'), findsOneWidget);
+      expect(find.text('Google'), findsOneWidget);
       expect(tester.takeException(), isNull);
     });
   }

@@ -374,7 +374,7 @@ void main() {
     expect(find.text('先创建一个证券账户'), findsOneWidget);
     expect(fixture.createKeys, isEmpty);
     await _tap(tester, find.text('创建第一个证券账户'));
-    expect(find.textContaining('登录账号用于访问 Lyra'), findsOneWidget);
+    expect(find.text('用于归集你导入的交易记录。'), findsOneWidget);
     await _fillAccount(tester);
     await _tap(tester, find.byKey(const ValueKey('create-account-submit')));
     expect(find.byType(AccountSheet), findsNothing);
@@ -386,7 +386,7 @@ void main() {
     expect(fixture.createBodies.single['accountIdentifier'], 'XXX276');
     await _tap(tester, find.text('选择文件并预览'));
     expect(find.text('总行数 1 · 可新增 1 · 已存在 0'), findsOneWidget);
-    await _tap(tester, find.text('确认写入账本（1 行）'));
+    await _tap(tester, find.text('确认导入'));
     expect(find.text('导入完成：新增 1 条交易。'), findsOneWidget);
     expect(find.textContaining('账本版本'), findsNothing);
     expect(container.read(accountScopeProvider).id, LedgerFixture.account);
@@ -405,7 +405,7 @@ void main() {
   testWidgets('已有账户的范围选择器保留新增入口并选中新建账户', (tester) async {
     final fixture = _FirstUseFixture()..created = true;
     await _pumpFixture(tester, fixture, fullApp: true);
-    await _tap(tester, find.text('全部账号'));
+    await _tap(tester, find.text('全部账户'));
     expect(find.text('选择证券账户'), findsOneWidget);
     await _tap(tester, find.text('新增证券账户'));
     await _fillAccount(tester);
@@ -441,7 +441,7 @@ void main() {
     await _openImportCreation(tester);
     await _tap(tester, find.byKey(const ValueKey('create-account-submit')));
     expect(find.byType(AccountSheet), findsOneWidget);
-    expect(find.text('暂时无法创建证券账户，请重试。'), findsOneWidget);
+    expect(find.text('请求超时，请稍后重试。'), findsOneWidget);
     expect(find.textContaining('CLIENT_REQUEST_FAILED'), findsNothing);
     expect(fixture.previewAccounts, [null]);
     await _tap(tester, find.byKey(const ValueKey('create-account-submit')));
@@ -496,7 +496,13 @@ void main() {
     final fixture = _FirstUseFixture();
     await _pumpFixture(tester, fixture);
     await _openImportCreation(tester);
-    await _tap(tester, find.text('取消'));
+    await _tap(
+      tester,
+      find.descendant(
+        of: find.byType(AccountSheet),
+        matching: find.byTooltip('关闭'),
+      ),
+    );
     expect(fixture.createKeys, isEmpty);
     expect(find.textContaining('已选择：$_fileName'), findsOneWidget);
     await _tap(tester, find.text('新增证券账户'));

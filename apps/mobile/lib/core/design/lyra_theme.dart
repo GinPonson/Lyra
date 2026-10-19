@@ -19,6 +19,7 @@ abstract final class LyraTheme {
   /// 数字采用等宽字形，金额和时间戳在更新时保持对齐。
   static const TextStyle numeric = TextStyle(
     fontFamily: fontFamily,
+    fontFamilyFallback: _fontFallback,
     fontFeatures: <FontFeature>[FontFeature.tabularFigures()],
   );
 
@@ -356,13 +357,28 @@ abstract final class LyraTheme {
               : LyraColors.inkSecondary;
         }),
       ),
-      // 图标与标签始终可见；选中背景由外壳控制为紧凑圆角块。
+      // 选中块与按压、聚焦和悬停反馈共用原生形状，避免交互层露出两端。
       navigationBarTheme: NavigationBarThemeData(
         height: 76,
         elevation: 0,
         backgroundColor: LyraColors.surfaceSubtle,
         surfaceTintColor: Colors.transparent,
         indicatorColor: LyraColors.accentTint,
+        indicatorShape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.all(Radius.circular(10)),
+        ),
+        overlayColor: WidgetStateProperty.resolveWith<Color?>((states) {
+          if (states.contains(WidgetState.pressed)) {
+            return LyraColors.accent.withValues(alpha: 0.14);
+          }
+          if (states.contains(WidgetState.focused)) {
+            return LyraColors.accent.withValues(alpha: 0.18);
+          }
+          if (states.contains(WidgetState.hovered)) {
+            return LyraColors.accent.withValues(alpha: 0.08);
+          }
+          return Colors.transparent;
+        }),
         iconTheme: WidgetStateProperty.resolveWith<IconThemeData>(
           (states) => IconThemeData(
             color: states.contains(WidgetState.selected)
@@ -380,7 +396,9 @@ abstract final class LyraTheme {
                 : LyraColors.inkSecondary,
             fontSize: 12,
             height: 1.25,
-            fontWeight: FontWeight.w500,
+            fontWeight: states.contains(WidgetState.selected)
+                ? FontWeight.w600
+                : FontWeight.w500,
             letterSpacing: 0,
           ),
         ),

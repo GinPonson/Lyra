@@ -151,6 +151,8 @@ class _LyraShellState extends State<LyraShell> {
         bottomNavigationBar: wide
             ? null
             : DecoratedBox(
+                // 边线绘制在导航背景之上，避免被子组件的不透明表面覆盖。
+                position: DecorationPosition.foreground,
                 decoration: const BoxDecoration(
                   border: Border(
                     top: BorderSide(
@@ -160,19 +162,14 @@ class _LyraShellState extends State<LyraShell> {
                   ),
                 ),
                 child: NavigationBar(
-                  // 选中底色由图形容器控制尺寸，导航按钮仍保留完整点击区域。
-                  indicatorColor: Colors.transparent,
                   selectedIndex: _selectedIndex,
                   onDestinationSelected: _selectDestination,
+                  animationDuration: const Duration(milliseconds: 200),
                   labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
                   destinations: [
                     for (final destination in LyraDestination.values)
                       NavigationDestination(
-                        icon: _NavigationGlyph(destination.icon),
-                        selectedIcon: _NavigationGlyph(
-                          destination.icon,
-                          selected: true,
-                        ),
+                        icon: LyraPrimaryIcon(destination.icon),
                         label: destination.label,
                       ),
                   ],
@@ -180,28 +177,6 @@ class _LyraShellState extends State<LyraShell> {
               ),
       );
     },
-  );
-}
-
-/// 选中背景从默认宽胶囊收为小圆角块，不影响导航的触控和语义区域。
-class _NavigationGlyph extends StatelessWidget {
-  const _NavigationGlyph(this.glyph, {this.selected = false});
-  final LyraPrimaryGlyph glyph;
-  final bool selected;
-
-  @override
-  Widget build(BuildContext context) => Container(
-    width: 52,
-    height: 32,
-    alignment: Alignment.center,
-    decoration: BoxDecoration(
-      color: selected ? LyraColors.accentTint : Colors.transparent,
-      borderRadius: BorderRadius.circular(10),
-    ),
-    child: LyraPrimaryIcon(
-      glyph,
-      color: selected ? LyraColors.accent : LyraColors.inkSecondary,
-    ),
   );
 }
 

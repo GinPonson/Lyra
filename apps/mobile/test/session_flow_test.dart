@@ -247,7 +247,7 @@ void main() {
     // 已登录状态展示真实汇总：十进制字符串原样展示，不伪造。先滚回顶部。
     await tester.drag(find.byType(CustomScrollView), const Offset(0, 800));
     await tester.pumpAndSettle();
-    expect(find.text('全部账号'), findsOneWidget);
+    expect(find.text('全部账户'), findsOneWidget);
     expect(
       find.byKey(const ValueKey<String>('overview-hero-value')),
       findsOneWidget,
@@ -301,6 +301,76 @@ void main() {
     expect(ok, isTrue);
     expect(exchangeCount, 2, reason: '一次瞬时失败后应当继续轮询，而不是放弃');
     expect((await store.read())?.accessToken, 'access-token-1');
+  });
+
+  test('授权窗口关闭后立即兑换，浏览器阶段不在后台轮询', () async {
+    final store = MemoryCredentialStore();
+    final opened = Completer<void>();
+    final authorization = Completer<bool>();
+    var exchangeCount = 0;
+    final container = _sessionContainer(
+      store,
+      (options) async {
+        if (options.uri.path.endsWith('/start')) {
+          return _response(_startResponse(), 201);
+        }
+        exchangeCount++;
+        return _response(_loginResponse, 200);
+      },
+      openAuthorizationUrl: (_) {
+        opened.complete();
+        return authorization.future;
+      },
+    );
+    addTearDown(container.dispose);
+    await container.read(sessionProvider.future);
+    final controller = container.read(sessionProvider.notifier);
+
+    final login = controller.signInWithGoogle(
+      serverUrl: 'https://lyra.example.com',
+      displayName: 'Test',
+    );
+    await opened.future;
+    await pumpEventQueue();
+    expect(exchangeCount, 0, reason: '系统授权窗口未结束时不请求兑换');
+    authorization.complete(true);
+    expect(await login, isTrue);
+    expect(exchangeCount, 1, reason: '窗口结束后立即兑换，不先等一个轮询间隔');
+    expect((await store.read())?.accessToken, 'access-token-1');
+  });
+
+  test('取消后迟到的浏览器返回不能发起兑换', () async {
+    final store = MemoryCredentialStore();
+    final opened = Completer<void>();
+    final authorization = Completer<bool>();
+    var exchangeCount = 0;
+    final container = _sessionContainer(
+      store,
+      (options) async {
+        if (options.uri.path.endsWith('/start')) {
+          return _response(_startResponse(), 201);
+        }
+        exchangeCount++;
+        return _response(_loginResponse, 200);
+      },
+      openAuthorizationUrl: (_) {
+        opened.complete();
+        return authorization.future;
+      },
+    );
+    addTearDown(container.dispose);
+    await container.read(sessionProvider.future);
+    final controller = container.read(sessionProvider.notifier);
+    final login = controller.signInWithGoogle(
+      serverUrl: 'https://lyra.example.com',
+      displayName: 'Test',
+    );
+    await opened.future;
+    controller.cancelSignIn();
+    authorization.complete(true);
+    expect(await login, isFalse);
+    expect(exchangeCount, 0);
+    expect(await store.read(), isNull);
   });
 
   test('取消授权停止轮询且不保存任何凭据', () async {
@@ -492,7 +562,10 @@ void main() {
           403,
         );
       }
-      return _response('{"code":"DEVICE_AUTH_INVALID","message":"expired"}', 401);
+      return _response(
+        '{"code":"DEVICE_AUTH_INVALID","message":"expired"}',
+        401,
+      );
     });
     addTearDown(container.dispose);
     await container.read(sessionProvider.future);
@@ -505,8 +578,10 @@ void main() {
     );
     await pumpEventQueue();
     expect(container.read(sessionProvider).value, isA<SessionSignedOut>());
-    expect((container.read(sessionProvider).value as SessionSignedOut).message,
-        '账号已停用，请联系管理员。');
+    expect(
+      (container.read(sessionProvider).value as SessionSignedOut).message,
+      '账号已停用，请联系管理员。',
+    );
     expect(refreshes, 1);
     expect(await store.read(), isNull);
   });
@@ -1007,6 +1082,7 @@ ProviderContainer _sessionContainer(
   MemoryCredentialStore store,
   Future<ResponseBody> Function(RequestOptions) handler, {
   MemoryAgentSessionStore? agentStore,
+  Future<bool> Function(Uri url)? openAuthorizationUrl,
 }) {
   return ProviderContainer(
     overrides: [
@@ -1014,7 +1090,7 @@ ProviderContainer _sessionContainer(
         SessionDependencies(
           credentialStore: store,
           agentSessionStore: agentStore ?? MemoryAgentSessionStore(),
-          openAuthorizationUrl: (_) async => true,
+          openAuthorizationUrl: openAuthorizationUrl ?? (_) async => true,
           clientFactory: (url) =>
               Dio(BaseOptions(baseUrl: url))
                 ..httpClientAdapter = FakeLyraAdapter(handler),

@@ -355,7 +355,8 @@ void main() {
     await tester.pumpAndSettle();
 
     // 服务端要求显式账户映射后，面板展示候选账户按钮。
-    expect(find.text('请选择文件对应的证券账户。'), findsOneWidget);
+    expect(find.text('请选择该文件对应的账户后重新预览：'), findsOneWidget);
+    expect(find.text('请选择文件对应的证券账户。'), findsNothing);
     expect(find.textContaining('ACCOUNT_MAPPING_REQUIRED'), findsNothing);
     expect(find.textContaining('请选择该文件对应的账户'), findsOneWidget);
     expect(find.text('Individual（TST276）'), findsOneWidget);
@@ -369,7 +370,7 @@ void main() {
     expect(find.text('总行数 2 · 可新增 2 · 已存在 0'), findsOneWidget);
     expect(find.textContaining('买入 × 1'), findsOneWidget);
 
-    await tester.tap(find.textContaining('确认写入账本'));
+    await tester.tap(find.text('确认导入'));
     await tester.pumpAndSettle();
 
     expect(find.text('导入完成：新增 2 条交易。'), findsOneWidget);
@@ -423,15 +424,15 @@ void main() {
       },
     );
     await _tapImport(tester, find.text('选择文件并预览'));
-    await _tapImport(tester, find.textContaining('确认写入账本'));
+    await _tapImport(tester, find.text('确认导入'));
     expect(find.text('当前预览已失效，请重新预览后再确认导入。'), findsOneWidget);
     expect(find.textContaining('IMPORT_PREVIEW_STALE'), findsNothing);
     expect(find.textContaining('confirm_token'), findsNothing);
-    expect(find.textContaining('确认写入账本'), findsNothing);
+    expect(find.text('确认导入'), findsNothing);
     await _tapImport(tester, find.text('重试当前文件'));
     expect(filePicks, 1);
     expect(previews, 2);
-    await _tapImport(tester, find.textContaining('确认写入账本'));
+    await _tapImport(tester, find.text('确认导入'));
     expect(commitKeys, [
       'commit-i1000000-0000-4000-8000-000000000001',
       'commit-i1000000-0000-4000-8000-000000000002',
@@ -468,7 +469,7 @@ void main() {
         return _routeImportRequest(options);
       });
       await _tapImport(tester, find.text('选择文件并预览'));
-      await _tapImport(tester, find.text('无新增交易，仍确认提交'));
+      await _tapImport(tester, find.text('确认无新增'));
       expect(
         find.text(skipped == 0 ? '文件中没有可导入的交易。' : '这些交易已在账本中，无需重复导入。'),
         findsOneWidget,

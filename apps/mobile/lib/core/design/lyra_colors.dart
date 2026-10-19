@@ -13,6 +13,7 @@ abstract final class LyraColors {
   static const Color surface = Color(0xFF191D25);
   static const Color surfaceSubtle = Color(0xFF151920);
   static const Color surfaceStrong = Color(0xFF222936);
+  static const Color cardBorder = Color(0xFF2C323C);
 
   // 文字。
   static const Color ink = Color(0xFFF1F4F8);

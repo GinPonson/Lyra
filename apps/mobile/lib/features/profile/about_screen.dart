@@ -5,14 +5,17 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
+import '../../core/design/lyra_widgets.dart';
 import '../system/system_workspace.dart';
 import 'profile_widgets.dart';
 
 const lyraProjectUrl = 'https://github.com/GinPonson/Lyra';
 
+/// 显示真实 App 版本与项目入口，不请求服务端诊断或连接状态。
 class AboutScreen extends ConsumerWidget {
   const AboutScreen({super.key});
 
+  /// 使用外部浏览器打开项目；[context] 用于明确反馈浏览器启动失败。
   Future<void> _openProject(BuildContext context) async {
     var opened = false;
     try {
@@ -37,23 +40,33 @@ class AboutScreen extends ConsumerWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const SizedBox(height: 12),
-          const Text(
-            'lyra',
-            style: TextStyle(
-              fontSize: 34,
-              fontWeight: FontWeight.w500,
-              letterSpacing: -1.4,
-              color: LyraColors.ink,
+          const LyraCard(
+            padding: EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'lyra',
+                  style: TextStyle(
+                    fontSize: 40,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: -1.6,
+                    color: LyraColors.ink,
+                  ),
+                ),
+                SizedBox(height: 8),
+                Text(
+                  '整理账户与交易，看清你的投资。',
+                  style: TextStyle(
+                    color: LyraColors.inkSecondary,
+                    fontSize: 14,
+                    height: 1.6,
+                  ),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 8),
-          const Text(
-            '整理账户与交易，看清你的投资。',
-            style: TextStyle(color: LyraColors.muted, height: 1.7),
-          ),
           ProfileSection(
-            title: '版本信息',
             children: [
               ProfileSettingRow(
                 title: 'App 版本',
@@ -71,11 +84,6 @@ class AboutScreen extends ConsumerWidget {
                       )
                     : null,
               ),
-            ],
-          ),
-          ProfileSection(
-            title: '项目',
-            children: [
               ProfileSettingRow(
                 title: 'GitHub 项目',
                 icon: LyraIcons.openLink,
@@ -85,12 +93,15 @@ class AboutScreen extends ConsumerWidget {
             ],
           ),
           const SizedBox(height: 16),
-          const SelectableText(
-            lyraProjectUrl,
-            style: TextStyle(
-              color: LyraColors.muted,
-              fontSize: 12,
-              height: 1.6,
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 8),
+            child: SelectableText(
+              lyraProjectUrl,
+              style: TextStyle(
+                color: LyraColors.muted,
+                fontSize: 12,
+                height: 1.6,
+              ),
             ),
           ),
         ],

@@ -9,8 +9,10 @@ import 'package:lyra_mobile/core/design/lyra_colors.dart';
 import 'package:lyra_mobile/core/design/lyra_theme.dart';
 import 'package:lyra_mobile/core/design/lyra_widgets.dart';
 import 'package:lyra_mobile/core/preferences/app_preferences.dart';
+import 'package:lyra_mobile/features/accounts/account_workspace.dart';
 import 'package:lyra_mobile/features/ledger/ledger_screen.dart';
 import 'package:lyra_mobile/features/ledger/ledger_view.dart';
+import 'package:lyra_mobile/features/ledger/ledger_workspace.dart';
 import 'package:lyra_mobile/features/overview/overview_screen.dart';
 
 import 'support/ledger_fixture.dart';
@@ -64,8 +66,95 @@ Future<ProviderContainer> _pump(
       ),
     ),
   );
+  final container = ProviderScope.containerOf(
+    tester.element(find.byType(MaterialApp)),
+  );
+  await _waitForFinancialData(tester, container, body);
   await tester.pumpAndSettle();
-  return ProviderScope.containerOf(tester.element(find.byType(MaterialApp)));
+  return container;
+}
+
+/// 等待页面实际读取的 provider，避免 pumpAndSettle 在无帧但请求未完成时提前返回。
+Future<void> _waitForFinancialData(
+  WidgetTester tester,
+  ProviderContainer container,
+  Widget body,
+) async {
+  container.read(appPreferencesProvider);
+  await _pumpUntilReady(
+    tester,
+    () => !container.read(appPreferencesProvider).isLoading,
+    '偏好读取',
+  );
+
+  final hasTrend = find.byType(LedgerTrendPreview).evaluate().isNotEmpty;
+  if (body is! OverviewScreen && !hasTrend) return;
+
+  await _pumpUntilReady(
+    tester,
+    () => !container.read(sessionProvider).isLoading,
+    '会话恢复',
+  );
+  final session = container.read(sessionProvider).value;
+  if (session is! SessionAuthenticated) return;
+  // 让认证完成后的页面先重建并订阅页面查询，再观察加载完成状态。
+  await tester.pump();
+  container.read(accountScopeReadyProvider);
+  await _pumpUntilReady(
+    tester,
+    () => !container.read(accountScopeReadyProvider).isLoading,
+    '账户范围恢复',
+  );
+  await tester.pump();
+  final scope = container.read(accountScopeProvider).id;
+
+  if (body is OverviewScreen) {
+    container.read(brokerageAccountsProvider);
+    await _pumpUntilReady(
+      tester,
+      () => !container.read(brokerageAccountsProvider).isLoading,
+      '证券账户查询',
+    );
+    await tester.pump();
+    container.read(scopedSummaryProvider);
+    await _pumpUntilReady(
+      tester,
+      () => !container.read(scopedSummaryProvider).isLoading,
+      '总览汇总查询',
+    );
+    await tester.pump();
+  }
+
+  for (final trend in tester.widgetList<LedgerTrendPreview>(
+    find.byType(LedgerTrendPreview),
+  )) {
+    final view = trend.embedded ? LedgerView.drawdown : LedgerView.monthly;
+    final read = ledgerReadProvider((
+      path: view.path,
+      parameters: '',
+      scope: scope,
+    ));
+    container.read(read);
+    await _pumpUntilReady(
+      tester,
+      () => !container.read(read).isLoading,
+      '收益走势查询',
+    );
+    await tester.pump();
+  }
+}
+
+/// 以短帧推进测试调度器，直到指定的真实异步依赖完成或明确失败。
+Future<void> _pumpUntilReady(
+  WidgetTester tester,
+  bool Function() ready,
+  String dependency,
+) async {
+  for (var attempt = 0; attempt < 150; attempt++) {
+    if (ready()) return;
+    await tester.pump(const Duration(milliseconds: 20));
+  }
+  fail('$dependency在测试等待期限内仍未完成');
 }
 
 Color? _textColor(WidgetTester tester, String value) =>
@@ -212,14 +301,22 @@ void main() {
   testWidgets('总览盈亏文字响应设置，深色卡片不受涨跌配色影响', (tester) async {
     final container = await _pump(tester, const OverviewScreen());
     final card = find.byKey(const ValueKey('overview-summary-card'));
-    final before = tester.widget<Container>(card).decoration as BoxDecoration;
-    expect(before.color, LyraColors.surface);
-    expect(before.gradient, isNull);
+    final cardSurface = find
+        .descendant(of: card, matching: find.byType(Container))
+        .first;
+    final before =
+        tester.widget<Container>(cardSurface).decoration as BoxDecoration;
+    expect(before.gradient!.colors, [
+      LyraColors.surface,
+      LyraColors.surfaceSubtle,
+    ]);
     expect(_textColor(tester, '+2,846.72'), LyraColors.positive);
     await _setScheme(tester, container, ProfitColorScheme.redUp);
     expect(_textColor(tester, '+2,846.72'), LyraColors.negative);
-    final after = tester.widget<Container>(card).decoration as BoxDecoration;
+    final after =
+        tester.widget<Container>(cardSurface).decoration as BoxDecoration;
     expect(after.color, before.color);
+    expect(after.gradient, before.gradient);
     expect(after.border, before.border);
     expect(tester.takeException(), isNull);
   });
@@ -263,6 +360,20 @@ void main() {
       fixture: _CrossingTrendFixture(),
     );
     await tester.tap(find.text('累计'));
+    await tester.pump();
+    final scope = container.read(accountScopeProvider).id;
+    final read = ledgerReadProvider((
+      path: LedgerView.drawdown.path,
+      parameters: '',
+      scope: scope,
+    ));
+    container.read(read);
+    await _pumpUntilReady(
+      tester,
+      () => !container.read(read).isLoading,
+      '累计收益走势查询',
+    );
+    await tester.pump();
     await tester.pumpAndSettle();
     expect(_textColor(tester, '12.63'), LyraColors.positive);
     expect(find.byTooltip('原始值：12.6250'), findsOneWidget);

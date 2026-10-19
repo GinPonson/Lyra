@@ -42,7 +42,7 @@ class AuthProviderAvailability {
   final bool available;
 }
 
-/// 登录方式目录；`registrationRequiresInvite` 决定登录页是否展示邀请码输入框。
+/// 登录方式目录；邀请码声明只描述注册门禁，是否需要补码由身份授权后的兑换结果决定。
 class AuthProviderCatalog {
   const AuthProviderCatalog({
     required this.providers,

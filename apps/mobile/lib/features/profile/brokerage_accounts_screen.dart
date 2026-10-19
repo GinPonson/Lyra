@@ -6,12 +6,15 @@ import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
+import '../../core/design/lyra_widgets.dart';
 import '../accounts/account_repository.dart';
 import '../accounts/account_sheet.dart';
 import '../accounts/account_workspace.dart';
+import '../gmail/gmail_sync_screen.dart';
 import '../overview/login_panel.dart';
 import 'profile_widgets.dart';
 
+/// 展示当前登录身份下的证券账户，并提供明确的账户创建入口。
 class BrokerageAccountsScreen extends ConsumerWidget {
   const BrokerageAccountsScreen({super.key});
 
@@ -26,10 +29,10 @@ class BrokerageAccountsScreen extends ConsumerWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const Text(
-            '证券账户用于归集导入的交易记录，与你的 Lyra 登录身份分开。',
+            '证券账户用于归集导入的交易记录。',
             style: TextStyle(color: LyraColors.muted, height: 1.7),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 16),
           if (session.isLoading)
             const LinearProgressIndicator(minHeight: 2)
           else if (!signedIn)
@@ -40,26 +43,52 @@ class BrokerageAccountsScreen extends ConsumerWidget {
                 padding: EdgeInsets.symmetric(vertical: 24),
                 child: LinearProgressIndicator(minHeight: 2),
               ),
-              error: (error, _) => ProfileNotice(
-                message: lyraErrorMessage(error, fallback: '暂时无法读取证券账户，请重新加载。'),
-                onRetry: () => ref.invalidate(brokerageAccountsProvider),
-                retryLabel: '重新加载账户',
+              error: (error, _) => LyraCard(
+                child: ProfileNotice(
+                  message: lyraErrorMessage(
+                    error,
+                    fallback: '暂时无法读取证券账户，请重新加载。',
+                  ),
+                  onRetry: () => ref.invalidate(brokerageAccountsProvider),
+                  retryLabel: '重新加载账户',
+                ),
               ),
-              data: (rows) => rows.isEmpty
-                  ? const ProfileNotice(
-                      message: '还没有证券账户。创建后即可导入券商文件，开始记录你的投资。',
-                    )
-                  : Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        for (final (index, account) in rows.indexed) ...[
-                          if (index > 0) const Divider(height: 1, indent: 48),
-                          _AccountRow(account: account),
+              data: (rows) => LyraCard(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 4,
+                ),
+                child: rows.isEmpty
+                    ? const ProfileNotice(message: '还没有证券账户。创建后即可导入券商文件。')
+                    : Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          for (final (index, account) in rows.indexed) ...[
+                            if (index > 0) const Divider(height: 1, indent: 48),
+                            _AccountRow(account: account),
+                          ],
                         ],
-                      ],
-                    ),
+                      ),
+              ),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 12),
+            LyraCard(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              child: ProfileSettingRow(
+                key: const ValueKey('profile-gmail-sync'),
+                title: '嘉信邮件',
+                icon: LyraIcons.gmail,
+                subtitle: '只读同步成交确认邮件',
+                value: '设置同步',
+                onTap: () => Navigator.push<void>(
+                  context,
+                  MaterialPageRoute<void>(
+                    builder: (_) => const GmailSyncScreen(),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
             FilledButton.icon(
               key: const ValueKey('profile-add-account'),
               onPressed: () => showCreateAccountSheet(context),
@@ -73,6 +102,7 @@ class BrokerageAccountsScreen extends ConsumerWidget {
   }
 }
 
+/// 呈现一条证券账户记录，名称与券商编号按内容自然换行。
 class _AccountRow extends StatelessWidget {
   const _AccountRow({required this.account});
 

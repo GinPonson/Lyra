@@ -12,6 +12,7 @@ abstract final class LyraIcons {
   static const IconData stocks = Icons.candlestick_chart_outlined;
   static const IconData search = Icons.search_outlined;
   static const IconData arrowUpRight = Icons.north_east_outlined;
+  static const IconData arrowDownRight = Icons.south_east_outlined;
   static const IconData back = Icons.arrow_back_outlined;
   static const IconData filter = Icons.tune_outlined;
   static const IconData portfolio = Icons.pie_chart_outline;

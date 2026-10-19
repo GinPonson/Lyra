@@ -8,8 +8,9 @@ import '../../core/api/lyra_api_client.dart';
 import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/preferences/app_preferences.dart';
-import '../auth/auth_provider.dart';
 import '../auth/auth_workspace.dart';
+import '../auth/auth_provider.dart';
+import '../auth/login_failure_message.dart';
 import '../system/system_repository.dart';
 
 /// 保留已有凭据与历史地址；新安装使用发布时配置的地址。
@@ -37,29 +38,6 @@ final currentServerUrlProvider = Provider<String?>((ref) {
     return null;
   }
 });
-
-/// 登录页只展示可采取行动的提示，不直接透传后台错误或配置细节。
-String _loginFailureMessage(LyraApiError error) => switch (error.code) {
-  'LOGIN_BROWSER_UNAVAILABLE' => '无法打开浏览器，请重试。',
-  'LOGIN_EXPIRED' => '登录已超时，请重新开始。',
-  'LOGIN_STATE_INVALID' || 'LOGIN_ALREADY_REDEEMED' => '此次登录已失效，请重新开始。',
-  'AUTH_FORBIDDEN' => '此账号暂时无法登录 Lyra，请换一个账号。',
-  'INVITE_CODE_REQUIRED' => '首次使用需要邀请码，请填写后重试。',
-  'INVITE_CODE_INVALID' => '邀请码无效或已被使用，请确认后重试。',
-  'LOGIN_DENIED' => '未能完成授权，请重试或换一个账号。',
-  'AUTH_NOT_CONFIGURED' => '此登录方式暂不可用，请选择其他方式。',
-  'LOGIN_RATE_LIMITED' => '尝试次数较多，请稍后重试。',
-  'CLIENT_VERSION_INCOMPATIBLE' => '请更新 Lyra 后重试。',
-  // 停用是终态：明确告知原因，不提供刷新或重试入口。
-  kUserDisabledCode => '账号已停用，请联系管理员。',
-  // 兑换阶段的通用失败（含自动注册事务失败）：明确失败并要求重新登录。
-  'LOGIN_FAILED' => '登录未能完成，请重新登录。',
-  _ when error.statusCode == 429 => '尝试次数较多，请稍后重试。',
-  _ when error.statusCode == 0 => '暂时无法登录，请检查网络后重试。',
-  // 服务端写入故障（含注册事务异常）：明确失败并允许重试，不假装成功。
-  _ when error.statusCode >= 500 => '登录服务暂时不可用，请稍后重试。',
-  _ => '登录未完成，请重试。',
-};
 
 /// 多个快捷入口共用登录操作归属，旧表单销毁不会取消新表单发起的登录。
 class _LoginPanelOwner {
@@ -105,15 +83,17 @@ class LoginPanel extends ConsumerStatefulWidget {
 class _LoginPanelState extends ConsumerState<LoginPanel> {
   Object? _currentOwner;
   late final _LoginPanelOwner _loginOwner;
-  /// 邀请码由三种入口共用；输入框只在服务端声明需要邀请码时展示。
-  final _inviteCodeController = TextEditingController();
+  AuthProvider? _activeProvider;
+  bool _pendingRegistration = false;
+  String? _message;
+
   bool _submitting = false;
   bool _clearingLogin = false;
   int _attempt = 0;
-  String? _message;
-  String _progressLabel = '等待授权…';
+
   /// 不可用只提示一次：状态行常驻会占位，且用户无法据此判断何时恢复。
   bool _notifiedUnavailable = false;
+
   /// 去掉手动刷新后，服务端瞬时失败需要自行恢复。
   Timer? _availabilityRetry;
   int _availabilityRetryAttempt = 0;
@@ -129,9 +109,11 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
   void dispose() {
     _attempt++;
     _availabilityRetry?.cancel();
-    _inviteCodeController.dispose();
     final owner = _currentOwner;
-    if (_submitting && owner != null) _loginOwner.cancel(owner);
+    // 邀请码补全页由父登录页接管 pending 状态，切屏时不能把授权结果取消。
+    if (_submitting && owner != null && !_pendingRegistration) {
+      _loginOwner.cancel(owner);
+    }
     super.dispose();
   }
 
@@ -159,10 +141,6 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
         )) {
       return;
     }
-    // 只在服务端要求时携带邀请码；未填写就不发该键，由服务端给出所需错误。
-    final inviteCode = catalog.registrationRequiresInvite
-        ? _inviteCodeController.text.trim()
-        : '';
     final controller = ref.read(sessionProvider.notifier);
     final originalClient = controller.client;
     final attempt = ++_attempt;
@@ -170,8 +148,8 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     _loginOwner.claim(owner, controller);
     setState(() {
       _submitting = true;
+      _activeProvider = provider;
       _message = null;
-      _progressLabel = '准备 ${provider.label} 登录…';
     });
     try {
       await ref
@@ -180,26 +158,43 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
       if (!_active(attempt, owner)) return;
       if (!identical(controller.client, originalClient) ||
           ref.read(currentServerUrlProvider) != url) {
-        setState(() => _message = '登录状态已变化，请重试。');
+        _showMessage('登录状态已变化，请重试。');
         return;
       }
-      setState(() => _progressLabel = '等待 ${provider.label} 授权…');
-      await controller.signIn(
+      final signedIn = await controller.signIn(
         provider: provider,
         serverUrl: url,
         displayName: 'Lyra Mobile',
-        inviteCode: inviteCode.isEmpty ? null : inviteCode,
       );
+      if (!signedIn && _active(attempt, owner)) {
+        // false 也表示授权已完成、正在等待邀请码；这时由父级切换到注册表单。
+        _pendingRegistration =
+            ref.read(sessionProvider).value is SessionRegistrationRequired;
+        if (!_pendingRegistration) {
+          _showMessage('已取消登录。');
+        }
+      }
     } on LyraApiError catch (error) {
       if (!_active(attempt, owner)) return;
-      setState(() => _message = _loginFailureMessage(error));
+      _showMessage(loginFailureMessage(error));
     } on Object {
       if (!_active(attempt, owner)) return;
-      setState(() => _message = '登录未完成，请重试。');
+      _showMessage('登录未完成，请重试。');
     } finally {
-      if (mounted && attempt == _attempt) setState(() => _submitting = false);
+      if (mounted && attempt == _attempt) {
+        setState(() {
+          _submitting = false;
+          _activeProvider = null;
+        });
+      }
       _loginOwner.release(owner);
     }
+  }
+
+  /// 仅在失败后显示可执行提示，初始登录页不占用按钮区域。
+  void _showMessage(String message) {
+    if (!mounted) return;
+    setState(() => _message = message);
   }
 
   /// 重新读取登录方式目录；不可用时由退避定时器自行调用，无需用户操作。
@@ -225,7 +220,9 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
 
   /// 退避重查（2/5/10/20/30 秒）；尝试完即停止，避免长期空转。
   void _scheduleAvailabilityRetry(String? url) {
-    if (url == null || _availabilityRetry != null || _availabilityRetryExhausted) {
+    if (url == null ||
+        _availabilityRetry != null ||
+        _availabilityRetryExhausted) {
       return;
     }
     const delays = [2, 5, 10, 20, 30];
@@ -255,8 +252,9 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     if (owner != null) _loginOwner.cancel(owner);
     setState(() {
       _submitting = false;
-      _message = '已取消登录。';
+      _activeProvider = null;
     });
+    _showMessage('已取消登录。');
   }
 
   Future<void> _retrySignOut() async {
@@ -278,8 +276,12 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
 
   @override
   Widget build(BuildContext context) {
+    ref.listen(sessionProvider, (_, next) {
+      _pendingRegistration = next.value is SessionRegistrationRequired;
+    });
     final state = ref.watch(sessionProvider);
     final session = state.value;
+    _pendingRegistration = session is SessionRegistrationRequired;
     final authenticated = session is SessionAuthenticated ? session : null;
     final sessionMessage = session is SessionSignedOut ? session.message : null;
     final preferences = ref.watch(appPreferencesProvider);
@@ -291,10 +293,8 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
     // 可用性，每次后台重查都会让整排按钮先禁用再恢复，看起来像"按钮在闪"。
     final catalogData = catalog?.value;
     final entries = catalogData?.providers;
-    final registrationRequiresInvite =
-        catalogData?.registrationRequiresInvite ?? false;
     // 只有**还没有任何目录**才算"准备中"。已有目录时后台重查属于静默刷新，
-    // 不能挡住用户点登录，也不能把底部文案切成"正在准备登录…"。
+    // 不能挡住用户点登录，也不需要常驻状态文案。
     final preparing =
         state.isLoading ||
         (url == null && preferences.isLoading) ||
@@ -351,81 +351,45 @@ class _LoginPanelState extends ConsumerState<LoginPanel> {
             child: const Text('退出登录'),
           ),
         ] else ...[
-          // 邀请码是大小写敏感的 base64url：关掉自动大写、纠错与联想，
-          // 避免手机键盘把用户粘贴的码改坏。
-          if (registrationRequiresInvite) ...[
-            TextField(
-              key: const ValueKey('login-invite-code'),
-              controller: _inviteCodeController,
-              enabled: !busy && !requiresLogoutRetry,
-              keyboardType: TextInputType.visiblePassword,
-              textCapitalization: TextCapitalization.none,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '邀请码',
-                hintText: '首次注册需要邀请码',
+          if (_message != null || sessionMessage != null) ...[
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Semantics(
+                liveRegion: true,
+                child: Text(
+                  _message ?? sessionMessage!,
+                  style: const TextStyle(
+                    color: LyraColors.inkSecondary,
+                    height: 1.5,
+                  ),
+                ),
               ),
             ),
-            const SizedBox(height: 12),
           ],
           for (final provider in AuthProvider.values) ...[
             _ProviderSignInButton(
               provider: provider,
+              cancelling: _submitting && _activeProvider == provider,
               available:
-                  !busy &&
-                  !requiresLogoutRetry &&
-                  (entries?.any(
-                        (item) => item.provider == provider && item.available,
-                      ) ??
-                      false),
-              onPressed: () => _submit(provider),
+                  (_submitting && _activeProvider == provider) ||
+                  (!busy &&
+                      !requiresLogoutRetry &&
+                      (entries?.any(
+                            (item) =>
+                                item.provider == provider && item.available,
+                          ) ??
+                          false)),
+              onPressed: () {
+                if (_submitting && _activeProvider == provider) {
+                  _cancel();
+                } else {
+                  _submit(provider);
+                }
+              },
             ),
-            const SizedBox(height: 12),
+            if (provider != AuthProvider.values.last)
+              const SizedBox(height: 12),
           ],
-          // 不提供独立注册表单：首次登录凭邀请码自动创建账号，新用户直接进入空账本
-          // 与既有首次导入流程。文案必须写清"需要邀请码"——注册已不再对外开放，
-          // 留着"自动创建账号"会让用户以为随便登录即可建号。
-          const Text(
-            '首次登录需要邀请码；已有账号可直接登录。',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: LyraColors.muted, fontSize: 13, height: 1.5),
-          ),
-          if (_submitting) ...[
-            Semantics(
-              liveRegion: true,
-              child: Text(
-                _progressLabel,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: LyraColors.accent, height: 1.6),
-              ),
-            ),
-            const SizedBox(height: 6),
-            const Text(
-              '请在浏览器完成授权，然后返回 Lyra。',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: LyraColors.muted, fontSize: 13),
-            ),
-            TextButton(onPressed: _cancel, child: const Text('取消登录')),
-          ] else if (preparing)
-            const Text(
-              '正在准备登录…',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: LyraColors.muted, height: 1.6),
-            ),
-        ],
-        if (_message != null || sessionMessage != null) ...[
-          const SizedBox(height: 16),
-          Semantics(
-            liveRegion: true,
-            child: Text(
-              _message ?? sessionMessage!,
-              style: const TextStyle(
-                color: LyraColors.inkSecondary,
-                height: 1.6,
-              ),
-            ),
-          ),
         ],
         if (requiresLogoutRetry)
           TextButton(
@@ -454,10 +418,12 @@ class _ProviderSignInButton extends StatelessWidget {
   const _ProviderSignInButton({
     required this.provider,
     required this.available,
+    required this.cancelling,
     required this.onPressed,
   });
   final AuthProvider provider;
   final bool available;
+  final bool cancelling;
   final VoidCallback onPressed;
 
   @override
@@ -491,14 +457,25 @@ class _ProviderSignInButton extends StatelessWidget {
         ),
         const SizedBox(width: 12),
         Expanded(
-          child: Text(
-            '使用 ${provider.label} 登录',
-            textAlign: TextAlign.center,
+          child: Semantics(
+            liveRegion: cancelling,
+            child: Text(
+              cancelling
+                  ? '取消 ${provider.label} 登录'
+                  : '使用 ${provider.label} 登录',
+              textAlign: TextAlign.center,
+            ),
           ),
         ),
-        // 与左侧图标 + 间距等宽的占位，使文字在整条按钮内真正居中，
-        // 而不是在「图标右侧的剩余空间」里居中。
-        const SizedBox(width: 32),
+        if (cancelling) ...[
+          const SizedBox(width: 16),
+          const SizedBox.square(
+            dimension: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ] else
+          // 与左侧图标及间距等宽的占位，使文字在整条按钮内真正居中。
+          const SizedBox(width: 32),
       ],
     ),
   );

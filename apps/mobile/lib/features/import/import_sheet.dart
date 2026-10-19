@@ -11,6 +11,7 @@ import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
 import '../../core/design/lyra_primary_icon.dart';
+import '../../core/design/lyra_widgets.dart';
 import '../accounts/account_sheet.dart';
 import '../accounts/account_workspace.dart';
 import '../ledger/ledger_workspace.dart';
@@ -27,7 +28,7 @@ final importFilePickerProvider = Provider<ImportFilePicker>(
       (types) => openFile(acceptedTypeGroups: types),
 );
 
-/// 选择 Schwab 文件、确认证券账户、预览后提交；重试和创建账户保留原文件。
+/// 选择 Schwab 文件、确认证券账户、预览后提交，并在重试时保留所选文件。
 class ImportSheet extends ConsumerStatefulWidget {
   const ImportSheet({super.key, this.openFileOverride});
 
@@ -267,6 +268,7 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
     }
   }
 
+  /// 按文件、预览和结果阶段呈现导入流程，所有请求继续由状态机约束。
   @override
   Widget build(BuildContext context) {
     ref.listen(sessionProvider, (previous, next) {
@@ -293,146 +295,183 @@ class _ImportSheetState extends ConsumerState<ImportSheet> {
     final preview = _preview;
     final result = _result;
     final candidates = _accountCandidates ?? const <ImportAccountView>[];
+    final chooseFile = _busy || _identityChanged ? null : _pickFile;
+    final chooseLabel = Text(switch (_stage) {
+      _ImportStage.picking => '打开文件中…',
+      _ImportStage.uploading => '正在准备预览…',
+      _ => preview == null ? '选择文件并预览' : '更换文件',
+    });
+    const chooseIcon = LyraPrimaryIcon(LyraPrimaryGlyph.importFile, size: 20);
     return Padding(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
-            children: [
-              const LyraPrimaryIcon(
-                LyraPrimaryGlyph.importFile,
-                size: 22,
-                color: LyraColors.accent,
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  '导入 Schwab 文件',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
+          const LyraSheetHeader(title: '导入交易'),
+          const SizedBox(height: 6),
           Text(
-            '支持 Schwab 导出的 CSV 和 Excel 文件。先预览，确认后再导入账本。',
+            '支持 CSV / Excel，预览后再导入。',
             style: Theme.of(context).textTheme.bodyMedium
-                ?.copyWith(color: LyraColors.muted),
+                ?.copyWith(color: LyraColors.muted, height: 1.5),
           ),
-          const SizedBox(height: 18),
-          FilledButton.icon(
-            onPressed: _busy || _identityChanged ? null : _pickFile,
-            icon: const LyraPrimaryIcon(LyraPrimaryGlyph.importFile, size: 20),
-            label: Text(switch (_stage) {
-              _ImportStage.picking => '打开文件中…',
-              _ImportStage.uploading => '正在准备预览…',
-              _ => '选择文件并预览',
-            }),
+          const SizedBox(height: 14),
+          LyraCard(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // 预览就绪后，确认是主要操作，更换文件降低为次级入口。
+                if (preview == null)
+                  FilledButton.icon(
+                    onPressed: chooseFile,
+                    icon: chooseIcon,
+                    label: chooseLabel,
+                  )
+                else
+                  OutlinedButton.icon(
+                    onPressed: chooseFile,
+                    icon: chooseIcon,
+                    label: chooseLabel,
+                  ),
+                if (_pendingFileName != null && preview == null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    '已选择：$_pendingFileName',
+                    style: Theme.of(context).textTheme.bodySmall
+                        ?.copyWith(color: LyraColors.inkSecondary, height: 1.5),
+                  ),
+                ],
+                if (_mappingRequired) ...[
+                  const Divider(height: 24),
+                  const _ImportSectionTitle(title: '选择账户'),
+                  const SizedBox(height: 6),
+                  Text(
+                    candidates.isEmpty
+                        ? _accountsError != null
+                              ? '暂时无法读取证券账户，所选文件已保留。'
+                              : '尚无可用的证券账户，请先创建。所选文件会保留。'
+                        : '请选择该文件对应的账户后重新预览：',
+                    style: Theme.of(context).textTheme.bodyMedium
+                        ?.copyWith(color: LyraColors.inkSecondary, height: 1.5),
+                  ),
+                  if (candidates.isNotEmpty) const SizedBox(height: 8),
+                  for (final account in candidates)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: OutlinedButton.icon(
+                        onPressed: _busy ? null : () => _selectAccount(account),
+                        icon: const LyraPrimaryIcon(
+                          LyraPrimaryGlyph.brokerage,
+                          size: 20,
+                        ),
+                        label: Text(
+                          '${account.displayName}（${account.maskedSuffix}）',
+                        ),
+                      ),
+                    ),
+                  OutlinedButton.icon(
+                    onPressed: _busy ? null : _createAccount,
+                    icon: const Icon(LyraIcons.addAccount),
+                    label: const Text('新增证券账户'),
+                  ),
+                  if (_accountsError != null) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      _accountsError!,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: LyraColors.inkSecondary,
+                        height: 1.5,
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: _busy ? null : _refreshCandidates,
+                      icon: const Icon(LyraIcons.sync, size: 18),
+                      label: const Text('重新加载账户'),
+                    ),
+                  ],
+                ],
+                if (preview != null) ...[
+                  const Divider(height: 24),
+                  const _ImportSectionTitle(title: '预览交易'),
+                  const SizedBox(height: 8),
+                  _PreviewStats(preview: preview),
+                  if (_stage != _ImportStage.committed) ...[
+                    const Divider(height: 24),
+                    FilledButton.icon(
+                      onPressed: _busy ? null : _commit,
+                      icon: const Icon(LyraIcons.confirm),
+                      label: Text(
+                        preview.insertableRows == 0 ? '确认无新增' : '确认导入',
+                      ),
+                    ),
+                  ],
+                ],
+                if (result != null) ...[
+                  const Divider(height: 24),
+                  Text(
+                    result.changed
+                        ? '导入完成：新增 ${result.insertedRows} 条交易'
+                              '${result.skippedRows > 0 ? '，已跳过 ${result.skippedRows} 条重复记录' : ''}。'
+                        : result.skippedRows > 0
+                        ? '这些交易已在账本中，无需重复导入。'
+                        : '文件中没有可导入的交易。',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: LyraColors.ink,
+                      fontWeight: FontWeight.w500,
+                      height: 1.5,
+                    ),
+                  ),
+                ],
+                // 缺少账户是上方已说明的必选步骤，不再重复显示同一条错误提示。
+                // 文件、网络或提交失败仍在这里保留原有错误与恢复入口。
+                if (_errorMessage != null && !_mappingRequired) ...[
+                  const Divider(height: 24),
+                  Text(
+                    _errorMessage!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                      height: 1.5,
+                    ),
+                  ),
+                  if (!_mappingRequired &&
+                      preview == null &&
+                      _pendingBytes != null &&
+                      !_identityChanged)
+                    TextButton.icon(
+                      onPressed: _busy ? null : () => _uploadPreview(),
+                      icon: const Icon(LyraIcons.sync, size: 18),
+                      label: const Text('重试当前文件'),
+                    ),
+                ],
+              ],
+            ),
           ),
-          if (_pendingFileName != null && preview == null) ...[
-            const SizedBox(height: 12),
-            Text(
-              '已选择：$_pendingFileName',
-              style: const TextStyle(
-                fontSize: 13,
-                height: 1.5,
-                color: LyraColors.inkSecondary,
-              ),
-            ),
-          ],
-          if (_mappingRequired) ...[
-            const SizedBox(height: 14),
-            Text(
-              candidates.isEmpty
-                  ? _accountsError != null
-                        ? '暂时无法读取证券账户，所选文件已保留。'
-                        : '尚无可用的证券账户，请先创建。所选文件会保留。'
-                  : '请选择该文件对应的账户后重新预览：',
-              style: Theme.of(context).textTheme.bodyMedium,
-            ),
-            const SizedBox(height: 8),
-            for (final account in candidates)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: OutlinedButton.icon(
-                  onPressed: _busy ? null : () => _selectAccount(account),
-                  icon: const LyraPrimaryIcon(
-                    LyraPrimaryGlyph.brokerage,
-                    size: 20,
-                  ),
-                  label: Text(
-                    '${account.displayName}（${account.maskedSuffix}）',
-                  ),
-                ),
-              ),
-            OutlinedButton.icon(
-              onPressed: _busy ? null : _createAccount,
-              icon: const Icon(LyraIcons.addAccount),
-              label: const Text('新增证券账户'),
-            ),
-            if (_accountsError != null) ...[
-              const SizedBox(height: 8),
-              Text(_accountsError!),
-              TextButton.icon(
-                onPressed: _busy ? null : _refreshCandidates,
-                icon: const Icon(LyraIcons.sync, size: 18),
-                label: const Text('重新加载账户'),
-              ),
-            ],
-          ],
-          if (preview != null) ...[
-            const SizedBox(height: 18),
-            _PreviewStats(preview: preview),
-            if (_stage != _ImportStage.committed) ...[
-              const SizedBox(height: 14),
-              FilledButton.icon(
-                onPressed: _busy ? null : _commit,
-                icon: const Icon(LyraIcons.confirm),
-                label: Text(
-                  preview.insertableRows == 0
-                      ? '无新增交易，仍确认提交'
-                      : '确认写入账本（${preview.insertableRows} 行）',
-                ),
-              ),
-            ],
-          ],
-          if (result != null) ...[
-            const SizedBox(height: 14),
-            Text(
-              result.changed
-                  ? '导入完成：新增 ${result.insertedRows} 条交易'
-                        '${result.skippedRows > 0 ? '，已跳过 ${result.skippedRows} 条重复记录' : ''}。'
-                  : result.skippedRows > 0
-                  ? '这些交易已在账本中，无需重复导入。'
-                  : '文件中没有可导入的交易。',
-              style: Theme.of(context).textTheme.bodyLarge
-                  ?.copyWith(fontWeight: FontWeight.w500),
-            ),
-          ],
-          if (_errorMessage != null) ...[
-            const SizedBox(height: 12),
-            Text(
-              _errorMessage!,
-              style: TextStyle(color: Theme.of(context).colorScheme.error),
-            ),
-            if (!_mappingRequired &&
-                preview == null &&
-                _pendingBytes != null &&
-                !_identityChanged)
-              TextButton.icon(
-                onPressed: _busy ? null : () => _uploadPreview(),
-                icon: const Icon(LyraIcons.sync, size: 18),
-                label: const Text('重试当前文件'),
-              ),
-          ],
         ],
       ),
     );
   }
 }
 
+/// 以轻量文字标记导入流程中的一个阶段。
+class _ImportSectionTitle extends StatelessWidget {
+  const _ImportSectionTitle({required this.title});
+
+  final String title;
+
+  @override
+  Widget build(BuildContext context) => Text(
+    title,
+    style: Theme.of(context).textTheme.labelMedium?.copyWith(
+      color: LyraColors.muted,
+      fontWeight: FontWeight.w500,
+      letterSpacing: 0,
+    ),
+  );
+}
+
+/// 显示服务端生成的预览文件名、行数统计与按操作分类的记录数。
 class _PreviewStats extends StatelessWidget {
   const _PreviewStats({required this.preview});
 
@@ -440,37 +479,32 @@ class _PreviewStats extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: LyraColors.surfaceSubtle,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: LyraColors.hairlineStrong),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Text(
-            preview.fileName,
-            style: Theme.of(context).textTheme.titleMedium
-                ?.copyWith(color: LyraColors.ink, fontWeight: FontWeight.w500),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          preview.fileName,
+          style: Theme.of(context).textTheme.titleSmall?.copyWith(
+            color: LyraColors.ink,
+            fontWeight: FontWeight.w500,
+            height: 1.5,
           ),
-          const SizedBox(height: 10),
-          Text(
-            '总行数 ${preview.totalRows} · 可新增 ${preview.insertableRows}'
-            ' · 已存在 ${preview.existingRows}',
-            style: const TextStyle(color: LyraColors.ink),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            preview.byAction.entries
-                .map((entry) => '${ledgerText(entry.key)} × ${entry.value}')
-                .join(' · '),
-            style: Theme.of(context).textTheme.bodySmall
-                ?.copyWith(color: LyraColors.inkSecondary, height: 1.6),
-          ),
-        ],
-      ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '总行数 ${preview.totalRows} · 可新增 ${preview.insertableRows}'
+          ' · 已存在 ${preview.existingRows}',
+          style: const TextStyle(color: LyraColors.ink, height: 1.5),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          preview.byAction.entries
+              .map((entry) => '${ledgerText(entry.key)} × ${entry.value}')
+              .join(' · '),
+          style: Theme.of(context).textTheme.bodySmall
+              ?.copyWith(color: LyraColors.inkSecondary, height: 1.5),
+        ),
+      ],
     );
   }
 }

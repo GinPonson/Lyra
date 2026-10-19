@@ -4,6 +4,10 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+dependencies {
+    implementation("androidx.browser:browser:1.10.0")
+}
+
 android {
     namespace = "com.lyrafinance.lyra_mobile"
     compileSdk = flutter.compileSdkVersion

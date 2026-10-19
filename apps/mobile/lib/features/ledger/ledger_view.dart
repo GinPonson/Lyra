@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 /// CLI 只读功能的产品目录；路由、口径和展示字段在此唯一声明。
 /// 字段沿用服务端公开协议，避免界面自行推算行情或账户净值。
 enum LedgerView {
-  positions('持仓', 'positions', '历史开仓成本，不代表实时市值', LyraIcons.stocks, 'cost'),
+  positions('持仓', 'positions', '历史开仓成本，不代表实时市值', LyraIcons.stocks, 'costBasis'),
   expiring(
     '期权到期',
     'expiring',
@@ -113,19 +113,13 @@ enum LedgerView {
   String get path => '/v1/${analytics ? 'analytics' : 'ledger'}/$command';
   bool get paginated => [trades, realized, cashflow].contains(this);
   bool get searchable => [positions, trades, realized].contains(this);
-  bool get dateFilter => [
-    trades,
-    realized,
-    cashflow,
-    monthly,
-    attribution,
-    drawdown,
-  ].contains(this);
+  /// 日期筛选只用于服务端已接线的逐笔查询，不给全时段分析提供无效条件。
+  bool get dateFilter => [trades, realized, cashflow].contains(this);
 
   /// 服务端要求的参数显式指定；其它参数只在用户选择后提交。
   Map<String, String> get parameters => switch (this) {
     expiring => {'days': '30'},
-    allocation || attribution => {'groupBy': 'underlying'},
+    allocation || attribution => {'group_by': 'underlying'},
     extremes => {'limit': '10'},
     trades || realized || cashflow => {'limit': '50'},
     _ => {},

@@ -15,11 +15,14 @@ import 'market_models.dart';
 import 'market_settings_widgets.dart';
 import 'market_workspace.dart';
 
-String marketTimeLabel(String value) {
+/// Formats the ISO timestamp [value] as a UTC date and time.
+/// [includeZone] may be false when the surrounding range labels UTC once.
+/// Throws [FormatException] if [value] is not a valid timestamp.
+String marketTimeLabel(String value, {bool includeZone = true}) {
   final time = DateTime.parse(value).toUtc();
   String two(int part) => part.toString().padLeft(2, '0');
   return '${time.year}-${two(time.month)}-${two(time.day)} '
-      '${two(time.hour)}:${two(time.minute)} UTC';
+      '${two(time.hour)}:${two(time.minute)}${includeZone ? ' UTC' : ''}';
 }
 
 String _timingLabel(MarketQuote? quote) => switch (quote?.timingKind) {
@@ -44,10 +47,15 @@ class MarketPositionsPanel extends ConsumerWidget {
     required this.ledger,
     this.underlying,
     this.initiallyExpanded = false,
+    this.compact = false,
   });
   final LedgerRead ledger;
   final String? underlying;
   final bool initiallyExpanded;
+
+  /// Embeds a concise status tile in the holdings card and reveals full details
+  /// on demand without dropping quote coverage, timing, source, or error state.
+  final bool compact;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -58,15 +66,29 @@ class MarketPositionsPanel extends ConsumerWidget {
       ledgerVersion: (ledger.metadata['ledgerVersion'] as num).toInt(),
     );
     final state = ref.watch(marketPositionsProvider(query));
-    return Container(
+    if (compact) {
+      return _CompactMarketPositionsPanel(
+        ledger: ledger,
+        underlying: underlying,
+        query: query,
+        state: state,
+        initiallyExpanded: initiallyExpanded,
+      );
+    }
+    final details = _marketDetails(
+      context,
+      ref,
+      ledger: ledger,
+      underlying: underlying,
+      query: query,
+      state: state,
+      initiallyExpanded: initiallyExpanded,
+      compactDetails: false,
+      settingsInCurrentView: true,
+    );
+    return LyraCard(
       key: const ValueKey('market-positions-panel'),
-      margin: const EdgeInsets.only(top: 16),
       padding: const EdgeInsets.fromLTRB(14, 8, 14, 14),
-      decoration: BoxDecoration(
-        color: LyraColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: LyraColors.hairline),
-      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -87,106 +109,247 @@ class MarketPositionsPanel extends ConsumerWidget {
               ),
             ],
           ),
-          state.when(
-            skipLoadingOnRefresh: false,
-            loading: () => const Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                LinearProgressIndicator(minHeight: 2),
-                SizedBox(height: 8),
-                _Note('正在读取行情…'),
-              ],
-            ),
-            error: (error, _) => _Note(switch (error) {
-              LyraApiError(code: 'MARKET_LEDGER_CHANGED') =>
-                '持仓已更新，请刷新账本后查看参考估值。',
-              LyraApiError(code: 'MARKET_SETTINGS_CHANGED') => '行情来源已切换，请刷新行情。',
-              _ => lyraErrorMessage(
-                error,
-                fallback: '行情暂不可用，历史成本与账本记录仍可查看。可稍后刷新行情。',
-              ),
-            }),
-            data: (read) {
-              if (!read.enabled) {
-                return const _Note('行情暂未开启。可在“我的 → 行情与估值”中查看可用来源。');
-              }
-              final positions =
-                  <({Map<String, Object?> row, String? currency})>[
-                    for (final section in ledger.sections)
-                      for (final raw in section.data['rows'] as List<Object?>)
-                        (
-                          row: raw as Map<String, Object?>,
-                          currency: section.currency ?? ledger.currencyFor(raw),
-                        ),
-                  ];
-              if (positions.isEmpty) return const _Note('暂无持仓，导入交易后可查看参考估值。');
-              final aligned =
-                  positions.length == read.rows.length &&
-                  positions.every(
-                    (item) =>
-                        read.match(item.row, currency: item.currency) != null,
-                  );
-              return Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const _Note('按各持仓报价时点估算 · 未实现盈亏不含费用'),
-                  if (!aligned)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 8),
-                      child: _Note('持仓已变化，估值合计暂不可用；请刷新账本后重试。'),
-                    ),
-                  if (read.rows.any((row) => row.status == 'stale'))
-                    const Padding(
-                      padding: EdgeInsets.only(top: 8),
-                      child: _Note('包含过期报价，请留意各项报价时间。'),
-                    ),
-                  if (aligned)
-                    for (final group in read.currencyGroups)
-                      _CurrencySummary(group: group),
-                  Theme(
-                    data: Theme.of(context)
-                        .copyWith(dividerColor: Colors.transparent),
-                    child: Material(
-                      color: Colors.transparent,
-                      child: ExpansionTile(
-                        key: PageStorageKey(('market-quote-details', query)),
-                        tilePadding: EdgeInsets.zero,
-                        childrenPadding: EdgeInsets.zero,
-                        initiallyExpanded: initiallyExpanded,
-                        title: const Text(
-                          '查看参考报价',
-                          style: TextStyle(fontSize: 13),
-                        ),
-                        subtitle: Text(
-                          '${read.pricedCount} / ${read.count} 项持仓有估值',
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: LyraColors.muted,
-                          ),
-                        ),
-                        children: [
-                          for (final item in positions)
-                            _PositionQuote(
-                              position: item.row,
-                              currency: item.currency,
-                              market: read.match(
-                                item.row,
-                                currency: item.currency,
-                              ),
-                            ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              );
-            },
-          ),
+          details,
         ],
       ),
     );
   }
 }
+
+class _CompactMarketPositionsPanel extends ConsumerWidget {
+  const _CompactMarketPositionsPanel({
+    required this.ledger,
+    required this.underlying,
+    required this.query,
+    required this.state,
+    required this.initiallyExpanded,
+  });
+
+  final LedgerRead ledger;
+  final String? underlying;
+  final MarketQuery query;
+  final AsyncValue<MarketPositionsRead> state;
+  final bool initiallyExpanded;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final status = state.when(
+      skipLoadingOnRefresh: false,
+      loading: () => '正在读取估值…',
+      error: (error, _) => _marketErrorLabel(error),
+      data: (read) {
+        if (!read.enabled) return '未开启';
+        if (read.count == 0) return '暂无持仓';
+        final statuses = <String>[
+          if (read.rows.any((row) => row.status == 'stale')) '含过期报价',
+          if (read.pricedCount < read.count) '存在缺价',
+        ];
+        final status = statuses.isEmpty ? '报价可用' : statuses.join(' · ');
+        return '${read.pricedCount} / ${read.count} 项有估值 · $status';
+      },
+    );
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: LyraCard(
+        inset: true,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        child: Theme(
+          data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+          child: ExpansionTile(
+            key: PageStorageKey(('market-compact-details', query)),
+            tilePadding: EdgeInsets.zero,
+            minTileHeight: 56,
+            dense: true,
+            childrenPadding: const EdgeInsets.only(bottom: 12),
+            initiallyExpanded: initiallyExpanded,
+            title: LayoutBuilder(
+              builder: (context, constraints) {
+                final stacked =
+                    constraints.maxWidth < 240 ||
+                    MediaQuery.textScalerOf(context).scale(14) > 18;
+                final label = const Text(
+                  '参考估值',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+                );
+                final stateLabel = Text(
+                  status,
+                  textAlign: stacked ? TextAlign.left : TextAlign.right,
+                  style: const TextStyle(fontSize: 12, color: LyraColors.muted),
+                );
+                return Row(
+                  children: [
+                    const Icon(
+                      LyraIcons.analytics,
+                      size: 24,
+                      color: LyraColors.inkSecondary,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: stacked
+                          ? Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                label,
+                                const SizedBox(height: 2),
+                                stateLabel,
+                              ],
+                            )
+                          : Row(
+                              children: [
+                                Expanded(child: label),
+                                const SizedBox(width: 8),
+                                Flexible(child: stateLabel),
+                              ],
+                            ),
+                    ),
+                  ],
+                );
+              },
+            ),
+            children: [
+              Row(
+                children: [
+                  const Expanded(child: _Note('历史成本仍为权威账本金额。')),
+                  IconButton(
+                    tooltip: '刷新行情',
+                    onPressed: state.isLoading
+                        ? null
+                        : () => ref.invalidate(marketPositionsProvider(query)),
+                    icon: const Icon(LyraIcons.sync, size: 18),
+                  ),
+                ],
+              ),
+              _marketDetails(
+                context,
+                ref,
+                ledger: ledger,
+                underlying: underlying,
+                query: query,
+                state: state,
+                initiallyExpanded: initiallyExpanded,
+                compactDetails: true,
+                settingsInCurrentView: false,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+String _marketErrorLabel(Object error) => switch (error) {
+  LyraApiError(code: 'MARKET_LEDGER_CHANGED') => '持仓已更新，估值暂不可用',
+  LyraApiError(code: 'MARKET_SETTINGS_CHANGED') => '行情来源已切换，请刷新',
+  _ => lyraErrorMessage(error, fallback: '行情读取失败，请展开查看并重试。'),
+};
+
+/// Full read content is shared by the regular panel and the compact inset tile.
+Widget _marketDetails(
+  BuildContext context,
+  WidgetRef ref, {
+  required LedgerRead ledger,
+  required String? underlying,
+  required MarketQuery query,
+  required AsyncValue<MarketPositionsRead> state,
+  required bool initiallyExpanded,
+  required bool compactDetails,
+  required bool settingsInCurrentView,
+}) => state.when(
+  skipLoadingOnRefresh: false,
+  loading: () => const Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      LinearProgressIndicator(minHeight: 2),
+      SizedBox(height: 8),
+      _Note('正在读取行情…'),
+    ],
+  ),
+  error: (error, _) => _Note(switch (error) {
+    LyraApiError(code: 'MARKET_LEDGER_CHANGED') => '持仓已更新，请刷新账本后查看参考估值。',
+    LyraApiError(code: 'MARKET_SETTINGS_CHANGED') => '行情来源已切换，请刷新行情。',
+    _ => lyraErrorMessage(error, fallback: '行情暂不可用，历史成本与账本记录仍可查看。可稍后刷新行情。'),
+  }),
+  data: (read) {
+    if (!read.enabled) {
+      return _Note(
+        settingsInCurrentView
+            ? '行情估值未开启：请确认服务端已配置行情源，再选择可用来源。'
+            : '行情估值未开启：请确认服务端已配置行情源，再到“我的 → 行情与估值”选择来源。',
+      );
+    }
+    final positions = <({Map<String, Object?> row, String? currency})>[];
+    for (final section in ledger.sections) {
+      for (final raw in section.data['rows'] as List<Object?>) {
+        final row = raw as Map<String, Object?>;
+        final symbol = row['underlying'] ?? row['symbolKey'];
+        if (underlying != null && symbol != underlying) continue;
+        positions.add((
+          row: row,
+          currency: section.currency ?? ledger.currencyFor(row),
+        ));
+      }
+    }
+    if (positions.isEmpty) return const _Note('暂无持仓，导入交易后可查看参考估值。');
+    final aligned =
+        positions.length == read.rows.length &&
+        positions.every(
+          (item) => read.match(item.row, currency: item.currency) != null,
+        );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const _Note('按各持仓报价时点估算 · 未实现盈亏不含费用'),
+        if (!aligned)
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: _Note('持仓已变化，估值合计暂不可用；请刷新账本后重试。'),
+          ),
+        if (read.rows.any((row) => row.status == 'stale'))
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: _Note('包含过期报价，请留意各项报价时间。'),
+          ),
+        if (aligned)
+          for (final group in read.currencyGroups)
+            _CurrencySummary(group: group),
+        if (compactDetails)
+          for (final item in positions)
+            _PositionQuote(
+              position: item.row,
+              currency: item.currency,
+              market: read.match(item.row, currency: item.currency),
+            )
+        else
+          Theme(
+            data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+            child: Material(
+              color: Colors.transparent,
+              child: ExpansionTile(
+                key: PageStorageKey(('market-quote-details', query)),
+                tilePadding: EdgeInsets.zero,
+                childrenPadding: EdgeInsets.zero,
+                initiallyExpanded: initiallyExpanded,
+                title: const Text('查看参考报价', style: TextStyle(fontSize: 13)),
+                subtitle: Text(
+                  '${read.pricedCount} / ${read.count} 项持仓有估值',
+                  style: const TextStyle(fontSize: 12, color: LyraColors.muted),
+                ),
+                children: [
+                  for (final item in positions)
+                    _PositionQuote(
+                      position: item.row,
+                      currency: item.currency,
+                      market: read.match(item.row, currency: item.currency),
+                    ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  },
+);
 
 class _CurrencySummary extends StatelessWidget {
   const _CurrencySummary({required this.group});
@@ -209,11 +372,13 @@ class _CurrencySummary extends StatelessWidget {
               label: '参考市值',
               value: group.complete ? group.marketValue : null,
               profit: false,
+              exact: false,
             ),
             (
               label: '未实现盈亏',
               value: group.complete ? group.unrealizedPnl : null,
               profit: true,
+              exact: false,
             ),
           ],
         ),
@@ -223,11 +388,20 @@ class _CurrencySummary extends StatelessWidget {
             '${group.pricedPositions} / ${group.positions} 项有估值；报价缺失或过期，暂不展示合计。',
           ),
         if (group.asOfFrom != null && group.asOfTo != null)
-          _Note(
-            group.asOfFrom == group.asOfTo
-                ? '报价截至 ${marketTimeLabel(group.asOfFrom!)}'
-                : '报价时点不同：${marketTimeLabel(group.asOfFrom!)} 至 ${marketTimeLabel(group.asOfTo!)}',
-          ),
+          if (group.asOfFrom == group.asOfTo)
+            _Note('报价截至 ${marketTimeLabel(group.asOfFrom!)}')
+          else
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const _Note('报价时点不同 · UTC'),
+                const SizedBox(height: 4),
+                _Note(
+                  '${marketTimeLabel(group.asOfFrom!, includeZone: false)} 至 '
+                  '${marketTimeLabel(group.asOfTo!, includeZone: false)}',
+                ),
+              ],
+            ),
       ],
     ),
   );
@@ -279,7 +453,11 @@ class _PositionQuote extends ConsumerWidget {
           ),
           const SizedBox(height: 10),
           if (reference == null || item?.status == 'unavailable')
-            const _Note('暂无可用报价，保留历史成本。')
+            _Note(
+              item == null
+                  ? '当前估值响应未匹配到该持仓，保留历史成本。'
+                  : '暂无可用报价${item.issue == null ? '' : ' · ${_marketIssueLabel(item.issue!)}'}，保留历史成本。',
+            )
           else ...[
             _Amounts(
               values: [
@@ -287,18 +465,33 @@ class _PositionQuote extends ConsumerWidget {
                   label: '参考价 · ${_basisLabel(item!.referenceBasis)}',
                   value: reference.value,
                   profit: false,
+                  exact: true,
                 ),
-                (label: '参考市值', value: item.marketValue, profit: false),
-                (label: '未实现盈亏（不含费用）', value: item.unrealizedPnl, profit: true),
+                (
+                  label: '参考市值',
+                  value: item.marketValue,
+                  profit: false,
+                  exact: false,
+                ),
+                (
+                  label: '未实现盈亏（不含费用）',
+                  value: item.unrealizedPnl,
+                  profit: true,
+                  exact: false,
+                ),
               ],
             ),
             const SizedBox(height: 8),
             _Note(
               '${_timingLabel(quote)}${item.status == 'stale' ? ' · 已过期' : ''}'
+              '${item.cached ? ' · 缓存报价' : ''}'
+              '${item.issue == null ? '' : ' · ${_marketIssueLabel(item.issue!)}'}'
               '\n报价 ${marketTimeLabel(reference.asOf)}',
             ),
             if (quote != null) ...[
-              const SizedBox(height: 8),
+              const SizedBox(height: 6),
+              _Note('来源 ${quote.providerId} · ${quote.feed}'),
+              const SizedBox(height: 6),
               for (final field in ['bid', 'ask'])
                 if (quote.prices[field] != null) ...[
                   _Amounts(
@@ -307,6 +500,7 @@ class _PositionQuote extends ConsumerWidget {
                         label: field == 'bid' ? '买价' : '卖价',
                         value: quote.prices[field]!.value,
                         profit: false,
+                        exact: true,
                       ),
                     ],
                   ),
@@ -322,9 +516,25 @@ class _PositionQuote extends ConsumerWidget {
   }
 }
 
+/// Known issue codes get concise Chinese labels; unknown server codes remain visible.
+String _marketIssueLabel(String issue) => switch (issue) {
+  'not_configured' => '未配置行情来源',
+  'unsupported_instrument' => '该标的不受支持',
+  'currency_unsupported' => '该报价币种不受支持',
+  'no_data' => '未找到可用报价',
+  'rate_limited' => '行情请求超出限额',
+  'credentials_rejected' => '行情来源鉴权失败',
+  'provider_unavailable' => '行情来源暂不可用',
+  'invalid_response' => '行情响应无效',
+  'timeout' => '行情请求超时',
+  _ => issue,
+};
+
+/// Keeps quote unit prices exact while formatting valuation amounts as money.
+/// Each value uses [LyraAmount] so visibility, tooltips and semantics stay shared.
 class _Amounts extends StatelessWidget {
   const _Amounts({required this.values});
-  final List<({String label, String? value, bool profit})> values;
+  final List<({String label, String? value, bool profit, bool exact})> values;
 
   @override
   Widget build(BuildContext context) => LayoutBuilder(
@@ -355,6 +565,7 @@ class _Amounts extends StatelessWidget {
                       size: 18,
                       colorBySign: value.profit,
                       showPositiveSign: value.profit,
+                      exact: value.exact,
                     ),
                   ),
                 ],
@@ -380,23 +591,26 @@ class _Note extends StatelessWidget {
   );
 }
 
+/// Opens the market settings sheet while keeping its ledger read in the sheet session.
 Future<void> showMarketDataSheet(BuildContext context) =>
     showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
       showDragHandle: true,
+      backgroundColor: LyraColors.canvas,
       builder: (context) => ConstrainedBox(
         constraints: BoxConstraints(
           maxHeight: MediaQuery.sizeOf(context).height * .85,
         ),
         child: const SingleChildScrollView(
-          padding: EdgeInsets.fromLTRB(20, 4, 20, 24),
+          padding: EdgeInsets.fromLTRB(14, 0, 14, 20),
           child: _MarketDataSheet(),
         ),
       ),
     );
 
+/// Builds the market settings sheet and its separately loaded valuation group.
 class _MarketDataSheet extends ConsumerWidget {
   const _MarketDataSheet();
 
@@ -413,48 +627,57 @@ class _MarketDataSheet extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                '行情与估值',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-            ),
-            IconButton(
-              tooltip: '关闭',
-              onPressed: () => Navigator.of(context).pop(),
-              icon: const Icon(LyraIcons.dismiss, size: 20),
-            ),
-          ],
-        ),
-        const SizedBox(height: 14),
+        const LyraSheetHeader(title: '行情与估值'),
         const MarketSettingsPanel(),
-        const SizedBox(height: 24),
-        const Divider(),
-        const SizedBox(height: 20),
-        const _Note('日终或延迟价格会标明报价时点，盈亏估算不含费用。'),
+        const SizedBox(height: 16),
         if (!signedIn)
-          const Padding(
-            padding: EdgeInsets.only(top: 16),
-            child: _Note('登录后查看当前账户的行情状态。'),
+          const LyraCard(
+            padding: EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  '参考估值',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+                ),
+                SizedBox(height: 8),
+                _Note('登录后查看当前账户的行情状态。'),
+              ],
+            ),
           )
         else
           read!.when(
-            loading: () => const Padding(
-              padding: EdgeInsets.only(top: 16),
-              child: LinearProgressIndicator(minHeight: 2),
+            loading: () => const LyraCard(
+              padding: EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    '参考估值',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+                  ),
+                  SizedBox(height: 10),
+                  LinearProgressIndicator(minHeight: 2),
+                ],
+              ),
             ),
-            error: (error, _) => Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const SizedBox(height: 16),
-                _Note(lyraErrorMessage(error, fallback: '暂时无法读取持仓，请稍后重试。')),
-                TextButton(
-                  onPressed: () => ref.invalidate(ledgerReadProvider(query)),
-                  child: const Text('重试'),
-                ),
-              ],
+            error: (error, _) => LyraCard(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '参考估值',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+                  ),
+                  const SizedBox(height: 8),
+                  _Note(lyraErrorMessage(error, fallback: '暂时无法读取持仓，请稍后重试。')),
+                  TextButton(
+                    onPressed: () => ref.invalidate(ledgerReadProvider(query)),
+                    child: const Text('重试'),
+                  ),
+                ],
+              ),
             ),
             data: (ledger) => MarketPositionsPanel(ledger: ledger),
           ),

@@ -285,7 +285,7 @@ void main() {
     container.read(amountsHiddenProvider);
     await container.read(appPreferencesProvider.future);
     final privacy = container.read(amountsHiddenProvider.notifier);
-    privacy.toggle();
+    await privacy.toggle();
     expect(container.read(amountsHiddenProvider), isTrue);
     await container
         .read(appPreferencesProvider.notifier)
@@ -337,10 +337,53 @@ void main() {
     final container = _container(store);
     addTearDown(container.dispose);
     expect(container.read(amountsHiddenProvider), isTrue);
-    container.read(amountsHiddenProvider.notifier).toggle();
+    final saving = container.read(amountsHiddenProvider.notifier).toggle();
     store.readGate!.complete();
     await container.read(appPreferencesProvider.future);
+    await saving;
     expect(container.read(amountsHiddenProvider), isFalse);
+  });
+
+  test('眼睛的最近选择会保存并在重启时恢复', () async {
+    final store = MemoryAppPreferencesStore();
+    final first = _container(store);
+    first.read(amountsHiddenProvider);
+    await first.read(appPreferencesProvider.future);
+    await first.read(amountsHiddenProvider.notifier).toggle();
+    expect(first.read(amountsHiddenProvider), isTrue);
+    expect((await store.read())!.hideAmountsOnStartup, isTrue);
+    first.dispose();
+
+    final restarted = _container(store);
+    addTearDown(restarted.dispose);
+    restarted.read(amountsHiddenProvider);
+    await restarted.read(appPreferencesProvider.future);
+    expect(restarted.read(amountsHiddenProvider), isTrue);
+    await restarted.read(amountsHiddenProvider.notifier).toggle();
+    expect(restarted.read(amountsHiddenProvider), isFalse);
+    expect((await store.read())!.hideAmountsOnStartup, isFalse);
+  });
+
+  test('眼睛保存失败保留本次隐藏并抛错，不覆盖最后保存的选择', () async {
+    final store = _ControlledStore();
+    final container = _container(store);
+    addTearDown(container.dispose);
+    container.read(amountsHiddenProvider);
+    await container.read(appPreferencesProvider.future);
+    store.failWrite = true;
+
+    await expectLater(
+      container.read(amountsHiddenProvider.notifier).toggle(),
+      throwsStateError,
+    );
+    expect(container.read(amountsHiddenProvider), isTrue);
+    expect(container.read(appPreferencesProvider).hasError, isTrue);
+    store.failWrite = false;
+    expect((await store.read())?.hideAmountsOnStartup ?? false, isFalse);
+
+    await container.read(amountsHiddenProvider.notifier).toggle();
+    expect(container.read(amountsHiddenProvider), isFalse);
+    expect((await store.read())!.hideAmountsOnStartup, isFalse);
   });
 
   test('稳定 userId 跨新设备恢复，不同服务器或 userId 不继承，旧凭据明确失败', () async {
@@ -351,10 +394,7 @@ void main() {
       ),
       key,
     );
-    expect(
-      preferencesIdentityKey(_snapshot(userId: 'other-user')),
-      isNot(key),
-    );
+    expect(preferencesIdentityKey(_snapshot(userId: 'other-user')), isNot(key));
     expect(
       preferencesIdentityKey(_snapshot(server: 'https://other.example')),
       isNot(key),

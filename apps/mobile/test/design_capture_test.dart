@@ -11,6 +11,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lyra_mobile/app/lyra_app.dart';
 import 'package:lyra_mobile/app/session.dart';
+import 'package:lyra_mobile/core/design/lyra_primary_icon.dart';
 import 'package:lyra_mobile/core/preferences/app_preferences.dart';
 import 'package:lyra_mobile/core/security/credential_store.dart';
 import 'package:lyra_mobile/features/import/import_sheet.dart';
@@ -35,8 +36,9 @@ const _capturePrefix = String.fromEnvironment(
   defaultValue: 'lyra-graphite',
 );
 
-/// The approved visual uses this cash balance; other synthetic records remain
-/// exactly those of the shared fixture. No production data is read or changed.
+/// Matches the approved mock's synthetic content for visual comparison.
+/// All overrides stay inside this opt-in capture; production and shared business
+/// fixtures never read these identities, dates, balances, or trade records.
 class _DesignLedgerFixture extends LedgerFixture {
   @override
   Future<SessionDependencies> dependencies({bool paired = true}) async {
@@ -94,6 +96,87 @@ class _DesignLedgerFixture extends LedgerFixture {
   @override
   Map<String, Object?> payload(String command, Map<String, dynamic> query) {
     final original = super.payload(command, query);
+    if (command == 'accounts') {
+      final accounts = (original['rows']! as List<Object?>)
+          .cast<Map<String, Object?>>();
+      return {
+        ...original,
+        'rows': [
+          ...accounts,
+          {
+            ...accounts.first,
+            'id': LedgerFixture.euroAccount,
+            'displayName': '长期储备',
+            'maskedSuffix': '••678',
+          },
+        ],
+        'count': 2,
+      };
+    }
+    if (command == 'trades') {
+      final template =
+          (original['rows']! as List<Object?>).first! as Map<String, Object?>;
+      final examples = query['cursor'] == null
+          ? [
+              ('AAPL', 'Buy', '12', '-2143.32', '2026-10-16'),
+              ('NVDA', 'Sell', '10', '1084.38', '2026-10-16'),
+            ]
+          : [
+              ('MSFT', 'Buy', '4', '-1662.00', '2026-10-15'),
+              ('VOO', 'Buy', '2', '-1027.38', '2026-10-15'),
+              ('AAPL', 'Sell', '2', '121.06', '2026-10-12'),
+              ('NVDA', 'Buy', '6', '-653.28', '2026-10-12'),
+            ];
+      return {
+        ...original,
+        'rows': [
+          for (final item in examples)
+            {
+              ...template,
+              'symbol': item.$1,
+              'underlying': item.$1,
+              'action': item.$2,
+              'quantity': item.$3,
+              'amount': item.$4,
+              'transactionDate': item.$5,
+              'recordDate': item.$5,
+            },
+        ],
+        'count': examples.length,
+      };
+    }
+    if (command == 'drawdown') {
+      return {
+        ...original,
+        'groups': (original['groups']! as List<Object?>).map((entry) {
+          final group = entry! as Map<String, Object?>;
+          return {
+            ...group,
+            'data': {
+              ...group['data']! as Map<String, Object?>,
+              'maxDrawdown': '412.35',
+              'rows': [
+                for (final (index, item) in [
+                  ('320.18', '320.18', '320.18', '0.00'),
+                  ('836.38', '516.20', '836.38', '0.00'),
+                  ('2039.55', '1203.17', '2039.55', '0.00'),
+                  ('1627.20', '-412.35', '2039.55', '412.35'),
+                  ('1973.16', '345.96', '2039.55', '66.39'),
+                  ('2846.72', '873.56', '2846.72', '0.00'),
+                ].indexed)
+                  {
+                    'date': '2026-${(index + 5).toString().padLeft(2, '0')}-01',
+                    'dailyPnl': item.$2,
+                    'cumulativePnl': item.$1,
+                    'runningPeak': item.$3,
+                    'drawdown': item.$4,
+                  },
+              ],
+            },
+          };
+        }).toList(),
+      };
+    }
     if (command != 'summary') return original;
     return {
       ...original,
@@ -319,20 +402,84 @@ void main() {
       if (scenario.signedIn && scenario.name != '1440') {
         await _selectDestination(tester, '我的');
         await _saveCapture(tester, boundaryKey, 'profile-${scenario.name}');
-      }
 
-      if (scenario.name == '390') {
+        // 所有二级页都通过正式入口打开；只填写合成表单，不创建真实账户。
+        final accounts = find.byKey(const ValueKey('profile-accounts'));
+        await tester.ensureVisible(accounts);
+        await tester.tap(accounts);
+        await _saveCapture(tester, boundaryKey, 'accounts-${scenario.name}');
+        await tester.tap(find.byKey(const ValueKey('profile-add-account')));
+        await tester.pumpAndSettle();
+        await tester.enterText(
+          find.byKey(const ValueKey('account-name')),
+          'Schwab 主账户',
+        );
+        await tester.enterText(
+          find.byKey(const ValueKey('account-identifier')),
+          'XXX000',
+        );
+        FocusManager.instance.primaryFocus?.unfocus();
+        await _saveCapture(
+          tester,
+          boundaryKey,
+          'create-account-${scenario.name}',
+        );
+        await tester.ensureVisible(find.byTooltip('关闭'));
+        await tester.tap(find.byTooltip('关闭'));
+        await tester.pumpAndSettle();
+        await tester.pageBack();
+        await tester.pumpAndSettle();
+
         for (final sheet in [
-          (key: 'profile-profit-colors', name: 'profit-colors-390'),
+          (key: 'profile-startup-account', name: 'startup-account'),
+          (key: 'profile-profit-colors', name: 'profit-colors'),
+          (key: 'profile-market-data', name: 'market-data'),
         ]) {
           final row = find.byKey(ValueKey(sheet.key));
           await tester.ensureVisible(row);
           await tester.tap(row);
-          await _saveCapture(tester, boundaryKey, sheet.name);
+          await _saveCapture(
+            tester,
+            boundaryKey,
+            '${sheet.name}-${scenario.name}',
+          );
+          await tester.ensureVisible(find.byTooltip('关闭'));
           await tester.tap(find.byTooltip('关闭'));
           await tester.pumpAndSettle();
           expect(tester.takeException(), isNull);
         }
+
+        final about = find.byKey(const ValueKey('profile-about'));
+        await tester.ensureVisible(about);
+        await tester.tap(about);
+        await _saveCapture(tester, boundaryKey, 'about-${scenario.name}');
+        await tester.pageBack();
+        await tester.pumpAndSettle();
+      }
+
+      if (scenario.name == '390') {
+        final profileIcon = find.descendant(
+          of: find.byType(NavigationBar),
+          matching: find.byWidgetPredicate(
+            (widget) =>
+                widget is LyraPrimaryIcon &&
+                widget.glyph == LyraPrimaryGlyph.profile,
+          ),
+        );
+        // 保持按下与鼠标悬停，才能捕获静态截图看不到的选中底色和 ink 状态层叠加。
+        final press = await tester.startGesture(tester.getCenter(profileIcon));
+        await _saveCapture(tester, boundaryKey, 'navigation-pressed-390');
+        await press.up();
+        await tester.pumpAndSettle();
+        final mouse = await tester.createGesture(
+          kind: ui.PointerDeviceKind.mouse,
+        );
+        await mouse.addPointer(location: Offset.zero);
+        await mouse.moveTo(tester.getCenter(profileIcon));
+        await _saveCapture(tester, boundaryKey, 'navigation-hovered-390');
+        await mouse.removePointer();
+        await tester.pumpAndSettle();
+
         await _selectDestination(tester, '总览');
         await tester.tap(find.byKey(const ValueKey('toggle-amounts')));
         await _saveCapture(tester, boundaryKey, 'overview-hidden-390');
@@ -341,14 +488,32 @@ void main() {
         await _saveCapture(tester, boundaryKey, 'import-390');
         await tester.tap(find.text('选择文件并预览'));
         await _saveCapture(tester, boundaryKey, 'import-preview-390');
-        await tester.tap(find.textContaining('确认写入账本'));
+        await tester.tap(find.text('确认导入'));
         await _saveCapture(tester, boundaryKey, 'import-complete-390');
         Navigator.of(tester.element(find.byType(ImportSheet))).pop();
         await tester.pumpAndSettle();
         await _selectDestination(tester, '交易');
         fixture.failures.add('trades');
-        await tester.tap(find.byTooltip('刷新数据'));
+        // 顶部不再常驻刷新按钮；使用正式页面的下拉刷新入口验证错误状态。
+        await tester.drag(
+          find.byKey(const PageStorageKey('ledger-scroll')),
+          const Offset(0, 420),
+        );
         await _saveCapture(tester, boundaryKey, 'load-error-390');
+      }
+
+      if (scenario.name == '320-large') {
+        await _selectDestination(tester, '总览');
+        await tester.tap(find.byTooltip('导入文件'));
+        await _saveCapture(tester, boundaryKey, 'import-320-large');
+        await tester.tap(find.text('选择文件并预览'));
+        await _saveCapture(tester, boundaryKey, 'import-preview-320-large');
+        final confirm = find.text('确认导入');
+        await tester.ensureVisible(confirm);
+        await tester.tap(confirm);
+        await _saveCapture(tester, boundaryKey, 'import-complete-320-large');
+        Navigator.of(tester.element(find.byType(ImportSheet))).pop();
+        await tester.pumpAndSettle();
       }
 
       await tester.pumpWidget(const SizedBox.shrink());

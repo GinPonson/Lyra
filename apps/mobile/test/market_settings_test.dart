@@ -196,11 +196,13 @@ void main() {
       fixture,
       page: const Scaffold(body: ProfileScreen()),
     );
+    final initialMarketRequests = fixture.requests
+        .where((request) => request.uri.path == '/v1/market/settings')
+        .toList();
+    expect(initialMarketRequests, isNotEmpty);
     expect(
-      fixture.requests.where(
-        (request) => request.uri.path == '/v1/market/settings',
-      ),
-      isEmpty,
+      initialMarketRequests.every((request) => request.method == 'GET'),
+      isTrue,
     );
     await _open(tester);
     expect(find.byKey(const ValueKey('market-settings-save')), findsNothing);
@@ -259,19 +261,21 @@ void main() {
     expect(_field(tester, 'stock').initialValue, 'second-feed');
     expect(_field(tester, 'stock', backup: true).initialValue, 'first-feed');
     expect(_field(tester, 'option').initialValue, 'first-feed');
+    // 我的页已加载并共享行情状态，面板重开时复用同一份已更新数据。
     expect(
       fixture.requests.where(
         (request) =>
             request.uri.path == '/v1/market/settings' &&
             request.method == 'GET',
       ),
-      hasLength(2),
+      hasLength(1),
     );
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('暂不可用来源可见但禁用，资产不支持的来源不进入候选', (tester) async {
+  testWidgets('未配置来源标明配置状态且禁用，资产不支持的来源不进入候选', (tester) async {
     final settings = MarketSettingsFixture.settingsPayload(
+      stock: ['second-feed'],
       option: [],
       secondConfigured: false,
     );
@@ -285,8 +289,8 @@ void main() {
     });
     final fixture = MarketSettingsFixture(initialSettings: settings);
     await _pump(tester, fixture);
-    expect(find.text('暂不可用的来源无法选择，请稍后再试。'), findsOneWidget);
-    for (final technical in ['服务端', '凭据', '未配置']) {
+    expect(find.text('未配置的来源需由服务端完成配置。'), findsNothing);
+    for (final technical in ['暂不可用', '稍后再试']) {
       expect(find.textContaining(technical), findsNothing);
     }
     expect(
@@ -307,20 +311,110 @@ void main() {
     await tester.ensureVisible(selector);
     await tester.tap(selector);
     await tester.pumpAndSettle();
-    expect(find.text('Second Data · 暂不可用'), findsWidgets);
+    expect(find.text('Second Data · 未配置'), findsWidgets);
+    expect(find.text('当前来源未配置'), findsOneWidget);
     final item = find.byWidgetPredicate(
       (widget) =>
           widget is DropdownMenuItem<String> && widget.value == 'second-feed',
     );
     await tester.tap(item);
     await tester.pumpAndSettle();
-    expect(_field(tester, 'stock').initialValue, 'first-feed');
+    expect(_field(tester, 'stock').initialValue, 'second-feed');
     await tester.sendKeyEvent(LogicalKeyboardKey.escape);
     await tester.pumpAndSettle();
     expect(
       fixture.requests.where((request) => request.method == 'PUT'),
       isEmpty,
     );
+  });
+
+  testWidgets('没有任何可选来源时明确说明服务端尚未配置行情源', (tester) async {
+    final settings = MarketSettingsFixture.settingsPayload(
+      secondConfigured: false,
+    );
+    for (final source
+        in (settings['providers']! as List).cast<Map<String, Object?>>()) {
+      source['configured'] = false;
+    }
+    final fixture = MarketSettingsFixture(initialSettings: settings);
+    await _pump(tester, fixture);
+    expect(find.text('服务端尚未配置行情源。'), findsOneWidget);
+    expect(find.textContaining('选择上方'), findsNothing);
+    expect(find.textContaining('稍后'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('刷新重新读取服务端来源配置，不自动启用也不提交路由', (tester) async {
+    final unconfigured = MarketSettingsFixture.settingsPayload(
+      stock: [],
+      option: [],
+      secondConfigured: false,
+    );
+    for (final source
+        in (unconfigured['providers']! as List).cast<Map<String, Object?>>()) {
+      source['configured'] = false;
+    }
+    final fixture = MarketSettingsFixture(initialSettings: unconfigured);
+    await _pump(tester, fixture, includePositions: true);
+    expect(find.text('服务端尚未配置行情源。'), findsOneWidget);
+    expect(_field(tester, 'stock').initialValue, '');
+    expect(
+      fixture.requests.where(
+        (request) => request.uri.path == '/v1/market/positions',
+      ),
+      hasLength(1),
+    );
+
+    fixture.settings = MarketSettingsFixture.settingsPayload(
+      revision: 1,
+      stock: [],
+      option: [],
+    );
+    await tester.tap(find.byKey(const ValueKey('market-settings-refresh')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('服务端尚未配置行情源。'), findsNothing);
+    expect(_field(tester, 'stock').initialValue, '');
+    expect(_field(tester, 'option').initialValue, '');
+    expect(
+      _button(
+        tester,
+        'stock',
+      ).items!.firstWhere((item) => item.value == 'first-feed').enabled,
+      isTrue,
+    );
+    expect(
+      fixture.requests.where(
+        (request) =>
+            request.uri.path == '/v1/market/settings' &&
+            request.method == 'GET',
+      ),
+      hasLength(2),
+    );
+    expect(
+      fixture.requests
+          .where((request) => request.uri.path == '/v1/market/positions')
+          .length,
+      greaterThan(1),
+    );
+    expect(
+      fixture.requests.where((request) => request.method == 'PUT'),
+      isEmpty,
+    );
+    expect(fixture.settings['routes'], {'stock': [], 'option': []});
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('行情来源设置加载期间禁用刷新入口', (tester) async {
+    final gate = Completer<void>();
+    final fixture = MarketSettingsFixture()..nextReadGate = gate;
+    await _pump(tester, fixture, settle: false);
+    final refresh = find.byKey(const ValueKey('market-settings-refresh'));
+    expect(tester.widget<IconButton>(refresh).onPressed, isNull);
+    gate.complete();
+    await tester.pumpAndSettle();
+    expect(tester.widget<IconButton>(refresh).onPressed, isNotNull);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('主备不重复，重复选择不发送请求，关闭立即清空主备来源', (tester) async {
@@ -489,12 +583,12 @@ void main() {
     expect(find.textContaining('已生效'), findsOneWidget);
   });
 
-  testWidgets('来源暂不可用时恢复已确认选择，重载后采用最新可用状态', (tester) async {
+  testWidgets('来源未配置时恢复已确认选择，重载后采用最新可用状态', (tester) async {
     final fixture = MarketSettingsFixture()
       ..saveFailure = (code: 'MARKET_PROVIDER_NOT_CONFIGURED', status: 400);
     await _pump(tester, fixture);
     await _select(tester, 'stock', 'second-feed');
-    expect(find.textContaining('所选来源暂不可用'), findsOneWidget);
+    expect(find.textContaining('所选来源未配置'), findsOneWidget);
     expect(find.textContaining('Synthetic fixture error'), findsNothing);
     expect(find.textContaining('MARKET_PROVIDER_NOT_CONFIGURED'), findsNothing);
     expect(_field(tester, 'stock').initialValue, 'first-feed');
@@ -524,6 +618,8 @@ void main() {
     final gate = Completer<void>();
     final fixture = MarketSettingsFixture()..saveResponseGate = gate;
     await _pump(tester, fixture);
+    final refresh = find.byKey(const ValueKey('market-settings-refresh'));
+    expect(tester.widget<IconButton>(refresh).onPressed, isNotNull);
     await _select(tester, 'stock', 'second-feed', settle: false);
     expect(find.text('正在切换…'), findsOneWidget);
     expect(find.byKey(const ValueKey('market-settings-save')), findsNothing);
@@ -531,6 +627,7 @@ void main() {
     expect(_field(tester, 'stock').onChanged, isNull);
     expect(_field(tester, 'option').onChanged, isNull);
     expect(_field(tester, 'stock', backup: true).onChanged, isNull);
+    expect(tester.widget<IconButton>(refresh).onPressed, isNull);
     expect(
       fixture.requests.where((request) => request.method == 'PUT'),
       hasLength(1),
@@ -794,6 +891,14 @@ void main() {
     final fixture = MarketSettingsFixture();
     await _pump(tester, fixture, paired: false);
     expect(find.text('登录后可以切换行情来源。'), findsOneWidget);
+    expect(
+      tester
+          .widget<IconButton>(
+            find.byKey(const ValueKey('market-settings-refresh')),
+          )
+          .onPressed,
+      isNull,
+    );
     expect(find.byType(DropdownButtonFormField<String>), findsNothing);
     expect(find.byType(TextField), findsNothing);
     expect(fixture.requests, isEmpty);

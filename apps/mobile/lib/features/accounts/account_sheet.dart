@@ -7,10 +7,13 @@ import '../../core/api/lyra_api_error.dart';
 import '../../core/design/lyra_colors.dart';
 import '../../core/design/lyra_error_message.dart';
 import '../../core/design/lyra_icons.dart';
-import '../../core/design/lyra_primary_icon.dart';
+import '../../core/design/lyra_widgets.dart';
 import 'account_repository.dart';
 import 'account_workspace.dart';
 
+/// 打开可滚动的证券账户创建面板并返回创建结果。
+/// [context] 提供导航；[sourceFileName] 为可空券商文件名，仅用于预填编号，
+/// 用户确认前不创建账户；取消返回 `null`。
 Future<BrokerageAccount?> showCreateAccountSheet(
   BuildContext context, {
   String? sourceFileName,
@@ -20,8 +23,10 @@ Future<BrokerageAccount?> showCreateAccountSheet(
   isDismissible: false,
   enableDrag: false,
   useSafeArea: true,
+  backgroundColor: LyraColors.canvas,
   shape: const RoundedRectangleBorder(
     borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+    side: BorderSide(color: LyraColors.cardBorder, width: .75),
   ),
   builder: (context) => Padding(
     padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
@@ -31,7 +36,7 @@ Future<BrokerageAccount?> showCreateAccountSheet(
   ),
 );
 
-/// 证券账户与登录身份分开；只在用户确认后提交创建。
+/// 收集证券账户信息，并且只在用户确认后提交创建。
 class AccountSheet extends ConsumerStatefulWidget {
   const AccountSheet({super.key, this.sourceFileName});
 
@@ -128,6 +133,7 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
     }
   }
 
+  /// 根据表单状态呈现可滚动的创建表单，并在会话切换后停用提交。
   @override
   Widget build(BuildContext context) {
     ref.listen(sessionProvider, (previous, next) {
@@ -149,115 +155,105 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
     return PopScope(
       canPop: !_busy,
       child: Padding(
-        padding: const EdgeInsets.all(20),
+        padding: const EdgeInsets.all(14),
         child: Form(
           key: _formKey,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Row(
-                children: [
-                  const LyraPrimaryIcon(
-                    LyraPrimaryGlyph.brokerage,
-                    color: LyraColors.accent,
-                    size: 22,
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      '新增证券账户',
-                      style: Theme.of(context).textTheme.titleLarge,
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: '关闭',
-                    onPressed: _busy ? null : () => Navigator.pop(context),
-                    icon: const Icon(LyraIcons.dismiss),
-                  ),
-                ],
-              ),
+              LyraSheetHeader(title: '新增证券账户', canClose: !_busy),
               const SizedBox(height: 8),
               const Text(
-                '登录账号用于访问 Lyra；证券账户用于归集你导入的交易记录。',
+                '用于归集你导入的交易记录。',
                 style: TextStyle(color: LyraColors.inkSecondary, height: 1.6),
               ),
-              const SizedBox(height: 20),
-              TextFormField(
-                key: const ValueKey('account-name'),
-                controller: _name,
-                enabled: !disabled,
-                maxLength: 64,
-                textInputAction: TextInputAction.next,
-                decoration: const InputDecoration(
-                  labelText: '账户名称',
-                  hintText: '例如：Schwab 主账户',
-                  counterText: '',
-                ),
-                validator: (value) {
-                  final name = value?.trim() ?? '';
-                  if (name.isEmpty) return '请填写便于识别的账户名称';
-                  if (name.length > 64 ||
-                      RegExp(r'[\x00-\x1F\x7F]').hasMatch(name)) {
-                    return '账户名称须为 1–64 个有效字符';
-                  }
-                  return null;
-                },
-              ),
               const SizedBox(height: 16),
-              TextFormField(
-                key: const ValueKey('account-identifier'),
-                controller: _identifier,
-                enabled: !disabled,
-                autocorrect: false,
-                textCapitalization: TextCapitalization.characters,
-                textInputAction: TextInputAction.next,
-                maxLength: 32,
-                decoration: const InputDecoration(
-                  labelText: '文件中的账户编号',
-                  hintText: '例如：XXX276',
-                  helperText: '使用文件名 Individual_XXX276_… 中的 XXX276，无需完整账号。',
-                  helperMaxLines: 3,
-                  counterText: '',
-                ),
-                validator: (value) => isValidAccountIdentifier(value ?? '')
-                    ? null
-                    : '填写 4–32 位字母、数字或连字符，末尾至少 3 位数字',
-              ),
-              if (accountIdentifierFromSchwabFile(widget.sourceFileName) !=
-                  null)
-                const Padding(
-                  padding: EdgeInsets.only(top: 8),
-                  child: Text(
-                    '已从文件名填入账户编号，请核对后创建。',
-                    style: TextStyle(
-                      fontSize: 13,
-                      height: 1.5,
-                      color: LyraColors.accent,
+              LyraCard(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    TextFormField(
+                      key: const ValueKey('account-name'),
+                      controller: _name,
+                      enabled: !disabled,
+                      maxLength: 64,
+                      textInputAction: TextInputAction.next,
+                      decoration: const InputDecoration(
+                        labelText: '账户名称',
+                        hintText: '例如：Schwab 主账户',
+                        counterText: '',
+                      ),
+                      validator: (value) {
+                        final name = value?.trim() ?? '';
+                        if (name.isEmpty) return '请填写便于识别的账户名称';
+                        if (name.length > 64 ||
+                            RegExp(r'[\x00-\x1F\x7F]').hasMatch(name)) {
+                          return '账户名称须为 1–64 个有效字符';
+                        }
+                        return null;
+                      },
                     ),
-                  ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      key: const ValueKey('account-identifier'),
+                      controller: _identifier,
+                      enabled: !disabled,
+                      autocorrect: false,
+                      textCapitalization: TextCapitalization.characters,
+                      textInputAction: TextInputAction.next,
+                      maxLength: 32,
+                      decoration: const InputDecoration(
+                        labelText: '文件中的账户编号',
+                        hintText: '例如：XXX276',
+                        helperText: '填写文件名中的编号，无需完整账号。',
+                        helperMaxLines: 2,
+                        counterText: '',
+                      ),
+                      validator: (value) =>
+                          isValidAccountIdentifier(value ?? '')
+                          ? null
+                          : '填写 4–32 位字母、数字或连字符，末尾至少 3 位数字',
+                    ),
+                    if (accountIdentifierFromSchwabFile(
+                          widget.sourceFileName,
+                        ) !=
+                        null) ...[
+                      const SizedBox(height: 6),
+                      const Text(
+                        '已从文件名填入账户编号，请核对后创建。',
+                        style: TextStyle(
+                          fontSize: 13,
+                          height: 1.5,
+                          color: LyraColors.accent,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      key: const ValueKey('account-currency'),
+                      controller: _currency,
+                      enabled: !disabled,
+                      autocorrect: false,
+                      textCapitalization: TextCapitalization.characters,
+                      textInputAction: TextInputAction.done,
+                      maxLength: 3,
+                      decoration: const InputDecoration(
+                        labelText: '记账币种',
+                        helperText: '按币种分别展示，例如 USD。',
+                        helperMaxLines: 2,
+                        counterText: '',
+                      ),
+                      validator: (value) =>
+                          RegExp(r'^[A-Z]{3}$')
+                              .hasMatch(value?.trim().toUpperCase() ?? '')
+                          ? null
+                          : '请输入三位币种代码，例如 USD',
+                      onFieldSubmitted: (_) => _create(),
+                    ),
+                  ],
                 ),
-              const SizedBox(height: 16),
-              TextFormField(
-                key: const ValueKey('account-currency'),
-                controller: _currency,
-                enabled: !disabled,
-                autocorrect: false,
-                textCapitalization: TextCapitalization.characters,
-                textInputAction: TextInputAction.done,
-                maxLength: 3,
-                decoration: const InputDecoration(
-                  labelText: '记账币种',
-                  helperText: '与券商文件一致，例如 USD。不同币种分别展示。',
-                  helperMaxLines: 2,
-                  counterText: '',
-                ),
-                validator: (value) =>
-                    RegExp(r'^[A-Z]{3}$')
-                        .hasMatch(value?.trim().toUpperCase() ?? '')
-                    ? null
-                    : '请输入三位币种代码，例如 USD',
-                onFieldSubmitted: (_) => _create(),
               ),
               if (_identityChanged) ...[
                 const SizedBox(height: 16),
@@ -281,17 +277,12 @@ class _AccountSheetState extends ConsumerState<AccountSheet> {
                   ),
                 ],
               ],
-              const SizedBox(height: 24),
+              const SizedBox(height: 16),
               FilledButton.icon(
                 key: const ValueKey('create-account-submit'),
                 onPressed: disabled ? null : _create,
                 icon: const Icon(LyraIcons.confirm, size: 18),
                 label: Text(_busy ? '创建中…' : '创建证券账户'),
-              ),
-              const SizedBox(height: 8),
-              TextButton(
-                onPressed: _busy ? null : () => Navigator.pop(context),
-                child: Text(_identityChanged ? '关闭' : '取消'),
               ),
             ],
           ),

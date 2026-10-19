@@ -26,6 +26,12 @@ void main() {
       ('INVITE_CODE_REQUIRED', 403, '首次使用需要邀请码，请填写后重试。'),
       ('INVITE_CODE_INVALID', 403, '邀请码无效或已被使用，请确认后重试。'),
       ('UNKNOWN_THROTTLE', 429, '操作较频繁，请稍后重试。'),
+      ('CLIENT_CONNECTION_FAILED', 0, '网络连接失败，请检查网络后重试。'),
+      ('CLIENT_REQUEST_TIMEOUT', 0, '请求超时，请稍后重试。'),
+      ('CLIENT_CERTIFICATE_INVALID', 0, '无法验证服务器安全证书，请联系支持。'),
+      ('CLIENT_REQUEST_CANCELLED', 0, '请求已取消。'),
+      ('CLIENT_PROTOCOL_ERROR', 0, '服务器响应异常，暂时无法完成此操作。'),
+      ('CLIENT_REQUEST_FAILED', 0, '请求暂时无法完成。'),
     ]) {
       expect(
         lyraErrorMessage(

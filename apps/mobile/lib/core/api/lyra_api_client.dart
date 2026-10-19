@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 
 import '../security/credential_store.dart';
 import 'lyra_api_error.dart';
@@ -36,7 +37,21 @@ class LyraApiClient {
                },
              ),
            ) {
-    _dio.interceptors.add(InterceptorsWrapper(onRequest: _attachToken));
+    _dio.interceptors.add(
+      InterceptorsWrapper(
+        onRequest: _attachToken,
+        onError: (error, handler) {
+          // 仅记录失败元数据，排查 HTTP 与传输故障，同时避免泄漏凭据、查询参数和交易正文。
+          debugPrint(
+            'LYRA_HTTP_ERROR ${error.requestOptions.method} '
+            '${error.requestOptions.uri.path} status=${error.response?.statusCode} '
+            'type=${error.type.name} cause=${error.error.runtimeType} '
+            'requestId=${error.response?.headers.value('x-request-id')}',
+          );
+          handler.next(error);
+        },
+      ),
+    );
   }
 
   final String serverUrl;
@@ -88,8 +103,37 @@ class LyraApiClient {
     return snapshot;
   }
 
+  /// 向当前服务端的 API [path] 发起只读 GET，并返回类型为 [T] 的响应。
+  ///
+  /// [path] 必须解析到当前服务端 origin；[query] 在调用开始时复制并冻结，保证游标、
+  /// 账户范围等查询条件在传输恢复和 401 认证重放期间保持不变。整个调用（含认证重放）
+  /// 最多恢复一次无响应的连接错误或连接、发送、接收超时；HTTP 与其他 Dio 错误不恢复。
+  ///
+  /// Returns: 成功的 HTTP 响应。
+  /// Throws: 请求失败时抛出转换后的 [LyraApiError]；认证刷新回调自身异常按原有流程传播。
   Future<Response<T>> get<T>(String path, Map<String, String> query) {
-    return _send<T>(() => _dio.get<T>(path, queryParameters: query));
+    final querySnapshot = Map<String, String>.unmodifiable(query);
+    var recoveryUsed = false;
+
+    Future<Response<T>> read() async {
+      while (true) {
+        try {
+          return await _dio.get<T>(path, queryParameters: querySnapshot);
+        } on DioException catch (error) {
+          if (recoveryUsed || !_isRecoverableGetTransportError(error)) {
+            rethrow;
+          }
+          recoveryUsed = true;
+          if (_invalidated) throw _sessionChanged;
+          // GET 只读且可安全重放；一次短暂等待可跨过瞬时断连，不对写请求应用此策略。
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          if (_invalidated) throw _sessionChanged;
+        }
+      }
+    }
+
+    // 局部恢复预算属于这次 get；401 认证重放会复用 read，不会获得新预算。
+    return _send<T>(read);
   }
 
   Future<Response<T>> post<T>(String path, Object? body) {
@@ -117,6 +161,10 @@ class LyraApiClient {
         // 停用是终态：先结束会话再抛出不可重试错误，绝不进入刷新与重放。
         await _endDisabledSession();
         throw disabled;
+      }
+      if (_isGmailGrantRevoked(error)) {
+        // Gmail 的第三方授权与 Lyra 设备会话独立；读信授权失效不能登出 App。
+        throw _toLyraApiError(error);
       }
       if (response?.statusCode == 401) {
         await _readBoundCredentials();
@@ -158,20 +206,94 @@ class LyraApiClient {
             await _endDisabledSession();
             throw retryDisabled;
           }
-          if (retryError.response?.statusCode == 401) await _unauthorized();
-          throw LyraApiError.fromResponseBody(
-            retryError.response?.data,
-            retryError.response?.statusCode ?? 0,
-            requestId: _requestId(retryError),
-          );
+          if (retryError.response?.statusCode == 401 &&
+              !_isGmailGrantRevoked(retryError)) {
+            await _unauthorized();
+          }
+          throw _toLyraApiError(retryError);
         }
       }
-      throw LyraApiError.fromResponseBody(
-        response?.data,
-        response?.statusCode ?? 0,
+      throw _toLyraApiError(error);
+    }
+  }
+
+  /// 区分 Gmail 第三方授权失效与 Lyra 设备凭据失效。
+  ///
+  /// [error] 必须来自 Gmail API，且响应包含第三方授权的稳定 401 错误码。
+  /// 返回是否只需重新授权邮箱；其他 401 保持既有令牌轮换与退出行为。
+  bool _isGmailGrantRevoked(DioException error) =>
+      error.response?.statusCode == 401 &&
+      error.requestOptions.uri.path.startsWith('/v1/google/') &&
+      _toLyraApiError(error).code == 'GMAIL_AUTH_REVOKED';
+
+  /// 把 Dio 失败稳定映射为客户端错误；有 HTTP 响应时完整保留服务端错误语义。
+  LyraApiError _toLyraApiError(DioException error) {
+    final response = error.response;
+    if (response != null) {
+      return LyraApiError.fromResponseBody(
+        response.data,
+        response.statusCode ?? 0,
         requestId: _requestId(error),
       );
     }
+
+    return switch (error.type) {
+      DioExceptionType.connectionError => const LyraApiError(
+        code: 'CLIENT_CONNECTION_FAILED',
+        message: '无法连接 Lyra 服务端',
+        statusCode: 0,
+        retryable: true,
+      ),
+      DioExceptionType.connectionTimeout ||
+      DioExceptionType.sendTimeout ||
+      DioExceptionType.receiveTimeout ||
+      DioExceptionType.transformTimeout => const LyraApiError(
+        code: 'CLIENT_REQUEST_TIMEOUT',
+        message: '连接 Lyra 服务端超时',
+        statusCode: 0,
+        retryable: true,
+      ),
+      DioExceptionType.badCertificate => const LyraApiError(
+        code: 'CLIENT_CERTIFICATE_INVALID',
+        message: 'Lyra 服务端证书验证失败',
+        statusCode: 0,
+        retryable: false,
+      ),
+      DioExceptionType.cancel => const LyraApiError(
+        code: 'CLIENT_REQUEST_CANCELLED',
+        message: 'Lyra 请求已取消',
+        statusCode: 0,
+        retryable: false,
+      ),
+      DioExceptionType.badResponse => const LyraApiError(
+        code: 'CLIENT_PROTOCOL_ERROR',
+        message: 'Lyra 服务端响应异常',
+        statusCode: 0,
+        retryable: false,
+      ),
+      DioExceptionType.unknown => const LyraApiError(
+        code: 'CLIENT_REQUEST_FAILED',
+        message: 'Lyra 请求失败',
+        statusCode: 0,
+        retryable: false,
+      ),
+    };
+  }
+
+  /// 判断只读 GET 可恢复的无响应传输错误，不包含解析、证书与 HTTP 失败。
+  bool _isRecoverableGetTransportError(DioException error) {
+    if (error.response != null) return false;
+    return switch (error.type) {
+      DioExceptionType.connectionError ||
+      DioExceptionType.connectionTimeout ||
+      DioExceptionType.sendTimeout ||
+      DioExceptionType.receiveTimeout => true,
+      DioExceptionType.transformTimeout ||
+      DioExceptionType.badCertificate ||
+      DioExceptionType.cancel ||
+      DioExceptionType.badResponse ||
+      DioExceptionType.unknown => false,
+    };
   }
 
   Future<String?> _refreshOnce() async {

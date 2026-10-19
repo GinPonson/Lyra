@@ -29,11 +29,7 @@ Map<String, Object?> userPayload({
   'displayName': displayName,
   'status': status,
   'role': role,
-  'identity': {
-    'provider': provider.id,
-    'subject': subject,
-    'email': email,
-  },
+  'identity': {'provider': provider.id, 'subject': subject, 'email': email},
 };
 
 class LoginCredentialStore extends MemoryCredentialStore {
@@ -58,10 +54,17 @@ class LoginFixture extends LedgerFixture {
   String? loginError;
   int loginErrorStatus = 403;
   int? catalogStatus;
+
+  /// 控制目录的全局提示字段，不能决定实际授权身份是否需要邀请码。
+  bool catalogRegistrationRequiresInvite = false;
+
+  /// 模拟本次第三方身份对应的新用户是否需要在授权后提交邀请码。
   bool registrationRequiresInvite = false;
+  String validInviteCode = 'VALID-INVITE-CODE';
   AuthProvider? exchangedProvider;
   String? authorizationUrlOverride;
   Completer<ResponseBody>? catalogGate;
+  Completer<ResponseBody>? registrationExchangeGate;
 
   Dio dio(String url) => Dio(BaseOptions(baseUrl: url))
     ..httpClientAdapter = FakeLyraAdapter((options) async {
@@ -150,6 +153,26 @@ class LoginFixture extends LedgerFixture {
           }, loginErrorStatus);
         }
         if (pending) return json({'status': 'pending'}, 202);
+        if (registrationRequiresInvite) {
+          final inviteCode = (options.data as Map?)?['inviteCode'];
+          if (inviteCode == null) {
+            return json({
+              'code': 'INVITE_CODE_REQUIRED',
+              'message': '此邀请码错误由测试夹具生成。',
+              'retryable': true,
+            }, 403);
+          }
+          if (inviteCode != validInviteCode) {
+            return json({
+              'code': 'INVITE_CODE_INVALID',
+              'message': '此邀请码错误由测试夹具生成。',
+              'retryable': true,
+            }, 403);
+          }
+          if (registrationExchangeGate != null) {
+            return registrationExchangeGate!.future;
+          }
+        }
         final resultProvider = exchangedProvider ?? provider;
         return json({
           'status': 'complete',
@@ -190,7 +213,7 @@ class LoginFixture extends LedgerFixture {
           'available': available.contains(provider),
         },
     ],
-    'registrationRequiresInvite': registrationRequiresInvite,
+    'registrationRequiresInvite': catalogRegistrationRequiresInvite,
   };
 
   static ResponseBody json(Object data, [int status = 200]) =>

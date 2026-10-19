@@ -37,6 +37,7 @@ class MarketFixture extends LedgerFixture {
                 'optionType': 'C',
                 'quantity': '1',
                 'cost': '18.6500',
+                'costBasis': '1865.0000',
               },
               {
                 ...stock,
@@ -48,6 +49,7 @@ class MarketFixture extends LedgerFixture {
                 'direction': 'short',
                 'quantity': '2',
                 'cost': '40.80',
+                'costBasis': '4080.00',
               },
             ]
             .where(

@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'lyra_colors.dart';
 import 'lyra_icons.dart';
 
-/// 本地证券品牌标识；输入标的代码，输出固定尺寸的头像。
+/// 本地证券品牌标识；输入标的代码，输出固定尺寸的圆形头像。
 /// 别名显式归并，期权由调用方传入 underlying，空代码表示现金类记录。
 class StockAvatar extends StatelessWidget {
   const StockAvatar({super.key, required this.symbol, this.size = 42});
@@ -129,7 +129,7 @@ class StockAvatar extends StatelessWidget {
         padding: EdgeInsets.all(size * (asset == 'AAPL' ? 2 / 42 : 8 / 42)),
         decoration: BoxDecoration(
           color: lightPlate ? const Color(0xFFFFFFFF) : LyraColors.surface,
-          borderRadius: BorderRadius.circular(size * 12 / 42),
+          shape: BoxShape.circle,
           border: Border.all(color: LyraColors.hairlineStrong),
         ),
         child:

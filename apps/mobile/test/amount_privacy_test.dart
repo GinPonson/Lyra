@@ -9,8 +9,10 @@ import 'package:lyra_mobile/core/design/lyra_number.dart';
 import 'package:lyra_mobile/core/design/lyra_theme.dart';
 import 'package:lyra_mobile/core/design/lyra_widgets.dart';
 import 'package:lyra_mobile/core/preferences/app_preferences.dart';
+import 'package:lyra_mobile/features/accounts/account_workspace.dart';
 import 'package:lyra_mobile/features/ledger/ledger_screen.dart';
 import 'package:lyra_mobile/features/ledger/ledger_view.dart';
+import 'package:lyra_mobile/features/ledger/ledger_workspace.dart';
 import 'package:lyra_mobile/features/overview/overview_screen.dart';
 
 import 'support/ledger_fixture.dart';
@@ -55,6 +57,7 @@ class _OptionPrivacyFixture extends LedgerFixture {
           'optionType': 'C',
           'quantity': '1.000100',
           'cost': '18.6500',
+          'costBasis': '1865.0000',
           'description': '开仓价格 18.6500，行权价 385.25',
         },
       ];
@@ -71,6 +74,25 @@ class _OptionPrivacyFixture extends LedgerFixture {
           'expiry': '2027-03-19',
           'optionType': 'C',
         },
+      ];
+      // 此用例只验证一笔缺少 underlying 的旧记录，避免滚动触发分页重复数据。
+      data['nextCursor'] = null;
+    }
+    return data;
+  }
+}
+
+/// 为现金流说明加入唯一金额，验证自由文本也遵循金额隐私。
+class _CashflowDescriptionPrivacyFixture extends LedgerFixture {
+  static const description = '每股价格 731.2468 USD；现金入账 5194.8273 USD。';
+
+  @override
+  Map<String, Object?> payload(String command, Map<String, dynamic> query) {
+    final data = super.payload(command, query);
+    if (command == 'cashflow') {
+      final rows = (data['rows'] as List).cast<Map<String, Object?>>();
+      data['rows'] = [
+        for (final row in rows) {...row, 'description': description},
       ];
     }
     return data;
@@ -161,8 +183,122 @@ Future<ProviderContainer> _pumpFinancialPage(
       ),
     ),
   );
+  final container = ProviderScope.containerOf(
+    tester.element(find.byType(MaterialApp)),
+  );
+  await _waitForFinancialData(tester, container, page);
   await tester.pumpAndSettle();
-  return ProviderScope.containerOf(tester.element(find.byType(MaterialApp)));
+  return container;
+}
+
+/// 等待页面本身依赖的真实 provider 完成，避免把仍在途的请求误判为空数据。
+Future<void> _waitForFinancialData(
+  WidgetTester tester,
+  ProviderContainer container,
+  Widget page,
+) async {
+  container.read(appPreferencesProvider);
+  await _pumpUntilReady(
+    tester,
+    () => !container.read(appPreferencesProvider).isLoading,
+    '偏好读取',
+  );
+
+  final hasOverview = find.byType(OverviewScreen).evaluate().isNotEmpty;
+  final hasReport = page is ReportScreen;
+  final hasTrend = find.byType(LedgerTrendPreview).evaluate().isNotEmpty;
+  if (!hasOverview && !hasReport && !hasTrend) return;
+
+  await _pumpUntilReady(
+    tester,
+    () => !container.read(sessionProvider).isLoading,
+    '会话恢复',
+  );
+  final session = container.read(sessionProvider).value;
+  if (session is! SessionAuthenticated) return;
+  // 让认证完成后的页面先重建并订阅账户查询，避免只等待一个无人监听的 provider 实例。
+  await tester.pump();
+
+  // 所有金融查询都要等账户范围恢复完成，保证等待的是当前真实查询键。
+  container.read(accountScopeReadyProvider);
+  await _pumpUntilReady(
+    tester,
+    () => !container.read(accountScopeReadyProvider).isLoading,
+    '账户范围恢复',
+  );
+  await tester.pump();
+  final scope = container.read(accountScopeProvider).id;
+
+  if (hasOverview) {
+    container.read(brokerageAccountsProvider);
+    await _pumpUntilReady(
+      tester,
+      () => !container.read(brokerageAccountsProvider).isLoading,
+      '证券账户查询',
+    );
+    await tester.pump();
+    container.read(scopedSummaryProvider);
+    await _pumpUntilReady(
+      tester,
+      () => !container.read(scopedSummaryProvider).isLoading,
+      '总览汇总查询',
+    );
+    await tester.pump();
+  }
+  if (page is ReportScreen) {
+    // 日期分析的基准日属于当前页面查询，测试等待同一参数，避免订阅另一份缓存。
+    final parameters = Uri(
+      queryParameters: {
+        ...page.view.parameters,
+        if ([LedgerView.expiring, LedgerView.risk].contains(page.view))
+          'as_of': DateTime.now().toIso8601String().substring(0, 10),
+      },
+    ).query;
+    final read = ledgerReadProvider((
+      path: page.view.path,
+      parameters: parameters,
+      scope: scope,
+    ));
+    container.read(read);
+    await _pumpUntilReady(
+      tester,
+      () => !container.read(read).isLoading,
+      '${page.view.title}查询',
+    );
+    await tester.pump();
+  }
+
+  // 页面可以把走势放在更深的组合容器里，所以按已构建的公开 widget 参数等待。
+  for (final trend in tester.widgetList<LedgerTrendPreview>(
+    find.byType(LedgerTrendPreview),
+  )) {
+    final view = trend.embedded ? LedgerView.drawdown : LedgerView.monthly;
+    final read = ledgerReadProvider((
+      path: view.path,
+      parameters: '',
+      scope: scope,
+    ));
+    container.read(read);
+    await _pumpUntilReady(
+      tester,
+      () => !container.read(read).isLoading,
+      '收益走势查询',
+    );
+    await tester.pump();
+  }
+}
+
+/// 以短帧推进测试调度器，直到指定的真实异步依赖完成或明确失败。
+Future<void> _pumpUntilReady(
+  WidgetTester tester,
+  bool Function() ready,
+  String dependency,
+) async {
+  for (var attempt = 0; attempt < 150; attempt++) {
+    if (ready()) return;
+    await tester.pump(const Duration(milliseconds: 20));
+  }
+  fail('$dependency在测试等待期限内仍未完成');
 }
 
 void main() {
@@ -219,7 +355,7 @@ void main() {
     expect(find.byTooltip('原始值：178.6017'), findsOneWidget);
   });
 
-  testWidgets('320 宽放大字体的总览眼睛按钮只改本次显隐并保留数量与笔数', (tester) async {
+  testWidgets('320 宽放大字体的总览眼睛同步保存显隐并保护原值', (tester) async {
     final store = _CountingPreferencesStore();
     final container = await _pumpFinancialPage(
       tester,
@@ -236,15 +372,13 @@ void main() {
     await tester.pumpAndSettle();
     expect(container.read(amountsHiddenProvider), isTrue);
     expect(find.byTooltip('显示金额').hitTestable(), findsOneWidget);
-    expect(find.text('4'), findsOneWidget);
-    expect(find.text('86'), findsOneWidget);
     _expectPrivate(tester, ['2846.72', '24850.00', '6584.16', '4286.40']);
-    expect(store.writes, 0);
-    expect((await store.read())!.hideAmountsOnStartup, isFalse);
+    expect(store.writes, 1);
+    expect((await store.read())!.hideAmountsOnStartup, isTrue);
     await tester.tap(find.byKey(const ValueKey('toggle-amounts')));
     await tester.pumpAndSettle();
     expect(find.text('+2,846.72'), findsOneWidget);
-    expect(store.writes, 0);
+    expect(store.writes, 2);
     expect(tester.takeException(), isNull);
   });
 
@@ -274,6 +408,15 @@ void main() {
       await tester.ensureVisible(row);
       await tester.tap(row);
       await tester.pumpAndSettle();
+      if (view == LedgerView.positions) {
+        // 持仓先展开标的分组，再进入同一条记录的原始明细。
+        final record = find
+            .descendant(of: row, matching: find.byType(ExpansionTile))
+            .first;
+        await tester.ensureVisible(record);
+        await tester.tap(record);
+        await tester.pumpAndSettle();
+      }
       _expectPrivate(tester, amounts);
       for (final value in preserved) {
         expect(find.text(value), findsWidgets, reason: '$value 应保留原精度');
@@ -289,15 +432,15 @@ void main() {
       const ReportScreen(view: LedgerView.positions),
       fixture: _OptionPrivacyFixture(),
     );
-    await tester.tap(find.text('AAPL'));
+    await tester.tap(find.byType(ExpansionTile).first);
     await tester.pumpAndSettle();
     final contract = find.text('•••• 看涨');
     expect(contract, findsOneWidget);
     await tester.ensureVisible(contract);
     await tester.tap(contract);
     await tester.pumpAndSettle();
-    _expectPrivate(tester, ['385.25', '18.6500']);
-    expect(find.text('1.0001 张 · 多头'), findsOneWidget);
+    _expectPrivate(tester, ['385.25', '18.6500', '1865.0000']);
+    expect(find.text('多头 · 1.0001 张'), findsOneWidget);
     expect(find.text('1.000100'), findsOneWidget);
     expect(find.text('2027-03-19'), findsWidgets);
     expect(find.text('说明已隐藏'), findsOneWidget);
@@ -305,9 +448,39 @@ void main() {
     container.read(amountsHiddenProvider.notifier).setHidden(false);
     await tester.pumpAndSettle();
     expect(find.text('385.25 看涨'), findsOneWidget);
-    expect(find.text('18.6500'), findsOneWidget);
+    expect(find.text('1865.0000'), findsOneWidget);
+    expect(find.text('18.6500'), findsNothing);
     expect(find.text('AAPL-2027-03-19-385.25-C'), findsOneWidget);
     expect(find.text('1.000100'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('隐藏现金流自由说明中的金额但保留动作与日期，显示后恢复原文', (tester) async {
+    final container = await _pumpFinancialPage(
+      tester,
+      const ReportScreen(view: LedgerView.cashflow),
+      fixture: _CashflowDescriptionPrivacyFixture(),
+    );
+    const amounts = ['731.2468', '5194.8273'];
+    final row = find.byType(ExpansionTile).first;
+    expect(find.text('现金股息'), findsOneWidget);
+    expect(find.text('2026/09/04'), findsOneWidget);
+
+    await tester.tap(row);
+    await tester.pumpAndSettle();
+    expect(find.text('说明已隐藏'), findsWidgets);
+    expect(find.text('现金股息'), findsWidgets);
+    expect(find.text('2026/09/04'), findsOneWidget);
+    _expectPrivate(tester, amounts);
+
+    container.read(amountsHiddenProvider.notifier).setHidden(false);
+    await tester.pumpAndSettle();
+    expect(
+      find.text(_CashflowDescriptionPrivacyFixture.description),
+      findsWidgets,
+    );
+    expect(_exposedText(tester), contains('731.2468'));
+    expect(_exposedText(tester), contains('5194.8273'));
     expect(tester.takeException(), isNull);
   });
 

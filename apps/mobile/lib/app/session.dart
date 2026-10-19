@@ -5,7 +5,6 @@ import 'dart:math' as math;
 import 'package:cryptography/cryptography.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import '../core/api/lyra_api_client.dart';
 import '../core/api/lyra_api_error.dart';
@@ -14,6 +13,7 @@ import '../core/security/credential_store.dart';
 import '../features/agent/agent_session_store.dart';
 import '../features/auth/auth_repository.dart';
 import '../features/auth/auth_provider.dart';
+import '../features/auth/authorization_browser.dart';
 import '../features/auth/user_profile.dart';
 import '../features/ledger/ledger_models.dart';
 import '../features/ledger/ledger_repository.dart';
@@ -30,7 +30,7 @@ class SessionDependencies {
   final AgentSessionStore? agentSessionStore;
   final DioFactory? clientFactory;
 
-  /// 系统浏览器入口；测试替换后不启动外部应用。
+  /// 系统授权窗口入口；Future 在授权窗口关闭后完成，测试可替换它避免打开浏览器。
   final Future<bool> Function(Uri url)? openAuthorizationUrl;
 }
 
@@ -59,6 +59,48 @@ class SessionAuthenticated extends SessionState {
   final LedgerSummaryRead? summary;
 }
 
+/// 第三方身份已通过验证，但新用户尚未通过邀请码完成 Lyra 注册。
+///
+/// 这里只发布界面所需的来源、地址与截止时间；PKCE、设备私钥和登录事务留在内存中。
+class SessionRegistrationRequired extends SessionState {
+  const SessionRegistrationRequired({
+    required this.provider,
+    required this.serverUrl,
+    required this.expiresAt,
+  });
+
+  final AuthProvider provider;
+  final String serverUrl;
+  final DateTime expiresAt;
+}
+
+/// 保留一次已授权尝试的证明，补邀请码时继续兑换同一事务，绝不重新打开浏览器。
+class _PendingRegistration {
+  const _PendingRegistration({
+    required this.provider,
+    required this.serverUrl,
+    required this.login,
+    required this.codeVerifier,
+    required this.devicePrivateKey,
+    required this.deadline,
+    required this.repository,
+    required this.cancel,
+    required this.loginGeneration,
+    required this.authGeneration,
+  });
+
+  final AuthProvider provider;
+  final String serverUrl;
+  final OAuthLoginStart login;
+  final String codeVerifier;
+  final String devicePrivateKey;
+  final DateTime deadline;
+  final AuthRepository repository;
+  final CancelToken cancel;
+  final int loginGeneration;
+  final int authGeneration;
+}
+
 class _PendingTokenRefresh {
   const _PendingTokenRefresh({required this.identity, required this.tokens});
 
@@ -73,6 +115,8 @@ const String _userDisabledMessage = '账号已停用，请联系管理员。';
 class SessionController extends AsyncNotifier<SessionState> {
   LyraApiClient? _client;
   _PendingTokenRefresh? _pendingRefresh;
+  _PendingRegistration? _pendingRegistration;
+  bool _registrationSubmitting = false;
   int _loginGeneration = 0;
   int _authGeneration = 0;
   int _ledgerRefreshGeneration = 0;
@@ -85,6 +129,7 @@ class SessionController extends AsyncNotifier<SessionState> {
   Future<SessionState> build() async {
     final dependencies = ref.watch(sessionDependenciesProvider);
     final generation = ++_authGeneration;
+    cancelSignIn();
     _client?.invalidate();
     _client = null;
     _publishedState = const SessionSignedOut();
@@ -197,12 +242,7 @@ class SessionController extends AsyncNotifier<SessionState> {
       return;
     }
     if (!_authActive(generation) || profile.userId == identity.userId) return;
-    await _expireIdentity(
-      dependencies,
-      identity,
-      generation,
-      '登录身份已变化，请重新登录。',
-    );
+    await _expireIdentity(dependencies, identity, generation, '登录身份已变化，请重新登录。');
   }
 
   bool _authActive(int generation) =>
@@ -235,11 +275,14 @@ class SessionController extends AsyncNotifier<SessionState> {
     displayName: displayName,
   );
 
+  /// 验证指定来源的身份并建立会话；新用户需要邀请码时发布注册状态并返回 false。
+  ///
+  /// [serverUrl] 是已规范化的后台地址，[displayName] 是当前设备名称。
+  /// 只有兑换凭据并安全保存后才返回 true；授权取消返回 false，明确失败向上抛出。
   Future<bool> signIn({
     required AuthProvider provider,
     required String serverUrl,
     required String displayName,
-    String? inviteCode,
   }) async {
     cancelSignIn();
     final generation = _loginGeneration;
@@ -273,13 +316,14 @@ class SessionController extends AsyncNotifier<SessionState> {
         displayName: displayName,
         publicKeyPem: _spkiPem(publicKey.bytes),
         codeChallenge: challenge,
-        inviteCode: inviteCode,
         cancelToken: cancel,
       );
       if (!active()) return false;
       final launch =
           dependencies.openAuthorizationUrl ??
-          (Uri url) => launchUrl(url, mode: LaunchMode.externalApplication);
+          (Uri url) => authorizeInBrowser(url, cancel);
+      // 授权窗口由系统在固定回跳时关闭；回到 App 后才开始兑换，避免后台冻结
+      // 导致网络栈与轮询失步。回跳本身不表示登录成功，仍须核对服务端的用户对象。
       if (!await launch(login.authorizationUrl)) {
         throw const LyraApiError(
           code: 'LOGIN_BROWSER_UNAVAILABLE',
@@ -288,6 +332,7 @@ class SessionController extends AsyncNotifier<SessionState> {
           retryable: true,
         );
       }
+      if (!active()) return false;
       final maximumDeadline = DateTime.now().add(const Duration(minutes: 10));
       final deadline = login.expiresAt.isBefore(maximumDeadline)
           ? login.expiresAt
@@ -296,9 +341,11 @@ class SessionController extends AsyncNotifier<SessionState> {
       //
       // 浏览器授权可能已经成功、服务端事务正在等待兑换（10 分钟 TTL），此时一次
       // 网络抖动就放弃会让用户白跑一趟授权、还得多试一次。这里只容忍"再试可能
-      // 成功"的错误（网络层失败与服务端 5xx），连续失败超过预算仍然如实失败——
+      // 成功"的错误（仅网络层失败），连续失败超过预算仍然如实失败——
       // 不能把真实故障伪装成"还在等待"。
-      const transientBudget = 5;
+      // 冻结恢复后网络栈需要时间重新就绪，几次快速失败不代表授权失败；
+      // 预算给到约 1 分钟，仍由 10 分钟的登录截止时间兜底。
+      const transientBudget = 30;
       var transientFailures = 0;
       while (active()) {
         if (!DateTime.now().isBefore(deadline)) {
@@ -319,6 +366,31 @@ class SessionController extends AsyncNotifier<SessionState> {
           );
           transientFailures = 0;
         } on LyraApiError catch (error) {
+          if (error.code == 'INVITE_CODE_REQUIRED') {
+            if (!active()) return false;
+            // 缺邀请码是已经验证身份后的注册步骤，不是失败或已登录状态。
+            // 不把未完成注册的私钥与证明写进安全存储，重启后必须重新验证身份。
+            _pendingRegistration = _PendingRegistration(
+              provider: provider,
+              serverUrl: serverUrl,
+              login: login,
+              codeVerifier: verifier,
+              devicePrivateKey: base64Encode(privateKey),
+              deadline: deadline,
+              repository: repository,
+              cancel: cancel,
+              loginGeneration: generation,
+              authGeneration: authGeneration,
+            );
+            _publish(
+              SessionRegistrationRequired(
+                provider: provider,
+                serverUrl: serverUrl,
+                expiresAt: deadline,
+              ),
+            );
+            return false;
+          }
           if (!_isTransientPollFailure(error)) rethrow;
           transientFailures++;
           if (transientFailures >= transientBudget) rethrow;
@@ -327,53 +399,22 @@ class SessionController extends AsyncNotifier<SessionState> {
         }
         if (!active()) return false;
         if (credentials != null) {
-          // 停用账号只能得到明确的不可重试错误；即便服务端返回 200 也不建立会话。
-          if (credentials.user.status == LyraUserStatus.disabled) {
-            throw const LyraApiError(
-              code: kUserDisabledCode,
-              message: _userDisabledMessage,
-              statusCode: 403,
-              retryable: false,
-            );
-          }
-          final snapshot = CredentialSnapshot(
+          return await _persistLogin(
+            dependencies: dependencies,
+            credentials: credentials,
             serverUrl: serverUrl,
-            deviceId: credentials.deviceId,
-            accessToken: credentials.accessToken,
-            refreshToken: credentials.refreshToken,
-            userId: credentials.user.userId,
             devicePrivateKey: base64Encode(privateKey),
-            authMethod: provider.id,
-            userEmail: credentials.userEmail,
-            userDisplayName: credentials.userDisplayName,
-            providerSubject: credentials.subject,
-            googleSubject: credentials.googleSubject,
-          );
-          return await withCredentialMutation(
-            dependencies.credentialStore,
-            () async {
-              if (!active()) return false;
-              await dependencies.credentialStore.write(snapshot);
-              // 取消/新登录可能发生在安全存储 await 期间；回滚仍在同一队列内，
-              // 所以下一次登录只能在旧写入与回滚全部完成后提交。
-              if (!active()) {
-                await dependencies.credentialStore.clear();
-                return false;
-              }
-              await _sessionStore(dependencies).clear();
-              if (!active()) {
-                await dependencies.credentialStore.clear();
-                return false;
-              }
-              _client = _buildClient(dependencies, snapshot, authGeneration);
-              _publish(SessionAuthenticated(snapshot: snapshot, summary: null));
-              return true;
-            },
+            provider: provider,
+            authGeneration: authGeneration,
+            active: active,
           );
         }
         await _waitForPoll(login.pollInterval);
       }
       return false;
+    } on LyraApiError catch (error) {
+      if (error.code == 'LOGIN_CANCELLED') return false;
+      rethrow;
     } on DioException catch (error) {
       if (CancelToken.isCancel(error)) return false;
       rethrow;
@@ -385,11 +426,186 @@ class SessionController extends AsyncNotifier<SessionState> {
     }
   }
 
+  /// 对当前已授权的新用户补交邀请码，成功建立会话；取消或被替换时返回 false。
+  ///
+  /// [inviteCode] 为大小写敏感的邀请码，去掉首尾空白后发送。错码及网络错误保留
+  /// 当前注册步骤并抛给表单；过期、重放或账号停用会结束尝试并回到可重新登录状态。
+  Future<bool> completeRegistration({required String inviteCode}) async {
+    final pending = _pendingRegistration;
+    if (pending == null || !_registrationActive(pending)) {
+      throw const LyraApiError(
+        code: 'LOGIN_STATE_INVALID',
+        message: '此次登录已失效，请重新开始。',
+        statusCode: 409,
+        retryable: false,
+      );
+    }
+    if (_registrationSubmitting) {
+      throw const LyraApiError(
+        code: 'LOGIN_IN_PROGRESS',
+        message: '正在完成注册，请稍候。',
+        statusCode: 409,
+        retryable: true,
+      );
+    }
+    if (!DateTime.now().isBefore(pending.deadline)) {
+      cancelSignIn();
+      _publish(
+        SessionSignedOut(serverUrl: pending.serverUrl, message: '登录已超时，请重新开始。'),
+      );
+      throw const LyraApiError(
+        code: 'LOGIN_EXPIRED',
+        message: '登录已超时，请重新开始。',
+        statusCode: 410,
+        retryable: false,
+      );
+    }
+    final code = inviteCode.trim();
+    if (code.isEmpty) {
+      throw const LyraApiError(
+        code: 'INVITE_CODE_REQUIRED',
+        message: '请填写邀请码。',
+        statusCode: 403,
+        retryable: true,
+      );
+    }
+    _registrationSubmitting = true;
+    try {
+      final credentials = await pending.repository.exchangeLogin(
+        provider: pending.provider,
+        loginId: pending.login.loginId,
+        codeVerifier: pending.codeVerifier,
+        inviteCode: code,
+        cancelToken: pending.cancel,
+      );
+      if (!_registrationActive(pending)) return false;
+      if (credentials == null) {
+        throw const FormatException('已授权的注册事务返回了未授权状态');
+      }
+      final signedIn = await _persistLogin(
+        dependencies: ref.read(sessionDependenciesProvider),
+        credentials: credentials,
+        serverUrl: pending.serverUrl,
+        devicePrivateKey: pending.devicePrivateKey,
+        provider: pending.provider,
+        authGeneration: pending.authGeneration,
+        active: () => _registrationActive(pending),
+      );
+      if (identical(_pendingRegistration, pending)) {
+        _pendingRegistration = null;
+        _registrationSubmitting = false;
+      }
+      return signedIn;
+    } on LyraApiError catch (error) {
+      if (!_registrationActive(pending)) return false;
+      final terminalMessage = switch (error.code) {
+        'LOGIN_EXPIRED' => '登录已超时，请重新开始。',
+        'LOGIN_STATE_INVALID' || 'LOGIN_ALREADY_REDEEMED' => '此次登录已失效，请重新开始。',
+        'LOGIN_FAILED' || 'LOGIN_DENIED' => '登录未能完成，请重新登录。',
+        kUserDisabledCode => _userDisabledMessage,
+        _ => null,
+      };
+      if (terminalMessage != null) {
+        cancelSignIn();
+        _publish(
+          SessionSignedOut(
+            serverUrl: pending.serverUrl,
+            message: terminalMessage,
+          ),
+        );
+      }
+      rethrow;
+    } on DioException catch (error) {
+      if (CancelToken.isCancel(error)) return false;
+      rethrow;
+    } finally {
+      if (identical(_pendingRegistration, pending)) {
+        _registrationSubmitting = false;
+      }
+    }
+  }
+
+  /// 返回登录首页并撤销尚未完成的注册；旧表单不能影响已建立或已替换的新会话。
+  void cancelRegistration() {
+    if (_pendingRegistration == null ||
+        _publishedState is! SessionRegistrationRequired) {
+      return;
+    }
+    cancelSignIn();
+  }
+
+  /// 核对注册仍属于当前登录代次，防止取消、换身份或销毁后的响应写回。
+  bool _registrationActive(_PendingRegistration pending) =>
+      identical(_pendingRegistration, pending) &&
+      _authActive(pending.authGeneration) &&
+      pending.loginGeneration == _loginGeneration;
+
+  /// 将普通登录或邀请注册的凭据通过同一串行边界安全提交，返回是否建立了会话。
+  ///
+  /// [active] 在每个存储等待点核对尝试归属；被取消的写入在同一队列内回滚。
+  /// [devicePrivateKey] 是本次设备生成的 base64 私钥，不能取自之前身份的凭据。
+  Future<bool> _persistLogin({
+    required SessionDependencies dependencies,
+    required LoginCredentials credentials,
+    required String serverUrl,
+    required String devicePrivateKey,
+    required AuthProvider provider,
+    required int authGeneration,
+    required bool Function() active,
+  }) async {
+    if (!active()) return false;
+    // 停用账号只能得到明确的不可重试错误；即便服务端返回 200 也不建立会话。
+    if (credentials.user.status == LyraUserStatus.disabled) {
+      throw const LyraApiError(
+        code: kUserDisabledCode,
+        message: _userDisabledMessage,
+        statusCode: 403,
+        retryable: false,
+      );
+    }
+    final snapshot = CredentialSnapshot(
+      serverUrl: serverUrl,
+      deviceId: credentials.deviceId,
+      accessToken: credentials.accessToken,
+      refreshToken: credentials.refreshToken,
+      userId: credentials.user.userId,
+      devicePrivateKey: devicePrivateKey,
+      authMethod: provider.id,
+      userEmail: credentials.userEmail,
+      userDisplayName: credentials.userDisplayName,
+      providerSubject: credentials.subject,
+      googleSubject: credentials.googleSubject,
+    );
+    return withCredentialMutation(dependencies.credentialStore, () async {
+      if (!active()) return false;
+      await dependencies.credentialStore.write(snapshot);
+      if (!active()) {
+        await dependencies.credentialStore.clear();
+        return false;
+      }
+      await _sessionStore(dependencies).clear();
+      if (!active()) {
+        await dependencies.credentialStore.clear();
+        return false;
+      }
+      _client = _buildClient(dependencies, snapshot, authGeneration);
+      _publish(SessionAuthenticated(snapshot: snapshot, summary: null));
+      return true;
+    });
+  }
+
   /// 用户取消或界面销毁即停止轮询，过期事务由服务端清理。
   void cancelSignIn() {
     _loginGeneration++;
     _loginCancel?.cancel();
     _loginCancel = null;
+    final pending = _pendingRegistration;
+    _pendingRegistration = null;
+    _registrationSubmitting = false;
+    pending?.cancel.cancel();
+    if (pending != null && _publishedState is SessionRegistrationRequired) {
+      _publish(SessionSignedOut(serverUrl: pending.serverUrl));
+    }
     _cancelPoll();
   }
 
@@ -420,6 +636,7 @@ class SessionController extends AsyncNotifier<SessionState> {
     final serverUrl = switch (_publishedState) {
       SessionAuthenticated(:final snapshot) => snapshot.serverUrl,
       SessionSignedOut(:final serverUrl) => serverUrl,
+      SessionRegistrationRequired(:final serverUrl) => serverUrl,
     };
     final pendingRefresh = _pendingRefresh;
     cancelSignIn();

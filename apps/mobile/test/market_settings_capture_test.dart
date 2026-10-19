@@ -216,13 +216,12 @@ void main() {
       expect(find.text('保存'), findsNothing);
       expect(find.text('取消'), findsNothing);
       if (scenario.unavailable) {
-        expect(find.text('暂不可用的来源无法选择，请稍后再试。'), findsOneWidget);
-        expect(find.textContaining('服务端'), findsNothing);
+        expect(find.text('未配置的来源需由服务端完成配置。'), findsNothing);
         expect(find.textContaining('凭据'), findsNothing);
         await tester.ensureVisible(find.byTooltip('关闭'));
         await tester.tap(_field('stock'));
         await tester.pumpAndSettle();
-        expect(find.text('MarketData · 暂不可用'), findsWidgets);
+        expect(find.text('MarketData · 未配置'), findsWidgets);
         await _capture(
           tester,
           boundaryKey,

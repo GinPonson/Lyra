@@ -69,6 +69,13 @@ void main() {
       page: 'login',
     ),
     (
+      name: 'invite-320-large',
+      size: const Size(320, 740),
+      scale: 1.6,
+      unavailable: false,
+      page: 'invite',
+    ),
+    (
       name: '390-unavailable',
       size: const Size(390, 844),
       scale: 1.0,
@@ -99,6 +106,9 @@ void main() {
       addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
       final fixture = LoginFixture();
       if (scenario.unavailable) fixture.available = {AuthProvider.github};
+      if (scenario.page == 'invite') {
+        fixture.registrationRequiresInvite = true;
+      }
       final key = GlobalKey();
       await tester.pumpWidget(
         ProviderScope(
@@ -120,7 +130,16 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      if (scenario.page != 'login') {
+      if (scenario.page == 'invite') {
+        final google = find.byKey(const ValueKey('login-google'));
+        await tester.ensureVisible(google);
+        await tester.tap(google);
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('invite-code-screen')),
+          findsOneWidget,
+        );
+      } else if (scenario.page != 'login') {
         await tester.tap(find.text('我的'));
         await tester.pumpAndSettle();
         if (scenario.page == 'about') {

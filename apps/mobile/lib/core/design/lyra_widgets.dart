@@ -24,7 +24,7 @@ class LyraPage extends StatelessWidget {
     bottom: false,
     child: LayoutBuilder(
       builder: (context, constraints) {
-        final gutter = constraints.maxWidth >= 800 ? 40.0 : 20.0;
+        final gutter = constraints.maxWidth >= 800 ? 40.0 : 14.0;
         return Align(
           alignment: Alignment.topCenter,
           child: ConstrainedBox(
@@ -33,7 +33,7 @@ class LyraPage extends StatelessWidget {
               key: PageStorageKey<String>(storageKey),
               slivers: [
                 SliverPadding(
-                  padding: EdgeInsets.fromLTRB(gutter, 24, gutter, 32),
+                  padding: EdgeInsets.fromLTRB(gutter, 32, gutter, 32),
                   sliver: SliverToBoxAdapter(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -110,6 +110,199 @@ class LyraPageTitle extends StatelessWidget {
       },
     ),
   );
+}
+
+/// 构建金融页面共用的外层卡或内嵌面板。
+/// [child] 是卡片内容；[padding] 控制留白；[inset] 使用更亮的 16px 样式；[tint] 为表面叠加轻微语义色。
+class LyraCard extends StatelessWidget {
+  const LyraCard({
+    super.key,
+    required this.child,
+    this.padding = const EdgeInsets.all(16),
+    this.inset = false,
+    this.tint,
+  });
+
+  final Widget child;
+  final EdgeInsetsGeometry padding;
+  final bool inset;
+  final Color? tint;
+
+  @override
+  Widget build(BuildContext context) {
+    final base = inset ? LyraColors.surfaceStrong : LyraColors.surface;
+    final end = inset ? LyraColors.surface : LyraColors.surfaceSubtle;
+    // 语义色只低比例叠加在炭黑表面，避免整块背景变成高饱和填色。
+    Color tinted(Color color, int alpha) =>
+        tint == null ? color : Color.alphaBlend(tint!.withAlpha(alpha), color);
+
+    return Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [tinted(base, inset ? 12 : 7), tinted(end, inset ? 8 : 4)],
+        ),
+        border: Border.all(color: LyraColors.cardBorder, width: .75),
+        borderRadius: BorderRadius.circular(inset ? 16 : 24),
+      ),
+      child: child,
+    );
+  }
+}
+
+/// 二级面板共用紧凑标题与关闭入口。
+///
+/// [title] 是非空面板标题；[canClose] 默认为 `true`，提交期间可设为 `false`
+/// 以保留原有忙态保护。关闭入口始终占据 44px 点击区域，大字标题可自然换行。
+class LyraSheetHeader extends StatelessWidget {
+  const LyraSheetHeader({super.key, required this.title, this.canClose = true});
+
+  final String title;
+  final bool canClose;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(left: 8, bottom: 12),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 7),
+            child: Text(
+              title,
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                fontSize: 24,
+                fontWeight: FontWeight.w600,
+                height: 1.25,
+                letterSpacing: -.4,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        IconButton(
+          tooltip: '关闭',
+          constraints: const BoxConstraints.tightFor(width: 44, height: 44),
+          onPressed: canClose ? () => Navigator.of(context).pop() : null,
+          icon: const Icon(LyraIcons.dismiss, size: 22),
+        ),
+      ],
+    ),
+  );
+}
+
+/// 构建金融页面共用页头：[title] 为页面标题，[actions] 追加到金额显隐按钮之后。
+/// 账户范围沿用当前已授权账户状态；窄屏或大字时将范围放到下一行。
+class LyraFinancialHeader extends StatelessWidget {
+  const LyraFinancialHeader({
+    super.key,
+    required this.title,
+    this.actions = const [],
+  });
+
+  final String title;
+  final List<Widget> actions;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 8),
+    child: LayoutBuilder(
+      builder: (context, constraints) {
+        final heading = Text(
+          title,
+          style: Theme.of(context).textTheme.headlineLarge?.copyWith(
+            fontSize: 28,
+            height: 1.2,
+            fontWeight: FontWeight.w600,
+            letterSpacing: -.5,
+          ),
+        );
+        final controls = Wrap(
+          alignment: WrapAlignment.end,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 0,
+          runSpacing: 0,
+          children: [const LyraAmountsButton(), ...actions],
+        );
+
+        final actionWidth = 44.0 * (actions.length + 1);
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: EdgeInsets.only(right: actionWidth),
+                  child: heading,
+                ),
+                const SizedBox(height: 2),
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: AccountScopeButton(compact: true),
+                ),
+              ],
+            ),
+            Positioned(
+              top: -4,
+              right: 0,
+              child: IconButtonTheme(
+                data: IconButtonThemeData(
+                  style: IconButton.styleFrom(
+                    minimumSize: const Size(44, 44),
+                    padding: const EdgeInsets.all(10),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                ),
+                child: controls,
+              ),
+            ),
+          ],
+        );
+      },
+    ),
+  );
+}
+
+/// 切换本次会话的金额显隐，并在偏好写入失败时说明会话状态仍已切换。
+class LyraAmountsButton extends ConsumerWidget {
+  const LyraAmountsButton({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final hidden = ref.watch(amountsHiddenProvider);
+    final label = hidden ? '显示金额' : '隐藏金额';
+
+    Future<void> toggle() async {
+      try {
+        await ref.read(amountsHiddenProvider.notifier).toggle();
+      } on Object {
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            const SnackBar(content: Text('金额显隐已在本次会话中切换，但偏好保存失败。')),
+          );
+      }
+    }
+
+    return Semantics(
+      label: label,
+      toggled: !hidden,
+      child: IconButton(
+        key: const ValueKey<String>('toggle-amounts'),
+        tooltip: label,
+        onPressed: toggle,
+        icon: LyraPrimaryIcon(
+          hidden ? LyraPrimaryGlyph.hideAmounts : LyraPrimaryGlyph.showAmounts,
+          size: 22,
+        ),
+      ),
+    );
+  }
 }
 
 /// 有边界的图标按钮，统一可点击区域和无障碍标签。
@@ -244,11 +437,13 @@ Color lyraProfitColor(String value, ProfitColorScheme scheme) {
 
 /// 金额按展示精度排版；隐藏时同时移除原始值提示与辅助阅读内容。
 /// 股数、笔数等复用数字排版时须显式设置 [isMonetary] 为 false。
+/// [weight] 仅调整数字层级；默认中等字重，主金额可使用半粗体。
 class LyraAmount extends ConsumerWidget {
   const LyraAmount(
     this.value, {
     super.key,
     this.size = 24,
+    this.weight = FontWeight.w500,
     this.color,
     this.currency,
     this.decimals = 2,
@@ -260,6 +455,7 @@ class LyraAmount extends ConsumerWidget {
   });
   final String value;
   final double size;
+  final FontWeight weight;
   final Color? color;
   final String? currency;
   final int decimals;
@@ -301,7 +497,7 @@ class LyraAmount extends ConsumerWidget {
         color: amountColor,
         letterSpacing: -size * .015,
         height: 1.2,
-        fontWeight: FontWeight.w500,
+        fontWeight: weight,
       ),
     );
     if (hidden) {
@@ -326,12 +522,13 @@ class AccountScopeButton extends ConsumerWidget {
   /// 账号首页可直接使用范围选择器作为页头，其余页面保持紧凑按钮。
   final bool prominent;
 
-  /// 总览单行页头使用短胶囊；长账户名省略但仍可通过提示完整读取。
+  /// 金融页头使用无边框短标签；长账户名省略但仍可通过提示完整读取。
   final bool compact;
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final scope = ref.watch(accountScopeProvider);
     final paired = ref.watch(sessionProvider).value is SessionAuthenticated;
+    final visibleLabel = scope.id == 'all' ? '全部账户' : scope.label;
     final button = TextButton.icon(
       onPressed: paired
           ? () => showModalBottomSheet<void>(
@@ -351,10 +548,10 @@ class AccountScopeButton extends ConsumerWidget {
           children: [
             Flexible(
               child: Text(
-                scope.label,
+                compact ? visibleLabel : scope.label,
                 style: TextStyle(
-                  fontSize: compact ? 13 : (prominent ? 18 : 14),
-                  fontWeight: FontWeight.w500,
+                  fontSize: compact ? 14 : (prominent ? 18 : 14),
+                  fontWeight: compact ? FontWeight.w400 : FontWeight.w500,
                 ),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
@@ -366,21 +563,25 @@ class AccountScopeButton extends ConsumerWidget {
         ),
       ),
       style: TextButton.styleFrom(
-        foregroundColor: LyraColors.ink,
-        backgroundColor: compact ? LyraColors.surface : null,
+        foregroundColor: compact ? LyraColors.inkSecondary : LyraColors.ink,
+        backgroundColor: null,
         padding: EdgeInsets.symmetric(
-          horizontal: compact ? 10 : (prominent ? 0 : 12),
+          horizontal: compact ? 0 : (prominent ? 0 : 12),
         ),
-        minimumSize: compact ? const Size(0, 34) : null,
-        shape: compact
-            ? RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-                side: const BorderSide(color: LyraColors.hairline),
-              )
-            : null,
+        minimumSize: compact ? const Size(0, 32) : null,
+        tapTargetSize: compact ? MaterialTapTargetSize.shrinkWrap : null,
+        shape: compact ? const StadiumBorder() : null,
       ),
     );
-    return compact ? Tooltip(message: scope.label, child: button) : button;
+    if (!compact) return button;
+    return Tooltip(
+      message: visibleLabel,
+      child: Semantics(
+        label: '账户范围：$visibleLabel',
+        button: paired,
+        child: button,
+      ),
+    );
   }
 }
 
@@ -411,13 +612,13 @@ class _AccountPicker extends ConsumerWidget {
               ),
               const SizedBox(height: 16),
               ListTile(
-                title: const Text('全部账号'),
+                title: const Text('全部账户'),
                 subtitle: const Text('不同币种分别展示'),
                 leading: const LyraPrimaryIcon(LyraPrimaryGlyph.accountScope),
                 trailing: scope.id == 'all'
                     ? const Icon(LyraIcons.confirm)
                     : null,
-                onTap: () => select('all', '全部账号'),
+                onTap: () => select('all', '全部账户'),
               ),
               accounts.when(
                 loading: () => const LyraSkeleton(),

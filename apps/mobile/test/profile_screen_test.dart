@@ -34,7 +34,12 @@ ResponseBody _json(Object value, [int status = 200]) => ResponseBody.fromString(
   },
 );
 
+/// Profile 页面测试夹具，可为长身份布局指定测试凭据。
 class _ProfileFixture extends LedgerFixture {
+  /// 使用 [snapshot] 作为模拟登录凭据，默认采用常规 Profile 用户。
+  _ProfileFixture({this.snapshot = _snapshot});
+
+  final CredentialSnapshot snapshot;
   final store = MemoryCredentialStore();
   final openedUrls = <Uri>[];
   bool offline = false;
@@ -124,6 +129,15 @@ class _ProfileFixture extends LedgerFixture {
             });
           }
           if (path == '/v1/health') return _json({'status': 'healthy'});
+          if (path == '/v1/market/settings') {
+            return _json({
+              'revision': 0,
+              'routes': {'stock': <String>[], 'option': <String>[]},
+              'effectiveRoutes': {'stock': <String>[], 'option': <String>[]},
+              'providers': <Object?>[],
+              'updatedAt': null,
+            });
+          }
           if (path == '/v1/ledger/accounts' && options.method == 'POST') {
             final body = (options.data as Map).cast<String, Object?>();
             final account = {
@@ -152,7 +166,7 @@ class _ProfileFixture extends LedgerFixture {
 
   @override
   Future<SessionDependencies> dependencies({bool paired = true}) async {
-    if (paired) await store.write(_snapshot);
+    if (paired) await store.write(snapshot);
     return SessionDependencies(
       credentialStore: store,
       agentSessionStore: MemoryAgentSessionStore(),
@@ -268,9 +282,21 @@ void main() {
           textScale: configuration.$2,
         );
         expect(find.text('owner@example.com'), findsOneWidget);
-        expect(find.text('Google 已登录'), findsOneWidget);
+        expect(find.text('Google'), findsOneWidget);
         expect(find.text('Lyra Mobile'), findsNothing);
-        expect(find.text('启动时隐藏金额'), findsOneWidget);
+        expect(find.text('账户与数据'), findsNothing);
+        expect(find.text('使用偏好'), findsNothing);
+        expect(find.text('应用'), findsNothing);
+        expect(find.text('启动时隐藏金额'), findsNothing);
+        expect(
+          find.byKey(const ValueKey('startup-hide-amounts')),
+          findsNothing,
+        );
+        expect(find.byType(Switch), findsNothing);
+        expect(find.text('1 个'), findsOneWidget);
+        expect(find.text('暂无可用来源'), findsOneWidget);
+        expect(find.text('未开启'), findsNothing);
+        expect(find.textContaining('切换行情来源'), findsNothing);
         expect(find.textContaining('服务端'), findsNothing);
         expect(find.textContaining('fixture.invalid'), findsNothing);
         expect(find.textContaining('正在检测'), findsNothing);
@@ -280,6 +306,7 @@ void main() {
         await _tap(tester, find.byTooltip('关闭'));
         await _tap(tester, find.byKey(const ValueKey('profile-about')));
         expect(find.text('App 版本'), findsOneWidget);
+        expect(find.text('GitHub 项目'), findsOneWidget);
         expect(find.text('1.0.0 (2)'), findsOneWidget);
         expect(find.text('1.2.3'), findsNothing);
         expect(find.textContaining('服务端'), findsNothing);
@@ -289,6 +316,40 @@ void main() {
       },
     );
   }
+
+  testWidgets('长邮箱在窄屏大字号下自然换行并保留完整身份', (tester) async {
+    const longEmail = 'averylonginvestmentidentity@exampleportfolio.com';
+    final fixture = _ProfileFixture(
+      snapshot: const CredentialSnapshot(
+        serverUrl: 'https://fixture.invalid',
+        deviceId: 'profile-device',
+        accessToken: 'profile-access',
+        refreshToken: 'profile-refresh',
+        userId: 'profile-user',
+        authMethod: 'google',
+        userEmail: longEmail,
+        googleSubject: 'profile-owner',
+      ),
+    );
+    await _pumpProfile(
+      tester,
+      fixture,
+      size: const Size(320, 740),
+      textScale: 2,
+    );
+
+    final identity = tester.widget<Text>(
+      find.byKey(const ValueKey('profile-identity-name')),
+    );
+    expect(identity.semanticsLabel, longEmail);
+    expect(identity.data, contains('\u200B'));
+    expect(identity.data!.replaceAll('\u200B', ''), longEmail);
+    expect(
+      identity.data!.split('\u200B').every((part) => part.length > 1),
+      isTrue,
+    );
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('关于页的 App 版本读取失败可重试，不查询连接状态', (tester) async {
     final fixture = _ProfileFixture();
@@ -321,7 +382,7 @@ void main() {
     );
   });
 
-  testWidgets('未登录可保存本机偏好，金额开关失败可重试且不假报成功', (tester) async {
+  testWidgets('未登录可管理本机偏好，启动账户写入失败可重试', (tester) async {
     final fixture = _ProfileFixture();
     final store = _FailablePreferencesStore(
       initialValue: const AppPreferences(
@@ -336,20 +397,18 @@ void main() {
     );
     expect(find.text('使用 Google 登录'), findsOneWidget);
     store.failWrites = true;
-    await _tap(tester, find.byKey(const ValueKey('startup-hide-amounts')));
+    await _tap(tester, find.byKey(const ValueKey('profile-startup-account')));
+    await _tap(tester, find.text('全部证券账户').hitTestable());
+    expect(find.text('启动账户未能保存，请重试。'), findsOneWidget);
     expect(
-      tester
-          .widget<Switch>(find.byKey(const ValueKey('startup-hide-amounts')))
-          .value,
-      isFalse,
+      (await store.read())!.startupAccountMode,
+      StartupAccountMode.rememberLast,
     );
-    expect(find.text('隐藏金额设置未能保存，请重试。'), findsOneWidget);
-    expect((await store.read())!.hideAmountsOnStartup, isFalse);
     expect(find.textContaining('saved.example.com'), findsNothing);
     expect(find.textContaining('服务端'), findsNothing);
     store.failWrites = false;
-    await _tap(tester, find.byKey(const ValueKey('startup-hide-amounts')));
-    expect((await store.read())!.hideAmountsOnStartup, isTrue);
+    await _tap(tester, find.text('全部证券账户').hitTestable());
+    expect((await store.read())!.startupAccountMode, StartupAccountMode.all);
     await _tap(tester, find.byKey(const ValueKey('profile-profit-colors')));
     await _tap(tester, find.text('红涨绿跌').hitTestable());
     expect((await store.read())!.profitColorScheme, ProfitColorScheme.redUp);
@@ -419,7 +478,7 @@ void main() {
     final store = MemoryAppPreferencesStore();
     await _pumpProfile(tester, fixture, preferencesStore: store);
     await _tap(tester, find.byKey(const ValueKey('profile-startup-account')));
-    expect(find.textContaining('当前登录账号'), findsOneWidget);
+    expect(find.text('下次启动时生效，当前查看范围保持不变。'), findsOneWidget);
     expect(find.textContaining('服务端'), findsNothing);
     await _tap(tester, find.text('长期投资').hitTestable());
     final saved = (await store.read())!;
@@ -436,15 +495,38 @@ void main() {
   testWidgets('离线保留登录和本机偏好，不显示连接检测信息', (tester) async {
     final fixture = _ProfileFixture()..offline = true;
     final store = MemoryAppPreferencesStore();
-    await _pumpProfile(tester, fixture, preferencesStore: store);
-    expect(find.text('Google 已登录'), findsOneWidget);
+    final container = await _pumpProfile(
+      tester,
+      fixture,
+      preferencesStore: store,
+    );
+    // 有界传输恢复等待期间没有动画帧；等待两项读取实际失败，再核对离线状态。
+    for (
+      var attempt = 0;
+      attempt < 40 &&
+          (find.text('暂时无法读取账户').evaluate().isEmpty ||
+              find.text('行情来源读取失败').evaluate().isEmpty);
+      attempt++
+    ) {
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+    final startupAccountModeBefore = container
+        .read(appPreferencesProvider)
+        .value
+        ?.startupAccountMode;
+    expect(startupAccountModeBefore, isNotNull);
+    expect(find.text('Google'), findsOneWidget);
     expect(find.text('登录 Lyra'), findsNothing);
     expect(find.text('暂时无法读取账户'), findsOneWidget);
+    expect(find.text('行情来源读取失败'), findsOneWidget);
     expect(find.textContaining('服务端'), findsNothing);
     expect(find.textContaining('fixture.invalid'), findsNothing);
     expect(find.textContaining('检测'), findsNothing);
-    await _tap(tester, find.byKey(const ValueKey('startup-hide-amounts')));
-    expect((await store.read())!.hideAmountsOnStartup, isTrue);
+    // 离线状态不应改变页面已加载的本机启动账户偏好。
+    expect(
+      container.read(appPreferencesProvider).value?.startupAccountMode,
+      startupAccountModeBefore,
+    );
     expect((await fixture.store.read())!.deviceId, _snapshot.deviceId);
     expect(
       fixture.requests.where(
