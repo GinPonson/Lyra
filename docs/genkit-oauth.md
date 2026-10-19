@@ -88,11 +88,11 @@ Connect 文档将用户资料中的 `id` 定义为不可变标识。授权范围
 
 ### 多用户与自动注册
 
-三种来源都能让**新身份自动注册**，不再有 owner 白名单或「不开放注册」的限制。
+三种来源都先验证第三方身份；已有身份直接登录，新身份须在授权后填写有效邀请码完成注册。登录首页只显示品牌与底部三个登录按钮，不展示邀请码输入框或按钮下的说明文字。
 
 - 身份键始终是已验证的 **`(provider, subject)`**。Lyra **不**按相同邮箱、昵称或不同来源碰巧相同的数字 ID 自动合并——同一自然人的两个来源身份会得到两个独立用户，除非运维在旧库升级时显式确认它们属于同一人。
 - **首版没有自助绑定**：界面不能把另一个来源绑到已有用户上，也不能做所有者转移。
-- 新身份一律注册为 `member` 并获得空账本。`admin` **只能**由离线入口显式创建（见[部署文档](deployment.md#新安装显式创建首个管理员)），任何登录路径都不会产生管理员。
+- 新身份通过邀请码注册后，一律成为 `member` 并获得空账本。账号、身份、设备凭据和邀请码核销在同一事务内提交；缺码或错码会整体回滚。`admin` **只能**由离线入口显式创建（见[部署文档](deployment.md#新安装显式创建首个管理员)），任何登录路径都不会产生管理员。
 - 用户间完全隔离：有效但不属于当前用户的资源与「不存在」返回相同的 404。
 - **停用**用户会立刻撤销其全部设备凭据、关闭其事件流并终止在飞回合；被停用的身份再次 OAuth 登录会被拒绝（身份映射保留，不会因此新建一个用户绕开停用）。恢复用户后需要重新登录，旧令牌不复活。
 - 三种来源的邮箱都允许为空，App 显示对应来源与可用的显示名。
@@ -101,13 +101,16 @@ Connect 文档将用户资料中的 `id` 定义为不可变标识。授权范围
 
 ### App 登录过程
 
-1. 未登录时进入独立「登录 Lyra」页面，填写并检测 HTTPS 服务端地址。
-2. 选择服务器已启用的 Google、Linux.do 或 GitHub；App 生成本地 PKCE verifier，并向对应 `/v1/auth/{provider}/start` 创建登录事务。
-3. 系统浏览器打开所选来源的官方授权页，使用自己的账号完成授权。
-4. 服务端通过固定回调验证 state、来源与身份；Google 另验证 ID token 与 nonce，GitHub / Linux.do 通过固定用户资料端点验证身份。浏览器显示返回 Lyra 的提示。
-5. App 使用仅保存在自身内存中的 verifier 向同一来源的 `/exchange` 轮询并领取 Lyra 设备凭据；**用户在此时机按 `(provider, subject)` 查找或自动注册**，成功后进入工作台。取消或失败后可重新发起，迟到响应不应覆盖新的登录或服务器选择。
+1. 未登录时进入独立登录首页；App 自动恢复或使用构建时配置的 HTTPS 服务端地址。Google、Linux.do、GitHub 三个入口按顺序放在底部安全区上方；失败时在登录入口上方显式反馈。
+2. 选择服务器已启用的来源；App 生成本地 PKCE verifier，并向对应 `/v1/auth/{provider}/start` 创建登录事务。该请求只接受设备名、公钥和 PKCE 挑战，不再接收 `inviteCode`。
+3. Android 系统浏览器的 Auth Tab 打开所选来源的官方授权页，使用自己的账号完成授权；浏览器阶段 App 不在后台轮询兑换。
+4. 服务端通过固定 HTTPS 回调验证 state、来源与身份；Google 另验证 ID token 与 nonce，GitHub / Linux.do 通过固定用户资料端点验证身份。无论成败，服务端都返回相同的 303 重定向到 `com.lyrafinance.lyra://auth/callback`。该地址固定且不携带查询参数、片段、code、state 或用户数据，不能由请求指定。系统捕获该回跳，关闭授权窗口并自动回到 Lyra。
+5. App 回到前台后立即使用仅保存在自身内存中的 verifier 向同一来源的 `/exchange` 领取 Lyra 设备凭据，必要时继续轮询。已存在的 `(provider, subject)` 直接登录；新身份收到 `INVITE_CODE_REQUIRED` 后进入「完成注册」页面，此时还没有建立 Lyra 会话。
+6. 新用户填写邀请码后，对同一 `/exchange` 提交 `{loginId, codeVerifier, inviteCode}`。缺码或错码保留已授权事务，表单可原地更正，无需再次授权；有效码核销并完成注册后才保存设备凭据、进入工作台。返回登录会撤销本机待注册尝试，过期则必须重新授权。关闭授权窗口即取消登录；迟到回跳或兑换响应不能覆盖新的登录或服务器选择。
 
-登录事务十分钟过期，只能成功兑换一次，并绑定来源；服务端重启会清除未完成事务，App 重新发起即可。Google 和 GitHub 的上游授权码交换使用 PKCE，App 到 Lyra 的最终兑换使用独立 PKCE。Linux.do 官方接入文档未保证上游 PKCE 支持，当前使用服务端机密客户端授权码流程，仍保留 App 到 Lyra 的 PKCE 与 state 校验。第三方令牌仅在服务端用于本次身份验证，不交给 App；浏览器 URL 和回调页面不携带 Lyra token。GitHub 流程见 [Authorizing OAuth apps](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps)。
+登录事务十分钟过期，补填或更正邀请码不会延长时限，只能成功兑换一次，并绑定来源；服务端重启会清除未完成事务，App 重新发起即可。Google 和 GitHub 的上游授权码交换使用 PKCE，App 到 Lyra 的最终兑换使用独立 PKCE。Linux.do 官方接入文档未保证上游 PKCE 支持，当前使用服务端机密客户端授权码流程，仍保留 App 到 Lyra 的 PKCE 与 state 校验。第三方令牌仅在服务端用于本次身份验证，不交给 App；浏览器 URL 和 App 回跳不携带 Lyra token。GitHub 流程见 [Authorizing OAuth apps](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps)。
+
+Auth Tab 需要支持该能力的浏览器（Chrome 137+），不支持时 App 明确提示；它复用系统浏览器的账号状态与自动填充。升级自动回 App 流程时须同时更新服务端与 APK，提供方控制台原有 HTTPS callback 地址无需修改。固定回跳不是登录成功证明，App 仍须校验 PKCE 兑换结果中的用户和来源。
 
 **自动注册只在完整验证之后发生**：回调未完成、授权取消、verifier 无效或事务过期都不会创建用户。用户、身份、设备与凭据在**同一个事务**内提交，失败不会留下「只有用户、没有身份」的半成品。
 
@@ -121,7 +124,29 @@ Lyra access token 有效期十五分钟，refresh token 有效期三十天并在
 
 ## 4. Gmail 授权保持独立
 
-Google 登录只请求 `openid email profile`，GitHub 与 Linux.do 登录也不申请 Gmail 权限。已有 Gmail 授权继续使用 `LYRA_GOOGLE_CLIENT_ID`、`LYRA_GOOGLE_CLIENT_SECRET` 和 `LYRA_GOOGLE_REDIRECT_URI`，由已有 Gmail 授权与导入流程处理；它不是新的登录 callback。
+Google 登录只请求 `openid email profile`，GitHub 与 Linux.do 登录也不申请 Gmail 权限。「我的 → 证券账户 → 嘉信邮件」单独发起 Gmail 只读授权；Google 授予邮箱只读权限，Lyra 只查询嘉信成交确认邮件，不发送、删除或修改邮件。
+
+Gmail 使用显式配置的 `LYRA_GOOGLE_CLIENT_ID`、`LYRA_GOOGLE_CLIENT_SECRET` 和 `LYRA_GOOGLE_REDIRECT_URI`。可以复用同一 Google Web OAuth 客户端及已经登记的 `/v1/auth/google/callback`；该回调根据服务端保存的短时 state 分派至 Gmail 或身份登录流程，权限请求与凭据保存仍独立。三个 Gmail 变量必须明确填写，不会因 Google 登录可用而隐式启用邮件读取。对应 Google Cloud 项目需要启用 [Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com)，授权范围依据 [Gmail scopes](https://developers.google.com/workspace/gmail/api/auth/scopes)。
+
+App 创建绑定当前用户与设备的授权事务，使用既有 Android 系统授权窗口完成 Google 同意流程；服务端交换授权码后固定回跳 App。App 只查询短时事务结果，不接收 Google 授权码或令牌。拒绝、取消、过期、重复回调与第三方授权失效均明确反馈；Gmail 授权失效不会登出 Lyra。重新授权保留该用户已有连接 ID、消息归档与账户映射。
+
+首次扫描独立选择「全部嘉信成交邮件」或自定义起始日期，**不从 CSV 或账本日期推导邮件范围**；后续使用 Gmail history 游标增量读取。同步前选择现有证券账户，服务端仍校验邮件尾号与账户归属；不会创建证券账户或将其他尾号强塞进所选账户。主动重新扫描同样需要明确范围。读取消息数有界，截断不推进游标，也不显示为全量完成。
+
+首次历史扫描可能持续数分钟。Google 新项目的用户配额为每分钟 6,000 单位，读取一封完整邮件消耗 60 单位，见 [Gmail 使用限制](https://developers.google.com/workspace/gmail/api/reference/quota)。仅对明确的临时速率限制，服务端在同一个只读 GET 上最多重试六次，采用 1、2、4、8、16、32 秒及少量随机延迟；耗尽仍返回限流错误。日配额、授权、配置、访问拒绝与响应格式错误直接暴露；App 不自动重放同步 POST，网络断开后先刷新连接状态再确认结果。
+
+邮件与 CSV 共用账户、规范化成交事实、业务哈希和 occurrence 去重。已处理的 Gmail message ID 重试不重复入账；分散在不同邮件的相同成交按已关联的 occurrence 匹配已有交易，实际新增与已有跳过分别计数。不同 message ID 的相同内容不会被误当成同一份有顺序保证的原始文件；缺少执行编号或成交时分秒时，不声称能辨别不同投递是否属于同一次执行。
+
+已有 CSV 账本的哈希保持原值。跨来源的证券描述或记账日展示可能不同：只在账户、实际成交日、动作、完整证券身份、数量、价格及原始精度、费用和净额全部一致，且复用既有描述与记录日能精确重建唯一已有业务哈希时，才关联既有交易。期权必须完整匹配正股、到期日、行权价和认购 / 认沽类型。股票代码只接受已核实的 Berkshire B 类股 `BRK.B / BRKB` 及其完整发行人、B 类股描述组合（包含嘉信重复 `CLASS` 的既有表示），并沿用账户唯一使用的代码；不做通用去点或模糊匹配。命中多个不同业务哈希或账户同时存在两种表示时明确报告冲突。
+
+多价格成交支持表头明确声明的 `Quantity / Price / Principal / Charge and/or Interest / Total Amount` 五列模板。逐笔费用只接受明确的 `N/A`、`Commission` 或 `Industry Fee` 标签，并复用既有费用解析与合计校验；逐笔本金和净额、总数量、总费用及总金额均须勾稽。不会将无标签金额猜作费用、按合计分摊费用，或依据平均单价脚注虚构逐笔执行。邮件正文和附件接受合法的带填充或无填充 Base64URL，非法字符、填充和非规范编码仍明确拒绝。
+
+期权邮件的 `Sale / Cash` 不提供开平仓方向，不直接映射为卖出开仓或平仓。只有当前用户已映射账户中的既有期权卖出，在实际成交日、完整合约身份及全部数值精度上相同，且能重建唯一业务哈希时，才借用该已有动作并标记为「仅关联」。该标记在跨邮件 occurrence 接续后再次校验，任何超出已有成交次数的新哈希都会拒绝整封邮件。缺少已确认事实或存在歧义时明确计入解析失败，不参考当前持仓猜测方向；这项核对不改变独立的邮件扫描范围。
+
+同封邮件中，只有一种 MIME 表示已严格命中既有业务哈希时，才允许另一种表示对该 Cash 行的数量、价格采用同值的尾随零书写；本金、费用、净额和完整证券身份仍须一致。先独立验证失败候选中的全部 Cash 块，再重跑完整正文，避免普通格式错误遮住后续未验证的期权。该规范值不跨邮件复用，不改变全局交易哈希规则。
+
+无法证明同日同标的成交先后的新增邮件，明确提示导入覆盖该日全部成交的嘉信 CSV；它不会用收信时间猜测 FIFO 顺序。此类冲突与账户映射冲突、解析失败分别计数，其余可确认的邮件继续处理。正文和明文令牌不持久化，账本写入、消息元数据及交易关联在同一个事务内提交。
+
+授权接口为已鉴权的 `POST /v1/google/authorization-transactions` 和 `GET /v1/google/authorization-transactions/{authorizationId}`，连接状态为 `GET /v1/google/connections`。同步使用 `POST /v1/google/connections/{id}/sync`，App 始终提供已选择的现有账户 `explicitAccountId`；首次或重扫选择 `scanAll=true`，或 `scanAll=false` 加 `confirmedRescanAfterDate=YYYY-MM-DD`，两种范围互斥。正常增量不带范围参数。结果包括新增交易、已有交易、已处理邮件、账户冲突、顺序冲突及解析失败计数；同步完成后刷新现有持仓、交易、总览与行情读模型，保留当前账户范围。
 
 不使用 Gmail 导入时，省略这些可选变量即可。已有部署保留原来的 `LYRA_SECRET_MASTER_KEY`，否则原先加密保存的 Gmail refresh token 无法用新密钥解密。新部署可以在本机生成 32 字节随机密钥：
 
