@@ -7,6 +7,8 @@
 | ``GET /v1/market/settings`` | 读取**当前用户**的设置（含实际生效的路由） |
 | ``PUT /v1/market/settings`` | 保存**当前用户**的设置（revision CAS） |
 | ``GET /v1/market/positions`` | 当前用户在请求范围内持仓的参考估值 |
+| ``GET /v1/market/history`` | 当前用户已持有证券的历史行情 |
+| ``GET /v1/market/underlying-quote`` | 当前用户已持仓标的的正股成交与前收盘摘要 |
 
 **设置按用户读写**：设置行按 ``user_id`` 独立（P0 契约 §3.12 点名本模块）。
 保存后的路由**不写回任何共享运行时**——路由每次由 :meth:`MarketDataRuntime.settings_snapshot`
@@ -20,8 +22,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
+import re
 from typing import Any
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -32,7 +38,11 @@ from ..application.app_error import ApplicationError
 _MAX_SETTINGS_BODY_BYTES = 2_048
 
 from ..application.financial_tool_handlers import handle_market_positions
-from ..domain.analytics.types import AccountScope
+from ..application.market_data_service import MarketStockSummaryLookup
+from ..domain.analytics.positions import aggregate_positions
+from ..domain.analytics.types import AccountScope, PositionRow
+from ..domain.market_data.history import MarketHistoryRange
+from ..domain.market_data.types import StockInstrument, market_instrument_key
 from ..domain.market_data.settings import (
     effective_routes,
     normalize_routes,
@@ -43,6 +53,7 @@ from ..infrastructure.db.market_settings_repository import (
     load_market_settings,
     persist_market_settings,
 )
+from ..infrastructure.market_data.identifiers import provider_instrument
 from ..infrastructure.market_data.runtime import (
     MarketDataRuntime,
     MarketDataRuntimeSettings,
@@ -195,7 +206,525 @@ def create_market_router() -> APIRouter:
             public_scope, snapshot, data, ledger_version
         )
 
+    @router.get("/v1/market/history")
+    def read_market_history(request: Request) -> Any:
+        """读取一个已授权账户中指定现有持仓的历史行情。
+
+        证券身份只从同一短事务里的当前账本快照推导；请求传入的 opaque symbolKey
+        不会被用作上游 ticker。账本版本与用户来源设置 revision 检查完成并提交后，
+        才会读取共享行情服务，避免网络 I/O 占用 DuckDB 事务。可选 ``target`` 只改变
+        历史序列身份；即使读取标的股票，也必须先匹配该账户内的真实持仓。
+
+        @param request: 已通过认证中间件的单次 HTTP 请求。
+        @returns 协议 3 历史行情响应，bars 时间戳表示区间起点。
+        @raises HTTPException: query 非法、账户无权访问或账本/设置版本已变化时返回错误。
+        """
+        query = _strict_market_history_query(request)
+        public_account_id = query["scope"]
+        connection = request.app.state.database.connection
+        user_id = _current_user_id(request)
+        runtime = request.app.state.market_runtime
+        authorized = _authorized_market_position(
+            connection=connection,
+            user_id=user_id,
+            runtime=runtime,
+            account_id=public_account_id,
+            symbol_key=query["symbol_key"],
+            direction=query["direction"],
+            ledger_version=query["ledger_version"],
+            settings_revision=query["settings_revision"],
+        )
+        position = authorized.position
+        account_currency = authorized.account_currency
+        ledger_version = authorized.ledger_version
+        market_settings = authorized.market_settings
+
+        # 行情序列身份只从已匹配持仓的字段派生，target 不会跳过账户持仓授权。
+        from ..application.financial_tool_handlers import _instrument_for
+
+        target_identity_issue: str | None = None
+        if query["target"] == "underlying":
+            instrument, target_identity_issue = _underlying_stock_identity(position)
+            sequence_asset_type = "stock"
+        else:
+            instrument = _instrument_for(position)
+            sequence_asset_type = position.asset_type
+        timeframe: str = _history_timeframe(query["range"])
+        adjustment = "split" if sequence_asset_type == "stock" else "raw"
+        expired = _history_expired(position.expiry, instrument)
+        currency = account_currency
+        instrument_key = (
+            None if instrument is None else market_instrument_key(instrument)
+        )
+        if account_currency != "USD":
+            lookup = _unavailable_history("currency_unsupported")
+        elif target_identity_issue is not None:
+            lookup = _unavailable_history(target_identity_issue)
+        elif instrument is None:
+            lookup = _unavailable_history("unsupported_instrument")
+        else:
+            if account_currency != instrument.currency:
+                lookup = _unavailable_history("currency_unsupported")
+            elif runtime is None:
+                lookup = _unavailable_history("not_configured")
+            else:
+                asset_route = market_settings.routes.get(
+                    sequence_asset_type, ()
+                )
+                lookup = runtime.service.read_history(
+                    instrument, query["range"], asset_route
+                )
+
+        fetched_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+        metadata = {
+            "accountScope": {"kind": "account", "account": public_account_id},
+            "ledgerVersion": ledger_version,
+            "settingsRevision": market_settings.revision,
+            "fetchedAt": fetched_at,
+        }
+        data = {
+            "accountId": public_account_id,
+            "symbolKey": query["symbol_key"],
+            "direction": query["direction"],
+            "target": query["target"],
+            "positionAssetType": position.asset_type,
+            "assetType": sequence_asset_type,
+            "currency": currency,
+            "instrumentKey": instrument_key,
+            "range": query["range"],
+            "timeframe": timeframe,
+            "status": lookup.status,
+            "issue": lookup.issue,
+            "cached": lookup.cached,
+            "providerId": lookup.provider_id,
+            "feed": lookup.feed,
+            "timing": {"kind": "delayed", "delayMinutes": 16},
+            "adjustment": adjustment,
+            "expired": expired,
+            "cutoff": lookup.cutoff,
+            "fetchedAt": lookup.fetched_at,
+            "bars": [
+                {
+                    "timestamp": bar.timestamp,
+                    "open": bar.open,
+                    "high": bar.high,
+                    "low": bar.low,
+                    "close": bar.close,
+                    "volume": bar.volume,
+                }
+                for bar in lookup.bars
+            ],
+        }
+        return to_jsonable({"metadata": metadata, "data": data})
+
+    @router.get("/v1/market/underlying-quote")
+    def read_underlying_quote(request: Request) -> Any:
+        """读取当前授权账户真实持仓标的的正股最新成交和前收盘摘要。
+
+        请求只携带账本已有 ``symbol_key`` 与方向。真实股票代码只从已授权快照的
+        ``underlying`` 派生并校验；即使是期权或已到期期权，也只查询其正股。短事务
+        提交后才调用共享行情服务，避免网络请求占住数据库连接。
+
+        @param request: 已通过认证中间件的单次 HTTP 请求。
+        @returns 协议 3 正股成交/前收盘响应；缺前收盘时保留有效最新成交价。
+        @raises HTTPException: query 非法、账户无权访问或版本已变化时返回稳定错误。
+        """
+        query = _strict_underlying_quote_query(request)
+        connection = request.app.state.database.connection
+        user_id = _current_user_id(request)
+        runtime = request.app.state.market_runtime
+        authorized = _authorized_market_position(
+            connection=connection,
+            user_id=user_id,
+            runtime=runtime,
+            account_id=query["scope"],
+            symbol_key=query["symbol_key"],
+            direction=query["direction"],
+            ledger_version=query["ledger_version"],
+            settings_revision=query["settings_revision"],
+        )
+        position = authorized.position
+        instrument, identity_issue = _underlying_stock_identity(position)
+        instrument_key = (
+            None if instrument is None else market_instrument_key(instrument)
+        )
+        if authorized.account_currency != "USD":
+            lookup = _unavailable_stock_summary("currency_unsupported")
+        elif identity_issue is not None:
+            lookup = _unavailable_stock_summary(identity_issue)
+        elif instrument is None:
+            lookup = _unavailable_stock_summary("unsupported_instrument")
+        elif runtime is None:
+            lookup = _unavailable_stock_summary("not_configured")
+        else:
+            lookup = runtime.service.read_stock_summary(
+                instrument, authorized.market_settings.routes.get("stock", ())
+            )
+
+        fetched_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+        metadata = {
+            "accountScope": {"kind": "account", "account": query["scope"]},
+            "ledgerVersion": authorized.ledger_version,
+            "settingsRevision": authorized.market_settings.revision,
+            "fetchedAt": fetched_at,
+        }
+        data = {
+            "accountId": query["scope"],
+            "symbolKey": query["symbol_key"],
+            "direction": query["direction"],
+            "positionAssetType": position.asset_type,
+            "assetType": "stock",
+            "instrumentKey": instrument_key,
+            "currency": authorized.account_currency,
+            "status": lookup.status,
+            "issue": lookup.issue,
+            "cached": lookup.cached,
+            "providerId": lookup.provider_id,
+            "feed": lookup.feed,
+            "timing": {"kind": "delayed", "delayMinutes": 15},
+            "fetchedAt": lookup.fetched_at,
+            "price": (
+                None
+                if lookup.price is None
+                else {"value": lookup.price.value, "asOf": lookup.price.as_of}
+            ),
+            "previousClose": (
+                None
+                if lookup.previous_close is None
+                else {
+                    "value": lookup.previous_close.value,
+                    "sessionDate": lookup.previous_close.session_date,
+                }
+            ),
+            "changePercent": lookup.change_percent,
+            "changeIssue": lookup.change_issue,
+            "comparisonBasis": "previous_session_close",
+            "adjustment": "split",
+        }
+        return to_jsonable({"metadata": metadata, "data": data})
+
     return router
+
+
+@dataclass(frozen=True)
+class _AuthorizedMarketPosition:
+    """在一个账本/设置版本快照中精确匹配的授权持仓。"""
+
+    position: PositionRow
+    account_currency: str
+    ledger_version: int
+    market_settings: MarketDataRuntimeSettings
+
+
+def _authorized_market_position(
+    *,
+    connection: duckdb.DuckDBPyConnection,
+    user_id: str,
+    runtime: MarketDataRuntime | None,
+    account_id: str,
+    symbol_key: str,
+    direction: str,
+    ledger_version: int,
+    settings_revision: int,
+) -> _AuthorizedMarketPosition:
+    """验证版本与账户授权，并从同一短事务内取得唯一真实持仓。
+
+    网络 I/O 不属于本 helper；事务在返回前提交，使调用方只能在授权快照通过后访问
+    共享行情服务。
+
+    @param connection: 当前请求共享数据库连接。
+    @param user_id: 已认证用户 UUID。
+    @param runtime: 行情运行时，用于读取该用户设置快照。
+    @param account_id: 请求中的单账户 UUID。
+    @param symbol_key: 账本已有的 opaque symbol key。
+    @param direction: 持仓方向。
+    @param ledger_version: 客户端观察到的账本版本。
+    @param settings_revision: 客户端观察到的行情设置修订号。
+    @returns 已授权持仓、账户币种和一致版本快照。
+    @raises HTTPException: 账户无权访问、版本冲突或持仓不存在/不唯一时失败。
+    """
+    public_scope = AccountScope(kind="account", account=account_id)
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        resolved_scope = _resolve_market_scope(connection, user_id, public_scope)
+        snapshot = DuckDbLedgerRepository(
+            connection, user_id=user_id
+        ).load_snapshot(resolved_scope)
+        market_settings = _user_settings_snapshot(runtime, connection, user_id)
+        version_row = connection.execute(
+            "SELECT coalesce(max(version), 0) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+            [user_id],
+        ).fetchone()
+        current_version = int(version_row[0]) if version_row else 0
+        if current_version != ledger_version:
+            raise HTTPException(
+                status_code=409, detail={"code": "MARKET_LEDGER_CHANGED"}
+            )
+        if market_settings.revision != settings_revision:
+            raise HTTPException(
+                status_code=409, detail={"code": "MARKET_SETTINGS_CHANGED"}
+            )
+        positions = aggregate_positions(snapshot.open_lots, resolved_scope)
+        matching = tuple(
+            position for position in positions
+            if position.symbol_key == symbol_key and position.direction == direction
+        )
+        if not matching:
+            raise HTTPException(
+                status_code=404, detail={"code": "POSITION_NOT_FOUND"}
+            )
+        if len(matching) != 1:
+            raise HTTPException(
+                status_code=409, detail={"code": "POSITION_NOT_UNIQUE"}
+            )
+        position = matching[0]
+        account = next(
+            (
+                item for item in snapshot.accounts
+                if item.legacy_account_key == position.account
+            ),
+            None,
+        )
+        if account is None:
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "ACCOUNT_SNAPSHOT_INCONSISTENT"},
+            )
+        connection.execute("COMMIT")
+        return _AuthorizedMarketPosition(
+            position=position,
+            account_currency=account.base_currency,
+            ledger_version=current_version,
+            market_settings=market_settings,
+        )
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _underlying_stock_identity(
+    position: PositionRow,
+) -> tuple[StockInstrument | None, str | None]:
+    """从真实持仓的权威标的字段推导并校验正股身份。
+
+    正股只有在 ``underlying`` 缺失时才允许尝试账本 ``symbol_key``；期权只接受其
+    ``underlying``。调用 provider 前校验可避免无效身份消费预算或生成伪有效键。
+
+    @param position: 已从当前用户账户快照匹配出的真实持仓。
+    @returns 股票身份与稳定失败原因；无失败原因时身份一定有效。
+    """
+    underlying = position.underlying
+    if (
+        (underlying is None or underlying == "")
+        and position.asset_type == "stock"
+    ):
+        underlying = position.symbol_key
+    if not isinstance(underlying, str) or underlying == "":
+        return None, "unsupported_instrument"
+    candidate = StockInstrument(symbol=underlying)
+    validation = provider_instrument(candidate)
+    if not validation.ok:
+        return None, validation.reason
+    return candidate, None
+
+
+def _strict_underlying_quote_query(request: Request) -> dict[str, Any]:
+    """校验最新正股摘要请求的单值 query 白名单与格式。
+
+    @param request: 本次 HTTP 请求。
+    @returns 规范化账户 UUID、持仓键、方向与两个非负版本号。
+    @raises HTTPException: 缺失、重复、未知或格式非法时返回 400。
+    """
+    required = {
+        "scope", "symbol_key", "direction", "ledger_version", "settings_revision"
+    }
+    values: dict[str, str] = {}
+    for key, value in request.query_params.multi_items():
+        if key not in required or key in values:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "行情摘要参数无效"},
+            )
+        values[key] = value
+    if not required.issubset(values) or any(value == "" for value in values.values()):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": "行情摘要参数无效"},
+        )
+    try:
+        account_id = str(UUID(values["scope"]))
+    except (ValueError, AttributeError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": "scope 必须是单账户 UUID"},
+        ) from error
+    if (
+        len(values["symbol_key"]) > 512
+        or values["direction"] not in ("long", "short")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": "行情摘要参数无效"},
+        )
+    versions: list[int] = []
+    for name in ("ledger_version", "settings_revision"):
+        value = values[name]
+        if len(value) > 19 or not re.fullmatch(r"[0-9]+", value):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "版本号必须是非负整数"},
+            )
+        parsed = int(value)
+        if parsed > 9_223_372_036_854_775_807:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "版本号超出范围"},
+            )
+        versions.append(parsed)
+    return {
+        "scope": account_id,
+        "symbol_key": values["symbol_key"],
+        "direction": values["direction"],
+        "ledger_version": versions[0],
+        "settings_revision": versions[1],
+    }
+
+
+def _unavailable_stock_summary(issue: str) -> MarketStockSummaryLookup:
+    """为身份、币种或运行时前置条件失败构造空摘要结果。"""
+    fetched_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+    return MarketStockSummaryLookup(
+        status="unavailable", price=None, previous_close=None,
+        change_percent=None, change_issue=None, issue=issue, cached=False,
+        provider_id=None, feed=None, fetched_at=fetched_at,
+    )
+
+
+def _strict_market_history_query(request: Request) -> dict[str, Any]:
+    """校验历史路由的严格 query 白名单、单值与参数取值。
+
+    FastAPI 常规参数绑定会忽略未知参数，并对重复参数默认取其中一个；历史持仓请求
+    要求查询身份明确且唯一，因此这里检查原始 query 项列表。
+
+    @param request: 本次 HTTP 请求。
+    @returns 规范化账户 UUID、持仓键、方向、range、target 与两个版本号；省略 target 时为 position。
+    @raises HTTPException: 参数缺失、重复、未知或格式非法时返回 400。
+    """
+    required = {
+        "scope", "symbol_key", "direction", "range",
+        "ledger_version", "settings_revision",
+    }
+    allowed = required | {"target"}
+    values: dict[str, str] = {}
+    for key, value in request.query_params.multi_items():
+        if key not in allowed or key in values:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "行情历史参数无效"},
+            )
+        values[key] = value
+    if not required.issubset(values) or any(value == "" for value in values.values()):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": "行情历史参数无效"},
+        )
+    try:
+        account_id = str(UUID(values["scope"]))
+    except (ValueError, AttributeError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": "scope 必须是单账户 UUID"},
+        ) from error
+    direction = values["direction"]
+    history_range = values["range"]
+    target = values.get("target", "position")
+    if len(values["symbol_key"]) > 512:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": "symbol_key 过长"},
+        )
+    if (
+        direction not in ("long", "short")
+        or history_range not in ("1d", "1w", "1m", "3m")
+        or target not in ("position", "underlying")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": "行情历史参数无效"},
+        )
+    version_texts = (values["ledger_version"], values["settings_revision"])
+    if any(
+        len(value) > 19 or not re.fullmatch(r"[0-9]+", value)
+        for value in version_texts
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": "版本号必须是非负整数"},
+        )
+    ledger_version, settings_revision = (int(value) for value in version_texts)
+    max_version = 9_223_372_036_854_775_807
+    if ledger_version > max_version or settings_revision > max_version:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": "版本号超出范围"},
+        )
+    return {
+        "scope": account_id,
+        "symbol_key": values["symbol_key"],
+        "direction": direction,
+        "range": history_range,
+        "target": target,
+        "ledger_version": ledger_version,
+        "settings_revision": settings_revision,
+    }
+
+
+def _history_timeframe(history_range: MarketHistoryRange) -> str:
+    """将受限历史窗口映射到固定 provider 粒度。
+
+    @param history_range: 协议允许的 range 枚举。
+    @returns Alpaca 使用的 ``15Min``、``1Hour`` 或 ``1Day``。
+    """
+    return {"1d": "15Min", "1w": "1Hour", "1m": "1Day", "3m": "1Day"}[history_range]
+
+
+def _history_expired(expiry: str | None, instrument: Any) -> bool:
+    """按纽约民用日期判断期权历史是否锚定在到期后的过去区间。
+
+    @param expiry: 持仓的 ISO 到期日；股票传 ``None``。
+    @param instrument: 从账本派生的完整行情合约。
+    @returns 当前纽约日期已晚于到期日时为 ``True``。
+    """
+    if instrument is None or getattr(instrument, "asset_type", None) != "option" or expiry is None:
+        return False
+    now_day = datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).date()
+    return now_day > datetime.fromisoformat(expiry).date()
+
+
+def _unavailable_history(issue: str) -> Any:
+    """构造不访问 provider 时使用的空历史结果。
+
+    @param issue: 对客户端稳定公开的不可用原因码。
+    @returns 无 bars 的行情服务查找结果。
+    """
+    from ..application.market_data_service import MarketHistoryLookup
+
+    now = datetime.now(UTC)
+    fetched_at = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    cutoff = (now.timestamp() * 1000 - 16 * 60_000)
+    cutoff_at = datetime.fromtimestamp(cutoff / 1000, UTC).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+    return MarketHistoryLookup(
+        status="unavailable", bars=(), issue=issue, cached=False,
+        provider_id=None, feed=None, fetched_at=fetched_at, cutoff=cutoff_at,
+    )
 
 
 def _current_user_id(request: Request) -> str:

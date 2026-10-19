@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -21,8 +22,10 @@ from fastapi.testclient import TestClient
 
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
 from lyra.application.device_pairing_service import DevicePairingService
+from lyra.application.public_projection import project_position
 from lyra.config import Settings
 from lyra.db.connection import open_lyra_database
+from lyra.domain.analytics.types import PositionRow
 from lyra.infrastructure.auth.login_provider import LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
 from lyra.infrastructure.db.user_repository import UserRepository
@@ -372,28 +375,89 @@ def test_position_projection_redacts_account_and_uses_camel_case(client) -> None
              open_transaction_hash, ledger_version)
         VALUES (CAST(? AS UUID), 'INTC 03/19/2027 100.00 C', 'option', 'INTC',
                 CAST('2027-03-19' AS DATE), CAST('100.00' AS DECIMAL(18,4)), 'C',
-                'long', CAST('2026-01-05' AS DATE), CAST('2.50' AS DECIMAL(18,6)),
+                'long', CAST('2026-01-05' AS DATE), CAST('9.525' AS DECIMAL(18,6)),
                 CAST('2' AS DECIMAL(18,6)), CAST('2' AS DECIMAL(18,6)),
                 CAST('0.66' AS DECIMAL(18,6)), CAST('0' AS DECIMAL(18,6)),
+                ?, 1),
+               (CAST(? AS UUID), 'INTC 03/19/2027 100.00 C', 'option', 'INTC',
+                CAST('2027-03-19' AS DATE), CAST('100.00' AS DECIMAL(18,4)), 'C',
+                'short', CAST('2026-01-06' AS DATE), CAST('9.525' AS DECIMAL(18,6)),
+                CAST('2' AS DECIMAL(18,6)), CAST('2' AS DECIMAL(18,6)),
+                CAST('0.66' AS DECIMAL(18,6)), CAST('0' AS DECIMAL(18,6)),
+                ?, 1),
+               (CAST(? AS UUID), 'INTC', 'stock', 'INTC', NULL, NULL, NULL,
+                'long', CAST('2026-01-05' AS DATE), CAST('19.05' AS DECIMAL(18,6)),
+                CAST('2' AS DECIMAL(18,6)), CAST('2' AS DECIMAL(18,6)),
+                CAST('0' AS DECIMAL(18,6)), CAST('0' AS DECIMAL(18,6)),
                 ?, 1)
         """,
-        [ACCOUNT_ID, _h("txn-1")],
+        [
+            ACCOUNT_ID, _h("txn-1"),
+            ACCOUNT_ID, _h("txn-1"),
+            ACCOUNT_ID, _h("txn-1"),
+        ],
     )
 
     body = _data(test_client.get("/v1/ledger/positions", headers=_auth(issued), params={"scope": "all"}).json())
 
-    assert body["count"] == 1
+    assert body["count"] == 3
     assert body["basis"] == "historical_cost_not_market_value"
-    row = body["rows"][0]
+    rows = {(row["assetType"], row["direction"]): row for row in body["rows"]}
+    long_option = rows[("option", "long")]
+    short_option = rows[("option", "short")]
+    stock = rows[("stock", "long")]
     # 账户脱敏为内部 UUID，不再是脱敏键。
-    assert row["accountId"] == ACCOUNT_ID
-    assert "account" not in row
+    assert long_option["accountId"] == ACCOUNT_ID
+    assert "account" not in long_option
     # camelCase 字段与十进制字符串。
-    assert row["symbolKey"] == "INTC 03/19/2027 100.00 C"
-    assert row["firstOpenDate"] == "2026-01-05"
-    assert row["quantity"] == "2"
-    assert isinstance(row["cost"], str)
-    assert "qty" not in row
+    assert long_option["symbolKey"] == "INTC 03/19/2027 100.00 C"
+    assert long_option["firstOpenDate"] == "2026-01-05"
+    assert long_option["quantity"] == "2"
+    # 聚合成本 19.05 已含两张合约；期权乘数只折算美元，不再重复乘数量。
+    assert long_option["cost"] == "19.05"
+    assert long_option["costBasis"] == "1905"
+    assert short_option["cost"] == "19.05"
+    assert short_option["costBasis"] == "1905"
+    assert stock["cost"] == "38.1"
+    assert stock["costBasis"] == "38.1"
+    assert all("qty" not in row for row in body["rows"])
+
+    expiring = _data(test_client.get(
+        "/v1/ledger/expiring", headers=_auth(issued),
+        params={"as_of": "2026-09-01", "days": 300, "scope": "all"},
+    ).json())
+    assert expiring["count"] == 2
+    expiring_rows = {row["direction"]: row for row in expiring["rows"]}
+    for direction, position in (("long", long_option), ("short", short_option)):
+        expiry_row = expiring_rows[direction]
+        assert expiry_row["cost"] == position["cost"]
+        assert expiry_row["costBasis"] == position["costBasis"]
+        # 到期分析已有的美元权利金字段保持原值和计算口径。
+        assert expiry_row["premiumDollars"] == "1905"
+
+
+def test_short_option_cost_basis_uses_absolute_cost_without_changing_cost() -> None:
+    """空头负成本也应独立折算为正美元成本，原领域成本仍原样公开。"""
+    row = PositionRow(
+        account="TST001",
+        symbol_key="INTC 03/19/2027 100.00 C",
+        asset_type="option",
+        underlying="INTC",
+        expiry="2027-03-19",
+        strike=Decimal("100"),
+        option_type="C",
+        direction="short",
+        qty=Decimal("2"),
+        cost=Decimal("-19.05"),
+        first_open_date="2026-01-05",
+    )
+
+    projected = project_position(row, {"TST001": ACCOUNT_ID})
+
+    assert projected["direction"] == "short"
+    assert projected["quantity"] == "2"
+    assert projected["cost"] == "-19.05"
+    assert projected["costBasis"] == "1905"
 
 
 def test_expiring_projection_uses_camel_case(client) -> None:

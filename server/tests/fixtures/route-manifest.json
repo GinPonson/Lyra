@@ -127,11 +127,19 @@
     },
     {
       "method": "GET",
+      "path": "/v1/market/history"
+    },
+    {
+      "method": "GET",
       "path": "/v1/market/positions"
     },
     {
       "method": "GET",
       "path": "/v1/market/settings"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/market/underlying-quote"
     },
     {
       "method": "GET",
@@ -182,8 +190,8 @@
       "path": "/v1/google/authorization-transactions"
     },
     {
-      "method": "POST",
-      "path": "/v1/google/authorization-transactions/{}/complete"
+      "method": "GET",
+      "path": "/v1/google/authorization-transactions/{}"
     },
     {
       "method": "POST",

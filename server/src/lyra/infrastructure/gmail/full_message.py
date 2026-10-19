@@ -18,8 +18,6 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import re
 from dataclasses import dataclass, field
 
@@ -29,6 +27,7 @@ from ...domain.gmail.econfirm import (
     is_schwab_sender,
 )
 from ...domain.ledger.errors import IngestError
+from .base64url import decode_base64url
 from .html_text import normalize_email_body_candidates
 
 TEXT_MIME_TYPES = ("text/plain", "text/html")
@@ -204,15 +203,16 @@ def _collect_text_parts(part: GmailPart, where: str) -> tuple[tuple[str, str], .
 
 
 def _decode_base64url(value: str, where: str) -> bytes:
-    """严格解码无填充 base64url。
+    """严格解码带填充或无填充的 Gmail Base64URL 正文。
 
-    @raises IngestError: 字符集不符或长度非法。
+    @param value: Gmail MIME 正文中的 Base64URL 数据。
+    @param where: 错误定位说明。
+    @returns 解码后的邮件正文字节。
+    @raises IngestError: 字符、填充、长度或 pad bits 不规范。
     """
-    if not re.fullmatch(r"[A-Za-z0-9_-]*", value) or len(value) % 4 == 1:
-        raise IngestError(f"{where}: Gmail Base64URL 数据无效")
     try:
-        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-    except (binascii.Error, ValueError) as error:
+        return decode_base64url(value)
+    except ValueError as error:
         raise IngestError(f"{where}: Gmail Base64URL 数据无效") from error
 
 

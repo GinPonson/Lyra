@@ -31,7 +31,10 @@ DEVICE = "device-1"
 
 
 def _created():
-    return create_google_oauth_transaction(DEVICE, NOW, TTL_MS)
+    return create_google_oauth_transaction(
+        DEVICE, NOW, TTL_MS,
+        user_id="user-1", authorization_id="authorization-1",
+    )
 
 
 def _consume(record, *, state, device_id=DEVICE, now=NOW):
@@ -85,20 +88,25 @@ def test_state_and_verifier_are_independent_random_values() -> None:
 def test_rejects_invalid_ttl(ttl: object) -> None:
     """有效期必须是正整数。"""
     with pytest.raises(ValueError, match="正安全整数"):
-        create_google_oauth_transaction(DEVICE, NOW, ttl)  # type: ignore[arg-type]
+        create_google_oauth_transaction(
+            DEVICE, NOW, ttl, user_id="user-1", authorization_id="authorization-1"
+        )  # type: ignore[arg-type]
 
 
 def test_rejects_blank_device() -> None:
     """设备 ID 不能为空。"""
     with pytest.raises(ValueError, match="deviceId 不能为空"):
-        create_google_oauth_transaction("  ", NOW, TTL_MS)
+        create_google_oauth_transaction(
+            "  ", NOW, TTL_MS, user_id="user-1", authorization_id="authorization-1"
+        )
 
 
 def test_rejects_naive_time() -> None:
     """时间必须带时区。"""
     with pytest.raises(ValueError, match="必须带时区"):
         create_google_oauth_transaction(
-            DEVICE, datetime(2026, 10, 12, 9, 0, 0), TTL_MS
+            DEVICE, datetime(2026, 10, 12, 9, 0, 0), TTL_MS,
+            user_id="user-1", authorization_id="authorization-1",
         )
 
 

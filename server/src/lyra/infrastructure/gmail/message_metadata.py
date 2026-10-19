@@ -33,7 +33,8 @@ from ...domain.ledger.errors import IngestError
 
 ParseStatus = Literal["parsed", "rejected", "conflict"]
 UnsuccessfulErrorCode = Literal[
-    "GMAIL_MESSAGE_REJECTED", "ACCOUNT_MAPPING_REQUIRED", "GMAIL_MESSAGE_CONFLICT"
+    "GMAIL_MESSAGE_REJECTED", "ACCOUNT_MAPPING_REQUIRED", "GMAIL_MESSAGE_CONFLICT",
+    "GMAIL_REPLAY_ORDER_AMBIGUOUS",
 ]
 
 _EPOCH = re.compile(r"^\d+$")

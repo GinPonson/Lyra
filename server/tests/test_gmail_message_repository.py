@@ -315,26 +315,110 @@ def test_archiving_with_another_users_account_writes_nothing(fixture) -> None:
     assert count is not None and count[0] == 0
 
 
-def test_persisting_the_same_message_twice_conflicts(fixture) -> None:
-    """**同一封邮件重复归档会撞主键。**
-
-    参考实现用的是普通 INSERT（无 upsert），主键是 ``(connection_id, message_id)``。
-    同步服务在失败路径上**无条件**调用归档，因此"同一封邮件在重叠窗口里被处理两次"
-    会在这里抛错。
-
-    这条测试固定真实行为；调用方若需要幂等重试，必须自己先查状态再决定是否归档。
-    """
+def test_persisting_the_same_failed_message_twice_updates_its_status(fixture) -> None:
+    """重叠扫描重复归档失败邮件时更新状态，而不是撞消息主键。"""
     handle, connections, _ = fixture
     metadata = _failed(connections[USER_A])
     persist_unsuccessful_gmail_message(
         handle.connection, USER_A, metadata, synced_at=SYNCED_AT
     )
 
-    with pytest.raises(duckdb.ConstraintException):
+    persist_unsuccessful_gmail_message(
+        handle.connection, USER_A, metadata,
+        synced_at="2026-10-12T10:00:00.000Z",
+    )
+
+    row = handle.connection.execute(
+        "SELECT count(*), max(synced_at) FROM gmail_messages "
+        "WHERE connection_id = CAST(? AS UUID) AND message_id = 'm1'",
+        [connections[USER_A]],
+    ).fetchone()
+    assert row is not None and row[0] == 1
+    assert row[1].astimezone(UTC).isoformat().startswith("2026-10-12T10:00:00")
+
+
+def test_failed_message_can_become_imported_after_mapping_is_fixed(fixture) -> None:
+    """失败时空账户归属可在修复映射后更新成导入状态。"""
+    from lyra.infrastructure.db.gmail_message_repository import (
+        persist_gmail_message_import,
+    )
+
+    handle, connections, accounts = fixture
+    persist_unsuccessful_gmail_message(
+        handle.connection, USER_A,
+        _failed(connections[USER_A], error_code="ACCOUNT_MAPPING_REQUIRED"),
+        synced_at=SYNCED_AT,
+    )
+    plan = _ready_plan(connections[USER_A], accounts[USER_A])
+
+    result = persist_gmail_message_import(
+        handle.connection, user_id=USER_A, plan=plan,
+        expected_ledger_version=0, synced_at=SYNCED_AT,
+    )
+
+    assert result.inserted_rows == 1
+    state = load_existing_gmail_message_state(
+        handle.connection, USER_A, connections[USER_A], "m1"
+    )
+    assert state is not None
+    assert state.parse_status == "imported"
+    assert state.account_id == accounts[USER_A]
+
+
+def test_imported_message_cannot_be_downgraded_by_a_late_failure(fixture) -> None:
+    """后到失败归档不得覆盖已提交的消息与交易关联。"""
+    from lyra.infrastructure.db.gmail_message_repository import (
+        persist_gmail_message_import,
+    )
+
+    handle, connections, accounts = fixture
+    plan = _ready_plan(connections[USER_A], accounts[USER_A])
+    persist_gmail_message_import(
+        handle.connection, user_id=USER_A, plan=plan,
+        expected_ledger_version=0, synced_at=SYNCED_AT,
+    )
+
+    with pytest.raises(ApplicationError) as raised:
         persist_unsuccessful_gmail_message(
-            handle.connection, USER_A, metadata,
-            synced_at="2026-10-12T10:00:00.000Z",
+            handle.connection, USER_A,
+            _failed(connections[USER_A]), synced_at=SYNCED_AT,
         )
+
+    assert raised.value.code == "GMAIL_MESSAGE_CONFLICT"
+    state = load_existing_gmail_message_state(
+        handle.connection, USER_A, connections[USER_A], "m1"
+    )
+    assert state is not None and state.parse_status == "imported"
+    links = handle.connection.execute(
+        "SELECT count(*) FROM gmail_message_transactions"
+    ).fetchone()
+    assert links is not None and links[0] == 1
+
+
+def test_occurrence_maxima_are_loaded_only_for_the_user_account(fixture) -> None:
+    """跨邮件 occurrence 高水位来自该用户账户已保存的 Gmail 关联。"""
+    from lyra.infrastructure.db.gmail_message_repository import (
+        load_gmail_transaction_occurrence_maxima,
+        persist_gmail_message_import,
+    )
+
+    handle, connections, accounts = fixture
+    plan = _ready_plan(connections[USER_A], accounts[USER_A])
+    business_hash = plan.commit.inserted_transactions[0].business_hash
+    persist_gmail_message_import(
+        handle.connection, user_id=USER_A, plan=plan,
+        expected_ledger_version=0, synced_at=SYNCED_AT,
+    )
+
+    assert load_gmail_transaction_occurrence_maxima(
+        handle.connection, USER_A, accounts[USER_A]
+    ) == {business_hash: 1}
+    assert load_gmail_transaction_occurrence_maxima(
+        handle.connection, USER_B, accounts[USER_A]
+    ) == {}
+    assert load_gmail_transaction_occurrence_maxima(
+        handle.connection, USER_A, accounts[USER_B]
+    ) == {}
 
 
 def test_row_without_a_content_hash_violates_the_schema_check(fixture) -> None:

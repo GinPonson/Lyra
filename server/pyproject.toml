@@ -7,7 +7,8 @@ dependencies = [
     "cryptography>=43,<46",
     "duckdb>=1.1,<2",
     "fastapi>=0.115,<1",
-    "google-auth>=2.30,<3",
+    # 默认 Google ID token 验签器通过 google.auth.transport.requests 获取签名证书。
+    "google-auth[requests]>=2.30,<3",
     "httpx>=0.27,<1",
     "jsonschema>=4.23,<5",
     # DuckDB 的 Python 驱动读取 TIMESTAMPTZ 需要 pytz；缺失时**写正常、读报错**，

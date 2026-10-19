@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import duckdb
 
@@ -25,15 +26,20 @@ from ...application.gmail_service import (
 from ...application.gmail_sync_service import (
     GmailSyncDependencies,
 )
-from ...application.gmail_user_scope import assert_gmail_user_active
+from ...application.gmail_user_scope import (
+    assert_gmail_authorization_active,
+    assert_gmail_user_active,
+)
 from ...infrastructure.db.gmail_connection_repository import (
     create_gmail_account_mapping_row,
     create_gmail_connection_row,
     load_gmail_account_mapping,
     load_gmail_account_mappings,
     load_gmail_connection,
+    load_gmail_connection_by_subject,
     load_gmail_connections,
     save_gmail_connection_row,
+    upsert_gmail_connection_row,
     update_gmail_account_mapping_row,
 )
 from ...security.secret_cipher import SecretCipher
@@ -47,7 +53,11 @@ from .google_oauth_client import (
     exchange_google_authorization_code,
     revoke_gmail_connection_authorization,
 )
-from .http_transport import build_form_getter, build_json_getter
+from .http_transport import (
+    build_form_getter,
+    build_json_getter,
+    build_oauth_json_getter,
+)
 
 # 单次同步的有界扫描/增量上限。
 #
@@ -59,7 +69,11 @@ DEFAULT_GMAIL_MAXIMUM_MESSAGES = 500
 
 
 def build_gmail_service(
-    *, connection: duckdb.DuckDBPyConnection, environment: object, cipher: SecretCipher
+    *,
+    connection: duckdb.DuckDBPyConnection,
+    environment: object,
+    cipher: SecretCipher,
+    transport: Any | None = None,
 ) -> GmailService:
     """装配 Gmail 服务。
 
@@ -70,15 +84,17 @@ def build_gmail_service(
     @param connection: 数据库连接。
     @param environment: 环境变量映射。
     @param cipher: 凭据加密器。
+    @param transport: 可选 HTTPX transport；测试可使用 MockTransport，生产传 ``None``。
     @returns 服务实例。
     """
-    post_form = build_form_getter()
-    get_json = build_json_getter()
+    post_form = build_form_getter(transport=transport)
+    get_json = build_json_getter(transport=transport)
+    get_oauth_json = build_oauth_json_getter(transport=transport)
     now = lambda: datetime.now(UTC)
 
     deps = _Dependencies(
         connection=connection, cipher=cipher, now=now,
-        post_form=post_form, get_json=get_json,
+        post_form=post_form, get_json=get_json, get_oauth_json=get_oauth_json,
     )
     return GmailService(
         dependencies=deps, oauth=load_gmail_google_oauth_config(environment)
@@ -93,16 +109,28 @@ class _Dependencies:
     这样仓储调用不可能漏掉用户范围。
     """
 
-    def __init__(self, *, connection, cipher, now, post_form, get_json) -> None:
+    def __init__(
+        self, *, connection, cipher, now, post_form, get_json, get_oauth_json
+    ) -> None:
         self._connection = connection
         self.cipher = cipher
         self._now = now
         self._post_form = post_form
         self._get_json = get_json
+        self._get_oauth_json = get_oauth_json
 
     def now(self) -> datetime:
         """服务端可信时间。"""
         return self._now()
+
+    def assert_authorization_active(self, user_id: str, device_id: str) -> None:
+        """确认等待 OAuth 的设备仍活动且归属给活动用户。
+
+        @param user_id: 创建授权事务的用户 UUID 文本。
+        @param device_id: 创建授权事务的设备 UUID 文本。
+        @raises ApplicationError: 用户停用（403）或设备失效/归属变化（401）。
+        """
+        assert_gmail_authorization_active(self._connection, user_id, device_id)
 
     def new_id(self) -> str:
         """新连接 ID。"""
@@ -111,7 +139,7 @@ class _Dependencies:
     def exchange_code(self, **kwargs) -> dict:
         """用授权码换取凭据与身份。"""
         return exchange_google_authorization_code(
-            post_form=self._post_form, get_userinfo=self._get_json,
+            post_form=self._post_form, get_userinfo=self._get_oauth_json,
             now=self.now(), **kwargs,
         )
 
@@ -126,6 +154,18 @@ class _Dependencies:
     def load_connection(self, user_id: str, connection_id: str):
         """读取一条属于该用户的连接。"""
         return load_gmail_connection(self._connection, user_id, connection_id)
+
+    def load_connection_by_subject(self, user_id: str, google_subject: str):
+        """按 Google subject 读取该用户已存在的连接。"""
+        return load_gmail_connection_by_subject(
+            self._connection, user_id, google_subject
+        )
+
+    def upsert_connection(self, user_id: str, record, *, device_id: str):
+        """事务内确认设备与用户仍有效，再插入或更新该用户的 Gmail 连接。"""
+        return upsert_gmail_connection_row(
+            self._connection, user_id, record, device_id=device_id
+        )
 
     def save_connection(
         self, user_id: str, record, *, expected_updated_at: str, **overrides
@@ -195,6 +235,7 @@ class _Dependencies:
         return build_gmail_sync_dependencies(
             connection=self._connection, cipher=self.cipher,
             maximum_messages=DEFAULT_GMAIL_MAXIMUM_MESSAGES, user_id=user_id,
+            post_form=self._post_form, get_json=self._get_json,
         )
 
 
@@ -223,14 +264,15 @@ class _SyncDependencies:
     """
 
     def __init__(
-        self, *, connection, cipher, maximum_messages, user_id
+        self, *, connection, cipher, maximum_messages, user_id,
+        post_form=None, get_json=None,
     ) -> None:
         self._connection = connection
         self._cipher = cipher
         self._maximum_messages = maximum_messages
         self._user_id = user_id
-        self._post_form = build_form_getter()
-        self._get_json = build_json_getter()
+        self._post_form = build_form_getter() if post_form is None else post_form
+        self._get_json = build_json_getter() if get_json is None else get_json
         # 由 ``load_connection`` 填入：有界扫描要用它校验 profile 属于同一个邮箱。
         self._expected_email: str | None = None
 
@@ -337,14 +379,17 @@ class _SyncDependencies:
 
         deps = GmailMessageProcessingDependencies(
             parse_records=lambda record: parse_gmail_full_input(record, source_name="Gmail 同步"),
+            parse_trades=lambda message, account_id: self._parse_message(
+                connection, message, account_id
+            ),
             # 账户候选与映射都限定在当前用户内：跨用户账户不可能被解析成映射目标，
             # 因此"跨归属映射"在解析阶段就无从产生，写入阶段还有仓储层的原子校验。
             load_accounts=self._load_accounts,
             load_mappings=lambda: load_gmail_account_mappings(
                 self._connection, self._user_id, connection.id
             ),
-            resolve_mapping=lambda **kwargs: resolve_gmail_account_mapping(
-                connection_id=connection.id, **kwargs
+            resolve_mapping=lambda *, suffix, **kwargs: resolve_gmail_account_mapping(
+                connection_id=connection.id, account_suffix=suffix, **kwargs
             ),
             create_mapping=lambda plan: create_gmail_account_mapping_row(
                 self._connection, self._user_id,
@@ -359,6 +404,60 @@ class _SyncDependencies:
             records, dependencies=deps, explicit_account_id=explicit_account_id
         )
         return summary.to_dict()
+
+    def _parse_message(self, connection, message, explicit_account_id):
+        """解析一封成交确认；仅对未标明方向的期权现金卖出查询已确认事实。
+
+        普通成交完全沿用领域解析器，避免为普通邮件增加账本读取。只有解析器明确抛出
+        ``UnresolvedCashOptionSaleError`` 时，才用当前用户的账户、当前 Gmail 连接映射和
+        本次显式账户选择解析目标账户，并读取该账户已有 option sells。该路径只提供事实
+        作为解析上下文，不创建映射、不写账本；任何其它解析或数据库错误都原样上抛。
+
+        @param connection: 正在同步的当前用户 Gmail 连接记录。
+        @param message: 已水合的单封邮件。
+        @param explicit_account_id: 用户在本次同步中显式选择的账户 UUID；未选择为 ``None``。
+        @returns 领域解析器返回的标准化交易。
+        @raises ApplicationError: 账户尾号尚未映射或选择不匹配时需要用户确认。
+        @raises IngestError: 无法用已确认交易唯一确定期权卖出动作。
+        """
+        from ...domain.gmail.econfirm import (
+            UnresolvedCashOptionSaleError,
+            extract_account_suffix,
+            parse_econfirm,
+        )
+
+        try:
+            return parse_econfirm(message)
+        except UnresolvedCashOptionSaleError:
+            suffix = extract_account_suffix(message)
+            mappings = load_gmail_account_mappings(
+                self._connection, self._user_id, connection.id
+            )
+            existing_mapping = next(
+                (
+                    mapping for mapping in mappings
+                    if mapping.account_suffix.strip().upper() == suffix
+                ),
+                None,
+            )
+            mapping = resolve_gmail_account_mapping(
+                connection_id=connection.id,
+                account_suffix=suffix,
+                accounts=self._load_accounts(),
+                existing_mapping=existing_mapping,
+                explicit_account_id=explicit_account_id,
+            )
+            existing_option_sales = tuple(
+                transaction
+                for transaction in _account_transactions(
+                    self._connection, self._user_id, mapping.legacy_account_key
+                )
+                if transaction.asset_type == "option"
+                and transaction.action in ("Sell to Open", "Sell to Close")
+            )
+            return parse_econfirm(
+                message, existing_option_sales=existing_option_sales
+            )
 
     def _load_accounts(self) -> tuple:
         """读取**当前用户的**账本账户。"""
@@ -404,7 +503,9 @@ class _SyncDependencies:
         **先读账本版本再建计划**：计划绑定读取时的账本版本，提交时用它做 CAS——
         两次同步交错时后到的一方会收到版本冲突而不是把基于旧快照的计划写进去。
         """
+        from ...application.gmail_message_processing import GmailMessageImportOutcome
         from ..db.gmail_message_repository import (
+            load_gmail_transaction_occurrence_maxima,
             load_existing_gmail_message_state,
             persist_gmail_message_import,
         )
@@ -427,15 +528,26 @@ class _SyncDependencies:
                 existing_account_transactions=_account_transactions(
                     self._connection, self._user_id, mapping.legacy_account_key
                 ),
+                existing_gmail_occurrence_maxima=load_gmail_transaction_occurrence_maxima(
+                    self._connection, self._user_id, mapping.account_id
+                ),
             )
             if plan.kind == "already_imported":
-                return "already_imported"
-            persist_gmail_message_import(
+                return GmailMessageImportOutcome(
+                    kind="already_imported",
+                    inserted_transactions=0,
+                    existing_transactions=len(trades),
+                )
+            result = persist_gmail_message_import(
                 self._connection, user_id=self._user_id, plan=plan,
                 expected_ledger_version=ledger_version,
                 synced_at=_iso(self.now()),
             )
-            return "imported"
+            return GmailMessageImportOutcome(
+                kind="imported",
+                inserted_transactions=result.inserted_rows,
+                existing_transactions=result.skipped_rows,
+            )
 
         return import_message
 
@@ -462,6 +574,8 @@ def build_gmail_sync_dependencies(
     cipher: SecretCipher,
     maximum_messages: int,
     user_id: str,
+    post_form=None,
+    get_json=None,
 ) -> GmailSyncDependencies:
     """装配同步编排所需的动作集合。
 
@@ -469,11 +583,14 @@ def build_gmail_sync_dependencies(
     @param cipher: 凭据加密器。
     @param maximum_messages: 单次同步的消息上限。
     @param user_id: 当前用户的 UUID 文本；**必填**，所有回调都限定在该用户内。
+    @param post_form: 可选令牌端点传输函数；工厂复用统一 OAuth HTTP 合同。
+    @param get_json: 可选 Gmail API tuple 传输函数。
     @returns 依赖集合。
     """
     deps = _SyncDependencies(
         connection=connection, cipher=cipher,
         maximum_messages=maximum_messages, user_id=user_id,
+        post_form=post_form, get_json=get_json,
     )
     return GmailSyncDependencies(
         load_connection=deps.load_connection,
@@ -561,7 +678,7 @@ def _parser_version() -> str:
     与 CSV 导入共用同一个常量——**规则变化后旧预览必须失效**，两条路径的版本号必须
     一起变，否则邮件导入的预览不会随规则更新而失效。
     """
-    from ...domain.ledger.parsers import PARSER_VERSION
+    from ..db.import_commit_repository import PARSER_VERSION
 
     return PARSER_VERSION
 

@@ -33,6 +33,8 @@ import duckdb
 
 from ...application.market_budget import MarketProviderPolicy
 from ...application.market_data_service import MarketDataService, ProviderQuote
+from ...domain.market_data.history import MarketHistoryResult
+from ...domain.market_data.stock_summary import MarketStockSummary
 from ...domain.market_data.settings import MarketProviderOption, MarketRoutes
 from ...domain.market_data.types import MarketTiming
 from ..db.market_settings_repository import load_market_settings
@@ -136,6 +138,8 @@ def create_market_data_runtime(
     @returns 运行时。
     """
     providers: dict[str, Callable[..., ProviderQuote]] = {}
+    history_providers: dict[str, Callable[..., MarketHistoryResult]] = {}
+    stock_summary_providers: dict[str, Callable[..., MarketStockSummary]] = {}
     policies: dict[str, MarketProviderPolicy] = {}
 
     if config.alpaca_api_key is not None and config.alpaca_secret_key is not None:
@@ -144,6 +148,8 @@ def create_market_data_runtime(
             fetch=fetch, timeout_ms=config.timeout_ms,
         )
         providers[alpaca.id] = alpaca.fetch_quote
+        history_providers[alpaca.id] = alpaca.fetch_history
+        stock_summary_providers[alpaca.id] = alpaca.fetch_stock_summary
         policies[alpaca.id] = MarketProviderPolicy(
             cache_ttl_ms=ALPACA_CACHE_TTL_MS,
             max_requests_per_minute=ALPACA_REQUESTS_PER_MINUTE,
@@ -208,6 +214,8 @@ def create_market_data_runtime(
     )
     service = MarketDataService(
         providers=providers,
+        history_providers=history_providers,
+        stock_summary_providers=stock_summary_providers,
         routes=routes,
         policies=policies,
         now=now,

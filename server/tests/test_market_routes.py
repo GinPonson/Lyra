@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -241,6 +241,93 @@ def _seed_stock_position(
             quantity, transaction_hash, version,
         ],
     )
+
+
+def _seed_option_position(
+    connection,
+    user_id: str,
+    account_id: str,
+    *,
+    strike: str,
+    quantity: str = "2",
+    price: str = "2",
+    underlying: str = "INTC",
+    expiry: str = "2027-12-17",
+    option_type: str = "C",
+) -> str:
+    """插入一笔用于行情路由测试的未平标准期权批次。
+
+    @param connection: 已迁移的 DuckDB 连接。
+    @param user_id: 持仓归属用户。
+    @param account_id: 持仓归属账户 UUID。
+    @param strike: 以四位小数插入，模拟数据库读出的固定标度 Decimal。
+    @param quantity: 合约数量。
+    @param price: 每股权利金成本。
+    @param underlying: 期权标的代码。
+    @param expiry: ISO 到期日。
+    @param option_type: ``C`` 或 ``P``。
+    @returns 测试持仓的 ``symbol_key``。
+    """
+    transaction_hash = hashlib.sha256(
+        f"{account_id}:{underlying}:{expiry}:{option_type}:{strike}".encode("utf-8")
+    ).hexdigest()
+    source_hash = hashlib.sha256(f"source:{transaction_hash}".encode()).hexdigest()
+    business_hash = hashlib.sha256(f"business:{transaction_hash}".encode()).hexdigest()
+    connection.execute(
+        """
+        INSERT INTO ledger_versions (user_id, reason, source_reference)
+        VALUES (CAST(? AS UUID), 'file_import', ?)
+        """,
+        [user_id, transaction_hash],
+    )
+    version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [user_id],
+    ).fetchone()[0]
+    amount = str(-(Decimal(quantity) * Decimal(price) * Decimal("100")))
+    connection.execute(
+        """
+        INSERT INTO transactions (
+            account_id, record_date, transaction_date, action, raw_symbol, description,
+            asset_type, underlying, expiry, strike, option_type, quantity, price, fees,
+            amount, source_type, source_reference, source_hash, sequence, occurrence,
+            business_hash, transaction_hash, parser_version, ledger_version
+        ) VALUES (
+            CAST(? AS UUID), CAST('2026-01-05' AS DATE), CAST('2026-01-05' AS DATE),
+            'Buy to Open', ?, ?, 'option', ?, CAST(? AS DATE),
+            CAST(? AS DECIMAL(18,4)), ?, CAST(? AS DECIMAL(18,6)),
+            CAST(? AS DECIMAL(18,6)), CAST('0' AS DECIMAL(18,6)),
+            CAST(? AS DECIMAL(18,4)), 'csv', ?, ?, 1, 1, ?, ?, 2, ?
+        )
+        """,
+        [
+            account_id, f"{underlying} {expiry} {option_type} {strike}",
+            f"{underlying} option", underlying, expiry, strike, option_type,
+            quantity, price, amount, f"test:{transaction_hash}", source_hash,
+            business_hash, transaction_hash, version,
+        ],
+    )
+    symbol_key = f"{underlying}:{expiry}:{option_type}:{strike}"
+    connection.execute(
+        """
+        INSERT INTO lots (
+            account_id, symbol_key, asset_type, underlying, expiry, strike, option_type,
+            direction, open_date, open_price, open_quantity, remaining_quantity,
+            open_fees, fees_allocated, open_transaction_hash, ledger_version
+        ) VALUES (
+            CAST(? AS UUID), ?, 'option', ?, CAST(? AS DATE),
+            CAST(? AS DECIMAL(18,4)), ?, 'long', CAST('2026-01-05' AS DATE),
+            CAST(? AS DECIMAL(18,6)), CAST(? AS DECIMAL(18,6)),
+            CAST(? AS DECIMAL(18,6)), CAST('0' AS DECIMAL(18,6)),
+            CAST('0' AS DECIMAL(18,6)), ?, ?
+        )
+        """,
+        [
+            account_id, symbol_key, underlying, expiry, strike, option_type,
+            price, quantity, quantity, transaction_hash, version,
+        ],
+    )
+    return symbol_key
 
 
 def _marketdata_runtime(
@@ -746,6 +833,624 @@ def test_positions_without_market_data_are_still_returned(client) -> None:
     }]
 
 
+def test_option_positions_normalize_database_strikes_for_alpaca_without_rounding(client) -> None:
+    """数据库 Decimal 去除无意义尾零后进入 OCC；额外精度仍由供应商规则拒绝。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    valid_symbol = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID, strike="125.5000"
+    )
+    unsupported_symbol = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID, strike="125.5001"
+    )
+
+    # DuckDB 的真实列类型保留四位标度；路由必须把它安全转换成 OCC 可表达的精度。
+    persisted_strike = connection.execute(
+        "SELECT strike FROM lots WHERE symbol_key = ?", [valid_symbol]
+    ).fetchone()[0]
+    assert persisted_strike == Decimal("125.5000")
+
+    requested_symbols: list[str] = []
+    now = int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000)
+
+    def fetch(url, *, headers, timeout):
+        symbol = parse_qs(urlsplit(url).query)["symbols"][0]
+        requested_symbols.append(symbol)
+        return _FakeResponse({
+            "bars": {
+                symbol: [{
+                    "t": "2026-10-15T19:43:00Z", "c": 3.25, "v": 10,
+                }]
+            }
+        })
+
+    runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: now,
+    )
+    test_client.app.state.market_runtime = runtime
+    saved = _save_routes(test_client, issued, {"option": ["alpaca"]})
+    assert saved.status_code == 200
+
+    body = test_client.get(
+        "/v1/market/positions?scope=all", headers=_auth(issued)
+    ).json()
+    rows = {row["symbolKey"]: row for row in body["data"]["rows"]}
+    priced = rows[valid_symbol]
+
+    assert priced["quote"]["status"] == "available"
+    assert priced["instrumentKey"] == "US:option:INTC:2027-12-17:C:125.5"
+    assert priced["quote"]["quote"]["providerId"] == "alpaca"
+    assert priced["quote"]["referencePrice"]["value"] == "3.25"
+    assert priced["valuation"]["multiplier"] == "100"
+    assert priced["valuation"]["marketValue"] == "650"
+    assert priced["valuation"]["unrealizedPnl"] == "250"
+    assert rows[unsupported_symbol]["quote"]["issue"] == "unsupported_instrument"
+    assert rows[unsupported_symbol]["valuation"]["marketValue"] is None
+    assert requested_symbols == ["INTC271217C00125500"]
+
+
+def test_market_history_uses_only_the_matching_holding_and_returns_complete_bars(client) -> None:
+    """历史请求只用授权持仓的完整 OCC 身份，并把延迟 bars 升序返回。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    symbol_key = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID, strike="125.5000"
+    )
+    requested: list[str] = []
+    now = int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000)
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        symbol = parse_qs(urlsplit(url).query)["symbols"][0]
+        return _FakeResponse({
+            "bars": {
+                symbol: [
+                    {"t": "2026-10-15T19:15:00Z", "o": 3.2, "h": 3.5, "l": 3.1, "c": 3.4, "v": 12},
+                    {"t": "2026-10-15T19:00:00Z", "o": 3.0, "h": 3.3, "l": 2.9, "c": 3.2, "v": 10},
+                    {"t": "2026-10-14T19:45:00Z", "o": 2.8, "h": 3.0, "l": 2.7, "c": 2.9, "v": 8},
+                ]
+            },
+            "next_page_token": None,
+        })
+
+    runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: now,
+    )
+    test_client.app.state.market_runtime = runtime
+    saved = _save_routes(test_client, issued, {"option": ["alpaca"]})
+    assert saved.status_code == 200
+    ledger_version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    response = test_client.get(
+        _history_path(
+            symbol_key,
+            ledger_version=ledger_version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["metadata"] == {
+        "accountScope": {"kind": "account", "account": ACCOUNT_ID},
+        "ledgerVersion": ledger_version,
+        "settingsRevision": saved.json()["revision"],
+        "fetchedAt": body["metadata"]["fetchedAt"],
+    }
+    data = body["data"]
+    assert data["symbolKey"] == symbol_key
+    assert data["direction"] == "long"
+    assert data["target"] == "position"
+    assert data["positionAssetType"] == "option"
+    assert data["assetType"] == "option"
+    assert data["currency"] == "USD"
+    assert data["instrumentKey"] == "US:option:INTC:2027-12-17:C:125.5"
+    assert data["range"] == "1d"
+    assert data["timeframe"] == "15Min"
+    assert data["status"] == "available"
+    assert data["issue"] is None
+    assert data["providerId"] == "alpaca"
+    assert data["feed"] == "alpaca_option_bars"
+    assert data["timing"] == {"kind": "delayed", "delayMinutes": 16}
+    assert data["adjustment"] == "raw"
+    assert data["expired"] is False
+    assert data["cutoff"] == "2026-10-15T19:44:00.000Z"
+    assert [bar["timestamp"] for bar in data["bars"]] == [
+        "2026-10-15T19:00:00.000Z",
+        "2026-10-15T19:15:00.000Z",
+    ]
+    assert data["bars"][0] == {
+        "timestamp": "2026-10-15T19:00:00.000Z",
+        "open": "3", "high": "3.3", "low": "2.9", "close": "3.2", "volume": 10,
+    }
+    query = parse_qs(urlsplit(requested[0]).query)
+    assert urlsplit(requested[0]).path == "/v1beta1/options/bars"
+    assert query["symbols"] == ["INTC271217C00125500"]
+    assert query["timeframe"] == ["15Min"]
+    assert query["end"] == ["2026-10-15T19:29:59.999Z"]
+    assert "feed" not in query and "adjustment" not in query
+    # 历史只进入单独的公开 bar 缓存，不写 quote 或持仓估值缓存。
+    assert runtime.service._cache == {}
+    assert len(runtime.service._history_cache) == 1
+
+
+def test_option_holding_can_read_current_underlying_stock_history(client) -> None:
+    """仅有过期期权持仓时也能看标的正股，且不继承期权精度或到期锚点。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    symbol_key = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID,
+        strike="125.5001", underlying="INTC", expiry="2025-03-21",
+    )
+    assert connection.execute(
+        "SELECT count(*) FROM lots WHERE account_id = CAST(? AS UUID) AND asset_type = 'stock'",
+        [ACCOUNT_ID],
+    ).fetchone()[0] == 0
+
+    requested: list[str] = []
+    now = int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000)
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        return _FakeResponse({"bars": [{
+            "t": "2026-10-15T19:00:00Z",
+            "o": 10.0, "h": 10.5, "l": 9.8, "c": 10.2, "v": 40,
+        }]})
+
+    runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: now,
+    )
+    test_client.app.state.market_runtime = runtime
+    saved = _save_routes(
+        test_client, issued, {"stock": ["alpaca"], "option": []}
+    )
+    assert saved.status_code == 200
+    ledger_version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    response = test_client.get(
+        _history_path(
+            symbol_key, target="underlying", ledger_version=ledger_version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["target"] == "underlying"
+    assert data["positionAssetType"] == "option"
+    assert data["assetType"] == "stock"
+    assert data["currency"] == "USD"
+    assert data["instrumentKey"] == "US:stock:INTC"
+    assert data["status"] == "available"
+    assert data["adjustment"] == "split"
+    assert data["expired"] is False
+    assert data["cutoff"] == "2026-10-15T19:44:00.000Z"
+    assert len(data["bars"]) == 1
+    assert len(requested) == 1
+    requested_url = urlsplit(requested[0])
+    requested_query = parse_qs(requested_url.query)
+    assert requested_url.path == "/v2/stocks/INTC/bars"
+    assert requested_query["start"] == ["2026-10-08T19:44:00.000Z"]
+    assert requested_query["end"] == ["2026-10-15T19:29:59.999Z"]
+    assert requested_query["feed"] == ["sip"]
+    assert requested_query["adjustment"] == ["split"]
+    assert "symbols" not in requested_query
+    assert len(runtime.service._history_cache) == 1
+
+
+def test_two_option_positions_share_the_same_underlying_history_cache(client) -> None:
+    """不同期权持仓的标的视图共享按公开股票身份建立的 bars 缓存。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    symbols = (
+        _seed_option_position(
+            connection, issued.user.id, ACCOUNT_ID, strike="125.5000",
+            underlying="INTC", expiry="2027-12-17",
+        ),
+        _seed_option_position(
+            connection, issued.user.id, ACCOUNT_ID, strike="130.0000",
+            underlying="INTC", expiry="2027-12-17",
+        ),
+    )
+    requested: list[str] = []
+    now = int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000)
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        return _FakeResponse({"bars": [{
+            "t": "2026-10-15T19:00:00Z",
+            "o": 10.0, "h": 10.5, "l": 9.8, "c": 10.2, "v": 40,
+        }]})
+
+    runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: now,
+    )
+    test_client.app.state.market_runtime = runtime
+    saved = _save_routes(
+        test_client, issued, {"stock": ["alpaca"], "option": []}
+    )
+    assert saved.status_code == 200
+    ledger_version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    results = [
+        test_client.get(
+            _history_path(
+                symbol, target="underlying", ledger_version=ledger_version,
+                settings_revision=saved.json()["revision"],
+            ),
+            headers=_auth(issued),
+        )
+        for symbol in symbols
+    ]
+
+    assert [result.status_code for result in results] == [200, 200]
+    data = [result.json()["data"] for result in results]
+    assert [item["instrumentKey"] for item in data] == [
+        "US:stock:INTC", "US:stock:INTC",
+    ]
+    assert [item["symbolKey"] for item in data] == list(symbols)
+    assert [item["cached"] for item in data] == [False, True]
+    assert len(requested) == 1
+    assert len(runtime.service._history_cache) == 1
+
+
+def test_underlying_target_rejects_unrecognized_stock_symbol_without_http(client) -> None:
+    """标的代码不符合股票身份规则时明确失败，不猜测代码也不请求上游。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    symbol_key = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID,
+        strike="125.5000", underlying="BRK/B",
+    )
+    requested: list[str] = []
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        return _FakeResponse({"bars": []})
+
+    runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000),
+    )
+    test_client.app.state.market_runtime = runtime
+    saved = _save_routes(
+        test_client, issued, {"stock": ["alpaca"], "option": []}
+    )
+    ledger_version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    response = test_client.get(
+        _history_path(
+            symbol_key, target="underlying", ledger_version=ledger_version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["assetType"] == "stock"
+    assert response.json()["data"]["instrumentKey"] is None
+    assert response.json()["data"]["status"] == "unavailable"
+    assert response.json()["data"]["issue"] == "unsupported_instrument"
+    assert requested == []
+    assert runtime.service._budgets["alpaca"].minute_calls == []
+
+
+def test_stock_underlying_target_prefers_ledger_underlying_to_symbol_key(client) -> None:
+    """正股走势使用权威 underlying，即使账本 symbol_key 是不同原代码。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    symbol_key = "BROKER-OPAQUE-INTC"
+    _seed_stock_position(
+        connection, issued.user.id, ACCOUNT_ID, symbol_key, underlying="INTC"
+    )
+    requested: list[str] = []
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        return _FakeResponse({"bars": [{
+            "t": "2026-10-15T19:00:00Z",
+            "o": 10.0, "h": 10.5, "l": 9.8, "c": 10.2, "v": 40,
+        }]})
+
+    test_client.app.state.market_runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000),
+    )
+    saved = _save_routes(
+        test_client, issued, {"stock": ["alpaca"], "option": []}
+    )
+    ledger_version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    response = test_client.get(
+        _history_path(
+            symbol_key, target="underlying", ledger_version=ledger_version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["instrumentKey"] == "US:stock:INTC"
+    assert response.json()["data"]["status"] == "available"
+    assert len(requested) == 1
+    assert urlsplit(requested[0]).path == "/v2/stocks/INTC/bars"
+
+
+def test_market_history_rejects_stale_versions_and_non_holding_identity(client) -> None:
+    """版本变更、缺失持仓与 query 歧义在调用上游之前失败。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _seed_stock_position(connection, issued.user.id, ACCOUNT_ID, "INTC")
+    requested: list[str] = []
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        return _FakeResponse({"bars": []})
+
+    test_client.app.state.market_runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000),
+    )
+    saved = _save_routes(test_client, issued, {"stock": ["alpaca"]})
+    assert saved.status_code == 200
+    version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+    revision = saved.json()["revision"]
+
+    invalid_paths = [
+        "/v1/market/history?scope=all&symbol_key=INTC&direction=long&range=1d&ledger_version=1&settings_revision=1",
+        _history_path("INTC", ledger_version=version, settings_revision=revision) + "&extra=1",
+        _history_path("INTC", ledger_version=version, settings_revision=revision) + "&range=1w",
+        _history_path("INTC", ledger_version="-1", settings_revision=revision),
+        _history_path("INTC", ledger_version="9" * 4_301, settings_revision=revision),
+        _history_path("I" * 513, ledger_version=version, settings_revision=revision),
+        _history_path(
+            "INTC", target="portfolio", ledger_version=version,
+            settings_revision=revision,
+        ),
+        _history_path(
+            "INTC", target="position", ledger_version=version,
+            settings_revision=revision,
+        ) + "&target=underlying",
+    ]
+    for path in invalid_paths:
+        response = test_client.get(path, headers=_auth(issued))
+        assert response.status_code == 400
+        assert response.json()["code"] == "INVALID_ARGUMENT"
+
+    stale_ledger = test_client.get(
+        _history_path(
+            "INTC", target="underlying", ledger_version=version + 1,
+            settings_revision=revision,
+        ),
+        headers=_auth(issued),
+    )
+    stale_settings = test_client.get(
+        _history_path("INTC", ledger_version=version, settings_revision=revision + 1),
+        headers=_auth(issued),
+    )
+    missing_position = test_client.get(
+        _history_path(
+            "AAPL", target="underlying", ledger_version=version,
+            settings_revision=revision,
+        ),
+        headers=_auth(issued),
+    )
+
+    assert stale_ledger.status_code == 409
+    assert stale_ledger.json()["code"] == "MARKET_LEDGER_CHANGED"
+    assert stale_settings.status_code == 409
+    assert stale_settings.json()["code"] == "MARKET_SETTINGS_CHANGED"
+    assert missing_position.status_code == 404
+    assert missing_position.json()["code"] == "POSITION_NOT_FOUND"
+    assert requested == []
+
+
+def test_market_history_checks_account_ownership_and_currency_before_provider(two_users) -> None:
+    """跨用户账户不可枚举，非 USD 账户不把 USD provider 数据误标成本币。"""
+    test_client, issued_a, issued_b = two_users
+    connection = test_client.app.state.database.connection
+    _insert_account(connection, issued_b.user.id, SECOND_ACCOUNT_ID, "TST002", "002")
+    _seed_stock_position(connection, issued_b.user.id, SECOND_ACCOUNT_ID, "AAPL")
+    _insert_account(
+        connection, issued_a.user.id, "33333333-3333-3333-3333-333333333333",
+        "EUR003", "003", base_currency="EUR",
+    )
+    euro_account = "33333333-3333-3333-3333-333333333333"
+    euro_symbol = _seed_option_position(
+        connection, issued_a.user.id, euro_account,
+        strike="125.5000", underlying="INTC",
+    )
+    requested: list[str] = []
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        return _FakeResponse({"bars": []})
+
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+    test_client.app.state.market_runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000),
+    )
+    saved_a = _save_routes(test_client, issued_a, {"stock": ["alpaca"]})
+    saved_b = _save_routes(test_client, issued_b, {"stock": ["alpaca"]})
+
+    cross_account = test_client.get(
+        _history_path(
+            "AAPL", scope=SECOND_ACCOUNT_ID,
+            ledger_version=1, settings_revision=saved_a.json()["revision"],
+        ),
+        headers=_auth(issued_a),
+    )
+    euro_version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued_a.user.id],
+    ).fetchone()[0]
+    euro = test_client.get(
+        _history_path(
+            euro_symbol, scope=euro_account, target="underlying",
+            ledger_version=euro_version,
+            settings_revision=saved_a.json()["revision"],
+        ),
+        headers=_auth(issued_a),
+    )
+
+    assert cross_account.status_code == 404
+    assert cross_account.json()["code"] == "ACCOUNT_NOT_FOUND"
+    assert euro.status_code == 200
+    assert euro.json()["data"]["currency"] == "EUR"
+    assert euro.json()["data"]["positionAssetType"] == "option"
+    assert euro.json()["data"]["assetType"] == "stock"
+    assert euro.json()["data"]["issue"] == "currency_unsupported"
+    assert euro.json()["data"]["status"] == "unavailable"
+    assert requested == []
+    assert saved_b.status_code == 200
+
+
+def test_market_history_does_not_silently_switch_to_alpaca(client) -> None:
+    """选中的 quote-only 来源明确报告不支持历史，不暗换到未选 Alpaca。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    _seed_stock_position(connection, issued.user.id, ACCOUNT_ID, "INTC")
+    fetched: list[str] = []
+    test_client.app.state.market_runtime = _marketdata_runtime(on_fetch=fetched.append)
+    saved = _save_routes(test_client, issued, {"stock": ["marketdata"]})
+    version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    response = test_client.get(
+        _history_path(
+            "INTC", ledger_version=version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "unavailable"
+    assert response.json()["data"]["issue"] == "history_not_supported"
+    assert response.json()["data"]["providerId"] is None
+    assert response.json()["data"]["bars"] == []
+    assert fetched == []
+
+
+def _history_path(
+    symbol_key: str,
+    *,
+    scope: str = ACCOUNT_ID,
+    direction: str = "long",
+    history_range: str = "1d",
+    target: str | None = None,
+    ledger_version: int | str,
+    settings_revision: int | str,
+) -> str:
+    """构造严格满足历史行情 query 契约的测试路径。
+
+    @param target: 可选序列身份；省略时覆盖 position 默认值。
+    """
+    from urllib.parse import urlencode
+
+    values: dict[str, str | int] = {
+        "scope": scope,
+        "symbol_key": symbol_key,
+        "direction": direction,
+        "range": history_range,
+        "ledger_version": ledger_version,
+        "settings_revision": settings_revision,
+    }
+    if target is not None:
+        values["target"] = target
+    query = urlencode(values)
+    return f"/v1/market/history?{query}"
+
+
 def test_positions_requires_scope_and_resolves_account_uuid(client) -> None:
     """positions 只接受 all 或账户 UUID，并把 UUID 映射到账本 legacy key。"""
     test_client, issued = client
@@ -1072,3 +1777,418 @@ def test_positions_report_unavailable_market_data_without_providers(client) -> N
     assert body["data"]["count"] == 0
     assert body["data"]["complete"] is True
     assert body["data"]["marketData"]["enabled"] is False
+
+
+def test_option_only_expired_nonstandard_holding_reads_its_stock_summary(client) -> None:
+    """仅有已到期非标准期权持仓时，仍按标的读取真实正股成交和拆股复权前收盘。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    symbol_key = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID,
+        strike="125.5001", underlying="INTC", expiry="2025-03-21",
+    )
+    assert connection.execute(
+        "SELECT count(*) FROM lots WHERE account_id = CAST(? AS UUID) AND asset_type = 'stock'",
+        [ACCOUNT_ID],
+    ).fetchone()[0] == 0
+    requested: list[str] = []
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        if "/snapshot?" in url:
+            return _FakeResponse({
+                "symbol": "INTC",
+                "latestTrade": {
+                    "p": 12.5,
+                    "t": "2026-10-15T19:40:00.123456789Z",
+                    "s": 1,
+                },
+            })
+        return _FakeResponse({
+            "symbol": "INTC",
+            "currency": "USD",
+            "bars": [{
+                "t": "2026-10-14T04:00:00Z",
+                "o": 9.8, "h": 10.2, "l": 9.6, "c": 10.0, "v": 400,
+            }],
+        })
+
+    now = int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000)
+    runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: now,
+    )
+    test_client.app.state.market_runtime = runtime
+    saved = _save_routes(test_client, issued, {"stock": ["alpaca"], "option": []})
+    ledger_version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    response = test_client.get(
+        _underlying_quote_path(
+            symbol_key,
+            ledger_version=ledger_version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    data = body["data"]
+    assert body["metadata"]["accountScope"] == {
+        "kind": "account", "account": ACCOUNT_ID,
+    }
+    assert data["accountId"] == ACCOUNT_ID
+    assert data["symbolKey"] == symbol_key
+    assert data["positionAssetType"] == "option"
+    assert data["assetType"] == "stock"
+    assert data["instrumentKey"] == "US:stock:INTC"
+    assert data["currency"] == "USD"
+    assert data["status"] == "available" and data["issue"] is None
+    assert data["providerId"] == "alpaca"
+    assert data["timing"] == {"kind": "delayed", "delayMinutes": 15}
+    assert data["price"] == {
+        "value": "12.5", "asOf": "2026-10-15T19:40:00.123456789Z",
+    }
+    assert data["previousClose"] == {
+        "value": "10", "sessionDate": "2026-10-14",
+    }
+    assert data["changePercent"] == "25"
+    assert data["changeIssue"] is None
+    assert data["comparisonBasis"] == "previous_session_close"
+    assert data["adjustment"] == "split"
+    assert len(requested) == 2
+    snapshot_url = urlsplit(requested[0])
+    assert snapshot_url.path == "/v2/stocks/INTC/snapshot"
+    assert parse_qs(snapshot_url.query) == {
+        "feed": ["delayed_sip"], "currency": ["USD"],
+    }
+    daily_url = urlsplit(requested[1])
+    daily_query = parse_qs(daily_url.query)
+    assert daily_url.path == "/v2/stocks/INTC/bars"
+    assert daily_query["feed"] == ["sip"]
+    assert daily_query["adjustment"] == ["split"]
+    assert daily_query["currency"] == ["USD"]
+    assert daily_query["end"] == ["2026-10-15T19:44:00.000Z"]
+    assert daily_query["limit"] == ["2"]
+    assert len(runtime.service._budgets["alpaca"].minute_calls) == 2
+
+
+def test_distinct_option_positions_share_underlying_stock_summary_cache(client) -> None:
+    """不同期权持仓的正股摘要共享 provider+股票身份缓存。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    first_symbol_key = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID,
+        strike="125.5000", underlying="INTC", expiry="2027-12-17",
+    )
+    second_symbol_key = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID,
+        strike="130.0000", underlying="INTC", expiry="2027-12-17",
+    )
+    requested: list[str] = []
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        if "/snapshot?" in url:
+            return _FakeResponse({
+                "symbol": "INTC",
+                "latestTrade": {"p": 12.5, "t": "2026-10-15T19:40:00Z", "s": 1},
+            })
+        return _FakeResponse({
+            "symbol": "INTC", "bars": [{
+                "t": "2026-10-14T04:00:00Z",
+                "o": 9.8, "h": 10.2, "l": 9.6, "c": 10.0, "v": 400,
+            }],
+        })
+
+    now = int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000)
+    runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=fetch,
+        now=lambda: now,
+    )
+    test_client.app.state.market_runtime = runtime
+    saved = _save_routes(test_client, issued, {"stock": ["alpaca"], "option": []})
+    ledger_version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    first = test_client.get(
+        _underlying_quote_path(
+            first_symbol_key, ledger_version=ledger_version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+    second = test_client.get(
+        _underlying_quote_path(
+            second_symbol_key, ledger_version=ledger_version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["data"]["cached"] is False
+    assert second.json()["data"]["cached"] is True
+    assert second.json()["data"]["price"] == first.json()["data"]["price"]
+    assert len(requested) == 2
+    assert len(runtime.service._stock_summary_cache) == 1
+    assert len(runtime.service._budgets["alpaca"].minute_calls) == 2
+
+
+def test_underlying_quote_preserves_price_when_previous_close_is_missing(client) -> None:
+    """日 K 缺失时仍返回最新成交，但不伪造涨跌幅。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    symbol_key = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID,
+        strike="125.5000", underlying="INTC", expiry="2027-12-17",
+    )
+    requested: list[str] = []
+
+    def fetch(url, *, headers, timeout):
+        requested.append(url)
+        if "/snapshot?" in url:
+            return _FakeResponse({
+                "symbol": "INTC",
+                "latestTrade": {"p": 12.5, "t": "2026-10-15T19:40:00Z", "s": 1},
+            })
+        return _FakeResponse({"symbol": "INTC", "currency": "USD", "bars": []})
+
+    now = int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000)
+    runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }), fetch=fetch, now=lambda: now,
+    )
+    test_client.app.state.market_runtime = runtime
+    saved = _save_routes(test_client, issued, {"stock": ["alpaca"], "option": []})
+    version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    response = test_client.get(
+        _underlying_quote_path(
+            symbol_key, ledger_version=version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    data = response.json()["data"]
+    assert response.status_code == 200
+    assert data["status"] == "available"
+    assert data["price"]["value"] == "12.5"
+    assert data["previousClose"] is None
+    assert data["changePercent"] is None
+    assert data["changeIssue"] == "no_previous_close"
+    assert len(requested) == 2
+
+
+def test_underlying_quote_rejects_old_versions_unknown_query_and_nonholding_symbols(client) -> None:
+    """授权持仓与版本校验先于 provider；摘要 query 不接受任意 ticker/range。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    symbol_key = _seed_stock_position(
+        connection, issued.user.id, ACCOUNT_ID, "BROKER-OPAQUE", underlying="INTC"
+    )
+    requested: list[str] = []
+    test_client.app.state.market_runtime = _marketdata_runtime(on_fetch=requested.append)
+    saved = _save_routes(test_client, issued, {"stock": ["marketdata"]})
+    version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+    revision = saved.json()["revision"]
+
+    malformed = [
+        _underlying_quote_path(
+            symbol_key, ledger_version=version, settings_revision=revision
+        ) + "&range=1d",
+        _underlying_quote_path(
+            symbol_key, ledger_version=version, settings_revision=revision
+        ) + "&symbol_key=INTC",
+        _underlying_quote_path(
+            "INTC", ledger_version=version, settings_revision=revision
+        ),
+    ]
+    malformed_responses = [
+        test_client.get(path, headers=_auth(issued)) for path in malformed
+    ]
+    assert [response.status_code for response in malformed_responses] == [400, 400, 404]
+    stale = test_client.get(
+        _underlying_quote_path(
+            symbol_key, ledger_version=version + 1, settings_revision=revision
+        ),
+        headers=_auth(issued),
+    )
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "MARKET_LEDGER_CHANGED"
+    stale_settings = test_client.get(
+        _underlying_quote_path(
+            symbol_key, ledger_version=version,
+            settings_revision=revision + 1,
+        ),
+        headers=_auth(issued),
+    )
+    assert stale_settings.status_code == 409
+    assert stale_settings.json()["code"] == "MARKET_SETTINGS_CHANGED"
+    assert requested == []
+
+
+@pytest.mark.parametrize(
+    ("stock_route", "expected_issue"),
+    [(["marketdata"], "summary_not_supported"), ([], "not_configured")],
+)
+def test_underlying_quote_reports_disabled_or_unsupported_source(
+    client, stock_route, expected_issue
+) -> None:
+    """摘要来源关闭或只支持 quote 时明确返回状态，不静默切源。"""
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    symbol_key = _seed_option_position(
+        connection, issued.user.id, ACCOUNT_ID,
+        strike="125.5000", underlying="INTC",
+    )
+    requested: list[str] = []
+    test_client.app.state.market_runtime = _marketdata_runtime(on_fetch=requested.append)
+    saved = _save_routes(test_client, issued, {"stock": stock_route, "option": []})
+    version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    response = test_client.get(
+        _underlying_quote_path(
+            symbol_key, ledger_version=version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["status"] == "unavailable"
+    assert data["issue"] == expected_issue
+    assert data["providerId"] is None
+    assert data["price"] is None
+    assert requested == []
+
+
+def test_underlying_quote_rejects_cross_user_account_scope(two_users) -> None:
+    """持仓摘要账户 UUID 必须属于当前认证用户。"""
+    test_client, issued_a, issued_b = two_users
+    connection = test_client.app.state.database.connection
+    _insert_account(connection, issued_b.user.id, SECOND_ACCOUNT_ID, "B002", "002")
+    _seed_stock_position(
+        connection, issued_b.user.id, SECOND_ACCOUNT_ID, "AAPL", underlying="AAPL"
+    )
+    requested: list[str] = []
+    test_client.app.state.market_runtime = _marketdata_runtime(on_fetch=requested.append)
+
+    response = test_client.get(
+        _underlying_quote_path(
+            "AAPL", scope=SECOND_ACCOUNT_ID, ledger_version=0, settings_revision=0
+        ),
+        headers=_auth(issued_a),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "ACCOUNT_NOT_FOUND"
+    assert requested == []
+
+
+def test_underlying_quote_rejects_non_usd_account_before_provider(client) -> None:
+    """非 USD 账户不把正股 USD 成交误标成本币，也不发上游请求。"""
+    from lyra.infrastructure.market_data.config import load_market_data_config
+    from lyra.infrastructure.market_data.runtime import create_market_data_runtime
+
+    test_client, issued = client
+    connection = test_client.app.state.database.connection
+    euro_account = "33333333-3333-3333-3333-333333333333"
+    _insert_account(
+        connection, issued.user.id, euro_account, "EUR003", "003", base_currency="EUR"
+    )
+    symbol_key = _seed_option_position(
+        connection, issued.user.id, euro_account,
+        strike="125.5000", underlying="INTC",
+    )
+    requested: list[str] = []
+    runtime = create_market_data_runtime(
+        load_market_data_config({
+            "LYRA_MARKET_STOCK_PROVIDERS": "",
+            "LYRA_ALPACA_API_KEY": "test-only-key",
+            "LYRA_ALPACA_SECRET_KEY": "test-only-secret",
+        }),
+        fetch=lambda url, **kwargs: requested.append(url),
+        now=lambda: int(datetime(2026, 10, 15, 20, tzinfo=UTC).timestamp() * 1000),
+    )
+    test_client.app.state.market_runtime = runtime
+    saved = _save_routes(test_client, issued, {"stock": ["alpaca"], "option": []})
+    version = connection.execute(
+        "SELECT max(version) FROM ledger_versions WHERE user_id = CAST(? AS UUID)",
+        [issued.user.id],
+    ).fetchone()[0]
+
+    response = test_client.get(
+        _underlying_quote_path(
+            symbol_key, scope=euro_account, ledger_version=version,
+            settings_revision=saved.json()["revision"],
+        ),
+        headers=_auth(issued),
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["currency"] == "EUR"
+    assert data["instrumentKey"] == "US:stock:INTC"
+    assert data["status"] == "unavailable"
+    assert data["issue"] == "currency_unsupported"
+    assert requested == []
+
+
+def _underlying_quote_path(
+    symbol_key: str,
+    *,
+    scope: str = ACCOUNT_ID,
+    direction: str = "long",
+    ledger_version: int | str,
+    settings_revision: int | str,
+) -> str:
+    """构造正股摘要路由的最小授权持仓 query。"""
+    from urllib.parse import urlencode
+
+    values = {
+        "scope": scope,
+        "symbol_key": symbol_key,
+        "direction": direction,
+        "ledger_version": str(ledger_version),
+        "settings_revision": str(settings_revision),
+    }
+    return f"/v1/market/underlying-quote?{urlencode(values)}"

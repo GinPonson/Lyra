@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from lyra.domain.market_data.valuation import (
     aggregate_currency_group,
     multiplier_for,
@@ -81,15 +83,32 @@ def test_short_position_is_negative() -> None:
     assert Decimal(short_side.market_value) == -Decimal(long_side.market_value)
 
 
-def test_option_multiplier_is_one_hundred() -> None:
-    """**期权乘数是 100**——忘掉它会让估值差 100 倍。"""
+@pytest.mark.parametrize(
+    ("direction", "expected_market_value", "expected_unrealized_pnl"),
+    [
+        ("long", "600", "100"),
+        ("short", "-600", "-100"),
+    ],
+)
+def test_option_multiplier_and_direction(
+    direction: str,
+    expected_market_value: str,
+    expected_unrealized_pnl: str,
+) -> None:
+    """期权乘数为 100，且多空方向同时决定市值与未实现盈亏的符号。
+
+    成本 5 表示尚未乘期权乘数的持仓价格合计：2 张合约的参考价值为
+    2 × 3 × 100 = 600，多头盈亏为 (2 × 3 - 5) × 100 = 100；
+    空头的市值和盈亏均取反。
+    """
     valuation = value_position(
-        quantity="2", cost="500", reference_price="3",
-        asset_type="option", direction="long",
+        quantity="2", cost="5", reference_price="3",
+        asset_type="option", direction=direction,
     )
 
     assert valuation.multiplier == "100"
-    assert valuation.market_value == "600"  # 2 × 3 × 100
+    assert valuation.market_value == expected_market_value
+    assert valuation.unrealized_pnl == expected_unrealized_pnl
 
 
 def test_multiplier_helper() -> None:

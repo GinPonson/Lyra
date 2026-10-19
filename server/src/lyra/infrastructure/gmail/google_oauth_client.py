@@ -30,6 +30,7 @@ from .oauth_transaction import (
     GmailOAuthError,
     assert_gmail_readonly_scope,
 )
+from .http_transport import GoogleEndpointFailure
 
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo"
@@ -262,7 +263,7 @@ def build_token_refresh_form(
 
 @dataclass(frozen=True)
 class GoogleTokenResponse:
-    """Google 令牌端点返回的字段。"""
+    """授权码兑换成功后返回的令牌字段。"""
 
     access_token: str
     refresh_token: str
@@ -271,7 +272,7 @@ class GoogleTokenResponse:
 
 
 def parse_google_token_response(payload: object) -> GoogleTokenResponse:
-    """解析令牌端点响应。
+    """解析授权码兑换响应；该流程必须返回离线 refresh token 与 granted scope。
 
     **``token_type`` 必须是 ``bearer``（不区分大小写）。** 其它类型说明响应不是我们
     预期的形状；把它当 Bearer 令牌用，会在下一次调用时报出一个与根因无关的 401。
@@ -299,6 +300,47 @@ def parse_google_token_response(payload: object) -> GoogleTokenResponse:
         access_token=_read_text(payload, "access_token"),
         refresh_token=_read_text(payload, "refresh_token"),
         granted_scope_text=_read_text(payload, "scope"),
+        expires_in_seconds=expires_in,
+    )
+
+
+@dataclass(frozen=True)
+class GoogleRefreshResponse:
+    """刷新 access token 的响应字段；Google 不要求返回 refresh token。"""
+
+    access_token: str
+    granted_scope_text: str | None
+    expires_in_seconds: int
+
+
+def parse_google_refresh_response(payload: object) -> GoogleRefreshResponse:
+    """解析刷新响应，并允许 Google 省略 refresh token 或未变化的 scope。
+
+    Google 的刷新请求沿用服务器已保存的 refresh token；成功响应要求 access token、
+    token 类型与有效期。若响应省略 scope，则调用方沿用此前已验证的持久化范围。
+
+    @param payload: 已解析的 JSON 响应。
+    @returns 新 access token、可选 scope 与有效秒数。
+    @raises GmailOAuthError: 响应形状不符。
+    """
+    if not isinstance(payload, dict):
+        raise _malformed_token_response()
+    token_type = payload.get("token_type")
+    expires_in = payload.get("expires_in")
+    if (
+        not isinstance(token_type, str)
+        or token_type.lower() != "bearer"
+        or not isinstance(expires_in, int)
+        or isinstance(expires_in, bool)
+        or expires_in <= 0
+    ):
+        raise _malformed_token_response()
+    scope = payload.get("scope")
+    if scope is not None and (not isinstance(scope, str) or scope.strip() == ""):
+        raise _malformed_token_response()
+    return GoogleRefreshResponse(
+        access_token=_read_text(payload, "access_token"),
+        granted_scope_text=None if scope is None else scope.strip(),
         expires_in_seconds=expires_in,
     )
 
@@ -394,8 +436,8 @@ def exchange_google_authorization_code(
     @param redirect_uri: 回调地址。
     @param client_secret: 可选密钥。
     @param now: 服务端可信时间。
-    @param post_form: ``(url, form, timeout_seconds) -> dict``；失败时抛 ``GoogleEndpointFailure``。
-    @param get_userinfo: ``(url, headers, timeout_seconds) -> dict``。
+    @param post_form: ``(url, form, timeout_seconds) -> payload``；失败时抛 ``GoogleEndpointFailure``。
+    @param get_userinfo: ``(url, headers, timeout_seconds) -> payload``；失败时抛同一安全异常。
     @returns ``{"accessToken", "accessTokenExpiresAt", "identity", "grant"}``。
     @raises GmailOAuthError: 授权失败、响应畸形或身份未验证。
     """
@@ -464,14 +506,18 @@ def refresh_google_access_token(
             retryable=failure.retryable,
         ) from failure
 
-    token = parse_google_token_response(payload)
+    token = parse_google_refresh_response(payload)
     expires_at = calculate_access_token_expiry(now, token.expires_in_seconds)
     if expires_at is None:
         raise _malformed_token_response()
+    # OAuth refresh 在 scope 未变化时可省略该字段；此时以已存储且验证过的 grant 为准。
+    granted_scopes = assert_gmail_readonly_scope(
+        granted_scope_text if token.granted_scope_text is None else token.granted_scope_text
+    )
     return {
         "accessToken": token.access_token,
         "accessTokenExpiresAt": expires_at,
-        "grantedScopeText": " ".join(assert_gmail_readonly_scope(token.granted_scope_text)),
+        "grantedScopeText": " ".join(granted_scopes),
     }
 
 
@@ -505,27 +551,6 @@ def revoke_gmail_connection_authorization(
         ) from failure
 
 
-class GoogleEndpointFailure(Exception):
-    """Google 端点调用失败。
-
-    @param status: HTTP 状态；``None`` 表示传输层失败。
-    @param retryable: 是否值得重试。
-    @param oauth_error_code: Google 返回的稳定错误码（只用于定位）。
-    """
-
-    def __init__(
-        self,
-        status: int | None,
-        retryable: bool,
-        oauth_error_code: str | None = None,
-    ) -> None:
-        super().__init__(f"Google endpoint failed with status {status}")
-        self.status = status
-        self.retryable = retryable
-        # 只留在原因链里：页面看到的仍是收敛后的上层错误码。
-        self.oauth_error_code = oauth_error_code
-
-
 def _request_google_token(form: dict[str, str], post_form: Any) -> GoogleTokenResponse:
     """请求令牌端点并解析响应。"""
     try:
@@ -535,7 +560,9 @@ def _request_google_token(form: dict[str, str], post_form: Any) -> GoogleTokenRe
     except GoogleEndpointFailure as failure:
         if failure.status is None:
             raise GmailOAuthError(
-                "GOOGLE_TOKEN_EXCHANGE_FAILED", "Google 授权响应无效，请重新授权"
+                "GOOGLE_TOKEN_EXCHANGE_FAILED",
+                "无法连接 Google，请稍后重试",
+                retryable=failure.retryable,
             ) from failure
         raise GmailOAuthError(
             "GOOGLE_TOKEN_EXCHANGE_FAILED",

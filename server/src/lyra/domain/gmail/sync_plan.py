@@ -4,9 +4,8 @@
 
 **两处"必须停下来问用户"的设计**：
 
-1. **首次扫描与重扫都需要用户确认起始日期**（``GMAIL_RESYNC_CONFIRMATION_REQUIRED``）。
-   一次全量扫描会把邮箱里的全部历史邮件拉下来——昂贵，且可能跨越数年。让代码自己
-   挑一个日期就是在替用户决定他要导入多久的历史。
+1. **首次扫描与重扫需要用户明确选择全部邮件或起始日期**。
+   邮箱是独立数据源，不能从已有 CSV 推断邮件扫描范围；全量同样保留单次消息上限。
 2. **增量响应被截断时判为需要重扫**（``GMAIL_INCREMENTAL_LIMIT_EXCEEDED``）。
    截断意味着这次的增量窗口**不完整**；照常推进游标会**静默漏掉**中间的消息，
    而那些交易本应进入账本。
@@ -71,23 +70,29 @@ class GmailBoundedRescanRequest:
     """有界重扫请求。"""
 
     mode: Literal["bounded_rescan"]
-    after_date: str
+    # None 仅由用户明确选择全部邮件产生，不能从缺失的确认参数推断全量。
+    after_date: str | None
 
 
 GmailSyncRequest = Union[GmailIncrementalRequest, GmailBoundedRescanRequest]
 
 
 def plan_gmail_sync(
-    state: GmailSyncState, *, confirmed_rescan_after_date: str | None = None
+    state: GmailSyncState, *, confirmed_rescan_after_date: str | None = None,
+    scan_all: bool = False,
 ) -> GmailSyncRequest:
     """决定本次同步的方式。
 
     @param state: 连接状态。
     @param confirmed_rescan_after_date: 用户确认的重扫起始日期。
+    @param scan_all: 用户是否显式选择全部嘉信成交邮件；与日期互斥。
     @returns 增量或有界重扫请求。
     @raises GmailSyncError: 游标不可用、缺少重扫确认、连接已断开或处于错误状态。
     """
-    if state.status == "active":
+    if not isinstance(scan_all, bool) or (scan_all and confirmed_rescan_after_date is not None):
+        raise ValueError("Gmail 全量扫描和起始日期必须二选一")
+    confirmed_scan = scan_all or confirmed_rescan_after_date is not None
+    if state.status == "active" and not confirmed_scan:
         if state.history_id is None:
             raise GmailSyncError(
                 "GMAIL_HISTORY_EXPIRED", "Gmail 增量游标不可用，必须确认重扫范围"
@@ -95,12 +100,12 @@ def plan_gmail_sync(
         return GmailIncrementalRequest(
             mode="incremental", start_history_id=normalize_gmail_history_id(state.history_id)
         )
-    if state.status in ("pending_initial_scan", "needs_resync"):
-        if confirmed_rescan_after_date is None:
-            # **不替用户挑日期**：全量扫描昂贵且可能跨越数年。
+    if state.status in ("pending_initial_scan", "needs_resync", "active"):
+        if not confirmed_scan:
+            # 缺少选择不是默认全量，也不能锚定已有文件的日期。
             raise GmailSyncError(
                 "GMAIL_RESYNC_CONFIRMATION_REQUIRED",
-                "Gmail 首次扫描或重扫必须由用户确认起始日期",
+                "Gmail 首次扫描或重扫必须选择全部邮件或起始日期",
             )
         return GmailBoundedRescanRequest(
             mode="bounded_rescan", after_date=confirmed_rescan_after_date

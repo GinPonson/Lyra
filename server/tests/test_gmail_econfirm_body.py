@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+from pathlib import Path
+
 import pytest
 
 from lyra.domain.gmail.econfirm import (
@@ -13,8 +16,18 @@ from lyra.domain.gmail.econfirm import (
     GmailMessage,
     parse_econfirm,
     parse_econfirm_body,
+    parse_value_rows,
 )
 from lyra.domain.ledger.errors import IngestError
+from lyra.infrastructure.gmail.html_text import html_to_text
+
+
+_MULTI_PRICE_HTML = (
+    Path(__file__).parent / "fixtures" / "gmail_econfirm_charge_interest_multi_price.html"
+).read_text()
+_LABELED_FEES_HTML = (
+    Path(__file__).parent / "fixtures" / "gmail_econfirm_charge_interest_labeled_fees.html"
+).read_text()
 
 
 def _block(
@@ -180,6 +193,137 @@ def test_one_block_can_yield_multiple_trades() -> None:
     ))))
 
     assert [trade.quantity for trade in trades] == ["2", "3"]
+
+
+def test_html_charge_interest_column_parses_every_zero_charge_fill() -> None:
+    """五列 eConfirm 模板按每个 N/A fill 解析，且逐笔与 Totals 勾稽。"""
+    normalized = html_to_text(_MULTI_PRICE_HTML)
+    trades = parse_econfirm_body("synthetic", normalized)
+
+    assert [(trade.quantity, trade.price, trade.fees, trade.amount) for trade in trades] == [
+        ("2", "10.00", "0", "-20.00"),
+        ("3", "11.00", "0", "-33.00"),
+        ("1", "12.00", "0", "-12.00"),
+    ]
+
+
+def test_html_charge_interest_parses_explicit_fees_per_fill() -> None:
+    """五列行可含 Commission、Industry Fee 或 N/A，且逐腿值与 Totals 勾稽。"""
+    trades = parse_econfirm_body("synthetic", html_to_text(_LABELED_FEES_HTML))
+
+    assert [(trade.quantity, trade.price, trade.fees, trade.amount) for trade in trades] == [
+        ("2", "10.00", "0.05", "-20.05"),
+        ("3", "11.00", "0.02", "-33.02"),
+        ("1", "12.00", "0", "-12.00"),
+    ]
+    assert sum((Decimal(trade.fees) for trade in trades), Decimal(0)) == Decimal("0.07")
+    assert sum((abs(Decimal(trade.amount)) for trade in trades), Decimal(0)) == Decimal("65.07")
+
+
+def test_charge_interest_rows_keep_leg_separators_and_safe_notes() -> None:
+    """五列多腿数据可保留分隔符；只跳过分隔符后无金额的普通说明。"""
+    trades = parse_value_rows(
+        values=(
+            "2", "$10.00", "$20.00", "N/A", "$20.00",
+            "for the above:",
+            "- Industry Fee: For certain securities transactions, synthetic example",
+            "3", "$11.00", "$33.00", "Industry Fee:", "$0.02", "$33.02",
+            "for the above:", "- The unit price shown is an average price.",
+            "1", "$12.00", "$12.00", "N/A", "$12.00",
+            "for the above:", "- Schwab acted as your agent.",
+            "1", "$13.00", "$13.00", "N/A", "$13.00",
+            "Totals", "7", "x", "x", "$0.02", "$78.02",
+        ),
+        where="synthetic",
+        trade_date="2026-04-05",
+        action="Buy",
+        symbol="XYZ",
+        description="SYNTHETIC CORP",
+        multiplier=1,
+        has_charge_interest_column=True,
+    )
+
+    assert len(trades) == 4
+    assert [(trade.quantity, trade.price, trade.fees, trade.amount) for trade in trades] == [
+        ("2", "10.00", "0", "-20.00"),
+        ("3", "11.00", "0.02", "-33.02"),
+        ("1", "12.00", "0", "-12.00"),
+        ("1", "13.00", "0", "-13.00"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Synthetic execution note",
+        "- Industry Fee: For certain securities transactions in 2026",
+        "- Industry Fee: For certain securities transactions costing $1.00",
+        "- Schwab acted as your agent. Additional unapproved text",
+        "- Schwab is acting as your agent.",
+    ],
+)
+def test_charge_interest_separator_rejects_unknown_or_numeric_notes(note: str) -> None:
+    """只接受已知脚注前缀，未知文本和含数字/金额的脚注都必须失败。"""
+    with pytest.raises(IngestError, match="分隔符后含未识别的字段"):
+        parse_value_rows(
+            values=(
+                "2", "$10.00", "$20.00", "N/A", "$20.00",
+                "for the above:", note,
+                "Totals", "2", "x", "x", "$0.00", "$20.00",
+            ),
+            where="synthetic",
+            trade_date="2026-04-05",
+            action="Buy",
+            symbol="XYZ",
+            description="SYNTHETIC CORP",
+            multiplier=1,
+            has_charge_interest_column=True,
+        )
+
+
+def test_parse_econfirm_uses_complete_html_candidate_when_plain_is_incomplete() -> None:
+    """纯文本候选缺少字段时，完整 HTML 候选仍须保留所有逐笔成交。"""
+    message = GmailMessage(
+        message_id="synthetic",
+        sender="donotreply@mail.schwab.com",
+        subject="Schwab eConfirms",
+        body="Symbol:\n\nXYZ\n\nSecurity Description:\n\nSYNTHETIC CORP",
+        email_timestamp=None,
+        body_candidates=(html_to_text(_MULTI_PRICE_HTML),),
+    )
+
+    trades = parse_econfirm(message)
+
+    assert len(trades) == 3
+    assert sum((Decimal(trade.quantity) for trade in trades), Decimal(0)) == Decimal("6")
+    assert sum((abs(Decimal(trade.amount)) for trade in trades), Decimal(0)) == Decimal("65")
+
+
+def test_charge_interest_amount_is_not_reclassified_as_a_fee() -> None:
+    """非 N/A 的 Charge and/or Interest 不能被猜成佣金或手续费。"""
+    html = _MULTI_PRICE_HTML.replace("<td>N/A</td>", "<td>$1.00</td>", 1)
+
+    with pytest.raises(IngestError, match="只接受 N/A 或明确标注"):
+        parse_econfirm_body("synthetic", html_to_text(html))
+
+
+def test_unknown_charge_interest_label_is_not_reclassified() -> None:
+    """费用列里的未知标签不能被忽略或按金额猜分类。"""
+    html = _LABELED_FEES_HTML.replace(
+        "Industry Fee:<br>$0.02", "Processing Fee:<br>$0.02", 1,
+    )
+
+    with pytest.raises(IngestError, match="只接受 N/A 或明确标注"):
+        parse_econfirm_body("synthetic", html_to_text(html))
+
+
+def test_charge_interest_layout_rejects_a_mismatched_total() -> None:
+    """五列模板的 Totals 金额必须与全部逐腿净额精确勾稽。"""
+    prefix, _ = _MULTI_PRICE_HTML.rsplit("<td>$65.00</td>", 1)
+    html = f"{prefix}<td>$66.00</td>"
+
+    with pytest.raises(IngestError, match="金额与 Totals 不一致"):
+        parse_econfirm_body("synthetic", html_to_text(html))
 
 
 def test_multi_leg_rows_use_the_labeled_fee_parser() -> None:

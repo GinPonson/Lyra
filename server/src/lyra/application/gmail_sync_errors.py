@@ -29,10 +29,17 @@ from .app_error import ApplicationError
 # 同步错误码 → (HTTP 状态, 是否可重试, 面向用户的说明)
 _SYNC_ERROR_MAP: dict[str, tuple[int, bool, str]] = {
     "GMAIL_RESYNC_CONFIRMATION_REQUIRED": (
-        409, False, "Gmail 首次扫描或重扫必须确认起始日期",
+        409, False, "Gmail 首次扫描或重扫必须选择全部邮件或起始日期",
     ),
     "GMAIL_AUTH_REVOKED": (401, False, "Gmail 连接已断开，需要重新授权"),
     "GMAIL_HISTORY_EXPIRED": (409, False, "Gmail 增量游标不可用，必须确认重扫范围"),
+    "GMAIL_API_DISABLED": (
+        503, False, "Google Cloud 项目尚未启用 Gmail API，请启用后重试",
+    ),
+    "GMAIL_RATE_LIMITED": (429, True, "Gmail 请求达到限额，请稍后再试"),
+    "GMAIL_ACCESS_DENIED": (
+        403, False, "Google 拒绝访问 Gmail，请检查邮箱权限或管理员策略",
+    ),
 }
 
 

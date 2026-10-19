@@ -28,14 +28,25 @@ from ..domain.market_data.reference_price import (
     is_crossed_market,
     select_market_reference_price,
 )
+from ..domain.market_data.history import (
+    MarketHistoryBar,
+    MarketHistoryRange,
+    MarketHistoryResult as ProviderHistory,
+)
+from ..domain.market_data.stock_summary import (
+    MarketStockSummary,
+    MarketPreviousClose,
+)
 from ..domain.market_data.types import (
     MarketInstrument,
+    MarketPricePoint,
     MarketQuote,
     MarketQuoteIssue,
     StockInstrument,
     market_instrument_key,
 )
 from .market_budget import (
+    DEFAULT_COOLDOWN_MS,
     MarketProviderPolicy,
     ProviderBudget,
     cooldown_ms,
@@ -65,12 +76,58 @@ class MarketQuoteLookup:
     cached: bool
 
 
+@dataclass(frozen=True)
+class MarketHistoryLookup:
+    """历史行情路由与缓存读取结果。"""
+
+    status: Literal["available", "unavailable"]
+    bars: tuple[MarketHistoryBar, ...]
+    issue: str | None
+    cached: bool
+    provider_id: str | None
+    feed: str | None
+    fetched_at: str
+    cutoff: str
+
+
+@dataclass(frozen=True)
+class MarketStockSummaryLookup:
+    """共享缓存与用户显式来源路由返回的正股成交摘要。"""
+
+    status: Literal["available", "unavailable"]
+    price: MarketPricePoint | None
+    previous_close: MarketPreviousClose | None
+    change_percent: str | None
+    change_issue: str | None
+    issue: str | None
+    cached: bool
+    provider_id: str | None
+    feed: str | None
+    fetched_at: str
+
+
 @dataclass
 class _CacheEntry:
     """一条缓存。失败也会缓存——避免对同一个坏符号反复打上游。"""
 
     quote: MarketQuote | None
     issue: MarketQuoteIssue | None
+    expires_at: int
+
+
+@dataclass
+class _HistoryCacheEntry:
+    """公开身份对应的历史结果；不保存任何用户或账户信息。"""
+
+    history: ProviderHistory
+    expires_at: int
+
+
+@dataclass
+class _StockSummaryCacheEntry:
+    """公开股票身份对应的最新成交摘要缓存。"""
+
+    summary: MarketStockSummary
     expires_at: int
 
 
@@ -91,6 +148,7 @@ class MarketDataService:
     合约标识（公开报价身份），与"谁在问"无关，所以不同用户可以复用同一条缓存。
 
     @param providers: 来源 id → 取报价的函数。
+    @param stock_summary_providers: 来源 id → 读取正股最新成交与前收盘摘要的函数。
     @param routes: 资产类型 → 来源 id 顺序（**顺序即主备**）；仅作装配默认值。
     @param policies: 来源 id → 策略。
     @param now: 当前毫秒时间戳提供者。
@@ -102,6 +160,8 @@ class MarketDataService:
         self,
         *,
         providers: Mapping[str, Callable[..., ProviderQuote]],
+        history_providers: Mapping[str, Callable[..., ProviderHistory]] | None = None,
+        stock_summary_providers: Mapping[str, Callable[..., MarketStockSummary]] | None = None,
         routes: Mapping[str, tuple[str, ...]],
         policies: Mapping[str, MarketProviderPolicy],
         now: Callable[[], int],
@@ -109,6 +169,8 @@ class MarketDataService:
         max_cache_entries: int = DEFAULT_MAX_CACHE_ENTRIES,
     ) -> None:
         self._providers = dict(providers)
+        self._history_providers = dict(history_providers or {})
+        self._stock_summary_providers = dict(stock_summary_providers or {})
         self._routes = dict(routes)
         self._policies = dict(policies)
         self._now = now
@@ -118,6 +180,10 @@ class MarketDataService:
         # 同一合约在两个用户之间可以复用同一条报价。按用户分片缓存等于把部署级的上游
         # 额度乘以用户数，反而击穿缓存的意义（计划 §4.4）。
         self._cache: dict[str, _CacheEntry] = {}
+        # 历史缓存也只由来源、完整证券身份、range 与时间桶构成，跨用户复用公开 bars。
+        self._history_cache: dict[str, _HistoryCacheEntry] = {}
+        # 最新成交摘要独立缓存，避免把涨跌基准混入 quote/估值缓存。
+        self._stock_summary_cache: dict[str, _StockSummaryCacheEntry] = {}
         # 网络调用可并行；共享缓存、路由与预算则通过状态锁读写。
         self._state_lock = RLock()
         # 同一来源与合约只允许一个刷新请求；固定条带数避免锁表随符号数增长。
@@ -125,7 +191,9 @@ class MarketDataService:
         # **预算是部署级共享的**（每来源一份，不是每用户一份）：若按用户复制服务，
         # 每个用户都会各自拿到全额额度，实际上游请求量被放大到用户数倍，限流形同虚设。
         self._budgets: dict[str, ProviderBudget] = {
-            provider_id: ProviderBudget() for provider_id in providers
+            provider_id: ProviderBudget()
+            for provider_id in (self._providers.keys() | self._history_providers.keys())
+            | self._stock_summary_providers.keys()
         }
 
     def get_quote(self, instrument: MarketInstrument) -> MarketQuoteLookup:
@@ -194,6 +262,373 @@ class MarketDataService:
             status="unavailable", quote=None, reference_price=None,
             issue=issue, cached=False,
         )
+
+    def read_history(
+        self,
+        instrument: MarketInstrument,
+        history_range: MarketHistoryRange,
+        route: tuple[str, ...],
+    ) -> MarketHistoryLookup:
+        """按用户本次显式来源路由读取公开历史 bars。
+
+        未支持历史的来源只会产生 ``history_not_supported``；服务仅尝试用户明确选中的
+        后续来源，不会暗中转向未选来源。历史请求消费与报价共用的供应商预算和锁条带。
+
+        @param instrument: 从当前授权持仓推导出的完整合约。
+        @param history_range: 客户端允许的有限历史窗口。
+        @param route: 同一数据库快照中的用户来源顺序。
+        @returns 历史结果；来源问题作为数据状态返回。
+        """
+        now = self._now()
+        requested_cutoff = _iso(now - 16 * 60_000)
+        issue: str | None = "not_configured" if not route else None
+        identifier = market_instrument_key(instrument)
+        tried = False
+        last_history: ProviderHistory | None = None
+        last_provider_id: str | None = None
+        last_cached = False
+
+        for provider_id in route:
+            provider = self._history_providers.get(provider_id)
+            if provider is None:
+                # 没有历史能力的已配置来源不得被 quote 接口伪装成历史数据来源。
+                issue = "history_not_supported"
+                continue
+            tried = True
+            key = _history_cache_key(provider_id, identifier, history_range, now)
+            history, cached = self._history_entry_for(
+                provider_id, provider, instrument, history_range, key
+            )
+            last_history = history
+            last_provider_id = provider_id
+            last_cached = cached
+            if history.status == "available":
+                return MarketHistoryLookup(
+                    status="available", bars=history.bars, issue=None,
+                    cached=cached, provider_id=provider_id, feed=history.feed,
+                    fetched_at=history.fetched_at or _iso(now),
+                    cutoff=history.cutoff or requested_cutoff,
+                )
+            issue = history.issue or "provider_unavailable"
+
+        return MarketHistoryLookup(
+            status="unavailable", bars=(), issue=(
+                issue or ("provider_unavailable" if tried else "history_not_supported")
+            ), cached=last_cached,
+            provider_id=last_provider_id,
+            feed=None if last_history is None else last_history.feed,
+            fetched_at=(
+                _iso(now) if last_history is None or last_history.fetched_at is None
+                else last_history.fetched_at
+            ),
+            cutoff=(
+                requested_cutoff if last_history is None or last_history.cutoff is None
+                else last_history.cutoff
+            ),
+        )
+
+    def read_stock_summary(
+        self, instrument: StockInstrument, route: tuple[str, ...]
+    ) -> MarketStockSummaryLookup:
+        """按用户显式来源路由读取正股成交与前收盘摘要。
+
+        摘要缓存只由来源和公开股票身份组成；多账户或多个期权持仓引用同一标的时，
+        会共享缓存与同一来源预算。来源若不具备该能力，只报告 ``summary_not_supported``
+        并继续检查用户显式配置的后续来源。
+
+        @param instrument: 从当前授权持仓推导出的已校验正股身份。
+        @param route: 同一数据库快照中的当前用户正股来源顺序。
+        @returns 成交摘要或稳定不可用状态；网络错误不向调用方抛出。
+        """
+        now = self._now()
+        identifier = market_instrument_key(instrument)
+        issue: str | None = "not_configured" if not route else None
+        partial: MarketStockSummaryLookup | None = None
+        last_provider_id: str | None = None
+        last_feed: str | None = None
+        last_fetched_at = _iso(now)
+        last_cached = False
+        attempted_provider = False
+
+        for provider_id in route:
+            provider = self._stock_summary_providers.get(provider_id)
+            if provider is None:
+                # Quote-only 来源不能被伪装成最新成交/前收盘来源。
+                if not attempted_provider:
+                    issue = "summary_not_supported"
+                continue
+            attempted_provider = True
+            key = f"{provider_id}\u0000stock-summary\u0000{identifier}"
+            summary, cached = self._stock_summary_entry_for(
+                provider_id, provider, instrument, key
+            )
+            last_provider_id = provider_id
+            last_feed = summary.feed
+            last_cached = cached
+            last_fetched_at = summary.fetched_at or last_fetched_at
+            if summary.status == "available":
+                lookup = MarketStockSummaryLookup(
+                    status="available",
+                    price=summary.price,
+                    previous_close=summary.previous_close,
+                    change_percent=summary.change_percent,
+                    change_issue=summary.change_issue,
+                    issue=None,
+                    cached=cached,
+                    provider_id=provider_id,
+                    feed=summary.feed,
+                    fetched_at=summary.fetched_at or _iso(now),
+                )
+                # 不混用两个供应商的成交和前收盘；若主来源仅缺前收盘，可以整体尝试
+                # 显式备来源，最终仍完整返回同一供应商的一组价格。
+                if summary.change_issue is None and summary.previous_close is not None:
+                    return lookup
+                if partial is None:
+                    partial = lookup
+                continue
+            issue = summary.issue or "provider_unavailable"
+
+        if partial is not None:
+            return partial
+        return MarketStockSummaryLookup(
+            status="unavailable",
+            price=None,
+            previous_close=None,
+            change_percent=None,
+            change_issue=None,
+            issue=issue or "provider_unavailable",
+            cached=last_cached,
+            provider_id=last_provider_id,
+            feed=last_feed,
+            fetched_at=last_fetched_at,
+        )
+
+    def _history_entry_for(
+        self,
+        provider_id: str,
+        provider: Callable[..., ProviderHistory],
+        instrument: MarketInstrument,
+        history_range: MarketHistoryRange,
+        key: str,
+    ) -> tuple[ProviderHistory, bool]:
+        """读取历史缓存，或在来源级预算与合约条带锁下刷新并缓存。
+
+        @param provider_id: 来源标识，用于找到共享预算与缓存策略。
+        @param provider: 该来源的历史读取函数。
+        @param instrument: 完整股票或期权身份。
+        @param history_range: 限定的历史窗口。
+        @param key: 不含用户信息的公开历史缓存键。
+        @returns 历史结果及其是否来自缓存。
+        """
+        now = self._now()
+        with self._state_lock:
+            existing = self._history_cache.get(key)
+            if existing is not None and existing.expires_at > now:
+                self._history_cache.pop(key)
+                self._history_cache[key] = existing
+                return existing.history, True
+
+        stripe = self._instrument_locks[hash(key) % len(self._instrument_locks)]
+        with stripe:
+            now = self._now()
+            with self._state_lock:
+                existing = self._history_cache.get(key)
+                if existing is not None and existing.expires_at > now:
+                    self._history_cache.pop(key)
+                    self._history_cache[key] = existing
+                    return existing.history, True
+                policy = self._policies[provider_id]
+                budget = self._budgets[provider_id]
+                denied = budget.consume(policy, now)
+
+            if denied is not None:
+                history = ProviderHistory(status="unavailable", issue=denied)
+            else:
+                try:
+                    history = provider(
+                        instrument,
+                        history_range=history_range,
+                        now_ms=now,
+                        consume_page=lambda: self._consume_history_page(provider_id),
+                    )
+                    if (
+                        history.status == "available"
+                        and not history.bars
+                    ):
+                        history = ProviderHistory(
+                            status="unavailable", issue="invalid_response"
+                        )
+                    if history.status == "available" and any(
+                        left.timestamp >= right.timestamp
+                        for left, right in zip(history.bars, history.bars[1:])
+                    ):
+                        history = ProviderHistory(
+                            status="unavailable", issue="invalid_response"
+                        )
+                except Exception:  # noqa: BLE001 - 来源协议/实现异常作为稳定数据状态返回
+                    history = ProviderHistory(
+                        status="unavailable", issue="provider_unavailable"
+                    )
+
+            completed = self._now()
+            if history.status == "available":
+                expires_at = completed + policy.cache_ttl_ms
+            else:
+                reason = history.issue or "provider_unavailable"
+                cooldown_reason = reason if reason in {
+                    "rate_limited", "credentials_rejected", "no_data",
+                    "unsupported_instrument", "currency_unsupported", "invalid_response",
+                    "timeout",
+                } else "provider_unavailable"
+                cooldown = cooldown_ms(cooldown_reason)  # type: ignore[arg-type]
+                if denied is None and should_block_provider(cooldown_reason):  # type: ignore[arg-type]
+                    with self._state_lock:
+                        budget.block(completed + cooldown, cooldown_reason)  # type: ignore[arg-type]
+                expires_at = completed + cooldown
+
+            with self._state_lock:
+                self._history_cache.pop(key, None)
+                self._history_cache[key] = _HistoryCacheEntry(
+                    history=history, expires_at=expires_at
+                )
+                while len(self._history_cache) > self._max_cache_entries:
+                    oldest = next(iter(self._history_cache), None)
+                    if oldest is None:
+                        break
+                    del self._history_cache[oldest]
+            return history, False
+
+    def _consume_history_page(self, provider_id: str) -> str | None:
+        """为附加历史页消费报价共用的部署级来源预算。
+
+        @param provider_id: 需要扣减额度的来源标识。
+        @returns 拒绝时的稳定 issue；获准时为 ``None``。
+        """
+        now = self._now()
+        with self._state_lock:
+            policy = self._policies[provider_id]
+            return self._budgets[provider_id].consume(policy, now)
+
+    def _stock_summary_entry_for(
+        self,
+        provider_id: str,
+        provider: Callable[..., MarketStockSummary],
+        instrument: StockInstrument,
+        key: str,
+    ) -> tuple[MarketStockSummary, bool]:
+        """在共享预算与股票条带锁下读取或刷新公开摘要缓存。
+
+        @param provider_id: 来源标识，用于读取共享预算和 TTL。
+        @param provider: 该来源的摘要读取函数。
+        @param instrument: 已验证股票身份。
+        @param key: 不包含用户、账户或持仓的公开缓存键。
+        @returns 来源摘要及缓存命中标记。
+        """
+        now = self._now()
+        with self._state_lock:
+            existing = self._stock_summary_cache.get(key)
+            if existing is not None and existing.expires_at > now:
+                self._stock_summary_cache.pop(key)
+                self._stock_summary_cache[key] = existing
+                return existing.summary, True
+
+        stripe = self._instrument_locks[hash(key) % len(self._instrument_locks)]
+        with stripe:
+            now = self._now()
+            with self._state_lock:
+                existing = self._stock_summary_cache.get(key)
+                if existing is not None and existing.expires_at > now:
+                    self._stock_summary_cache.pop(key)
+                    self._stock_summary_cache[key] = existing
+                    return existing.summary, True
+                policy = self._policies[provider_id]
+                budget = self._budgets[provider_id]
+                denied = budget.consume(policy, now)
+
+            if denied is not None:
+                summary = MarketStockSummary(status="unavailable", issue=denied)
+            else:
+                try:
+                    summary = provider(
+                        instrument,
+                        now_ms=now,
+                        consume_request=lambda: self._consume_history_page(provider_id),
+                    )
+                    if (
+                        summary.status == "available"
+                        and (
+                            summary.price is None
+                            or (summary.previous_close is None
+                                and summary.change_percent is not None)
+                            or (summary.previous_close is not None
+                                and summary.change_percent is None)
+                            or (summary.previous_close is None
+                                and summary.change_issue is None)
+                        )
+                    ):
+                        summary = MarketStockSummary(
+                            status="unavailable", issue="invalid_response"
+                        )
+                except Exception:  # noqa: BLE001 - 来源异常作为稳定状态返回
+                    summary = MarketStockSummary(
+                        status="unavailable", issue="provider_unavailable"
+                    )
+
+            completed = self._now()
+            if summary.status == "available":
+                if summary.change_issue is None:
+                    expires_at = completed + policy.cache_ttl_ms
+                else:
+                    # 部分摘要保留成交价，但缺少前收盘时很快重试，避免 15 分钟内
+                    # 一直卡住无涨跌幅状态；原始 asOf/fetchedAt 会随缓存结果保留。
+                    reason = summary.change_issue
+                    cooldown_reason = reason if reason in {
+                        "rate_limited", "credentials_rejected", "no_data",
+                        "unsupported_instrument", "currency_unsupported", "invalid_response",
+                        "timeout",
+                    } else None
+                    cooldown = (
+                        cooldown_ms(cooldown_reason)  # type: ignore[arg-type]
+                        if cooldown_reason is not None
+                        else DEFAULT_COOLDOWN_MS
+                    )
+                    if (
+                        denied is None
+                        and cooldown_reason is not None
+                        and should_block_provider(cooldown_reason)  # type: ignore[arg-type]
+                    ):
+                        with self._state_lock:
+                            budget.block(
+                                completed + cooldown, cooldown_reason  # type: ignore[arg-type]
+                            )
+                    expires_at = completed + cooldown
+            else:
+                reason = summary.issue or "provider_unavailable"
+                cooldown_reason = (
+                    reason if reason in {
+                        "rate_limited", "credentials_rejected", "no_data",
+                        "unsupported_instrument", "currency_unsupported", "invalid_response",
+                        "timeout",
+                    }
+                    else "provider_unavailable"
+                )
+                cooldown = cooldown_ms(cooldown_reason)  # type: ignore[arg-type]
+                if denied is None and should_block_provider(cooldown_reason):  # type: ignore[arg-type]
+                    with self._state_lock:
+                        budget.block(completed + cooldown, cooldown_reason)  # type: ignore[arg-type]
+                expires_at = completed + cooldown
+
+            with self._state_lock:
+                self._stock_summary_cache.pop(key, None)
+                self._stock_summary_cache[key] = _StockSummaryCacheEntry(
+                    summary=summary, expires_at=expires_at
+                )
+                while len(self._stock_summary_cache) > self._max_cache_entries:
+                    oldest = next(iter(self._stock_summary_cache), None)
+                    if oldest is None:
+                        break
+                    del self._stock_summary_cache[oldest]
+            return summary, False
 
     def _refresh(
         self,
@@ -286,4 +721,23 @@ def _parse_millis(value: str) -> int:
 
     return int(
         datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000
+    )
+
+
+def _history_cache_key(
+    provider_id: str, instrument_key: str, history_range: MarketHistoryRange, now_ms: int
+) -> str:
+    """按公开合约、时间范围及 15 分钟窗口缓存，不携带用户或持仓信息。"""
+    bucket = now_ms // (15 * 60_000)
+    return f"{provider_id}\u0000history\u0000{instrument_key}\u0000{history_range}\u0000{bucket}"
+
+
+def _iso(milliseconds: int) -> str:
+    """把毫秒时间戳渲染为 UTC ISO 文本。"""
+    from datetime import UTC, datetime
+
+    return (
+        datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
     )

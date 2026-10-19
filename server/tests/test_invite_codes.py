@@ -29,10 +29,7 @@ from lyra.db.connection import open_lyra_database
 from lyra.infrastructure.auth.login_provider import ConfiguredLoginProvider, LoginIdentity
 from lyra.infrastructure.db.device_repository import DuckDbDeviceRepository
 from lyra.application.login_service import pkce_challenge
-from lyra.infrastructure.db.invite_code_repository import (
-    InviteCodeRepository,
-    hash_invite_code,
-)
+from lyra.infrastructure.db.invite_code_repository import InviteCodeRepository, hash_invite_code
 from lyra.infrastructure.db.user_repository import UserRepository
 from lyra.main import _authorize_user_device, create_app
 from lyra.protocol import CLIENT_PROTOCOL_HEADERS
@@ -84,7 +81,6 @@ def app_client(tmp_path: Path):
             write_coordinator=application.state.write_coordinator,
             **kwargs,
         ),
-        InviteCodeRepository(database.connection),
     )
     try:
         with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
@@ -101,42 +97,48 @@ def _mint(connection, *, label: str | None = None) -> tuple[str, str]:
     return code, record.id
 
 
-def _start(client: TestClient, *, invite: str | None = None) -> dict:
+def _start(client: TestClient) -> dict:
     """发起登录。"""
-    body: dict[str, object] = {
+    body = {
         "displayName": "Pixel 9",
         "publicKeyPem": PUBLIC_KEY_PEM,
         "codeChallenge": CHALLENGE,
         "codeChallengeMethod": "S256",
     }
-    if invite is not None:
-        body["inviteCode"] = invite
     response = client.post("/v1/auth/github/start", json=body)
     return {"status": response.status_code, "body": response.json()}
 
 
 def _callback(client: TestClient, started: dict) -> None:
-    """走完浏览器回调。"""
+    """完成浏览器回调并读取 303 响应，不跟随 App 深链。"""
     from urllib.parse import parse_qs, urlsplit
 
     state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
-    client.get("/v1/auth/github/callback", params={"state": state, "code": "auth-code"})
+    response = client.get(
+        "/v1/auth/github/callback",
+        params={"state": state, "code": "auth-code"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
 
 
-def _exchange(client: TestClient, started: dict):
-    """用 App verifier 兑换。"""
+def _exchange(client: TestClient, started: dict, *, invite: str | None = None):
+    """用 App verifier 兑换；需要注册时可在此提交邀请码。"""
+    body = {"loginId": started["loginId"], "codeVerifier": VERIFIER}
+    if invite is not None:
+        body["inviteCode"] = invite
     return client.post(
         "/v1/auth/github/exchange",
-        json={"loginId": started["loginId"], "codeVerifier": VERIFIER},
+        json=body,
     )
 
 
 def _login(client: TestClient, *, invite: str | None = None):
-    """完整走一次登录，返回 exchange 响应。"""
-    start = _start(client, invite=invite)
+    """完整走一次登录，邀请码只在身份获批后的 exchange 中提交。"""
+    start = _start(client)
     assert start["status"] == 200, start
     _callback(client, start["body"])
-    return _exchange(client, start["body"])
+    return _exchange(client, start["body"], invite=invite)
 
 
 # ----------------------------------------------------------------------
@@ -145,7 +147,7 @@ def _login(client: TestClient, *, invite: str | None = None):
 
 
 def test_a_new_identity_without_an_invite_cannot_register(app_client) -> None:
-    """**没有邀请码 → 403 INVITE_CODE_REQUIRED**，而不是悄悄注册。"""
+    """获批的新身份没有邀请码时返回 403，事务仍可用同一 loginId 补码。"""
     client, database = app_client
 
     response = _login(client)
@@ -153,6 +155,102 @@ def test_a_new_identity_without_an_invite_cannot_register(app_client) -> None:
     assert response.status_code == 403
     assert response.json()["code"] == "INVITE_CODE_REQUIRED"
     assert UserRepository(database.connection).find_identity("github", "7001") is None
+
+
+def test_a_missing_invite_can_be_added_to_the_same_approved_transaction(app_client) -> None:
+    """缺码错误不清除 OAuth 身份；正确码可在同一事务中完成注册。"""
+    client, database = app_client
+    started = _start(client)["body"]
+    _callback(client, started)
+
+    missing = _exchange(client, started)
+    assert missing.status_code == 403
+    assert missing.json()["code"] == "INVITE_CODE_REQUIRED"
+    attempt = client.app.state.login_service._attempts[started["loginId"]]
+    assert attempt.status == "approved"
+    assert attempt.identity == IDENTITY
+    assert UserRepository(database.connection).find_identity("github", "7001") is None
+    assert database.connection.execute("SELECT count(*) FROM users").fetchone() == (0,)
+    assert database.connection.execute("SELECT count(*) FROM paired_devices").fetchone() == (0,)
+
+    code, invite_id = _mint(database.connection)
+    completed = _exchange(client, started, invite=code)
+    assert completed.status_code == 200, completed.text
+    invite = InviteCodeRepository(database.connection).find_by_id(invite_id)
+    assert invite is not None and invite.status == "used"
+    assert completed.json()["user"]["userId"] == invite.used_by
+
+
+def test_an_invalid_invite_can_be_corrected_without_writes(app_client) -> None:
+    """错码回滚新用户与设备写入，且后续正确码仍可使用同一事务。"""
+    client, database = app_client
+    started = _start(client)["body"]
+    _callback(client, started)
+    code, invite_id = _mint(database.connection)
+
+    rejected = _exchange(client, started, invite="z" * 32)
+    assert rejected.status_code == 403
+    assert rejected.json()["code"] == "INVITE_CODE_INVALID"
+    assert client.app.state.login_service._attempts[started["loginId"]].status == "approved"
+    assert database.connection.execute("SELECT count(*) FROM users").fetchone() == (0,)
+    assert database.connection.execute("SELECT count(*) FROM paired_devices").fetchone() == (0,)
+    invite = InviteCodeRepository(database.connection).find_by_id(invite_id)
+    assert invite is not None and invite.status == "active"
+
+    completed = _exchange(client, started, invite=code)
+    assert completed.status_code == 200, completed.text
+    invite = InviteCodeRepository(database.connection).find_by_id(invite_id)
+    assert invite is not None and invite.status == "used"
+
+
+def test_wrong_verifier_does_not_reveal_or_consume_the_invite_gate(app_client) -> None:
+    """PKCE 错误先于邀请码门禁；正确 verifier 随后仍可兑换并重放被拒。"""
+    client, database = app_client
+    started = _start(client)["body"]
+    _callback(client, started)
+    code, invite_id = _mint(database.connection)
+
+    wrong_verifier = client.post(
+        "/v1/auth/github/exchange",
+        json={
+            "loginId": started["loginId"],
+            "codeVerifier": "A" * 43,
+            "inviteCode": code,
+        },
+    )
+    assert wrong_verifier.status_code == 401
+    assert wrong_verifier.json()["code"] == "LOGIN_FAILED"
+    assert database.connection.execute("SELECT count(*) FROM users").fetchone() == (0,)
+    assert database.connection.execute("SELECT count(*) FROM paired_devices").fetchone() == (0,)
+    invite = InviteCodeRepository(database.connection).find_by_id(invite_id)
+    assert invite is not None and invite.status == "active"
+
+    completed = _exchange(client, started, invite=code)
+    assert completed.status_code == 200, completed.text
+    replay = _exchange(client, started, invite=code)
+    assert replay.status_code == 409
+    assert replay.json()["code"] == "LOGIN_ALREADY_REDEEMED"
+    assert database.connection.execute("SELECT count(*) FROM users").fetchone() == (1,)
+
+
+def test_exchange_after_login_ttl_does_not_accept_an_invite(app_client) -> None:
+    """获批事务过期后，即使补上有效码也不能创建用户或设备。"""
+    client, database = app_client
+    started = _start(client)["body"]
+    _callback(client, started)
+    missing = _exchange(client, started)
+    assert missing.status_code == 403
+    code, invite_id = _mint(database.connection)
+    attempt = client.app.state.login_service._attempts[started["loginId"]]
+    attempt.expires_at = 0
+
+    expired = _exchange(client, started, invite=code)
+    assert expired.status_code == 410
+    assert expired.json()["code"] == "LOGIN_EXPIRED"
+    assert database.connection.execute("SELECT count(*) FROM users").fetchone() == (0,)
+    assert database.connection.execute("SELECT count(*) FROM paired_devices").fetchone() == (0,)
+    invite = InviteCodeRepository(database.connection).find_by_id(invite_id)
+    assert invite is not None and invite.status == "active"
 
 
 def test_a_new_identity_with_a_valid_invite_registers_and_consumes_it(app_client) -> None:
@@ -184,42 +282,56 @@ def test_an_unusable_invite_is_rejected_with_one_code(app_client, state: str) ->
     else:
         # 造一个"已用"状态：哈希与该码一致，占用者是一个真实用户。
         user = UserRepository(database.connection).find_or_create_user_for_identity(
-            IDENTITY, now=datetime.now(UTC)
+            LoginIdentity("google", "existing-user", None, "Existing User"),
+            now=datetime.now(UTC),
         )
         assert invites.consume(
             code_hash=hash_invite_code(code), used_by=user.user.id, now=datetime.now(UTC)
         )
 
-    # **在 /start 就被拒**：不必跳一次浏览器才发现码不能用。
-    started = _start(client, invite=code)
+    # 码的有效性在获批后的原子注册事务里判断。
+    started = _start(client)
+    _callback(client, started["body"])
+    rejected = _exchange(client, started["body"], invite=code)
 
-    assert started["status"] == 403
-    assert started["body"]["code"] == "INVITE_CODE_INVALID"
+    assert rejected.status_code == 403
+    assert rejected.json()["code"] == "INVITE_CODE_INVALID"
 
 
 def test_an_unknown_invite_is_rejected(app_client) -> None:
     """不存在的码同样 403 INVITE_CODE_INVALID，且不会创建用户。"""
     client, database = app_client
-    started = _start(client, invite="z" * 32)
-    assert started["status"] == 403
-    assert started["body"]["code"] == "INVITE_CODE_INVALID"
+    started = _start(client)
+    _callback(client, started["body"])
+    rejected = _exchange(client, started["body"], invite="z" * 32)
+    assert rejected.status_code == 403
+    assert rejected.json()["code"] == "INVITE_CODE_INVALID"
     assert UserRepository(database.connection).find_identity("github", "7001") is None
 
 
-def test_start_rejects_an_unusable_invite_before_the_oauth_round_trip(app_client) -> None:
-    """**在 /start 就失败**：用户不必跳一次浏览器才发现码不对。"""
+def test_start_does_not_accept_an_invite_code(app_client) -> None:
+    """登录开始端点不再接受旧的邀请码字段。"""
     client, _ = app_client
-    started = _start(client, invite="z" * 32)
-    assert started["status"] == 403
-    assert started["body"]["code"] == "INVITE_CODE_INVALID"
+    body = {
+        "displayName": "Pixel 9",
+        "publicKeyPem": PUBLIC_KEY_PEM,
+        "codeChallenge": CHALLENGE,
+        "codeChallengeMethod": "S256",
+        "inviteCode": "z" * 32,
+    }
+    response = client.post("/v1/auth/github/start", json=body)
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_ARGUMENT"
 
 
-def test_a_malformed_invite_code_is_a_400_not_a_403(app_client) -> None:
-    """格式非法是请求错误（400），"码不可用"是业务状态（403）。"""
+def test_a_nonempty_unknown_invite_is_rejected_as_invalid(app_client) -> None:
+    """任何非空字符串按邀请码值处理；未命中的哈希返回统一业务错误。"""
     client, _ = app_client
-    started = _start(client, invite="短")
-    assert started["status"] == 400
-    assert started["body"]["code"] == "INVALID_ARGUMENT"
+    started = _start(client)["body"]
+    _callback(client, started)
+    response = _exchange(client, started, invite="短")
+    assert response.status_code == 403
+    assert response.json()["code"] == "INVITE_CODE_INVALID"
 
 
 # ----------------------------------------------------------------------
@@ -344,9 +456,9 @@ def test_admin_creates_lists_and_revokes_invite_codes(app_client) -> None:
     assert client.delete(f"/v1/admin/invite-codes/{invite_id}", headers=headers).status_code == 409
 
     # 撤销后的码无法注册（在 /start 就被拒）
-    rejected = _start(client, invite=code)
-    assert rejected["status"] == 403
-    assert rejected["body"]["code"] == "INVITE_CODE_INVALID"
+    rejected = _login(client, invite=code)
+    assert rejected.status_code == 403
+    assert rejected.json()["code"] == "INVITE_CODE_INVALID"
 
 
 def test_the_created_code_actually_registers_a_user(app_client) -> None:
@@ -386,8 +498,8 @@ def test_invite_management_requires_an_admin(app_client) -> None:
     assert client.post("/v1/admin/invite-codes", json={}).status_code == 401
 
 
-def test_providers_advertise_that_registration_needs_an_invite(app_client) -> None:
-    """登录页要据此显示邀请码输入框，因此这个能力位必须是公开且显式的。"""
+def test_providers_advertise_the_registration_invite_requirement(app_client) -> None:
+    """目录标记只公开新身份注册门禁，不控制首页输入框。"""
     client, _ = app_client
     body = client.get("/v1/auth/providers").json()
     assert body["registrationRequiresInvite"] is True

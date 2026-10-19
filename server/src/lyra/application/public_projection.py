@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..domain.analytics.currency_groups import CurrencyGroupedResult
+from ..domain.analytics.positions import OPTION_MULTIPLIER
 from ..domain.analytics.types import AccountSummary
 from ..domain.numeric import decimal_text
 from .app_error import ApplicationError
@@ -71,21 +72,34 @@ def account_id_map(accounts: tuple[Any, ...]) -> dict[str, str]:
     return {account.legacy_account_key: account.id for account in accounts}
 
 
-def project_position(row: Any, account_ids: dict[str, str]) -> dict[str, Any]:
+def project_position(
+    row: Any,
+    account_ids: dict[str, str],
+    *,
+    asset_type: str | None = None,
+) -> dict[str, Any]:
     """把持仓行投影为公开字段。
 
     对应 TypeScript 侧 ``projectPosition``：**账户引用改为内部 UUID**（脱敏），
-    数值改为十进制字符串。
+    数值改为十进制字符串；另提供以账户币种计价的 ``costBasis``，保留领域 ``cost``
+    的历史成本语义。
 
     @param row: 领域层持仓行。
     @param account_ids: 账户键到 UUID 的映射。
-    @returns camelCase 字段的公开字典。
+    @param asset_type: 行未携带资产类型时使用的显式类型；到期行保证是期权。
+    @returns camelCase 字段的公开字典，其中 ``cost`` 与 ``costBasis`` 分别表示领域成本
+        和包含合约乘数的账户币种成本。
     @raises KeyError: 账户不在范围内——宁可失败也不泄漏未授权账户。
     """
+    # 聚合行的 cost 已包含持仓数量；这里只做期权乘数换算，不能再乘 quantity。
+    projected_asset_type = row.asset_type if asset_type is None else asset_type
+    cost_basis = abs(row.cost) * (
+        OPTION_MULTIPLIER if projected_asset_type == "option" else 1
+    )
     return {
         "accountId": account_ids[row.account],
         "symbolKey": row.symbol_key,
-        "assetType": row.asset_type,
+        "assetType": projected_asset_type,
         "underlying": row.underlying,
         "expiry": row.expiry,
         "strike": None if row.strike is None else decimal_text(row.strike),
@@ -93,6 +107,7 @@ def project_position(row: Any, account_ids: dict[str, str]) -> dict[str, Any]:
         "direction": row.direction,
         "quantity": decimal_text(row.qty),
         "cost": decimal_text(row.cost),
+        "costBasis": decimal_text(cost_basis),
         "firstOpenDate": row.first_open_date,
     }
 
@@ -114,7 +129,7 @@ def project_expiring(result: Any, account_ids: dict[str, str]) -> dict[str, Any]
     return {
         "rows": [
             {
-                **project_position(row, account_ids),
+                **project_position(row, account_ids, asset_type="option"),
                 "status": row.status,
                 "daysRemaining": row.days_remaining,
                 "premiumDollars": decimal_text(row.premium_dollars),

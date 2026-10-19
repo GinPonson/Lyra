@@ -18,9 +18,10 @@ SCHWAB_FROM = "Schwab <donotreply@mail.schwab.com>"
 SCHWAB_SUBJECT = "Schwab eConfirms"
 
 
-def _encoded(text: str, charset: str = "utf-8") -> str:
-    """把文本按 base64url 无填充编码。"""
-    return base64.urlsafe_b64encode(text.encode(charset)).decode().rstrip("=")
+def _encoded(text: str, charset: str = "utf-8", *, padded: bool = False) -> str:
+    """把文本编码为带填充或无填充的 Base64URL 测试数据。"""
+    encoded = base64.urlsafe_b64encode(text.encode(charset)).decode()
+    return encoded if padded else encoded.rstrip("=")
 
 
 def _record(
@@ -73,6 +74,15 @@ def test_parses_a_single_record() -> None:
     assert message.sender == SCHWAB_FROM
     assert message.subject == SCHWAB_SUBJECT
     assert message.body == "Date: 1/5/2026"
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_parses_canonical_base64url_with_or_without_padding(padded: bool) -> None:
+    """Gmail 的 MIME data 带标准 ``=`` 填充或省略填充时都能严格解码。"""
+    record = _record()
+    record["payload"]["body"]["data"] = _encoded("Date: 1/5/2026", padded=padded)
+
+    assert _parse(record)[0].body == "Date: 1/5/2026"
 
 
 def test_parses_an_array_of_records() -> None:
@@ -194,10 +204,14 @@ def test_undecodable_body_is_rejected_not_replaced() -> None:
         _parse(record)
 
 
-def test_invalid_base64_data_is_rejected() -> None:
-    """字符集不符或长度非法的 base64 报错。"""
+@pytest.mark.parametrize(
+    "value",
+    ["not base64!", "+/8=", "YQ=", "YQ===", "Y=Q=", "YQ==\n", "Zh==", "Zh"],
+)
+def test_invalid_base64_data_is_rejected(value: str) -> None:
+    """字符、填充、长度或未使用 pad bits 非规范时必须报错。"""
     record = _record()
-    record["payload"]["body"]["data"] = "not base64!"
+    record["payload"]["body"]["data"] = value
 
     with pytest.raises(IngestError, match="Base64URL 数据无效"):
         _parse(record)

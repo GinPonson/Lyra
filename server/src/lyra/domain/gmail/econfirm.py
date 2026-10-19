@@ -10,11 +10,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
-from ..ledger.types import RawTransactionFields
+from ..ledger.errors import IngestError
+from ..ledger.transactions import create_business_hash, decimal_hash_text
+from ..ledger.types import ParsedOptionSymbol, ParsedTransaction, RawTransactionFields
 
 SCHWAB_ECONFIRM_SENDER = "donotreply@mail.schwab.com"
 SCHWAB_ECONFIRM_SUBJECT = "Schwab eConfirms"
@@ -35,6 +37,19 @@ class GmailMessage:
     body: str
     email_timestamp: str | None
     body_candidates: tuple[str, ...] = ()
+
+
+class UnresolvedCashOptionSaleError(IngestError):
+    """期权 Sale/Cash 缺少唯一、精确的既有成交事实关联。"""
+
+    def __init__(self, message: str, *, reason: str = "unresolved") -> None:
+        """保留供同封 MIME 桥接判断的失败类别，不暴露交易内容。
+
+        @param message: 不含成交数值的安全诊断。
+        @param reason: ``no_match``、``ambiguous``、``mixed_account``、桥接不匹配等内部原因。
+        """
+        super().__init__(message)
+        self.reason = reason
 
 
 def is_schwab_sender(sender: str) -> bool:
@@ -72,6 +87,84 @@ class EmailTrade:
     price: str
     fees: str
     amount: str
+    # 保留表格中的本金，以便 MIME 候选一致性校验不忽略容差内的金额差异。
+    principal: str | None = None
+    # 这是导入控制元数据，不是交易字段；匹配既有事实的成交不得再次入账。
+    existing_only: bool = False
+
+
+class _CashOptionSaleBridgeContext:
+    """仅供同一封邮件的候选重跑使用的既有成交桥接快照。
+
+    每个成功批次中的既有现金期权卖出只能被一个失败候选行消费，防止新成交借用
+    其它行的已验证结果。该对象只在一次 ``parse_econfirm`` 调用内创建。
+    """
+
+    def __init__(self, source_trades: tuple[EmailTrade, ...]) -> None:
+        """创建只含严格匹配既有事实的候选桥接快照。
+
+        @param source_trades: 唯一成功批次中的成交；仅保留 ``existing_only`` 行。
+        """
+        self.trades = tuple(trade for trade in source_trades if trade.existing_only)
+        self._used_indexes: set[int] = set()
+
+    @property
+    def fully_consumed(self) -> bool:
+        """判断失败候选是否逐行对应了全部既有成交桥接行。"""
+        return len(self._used_indexes) == len(self.trades)
+
+    def reconcile(
+        self,
+        trade: EmailTrade,
+        option: ParsedOptionSymbol,
+        strict_match: EmailTrade | None,
+        where: str,
+    ) -> EmailTrade:
+        """将失败候选的 Cash 行与一条唯一已验证事实对齐。
+
+        除数量与价格允许仅有小数尾随零精度差异外，日期、原始符号、规范描述、费用、
+        净额和期权完整身份必须完全相同；若严格解析已得到动作，也必须与桥接动作一致。
+
+        @param trade: 按 Sell 方向解析并已完成金额勾稽的候选行。
+        @param option: 候选行完整期权身份。
+        @param strict_match: 原业务哈希解析结果；未匹配时为 ``None``。
+        @param where: 安全的错误定位文本。
+        @returns 仅替换数量/价格精度并保留 ``existing_only=True`` 的成交。
+        @raises UnresolvedCashOptionSaleError: 未找到唯一兼容桥接行或动作冲突。
+        """
+        matches: list[tuple[int, EmailTrade]] = []
+        for index, bridge in enumerate(self.trades):
+            if index in self._used_indexes or not _cash_sale_bridge_matches(
+                trade, option, bridge
+            ):
+                continue
+            if strict_match is not None and strict_match.action != bridge.action:
+                continue
+            matches.append((index, bridge))
+
+        if not matches:
+            raise UnresolvedCashOptionSaleError(
+                f"{where}: 期权 Sale/Cash 与同封已验证成交不一致",
+                reason="bridge_mismatch",
+            )
+
+        # 重复填单可能有相同内容；只有最终语义完全一致时按顺序消费一个副本。
+        fingerprints = {trades_fingerprint((bridge,)) for _, bridge in matches}
+        if len(fingerprints) != 1:
+            raise UnresolvedCashOptionSaleError(
+                f"{where}: 期权 Sale/Cash 对应多个不同的已验证成交",
+                reason="ambiguous_bridge",
+            )
+
+        index, bridge = matches[0]
+        self._used_indexes.add(index)
+        return replace(
+            trade,
+            action=bridge.action,
+            quantity=bridge.quantity,
+            price=bridge.price,
+            existing_only=True,
+        )
 
 
 def email_trade_to_raw_fields(trade: EmailTrade) -> RawTransactionFields:
@@ -89,6 +182,8 @@ def email_trade_to_raw_fields(trade: EmailTrade) -> RawTransactionFields:
     @param trade: 邮件中提取的成交。
     @returns 领域层的原始字段对象（**与 CSV 适配器产出同一类型**）。
     @raises ValueError: 成交日期不是 ``YYYY-MM-DD``。
+
+    ``existing_only`` 是解析控制标记，不属于账本行字段，因此不会随此转换泄漏。
     """
     parts = trade.trade_date.split("-")
     if len(parts) != 3:
@@ -237,7 +332,9 @@ def trades_fingerprint(trades: tuple[EmailTrade, ...]) -> str:
                 "tradeDate": trade.trade_date, "action": trade.action,
                 "symbol": trade.symbol, "description": trade.description,
                 "quantity": trade.quantity, "price": trade.price,
+                "principal": trade.principal,
                 "fees": trade.fees, "amount": trade.amount,
+                "existingOnly": trade.existing_only,
             }
             for trade in trades
         ],
@@ -245,7 +342,102 @@ def trades_fingerprint(trades: tuple[EmailTrade, ...]) -> str:
     )
 
 
-def parse_econfirm(message: GmailMessage) -> tuple[EmailTrade, ...]:
+def _trim_decimal_fraction_zeros(value: str) -> str:
+    """仅移除十进制小数部分末尾的零，用于比较展示精度差异。
+
+    @param value: 已由邮件解析器规范化的十进制文本。
+    @returns 去掉小数末尾零后的文本；整数部分与其他字符保持不变。
+    """
+    if "." not in value:
+        return value
+    integer, fraction = value.split(".", 1)
+    fraction = fraction.rstrip("0")
+    return integer if not fraction else f"{integer}.{fraction}"
+
+
+def _cash_sale_bridge_matches(
+    trade: EmailTrade,
+    option: ParsedOptionSymbol,
+    bridge: EmailTrade,
+) -> bool:
+    """检查 Cash 行是否只存在数量或价格的小数尾零展示差异。
+
+    @param trade: 当前 MIME 候选中按现金卖出方向勾稽的行。
+    @param option: 当前候选的完整期权身份。
+    @param bridge: 唯一成功候选中已严格命中既有事实的行。
+    @returns 所有字段相同且数量/价格至多有尾随零精度差异时为真。
+    """
+    from ..ledger.parsers import parse_option_symbol
+
+    bridge_option = parse_option_symbol(bridge.symbol)
+    if (
+        not bridge.existing_only
+        or bridge.action not in ("Sell to Open", "Sell to Close")
+        or trade.action != "Sell"
+        or trade.trade_date != bridge.trade_date
+        or trade.symbol != bridge.symbol
+        or trade.description != bridge.description
+        or trade.principal != bridge.principal
+        or bridge_option is None
+        or option.underlying != bridge_option.underlying
+        or option.expiry != bridge_option.expiry
+        or option.strike != bridge_option.strike
+        or option.option_type != bridge_option.option_type
+        or trade.fees != bridge.fees
+        or trade.amount != bridge.amount
+    ):
+        return False
+
+    try:
+        quantity_equal = Decimal(trade.quantity) == Decimal(bridge.quantity)
+        price_equal = Decimal(trade.price) == Decimal(bridge.price)
+    except InvalidOperation:
+        return False
+    return (
+        quantity_equal
+        and price_equal
+        and _trim_decimal_fraction_zeros(trade.quantity)
+        == _trim_decimal_fraction_zeros(bridge.quantity)
+        and _trim_decimal_fraction_zeros(trade.price)
+        == _trim_decimal_fraction_zeros(bridge.price)
+    )
+
+
+def _cash_option_sale_blocks(body: str) -> tuple[str, ...]:
+    """提取候选正文中所有需要专门证明的期权 Sale/Cash 块。
+
+    @param body: 单个 MIME 正文候选。
+    @returns 原顺序的 Cash 交易块片段，不含 ``Symbol:`` 分隔行。
+    """
+    from ..ledger.parsers import parse_option_symbol
+
+    parts = SYMBOL_SPLIT_PATTERN.split(body)
+    cash_blocks: list[str] = []
+    for raw_block in parts[1:]:
+        block = raw_block.split(ADDITIONAL_INFORMATION_MARKER, 1)[0]
+        try:
+            action = field(block, "Action", "候选扫描")
+            position_type = field(block, "Type", "候选扫描")
+        except IngestError:
+            continue
+        first_line = next(
+            (line.strip() for line in block.replace("\r", "").split("\n") if line.strip()),
+            "",
+        )
+        if (
+            action == "Sale"
+            and position_type == "Cash"
+            and parse_option_symbol(unwrap_symbol(first_line)) is not None
+        ):
+            cash_blocks.append(raw_block)
+    return tuple(cash_blocks)
+
+
+def parse_econfirm(
+    message: GmailMessage,
+    *,
+    existing_option_sales: tuple[ParsedTransaction, ...] = (),
+) -> tuple[EmailTrade, ...]:
     """从全部正文候选中确定性提取成交。
 
     **两个候选必须解析出同一批交易。** 纯文本与 HTML 是同一封邮件的两种表示，
@@ -253,31 +445,111 @@ def parse_econfirm(message: GmailMessage) -> tuple[EmailTrade, ...]:
     那会在用户毫无察觉的情况下写入错误数据。
 
     @param message: 已解析的邮件。
+    @param existing_option_sales: 同一账户的既有期权卖出快照，仅用于解析 Sale/Cash。
     @returns 成交序列。
+    @raises UnresolvedCashOptionSaleError: Sale/Cash 无法唯一匹配既有成交。
     @raises IngestError: 全部候选失败，或候选之间结果不一致。
     """
-    from ..ledger.errors import IngestError
-
     successes: dict[str, tuple[EmailTrade, ...]] = {}
+    failures: list[tuple[int, str, IngestError]] = []
     errors: list[str] = []
     for index, body in enumerate(candidate_bodies(message)):
         try:
-            trades = parse_econfirm_body(message.message_id, body)
+            trades = parse_econfirm_body(
+                message.message_id,
+                body,
+                existing_option_sales=existing_option_sales,
+            )
         except IngestError as error:
             # 单个候选失败不致命：另一个候选可能解析得出来。
+            failures.append((index, body, error))
             errors.append(f"候选{index + 1}: {error}")
             continue
         successes[trades_fingerprint(trades)] = trades
 
-    if not successes:
-        raise IngestError(
-            f"邮件 {message.message_id}: 所有正文候选解析失败: {'；'.join(errors)}"
-        )
-    if len(successes) != 1:
+    if len(successes) > 1:
         raise IngestError(
             f"邮件 {message.message_id}: plain 与 HTML 解析出的交易不一致"
         )
-    return next(iter(successes.values()))
+
+    if not successes:
+        unresolved_errors = [
+            error for _, _, error in failures
+            if isinstance(error, UnresolvedCashOptionSaleError)
+        ]
+        if unresolved_errors and len(failures) == 1:
+            raise unresolved_errors[0]
+        if unresolved_errors:
+            # 保留未知动作的专用类型，同时把其他候选错误一并呈现，避免只报其中一方。
+            raise UnresolvedCashOptionSaleError(
+                f"邮件 {message.message_id}: 正文候选包含未解决的 Sale/Cash 或解析失败: "
+                f"{'；'.join(errors)}"
+            )
+        raise IngestError(
+            f"邮件 {message.message_id}: 所有正文候选解析失败: {'；'.join(errors)}"
+        )
+
+    canonical = next(iter(successes.values()))
+    bridge_rows = tuple(trade for trade in canonical if trade.existing_only)
+    for index, body, original_error in failures:
+        cash_blocks = _cash_option_sale_blocks(body)
+        if not cash_blocks:
+            if isinstance(original_error, UnresolvedCashOptionSaleError):
+                raise original_error
+            # 维持既有候选行为：与交易动作无关的单候选解析失败可由另一 MIME 候选兜底。
+            continue
+
+        if not bridge_rows:
+            raise UnresolvedCashOptionSaleError(
+                f"邮件 {message.message_id}: plain 与 HTML 候选无法一致验证 Sale/Cash "
+                f"(候选{index + 1}含未验证的期权 Sale/Cash)"
+            )
+
+        # 先独立校验整封候选中所有 Cash 行，避免普通块的早期格式错误掩盖后续新 Cash 行。
+        cash_only_body = "Symbol:\n" + "\nSymbol:\n".join(cash_blocks)
+        verification_context = _CashOptionSaleBridgeContext(canonical)
+        try:
+            parse_econfirm_body(
+                message.message_id,
+                cash_only_body,
+                existing_option_sales=existing_option_sales,
+                _bridge_context=verification_context,
+            )
+        except UnresolvedCashOptionSaleError:
+            raise
+        except IngestError as error:
+            raise UnresolvedCashOptionSaleError(
+                f"邮件 {message.message_id}: 候选{index + 1}的 Sale/Cash 无法全部验证"
+            ) from error
+        if not verification_context.fully_consumed:
+            raise UnresolvedCashOptionSaleError(
+                f"邮件 {message.message_id}: 候选{index + 1}没有验证全部既有 Sale/Cash"
+            )
+
+        bridge_context = _CashOptionSaleBridgeContext(canonical)
+        try:
+            retried = parse_econfirm_body(
+                message.message_id,
+                body,
+                existing_option_sales=existing_option_sales,
+                _bridge_context=bridge_context,
+            )
+        except UnresolvedCashOptionSaleError:
+            raise
+        except IngestError:
+            # Cash 行已独立全部验证；普通块仍有结构错误时，按旧规则使用成功候选。
+            continue
+
+        if not bridge_context.fully_consumed:
+            raise UnresolvedCashOptionSaleError(
+                f"邮件 {message.message_id}: 候选{index + 1}没有验证全部既有 Sale/Cash"
+            )
+        if trades_fingerprint(retried) != trades_fingerprint(canonical):
+            raise IngestError(
+                f"邮件 {message.message_id}: plain 与 HTML 解析出的交易不一致"
+            )
+
+    return canonical
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +762,7 @@ def build_trade(
         description=description,
         quantity=_plain_decimal(parsed_quantity),
         price=_plain_decimal(parsed_price),
+        principal=_plain_decimal(parsed_principal),
         fees=_plain_decimal(fees),
         # 买入为负：现金流出。
         amount=_plain_decimal(-net_amount if is_buy else net_amount),
@@ -624,6 +897,7 @@ def parse_value_rows(
     symbol: str,
     description: str,
     multiplier: int,
+    has_charge_interest_column: bool = False,
 ) -> tuple[EmailTrade, ...]:
     """解析成交金额表，返回该符号块下的全部成交。
 
@@ -640,6 +914,7 @@ def parse_value_rows(
     @param symbol: 符号。
     @param description: 规范化描述。
     @param multiplier: 1 或 100。
+    @param has_charge_interest_column: 表头是否明确包含 Charge and/or Interest 列。
     @returns 成交序列。
     @raises IngestError: 结构不符或任一勾稽失败。
     """
@@ -660,6 +935,7 @@ def parse_value_rows(
         return _parse_totals_rows(
             remaining=remaining, where=where, trade_date=trade_date, action=action,
             symbol=symbol, description=description, multiplier=multiplier,
+            has_charge_interest_column=has_charge_interest_column,
         )
 
     if len(remaining) < 4:
@@ -706,11 +982,105 @@ def _single_row_fees(tail: list[str], where: str) -> tuple[Decimal, str]:
     return parse_labeled_fees(tuple(tail), where)
 
 
+def _charge_interest_row_fees(
+    values: list[str], start: int, where: str,
+) -> tuple[Decimal, str, int]:
+    """解析五列成交行的费用单元格及其净额，并返回消耗的字段数。
+
+    五列 HTML 被规范化为扁平文本；费用单元格可以展开为多个标签/金额行。此处按
+    明确支持的标签语法确定边界，再交给既有单笔费用解析器校验，避免把后续腿误当
+    当前费用或把未标注金额猜成某种费用。
+
+    @param values: 当前成交行费用单元格开始处的扁平字段序列。
+    @param start: 费用单元格在 ``values`` 中的起始索引。
+    @param where: 错误定位说明。
+    @returns ``(费用, 净额原文, 消耗字段数)``，消耗数包含净额字段。
+    @raises IngestError: 费用标签未知、字段缺失或费用表勾稽失败。
+    """
+    from ..ledger.errors import IngestError
+
+    tail = values[start:]
+    if not tail:
+        raise IngestError(f"{where}: Charge and/or Interest 字段缺失")
+
+    label = tail[0].strip().lower()
+    if label in ("n/a", "n/a:"):
+        # 少数版本把 N/A 的零费用说明展开为四项；普通五列单元格只有 N/A 一项。
+        count = (
+            4
+            if label == "n/a:"
+            and len(tail) >= 4
+            and is_money(tail[1])
+            and tail[2].strip().lower() == "n/a"
+            and is_money(tail[3])
+            else 2
+        )
+    elif label == "industry fee:":
+        # Industry Fee-only 模板可能在费用金额后重复裸标签。
+        count = 4 if len(tail) >= 4 and tail[2].strip().lower() == "industry fee" else 3
+    elif label == "commission:":
+        # Commission 模板必须包含 Total；其后的两个金额分别是费用总额和成交净额。
+        total_index = next(
+            (index for index, value in enumerate(tail) if value.strip().lower() == "total:"),
+            -1,
+        )
+        if total_index < 0:
+            raise IngestError(f"{where}: Commission 费用缺少 Total 标签")
+        count = total_index + 3
+    else:
+        raise IngestError(
+            f"{where}: Charge and/or Interest 只接受 N/A 或明确标注的 Commission/Industry Fee"
+        )
+
+    if count > len(tail):
+        raise IngestError(f"{where}: Charge and/or Interest 成交行字段不完整")
+    fee_values = tail[:count]
+    fees, amount = _single_row_fees(fee_values, where)
+    return fees, amount, count
+
+
+def _is_nonfinancial_leg_note(value: str) -> bool:
+    """识别 eConfirm 已知的费用或平均单价说明脚注。
+
+    五列 HTML 可在 ``for the above:`` 后插入已确认的费用、平均单价或代理身份说明。只接受
+    这两类说明前缀和一条完整代理说明，且拒绝其中含任何数字或美元符号的文本。
+
+    @param value: 分隔符后的单个规范化文本字段。
+    @returns 是否以已确认的说明脚注前缀开头且不含数字/金额。
+    """
+    note = value.strip()
+    if not note or re.search(r"[$\d]", note):
+        return False
+    known_leg_note_prefixes = re.compile(
+        r"^\s*-\s*(?:Industry Fee:\s*For certain securities transactions\b|"
+        r"The unit price shown is an average price\.)",
+        re.IGNORECASE,
+    )
+    known_agent_note = "- Schwab acted as your agent."
+    return (
+        known_leg_note_prefixes.match(note) is not None
+        or note.strip() == known_agent_note
+    )
+
+
 def _parse_totals_rows(
     *, remaining: list[str], where: str, trade_date: str, action: str,
     symbol: str, description: str, multiplier: int,
+    has_charge_interest_column: bool,
 ) -> tuple[EmailTrade, ...]:
-    """解析带 Totals 的多价格成交表。"""
+    """解析带 Totals 的多价格成交表。
+
+    @param remaining: 含各腿和 Totals 的行。
+    @param where: 错误定位说明。
+    @param trade_date: 交易日期。
+    @param action: 已映射动作。
+    @param symbol: 证券代码。
+    @param description: 规范化描述。
+    @param multiplier: 1 或 100。
+    @param has_charge_interest_column: 表头明确声明第五列模板时为真。
+    @returns 逐腿成交。
+    @raises IngestError: 行结构或 Totals 勾稽不符。
+    """
     from ..ledger.errors import IngestError
 
     totals_index = remaining.index("Totals")
@@ -733,7 +1103,9 @@ def _parse_totals_rows(
         if value.lower().startswith(LEG_SEPARATOR_PREFIX)
     ]
     rows: list[EmailTrade] = []
-    if separators:
+    if not fill_values:
+        raise IngestError(f"{where}: 多价格成交缺少逐腿数据")
+    if separators and not has_charge_interest_column:
         # 逐腿拆分：每腿前四项是数量、价格、本金…（其余交给费用区域解析）。
         bounds: list[tuple[int, int]] = []
         start = 0
@@ -753,6 +1125,39 @@ def _parse_totals_rows(
                 quantity=quantity, price=price, principal=principal,
                 fees=fees, amount=amount, where=where,
             ))
+    elif has_charge_interest_column:
+        # HTML 转文本会把费用单元格里的标签和值展开，因此行宽不是固定五个文本字段。
+        # 逐行从三个固定数值列开始，费用尾部只接受可由现有语法完整解释的结构。
+        offset = 0
+        while offset < len(fill_values):
+            if fill_values[offset].lower().startswith(LEG_SEPARATOR_PREFIX):
+                # 分隔符后的少数 HTML 模板注入一条普通说明；只跳过经严格词法检查的
+                # 非金融文本，金额、数字或财务字段名都不能在此处被吞掉。
+                offset += 1
+                if offset < len(fill_values) and not re.fullmatch(
+                    r"-?[\d,]+(?:\.\d+)?", fill_values[offset].strip()
+                ):
+                    if not _is_nonfinancial_leg_note(fill_values[offset]):
+                        raise IngestError(
+                            f"{where}: 成交腿分隔符后含未识别的字段"
+                        )
+                    offset += 1
+                continue
+            if len(fill_values) - offset < 5:
+                raise IngestError(f"{where}: Charge and/or Interest 多价格结构列数不完整")
+            quantity, price, principal = fill_values[offset:offset + 3]
+            fees, amount, fee_tail_count = _charge_interest_row_fees(
+                fill_values, offset + 3, where,
+            )
+            rows.append(build_trade(
+                trade_date=trade_date, action=action, symbol=symbol,
+                description=description, multiplier=multiplier,
+                quantity=quantity, price=price, principal=principal,
+                fees=fees, amount=amount, where=where,
+            ))
+            offset += 3 + fee_tail_count
+        if not rows:
+            raise IngestError(f"{where}: 多价格成交缺少逐腿数据")
     else:
         if len(fill_values) % 4 != 0:
             raise IngestError(f"{where}: 无法识别多价格成交结构")
@@ -806,7 +1211,105 @@ TOTAL_AMOUNT_MARKER = re.compile(r"Total Amount\s*\n", re.IGNORECASE)
 ADDITIONAL_INFORMATION_MARKER = "Additional information for this security:"
 
 
-def parse_econfirm_body(message_id: str, body: str) -> tuple[EmailTrade, ...]:
+def _resolve_existing_cash_option_sale(
+    trade: EmailTrade,
+    option: ParsedOptionSymbol,
+    existing_option_sales: tuple[ParsedTransaction, ...],
+    where: str,
+) -> EmailTrade:
+    """仅在同账户既有期权卖出中唯一重建出业务哈希时补全 Sale/Cash 动作。
+
+    @param trade: 已按明确卖出方向完成金额勾稽的期权成交。
+    @param option: 从邮件原始 Symbol 解析出的完整期权身份。
+    @param existing_option_sales: 调用方绑定账户的既有期权卖出快照。
+    @param where: 错误定位文本。
+    @returns 复制既有 STO/STC 动作并标记为仅关联既有交易的成交。
+    @raises UnresolvedCashOptionSaleError: 快照混账户、没有精确匹配或匹配到多个业务哈希。
+    """
+    if not existing_option_sales:
+        raise UnresolvedCashOptionSaleError(
+            f"{where}: 期权 Sale/Cash 缺少既有成交上下文，无法确定开仓或平仓",
+            reason="missing_context",
+        )
+
+    accounts = {transaction.account for transaction in existing_option_sales}
+    if len(accounts) != 1:
+        raise UnresolvedCashOptionSaleError(
+            f"{where}: 期权 Sale/Cash 的既有成交上下文不属于唯一账户",
+            reason="mixed_account",
+        )
+
+    parsed_numbers = {
+        "quantity": Decimal(trade.quantity),
+        "price": Decimal(trade.price),
+        "fees": Decimal(trade.fees),
+        "amount": Decimal(trade.amount),
+    }
+    raw_fields = email_trade_to_raw_fields(trade)
+    matches: dict[str, ParsedTransaction] = {}
+    for existing in existing_option_sales:
+        if (
+            existing.account not in accounts
+            or existing.asset_type != "option"
+            or existing.action not in ("Sell to Open", "Sell to Close")
+            or existing.transaction_date != trade.trade_date
+            or existing.raw_symbol != trade.symbol
+            or existing.underlying != option.underlying
+            or existing.expiry != option.expiry
+            or existing.strike != option.strike
+            or existing.option_type != option.option_type
+        ):
+            continue
+
+        # Decimal 相等校验拦住数值不同；重建业务哈希还会保留 CSV 数值文本精度，
+        # 防止 1.0 与 1.00 这类显示差异被当作同一来源行。
+        existing_numbers = {
+            "quantity": existing.quantity,
+            "price": existing.price,
+            "fees": existing.fees if existing.fees is not None else Decimal(0),
+            "amount": existing.amount,
+        }
+        if any(
+            existing_numbers[name] is None
+            or existing_numbers[name] != expected
+            for name, expected in parsed_numbers.items()
+        ):
+            continue
+
+        expected_hash = create_business_hash(
+            account=existing.account,
+            record_date=existing.record_date,
+            transaction_date=trade.trade_date,
+            action=existing.action,
+            raw_symbol=trade.symbol,
+            # eConfirm 与 CSV 对公司名/描述的呈现可能不同；用候选原交易的描述与记录日
+            # 重建它自己的业务哈希，仍由原始合约身份和精确金额限定这笔匹配。
+            description=existing.description,
+            quantity_text=decimal_hash_text(raw_fields.quantity),
+            price_text=decimal_hash_text(raw_fields.price),
+            fees_text=decimal_hash_text(raw_fields.fees),
+            amount_text=decimal_hash_text(raw_fields.amount),
+        )
+        if expected_hash == existing.business_hash:
+            matches.setdefault(existing.business_hash, existing)
+
+    if len(matches) != 1:
+        raise UnresolvedCashOptionSaleError(
+            f"{where}: 期权 Sale/Cash 无法唯一关联到既有成交",
+            reason="no_match" if not matches else "ambiguous",
+        )
+
+    matched = next(iter(matches.values()))
+    return replace(trade, action=matched.action, existing_only=True)
+
+
+def parse_econfirm_body(
+    message_id: str,
+    body: str,
+    *,
+    existing_option_sales: tuple[ParsedTransaction, ...] = (),
+    _bridge_context: _CashOptionSaleBridgeContext | None = None,
+) -> tuple[EmailTrade, ...]:
     """从一段正文解析出全部成交。
 
     正文被 ``Symbol:`` 分成若干块（第一段是前言），**每块对应一个证券**；一个块内的
@@ -814,10 +1317,12 @@ def parse_econfirm_body(message_id: str, body: str) -> tuple[EmailTrade, ...]:
 
     @param message_id: 消息 ID，用于错误定位。
     @param body: 正文文本。
+    @param existing_option_sales: 同一账户的既有期权卖出快照，仅用于 Sale/Cash。
+    @param _bridge_context: 仅由同封 MIME 候选重试传入的已严格验证成交快照。
     @returns 成交序列。
+    @raises UnresolvedCashOptionSaleError: Sale/Cash 无法唯一匹配既有成交。
     @raises IngestError: 没有交易块、字段缺失，或动作无法映射。
     """
-    from ..ledger.errors import IngestError
     from ..ledger.parsers import parse_option_symbol
 
     parts = SYMBOL_SPLIT_PATTERN.split(body)
@@ -841,11 +1346,21 @@ def parse_econfirm_body(message_id: str, body: str) -> tuple[EmailTrade, ...]:
         trade_date = parse_trade_date(field(block, "Trade Date", where), where)
 
         option = parse_option_symbol(symbol)
-        # 期权看「买卖 + 保证金/做空」，正股只看买卖方向。
+        # 只对未知的期权 Sale/Cash 暂用明确的卖出现金方向完成勾稽；之后必须关联
+        # 既有事实，不能把该临时动作写入返回值或扩大全局动作映射。
+        unresolved_cash_sale = (
+            option is not None
+            and reported_action == "Sale"
+            and position_type == "Cash"
+        )
         action = (
-            STOCK_ACTIONS.get(reported_action)
-            if option is None
-            else OPTION_ACTIONS.get(f"{reported_action}|{position_type}")
+            "Sell"
+            if unresolved_cash_sale
+            else (
+                STOCK_ACTIONS.get(reported_action)
+                if option is None
+                else OPTION_ACTIONS.get(f"{reported_action}|{position_type}")
+            )
         )
         if action is None:
             raise IngestError(
@@ -856,15 +1371,70 @@ def parse_econfirm_body(message_id: str, body: str) -> tuple[EmailTrade, ...]:
         marker = TOTAL_AMOUNT_MARKER.search(block)
         if marker is None:
             raise IngestError(f"{where}: 缺少成交金额表")
+        # 列宽本身有歧义，只有正文在 Total Amount 前明确声明该列时才启用五列解析。
+        has_charge_interest_column = _has_charge_interest_column(block, marker.start())
         values = tuple(
             line.strip()
             for line in block[marker.end():].replace("\r", "").split("\n")
             if line.strip()
         )
-        trades.extend(parse_value_rows(
+        parsed_trades = parse_value_rows(
             values=values, where=where, trade_date=trade_date, action=action,
             symbol=symbol,
             description=normalize_description(symbol, security_description),
             multiplier=1 if option is None else 100,
-        ))
+            has_charge_interest_column=has_charge_interest_column,
+        )
+        if unresolved_cash_sale:
+            assert option is not None
+            for trade in parsed_trades:
+                try:
+                    strict_match = _resolve_existing_cash_option_sale(
+                        trade, option, existing_option_sales, where,
+                    )
+                except UnresolvedCashOptionSaleError as error:
+                    if (
+                        _bridge_context is None
+                        or error.reason != "no_match"
+                    ):
+                        raise
+                    trades.append(
+                        _bridge_context.reconcile(
+                            trade, option, strict_match=None, where=where,
+                        )
+                    )
+                else:
+                    if _bridge_context is None:
+                        trades.append(strict_match)
+                    else:
+                        trades.append(
+                            _bridge_context.reconcile(
+                                trade,
+                                option,
+                                strict_match=strict_match,
+                                where=where,
+                            )
+                        )
+        else:
+            trades.extend(parsed_trades)
     return tuple(trades)
+
+
+def _has_charge_interest_column(block: str, marker_start: int) -> bool:
+    """判断 Total Amount 前是否明确声明五列逐腿格式。
+
+    @param block: 完整交易块文本。
+    @param marker_start: ``Total Amount`` 匹配的起始位置。
+    @returns 表头以 Quantity、Price、Principal、Charge and/or Interest 顺序结束时为真。
+    """
+    header_lines = [
+        line.strip()
+        for line in block[:marker_start].replace("\r", "").split("\n")
+        if line.strip()
+    ]
+    expected = tuple(
+        label.casefold()
+        for label in ("Quantity", "Price", "Principal", "Charge and/or Interest")
+    )
+    actual = tuple(line.casefold() for line in header_lines[-len(expected):])
+    return actual == expected

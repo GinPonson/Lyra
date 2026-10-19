@@ -29,8 +29,11 @@ from lyra.infrastructure.db.gmail_connection_repository import (
     load_gmail_account_mapping,
     load_gmail_account_mappings,
     load_gmail_connection,
+    load_gmail_connection_by_subject,
     load_gmail_connections,
+    PersistedGmailAccountMappingRecord,
     save_gmail_connection_row,
+    upsert_gmail_connection_row,
     update_gmail_account_mapping_row,
 )
 from lyra.infrastructure.gmail.connection_credential import (
@@ -44,6 +47,7 @@ LATER = datetime(2026, 10, 13, 9, 0, 0, tzinfo=UTC)
 # 固定的用户 UUID：库本身是每个测试新建的，固定值让断言可以直接引用而不必到处取。
 USER_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+DEVICE_A = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 
 @pytest.fixture()
@@ -83,6 +87,37 @@ def _account_ids(database, user_id: str) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def _create_device(database, user_id: str, *, status: str = "active") -> str:
+    """为 OAuth upsert 测试建立一条归属明确的设备会话。"""
+    identity_id = str(uuid.uuid4())
+    device_id = DEVICE_A if user_id == USER_A else str(uuid.uuid4())
+    database.connection.execute(
+        """
+        INSERT INTO user_identities (id, user_id, provider, subject)
+        VALUES (CAST(? AS UUID), CAST(? AS UUID), 'github', ?)
+        """,
+        [identity_id, user_id, f"repo-test-{user_id[-1]}"],
+    )
+    database.connection.execute(
+        """
+        INSERT INTO paired_devices (
+            id, user_id, identity_id, display_name, public_key_pem,
+            public_key_fingerprint, key_algorithm, status, paired_at, updated_at,
+            revoked_at
+        ) VALUES (
+            CAST(? AS UUID), CAST(? AS UUID), CAST(? AS UUID), 'Test device',
+            'test public key', ?, 'ed25519', ?, CAST(? AS TIMESTAMPTZ),
+            CAST(? AS TIMESTAMPTZ), CASE WHEN ? = 'revoked' THEN CAST(? AS TIMESTAMPTZ) END
+        )
+        """,
+        [
+            device_id, user_id, identity_id, "a" * 64, status,
+            NOW.isoformat(), NOW.isoformat(), status, NOW.isoformat(),
+        ],
+    )
+    return device_id
+
+
 def _record(**overrides) -> GmailConnectionRecord:
     """构造一条待插入的连接记录。"""
     base = {
@@ -96,6 +131,26 @@ def _record(**overrides) -> GmailConnectionRecord:
     }
     base.update(overrides)
     return GmailConnectionRecord(**base)  # type: ignore[arg-type]
+
+
+def _add_connection_children(
+    database, record: GmailConnectionRecord
+) -> PersistedGmailAccountMappingRecord:
+    """为连接创建所有直接外键子表行，覆盖映射和邮件元数据。"""
+    account_id = _account_ids(database, USER_A)[0]
+    mapping = create_gmail_account_mapping_row(
+        database.connection, USER_A,
+        connection_id=record.id, account_suffix="276", account_id=account_id, at=NOW,
+    )
+    database.connection.execute(
+        """
+        INSERT INTO gmail_messages (
+            connection_id, message_id, parse_status, transaction_count, history_id
+        ) VALUES (CAST(? AS UUID), 'child-message', 'discovered', 0, 'message-history')
+        """,
+        [record.id],
+    )
+    return mapping
 
 
 # --------------------------------------------------------------------------
@@ -128,6 +183,79 @@ def test_inserts_and_reads_back_a_connection(database) -> None:
 def test_unknown_connection_returns_none(database) -> None:
     """未知 ID 返回 None 而不是抛错。"""
     assert load_gmail_connection(database.connection, USER_A, str(uuid.uuid4())) is None
+
+
+def test_reauthorization_upsert_preserves_connection_history_mapping_and_messages(database) -> None:
+    """重授权覆盖凭据，同时保留连接 ID、游标、映射与已处理消息。"""
+    original = _record(
+        status="active", history_id="history-42",
+        last_sync_at="2026-10-11T09:00:00.000Z",
+    )
+    create_gmail_connection_row(database.connection, USER_A, original)
+    device_id = _create_device(database, USER_A)
+    account_id = _account_ids(database, USER_A)[0]
+    mapping = create_gmail_account_mapping_row(
+        database.connection, USER_A,
+        connection_id=original.id, account_suffix="276", account_id=account_id, at=NOW,
+    )
+    database.connection.execute(
+        """
+        INSERT INTO gmail_messages (
+            connection_id, message_id, content_hash, account_id, parse_status,
+            transaction_count, history_id
+        ) VALUES (CAST(? AS UUID), ?, ?, CAST(? AS UUID), 'imported', 1, ?)
+        """,
+        [original.id, "message-1", "f" * 64, account_id, "history-42"],
+    )
+    replacement = _record(
+        id=original.id, google_email="updated@example.com",
+        encrypted_refresh_token="new-encrypted-token", status="needs_resync",
+        history_id=None, last_sync_at=None, created_at="2026-10-13T09:00:00.000Z",
+        updated_at="2026-10-13T09:00:00.000Z",
+    )
+
+    saved = upsert_gmail_connection_row(
+        database.connection, USER_A, replacement, device_id=device_id
+    )
+
+    assert saved.id == original.id
+    assert saved.google_email == "updated@example.com"
+    assert saved.encrypted_refresh_token == "new-encrypted-token"
+    assert saved.status == "needs_resync"
+    assert saved.history_id == "history-42"
+    assert saved.last_sync_at == original.last_sync_at
+    assert saved.created_at == original.created_at
+    assert load_gmail_connection_by_subject(
+        database.connection, USER_A, "subject-1"
+    ).id == original.id
+    assert load_gmail_account_mapping(database.connection, USER_A, mapping.id) is not None
+    message = database.connection.execute(
+        "SELECT parse_status, history_id FROM gmail_messages WHERE connection_id = CAST(? AS UUID) AND message_id = ?",
+        [original.id, "message-1"],
+    ).fetchone()
+    assert message == ("imported", "history-42")
+
+
+def test_reauthorization_upsert_rejects_a_revoked_device(database) -> None:
+    """设备在授权等待期间被撤销，旧回调不能覆盖连接凭据。"""
+    original = _record(status="disconnected", encrypted_refresh_token=None)
+    create_gmail_connection_row(database.connection, USER_A, original)
+    device_id = _create_device(database, USER_A, status="revoked")
+    replacement = _record(
+        id=original.id, encrypted_refresh_token="new-encrypted-token",
+        status="needs_resync", updated_at="2026-10-13T09:00:00.000Z",
+    )
+
+    with pytest.raises(ApplicationError) as raised:
+        upsert_gmail_connection_row(
+            database.connection, USER_A, replacement, device_id=device_id
+        )
+
+    assert raised.value.code == "DEVICE_CREDENTIAL_INVALID"
+    current = load_gmail_connection(database.connection, USER_A, original.id)
+    assert current is not None
+    assert current.encrypted_refresh_token is None
+    assert current.status == "disconnected"
 
 
 def test_another_users_connection_is_indistinguishable_from_missing(database) -> None:
@@ -216,9 +344,10 @@ def test_the_same_google_account_is_stored_independently_per_user(database) -> N
 
 
 def test_saving_a_disconnected_connection_clears_the_token(database) -> None:
-    """断开后保存：**令牌被清空且状态为 disconnected**（满足 schema 的 CHECK）。"""
+    """存在映射和邮件子行时仍可保存断开状态并清空令牌。"""
     record = _record()
     create_gmail_connection_row(database.connection, USER_A, record)
+    mapping = _add_connection_children(database, record)
 
     from lyra.infrastructure.gmail.connection_credential import (
         disconnect_gmail_connection,
@@ -236,6 +365,39 @@ def test_saving_a_disconnected_connection_clears_the_token(database) -> None:
     assert loaded.updated_at == "2026-10-13T09:00:00.000Z"
     # 历史与作用域保留用于审计。
     assert loaded.granted_scopes == record.granted_scopes
+    assert load_gmail_account_mapping(database.connection, USER_A, mapping.id) is not None
+    assert database.connection.execute(
+        "SELECT message_id FROM gmail_messages WHERE connection_id = CAST(? AS UUID)",
+        [record.id],
+    ).fetchone() == ("child-message",)
+
+
+def test_saving_connection_state_with_child_rows_succeeds(database) -> None:
+    """同步状态与游标可在保留映射和邮件元数据时更新。"""
+    from dataclasses import replace
+
+    record = _record()
+    create_gmail_connection_row(database.connection, USER_A, record)
+    mapping = _add_connection_children(database, record)
+    updated = replace(
+        record, status="active", history_id="history-100",
+        updated_at="2026-10-13T09:00:00.000Z",
+    )
+
+    save_gmail_connection_row(
+        database.connection, USER_A, updated, expected_updated_at=record.updated_at
+    )
+
+    loaded = load_gmail_connection(database.connection, USER_A, record.id)
+    assert loaded is not None
+    assert loaded.status == "active"
+    assert loaded.history_id == "history-100"
+    assert loaded.updated_at == "2026-10-13T09:00:00.000Z"
+    assert load_gmail_account_mapping(database.connection, USER_A, mapping.id) is not None
+    assert database.connection.execute(
+        "SELECT message_id FROM gmail_messages WHERE connection_id = CAST(? AS UUID)",
+        [record.id],
+    ).fetchone() == ("child-message",)
 
 
 def test_saving_with_a_stale_timestamp_is_a_conflict(database) -> None:
@@ -247,6 +409,7 @@ def test_saving_with_a_stale_timestamp_is_a_conflict(database) -> None:
     """
     record = _record()
     create_gmail_connection_row(database.connection, USER_A, record)
+    _add_connection_children(database, record)
 
     from dataclasses import replace
 
@@ -258,6 +421,14 @@ def test_saving_with_a_stale_timestamp_is_a_conflict(database) -> None:
 
     assert raised.value.status_code == 409
     assert raised.value.retryable is True
+    loaded = load_gmail_connection(database.connection, USER_A, record.id)
+    assert loaded is not None
+    assert loaded.status == record.status
+    assert loaded.updated_at == record.updated_at
+    assert database.connection.execute(
+        "SELECT message_id FROM gmail_messages WHERE connection_id = CAST(? AS UUID)",
+        [record.id],
+    ).fetchone() == ("child-message",)
 
 
 def test_another_user_cannot_save_the_connection(database) -> None:

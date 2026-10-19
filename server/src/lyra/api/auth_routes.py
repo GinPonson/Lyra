@@ -9,7 +9,7 @@
 | ``POST /v1/devices/tokens`` | ✅ 可直接实现（刷新轮换） |
 | ``POST /v1/auth/{provider}/start`` | ✅ 需要登录服务装配 |
 | ``POST /v1/auth/{provider}/exchange`` | ✅ 同上 |
-| ``GET /v1/auth/{provider}/callback`` | ✅ 同上，返回 HTML 页面 |
+| ``GET /v1/auth/{provider}/callback`` | ✅ 同上，固定重定向回 App |
 | ``POST /v1/auth/logout`` | ✅ 需要设备会话撤销 |
 | ``GET /v1/me`` | ✅ 当前设备会话的用户对象 |
 | ``GET /v1/admin/users`` | ✅ 仅 admin |
@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from ..application.app_error import ApplicationError
 from ..application.device_pairing_service import DevicePairingService
@@ -58,7 +58,7 @@ _DEVICE_TOKEN_MESSAGE = "设备令牌刷新参数无效"
 
 # 登录发起正文必须齐备的字符串字段；顺序与 ``LoginStartInput`` 一致。
 _START_TEXT_FIELDS = ("displayName", "publicKeyPem", "codeChallenge", "codeChallengeMethod")
-# 兑换正文必须齐备的字符串字段。
+# 兑换正文必须齐备的字符串字段；邀请码仅在 OAuth 身份获批后可选提交。
 _EXCHANGE_TEXT_FIELDS = ("loginId", "codeVerifier")
 
 # 管理端用户列表的默认页大小。上限由 ``UserRepository`` 把守（越界抛 400 而不是静默截断）。
@@ -82,8 +82,7 @@ def create_auth_router() -> APIRouter:
         """
         configured = getattr(request.app.state, "login_provider_ids", frozenset())
         return {
-            # 新身份注册一律凭邀请码（见 ``UserLoginService.start``）。这是公开信息：
-            # 客户端据此决定是否显示邀请码输入框；码的值才是秘密。
+            # 新身份注册需要邀请码，但用户只在 OAuth 身份获批后提交，不据此显示首页输入框。
             "registrationRequiresInvite": True,
             "providers": [
                 {
@@ -142,7 +141,8 @@ def create_auth_router() -> APIRouter:
     async def start_login(provider: str, request: Request) -> Any:
         """发起登录。
 
-        正文为 ``{displayName, publicKeyPem, codeChallenge, codeChallengeMethod}``。
+        正文为 ``{displayName, publicKeyPem, codeChallenge, codeChallengeMethod}``；
+        邀请码在身份验证后通过 exchange 提交。
         返回登录 ID 与授权地址。
 
         **响应带 ``cache-control: no-store``**：正文含 state 与授权地址，
@@ -160,6 +160,12 @@ def create_auth_router() -> APIRouter:
                 status_code=400,
                 detail={"code": "INVALID_ARGUMENT", "message": _LOGIN_ARGUMENT_MESSAGE},
             )
+        # 首页开始登录不再接收邀请码；这样用户只需在确认 OAuth 身份后提交注册凭据。
+        if "inviteCode" in body:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": _LOGIN_ARGUMENT_MESSAGE},
+            )
         # **类型收口必须在服务层之前**：见 :func:`_required_text_fields`。
         fields = _required_text_fields(body, _START_TEXT_FIELDS)
         if fields is None:
@@ -167,19 +173,6 @@ def create_auth_router() -> APIRouter:
                 status_code=400,
                 detail={"code": "INVALID_ARGUMENT", "message": _LOGIN_ARGUMENT_MESSAGE},
             )
-
-        # **``inviteCode`` 可选，但一旦出现必须是字符串。**
-        #
-        # "类型不对"是请求错误（400），"没带码"是业务状态（新身份注册时由服务层回
-        # 403 INVITE_CODE_REQUIRED）。把两者混在一起，客户端就无法区分"我写错了"
-        # 与"我需要一个邀请码"。
-        invite_code = body.get("inviteCode")
-        if invite_code is not None and not isinstance(invite_code, str):
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "INVALID_ARGUMENT", "message": _LOGIN_ARGUMENT_MESSAGE},
-            )
-        invite_code = invite_code.strip() if isinstance(invite_code, str) else None
 
         service = request.app.state.login_service
         try:
@@ -190,7 +183,6 @@ def create_auth_router() -> APIRouter:
                     public_key_pem=fields["publicKeyPem"],
                     code_challenge=fields["codeChallenge"],
                     code_challenge_method=fields["codeChallengeMethod"],
-                    invite_code=invite_code or None,
                 ),
                 _source_key(request),
             )
@@ -211,23 +203,46 @@ def create_auth_router() -> APIRouter:
     @router.get("/v1/auth/{provider}/callback")
     def complete_login_callback(
         provider: str, request: Request,
-        state: str = Query(...),
+        state: str | None = Query(default=None),
         code: str | None = Query(default=None),
         error: str | None = Query(default=None),
     ) -> Any:
-        """浏览器回调。
+        """完成浏览器回调后，将浏览器固定带回 Lyra App。
 
-        app 与浏览器在此分离：**浏览器只完成身份验证**，Lyra 凭据始终经绑定 verifier
-        的 POST 返回 App。因此本端点返回的 HTML **不含任何令牌**。
+        app 与浏览器在此分离：**浏览器只完成身份验证**，Lyra 凭据始终由 App 携带
+        绑定的 PKCE verifier 调用 exchange 获得。回跳地址固定且不含回调参数，避免
+        将授权码、state 或用户数据带入 App 链接；成败均返回相同响应。
 
-        @returns 固定文案的 HTML 页面。
+        @param provider: 登录来源 ID。
+        @param request: 请求对象，用于调用已装配的登录服务。
+        @param state: OAuth 流程的 state；缺失或无效时也只返回固定回 App 地址。
+        @param code: 授权码；用户拒绝时可缺省。
+        @param error: OAuth 错误；成功时可缺省。
+        @returns 固定的 303 重定向响应。
         """
+        if state is None:
+            return _callback_response()
+
+        # Gmail 与 Google 身份登录共用已登记的 HTTPS 回调 URI，但授权事务相互独立。
+        # 只有 Gmail 服务端事务识别出该 state 才会在此兑换 Gmail code；否则原登录
+        # 流程保持原样，登录授权不会额外请求 Gmail scope。
+        if provider == "google":
+            gmail_service = getattr(request.app.state, "gmail_service", None)
+            if gmail_service is not None:
+                try:
+                    if gmail_service.complete_authorization_callback(
+                        state=state, authorization_code=code, error=error
+                    ):
+                        return _callback_response()
+                except ApplicationError:
+                    # 回调目标始终固定；不把事务是否存在或内部 OAuth 结果暴露给浏览器。
+                    return _callback_response()
+
         service = request.app.state.login_service
         try:
             service.complete_callback(provider, state=state, code=code, error=error)
         except ApplicationError:
-            # **无论成功失败都返回同一页面**：区分成功与失败会让未授权方凭页面内容
-            # 判断某个 state 是否存在。
+            # **无论成功失败都返回同一 Location**：不同目标会暴露 state 是否有效。
             return _callback_response()
         return _callback_response()
 
@@ -279,7 +294,8 @@ def create_auth_router() -> APIRouter:
     async def exchange_login(provider: str, request: Request) -> Any:
         """用 App verifier 领取凭据（或得知仍在处理中）。
 
-        正文为 ``{loginId, codeVerifier}``。
+        正文为 ``{loginId, codeVerifier, inviteCode?}``；新身份注册时可在 OAuth 身份
+        获批后提交邀请码。
 
         **必须带 verifier**：只有 loginId 甚至浏览器 URL 都不足以领取凭据。
         未完成时返回 202（而不是错误），客户端据此继续轮询。
@@ -303,6 +319,20 @@ def create_auth_router() -> APIRouter:
                 status_code=400,
                 detail={"code": "INVALID_ARGUMENT", "message": _LOGIN_ARGUMENT_MESSAGE},
             )
+        invite_code: str | None = None
+        if "inviteCode" in body:
+            supplied_invite = body["inviteCode"]
+            if not isinstance(supplied_invite, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "INVALID_ARGUMENT", "message": _LOGIN_ARGUMENT_MESSAGE},
+                )
+            invite_code = supplied_invite.strip()
+            if not invite_code:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "INVALID_ARGUMENT", "message": _LOGIN_ARGUMENT_MESSAGE},
+                )
 
         service = request.app.state.login_service
         try:
@@ -310,6 +340,7 @@ def create_auth_router() -> APIRouter:
                 provider,
                 login_id=fields["loginId"],
                 code_verifier=fields["codeVerifier"],
+                invite_code=invite_code,
             )
         except ApplicationError as error:
             raise HTTPException(
@@ -642,11 +673,10 @@ def _source_key(request: Request) -> str | None:
     return None if request.client is None else request.client.host
 
 
-# 回调页面的安全响应头，与参考实现逐项一致。
+# 回调重定向沿用原有安全响应头，避免改变响应形式时丢失既有防护配置。
 #
-# **这不是可选项**：该页面是返回给浏览器的 HTML，而这些头各自挡住一类真实攻击——
-# 缺 CSP 的 `frame-ancestors` 会被套框（点击劫持），缺 `nosniff` 会被 MIME 嗅探，
-# 缺 `no-store` 会让"一次性"的回调页留在浏览器缓存里。
+# **这些头继续随重定向返回**：`no-store` 防止一次性回调被缓存，`no-referrer` 避免
+# state 从浏览器导航链路泄漏；CSP 与 `nosniff` 保持回调响应的防护基线。
 _CALLBACK_HEADERS = {
     "cache-control": "no-store",
     "pragma": "no-cache",
@@ -657,26 +687,20 @@ _CALLBACK_HEADERS = {
     "x-content-type-options": "nosniff",
 }
 
+_CALLBACK_APP_URI = "com.lyrafinance.lyra://auth/callback"
 
-def _callback_response() -> HTMLResponse:
-    """构造回调页面的响应（含全套安全头）。
 
-    @returns 带安全头的 HTML 响应。
+def _callback_response() -> RedirectResponse:
+    """构造固定回 App 的 303 响应（含全套安全头）。
+
+    URI 不接受请求参数，也不携带 OAuth 结果；App 之后通过 PKCE exchange 查询结果。
+
+    @returns 带安全头且 Location 固定的重定向响应。
     """
-    return HTMLResponse(_callback_page(), headers=_CALLBACK_HEADERS)
-
-
-def _callback_page() -> str:
-    """回调页面的固定文案。
-
-    **不区分成功与失败**：区分会让未授权方凭页面内容判断某个 state 是否存在。
-    真正的结果由 App 通过轮询获得。
-    """
-    return (
-        "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
-        "<title>Lyra</title></head><body>"
-        "<p>已完成浏览器验证，请返回 Lyra App 继续。</p>"
-        "</body></html>"
+    return RedirectResponse(
+        _CALLBACK_APP_URI,
+        status_code=303,
+        headers=_CALLBACK_HEADERS,
     )
 
 
@@ -755,7 +779,6 @@ async def _revoke_user_sessions(request: Request, user_id: str) -> None:
 def build_login_service(
     environment: Any,
     device_authorizer: Any,
-    invites: InviteCodeRepository,
 ) -> UserLoginService:
     """按环境装配登录服务。
 
@@ -767,14 +790,12 @@ def build_login_service(
 
     @param environment: 环境变量映射。
     @param device_authorizer: 兑换成功后的用户解析与设备签发用例。
-    @param invites: 邀请码仓储；``/start`` 用它提前校验，注册时的核销由签发用例完成。
     @returns 登录服务。
     """
     providers = load_login_providers(environment)
     return UserLoginService(
         providers,
         device_authorizer,
-        invites,
         now=lambda: datetime.now(UTC),
     )
 

@@ -2,8 +2,7 @@
 
 两处"必须停下来问用户"的设计：
 
-1. **首次扫描与重扫都需要用户确认起始日期**——让代码自己挑一个日期就是在替用户
-   决定他要导入多久的历史；
+1. **首次扫描与重扫需要用户选择全部邮件或起始日期**——与 CSV 独立；
 2. **增量响应被截断时判为需要重扫**——照常推进游标会**静默漏掉**中间的消息。
 """
 
@@ -53,11 +52,7 @@ def test_active_without_a_cursor_requires_a_rescan_range() -> None:
 
 @pytest.mark.parametrize("status", ["pending_initial_scan", "needs_resync"])
 def test_first_scan_and_rescan_require_user_confirmation(status: str) -> None:
-    """**首次扫描与重扫必须由用户确认起始日期。**
-
-    让代码自己挑一个日期就是在替用户决定他要导入多久的历史——而一次全量扫描可能
-    跨越数年、上万封邮件。
-    """
+    """缺少明确范围时不默认全量，也不从已有 CSV 代选日期。"""
     with pytest.raises(GmailSyncError) as raised:
         plan_gmail_sync(_state(status, history_id=None))
 
@@ -73,6 +68,23 @@ def test_confirmed_range_yields_a_bounded_rescan(status: str) -> None:
 
     assert request.mode == "bounded_rescan"
     assert request.after_date == "2026-01-05"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("status", ["pending_initial_scan", "needs_resync", "active"])
+def test_explicit_all_mail_is_independent_of_any_csv_dates(status: str) -> None:
+    """显式选择全量时不注入任何日期下界，仍使用有界消息读取。"""
+    request = plan_gmail_sync(_state(status), scan_all=True)
+    assert request.mode == "bounded_rescan"
+    assert request.after_date is None  # type: ignore[union-attr]
+
+
+def test_all_mail_and_custom_date_are_mutually_exclusive() -> None:
+    """拒绝含义冲突的范围，不能悄悄取其中一个。"""
+    with pytest.raises(ValueError):
+        plan_gmail_sync(
+            _state("pending_initial_scan"), scan_all=True,
+            confirmed_rescan_after_date="2026-01-05",
+        )
 
 
 def test_disconnected_connection_reports_auth_revoked() -> None:

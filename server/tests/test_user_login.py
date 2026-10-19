@@ -109,17 +109,6 @@ def _provider(identity: LoginIdentity | None = None, *, fail: bool = False):
     return ConfiguredLoginProvider(id="github", name="GitHub", client=client)
 
 
-class _FakeInvites:
-    """邀请码仓储的替身：本文件测的是登录事务本身，不是注册门禁。
-
-    默认所有码都"可用"；``start`` 只做一次 ``is_active`` 预检，真正的核销发生在
-    设备签发用例里（那一层由集成测试覆盖）。
-    """
-
-    def is_active(self, code_hash: str) -> bool:
-        return True
-
-
 def _service(*, now: datetime = NOW, **provider_kwargs: Any) -> UserLoginService:
     """构造只带 GitHub 来源的服务，并注入固定时钟与设备签发记录器。"""
     issued: list[dict[str, Any]] = []
@@ -138,7 +127,7 @@ def _service(*, now: datetime = NOW, **provider_kwargs: Any) -> UserLoginService
         }
 
     service = UserLoginService(
-        [_provider(**provider_kwargs)], authorize, _FakeInvites(), now=lambda: _service.clock
+        [_provider(**provider_kwargs)], authorize, now=lambda: _service.clock
     )
     service.issued = issued  # type: ignore[attr-defined]
     _service.clock = now  # type: ignore[attr-defined]
@@ -414,8 +403,40 @@ def test_exchange_requires_app_verifier() -> None:
     service.complete_callback("github", state=state, code="c")
 
     with pytest.raises(ApplicationError) as raised:
-        _exchange(service, "github", login_id=login_id, code_verifier="w" * 43)
+        _exchange(
+            service,
+            "github",
+            login_id=login_id,
+            code_verifier="w" * 43,
+            invite_code="some-invite",
+        )
     assert raised.value.code == "LOGIN_FAILED"
+    assert service.issued == []  # type: ignore[attr-defined]
+
+
+def test_exchange_rejects_the_wrong_provider_before_invite_authorization() -> None:
+    """同一事务使用错误来源兑换时不触发设备或邀请码门禁。"""
+    service, login_id, state = _started()
+    service._providers["linuxdo"] = ConfiguredLoginProvider(
+        id="linuxdo",
+        name="LINUX DO",
+        client=FakeProviderClient(
+            LoginIdentity("linuxdo", "other-provider", None, "other")
+        ),
+    )
+    service.complete_callback("github", state=state, code="c")
+
+    with pytest.raises(ApplicationError) as raised:
+        _exchange(
+            service,
+            "linuxdo",
+            login_id=login_id,
+            code_verifier="v" * 43,
+            invite_code="some-invite",
+        )
+
+    assert raised.value.code == "LOGIN_FAILED"
+    assert service.issued == []  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize("verifier", ["short", "x" * 42, "x" * 129, "bad chars here"])

@@ -436,8 +436,13 @@ def handle_market_positions(
 def _instrument_for(position: Any) -> Any:
     """把持仓行转成行情合约；无法翻译时返回 ``None``。
 
+    DuckDB 的期权行权价列固定为四位小数；这里仅移除 Decimal 的无意义尾零，保留
+    OCC 千分之一美元的完整精度。此格式化不量化也不舍入，因此真实存在的第四位小数
+    仍会由供应商标识校验拒绝。
+
     @returns 股票或期权合约；不支持的身份返回 ``None``。
     """
+    from ..domain.numeric import fixed_point_text
     from ..domain.market_data.types import OptionInstrument, StockInstrument
 
     if position.asset_type == "stock":
@@ -458,7 +463,7 @@ def _instrument_for(position: Any) -> Any:
         return None
     return OptionInstrument(
         underlying=position.underlying, expiry=position.expiry,
-        strike=str(position.strike), option_type=position.option_type,
+        strike=fixed_point_text(position.strike), option_type=position.option_type,
     )
 
 

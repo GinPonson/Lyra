@@ -20,7 +20,6 @@ from .api.gmail_routes import create_gmail_router
 from .api.health import create_health_router
 from .application.agent_availability import create_agent_availability_snapshot
 from .application.write_coordinator import WriteCoordinator
-from .infrastructure.db.invite_code_repository import InviteCodeRepository
 from .infrastructure.db.gmail_connection_repository import (
     count_gmail_connections_needing_attention,
 )
@@ -156,8 +155,6 @@ def create_app(settings: Settings, database: LyraDatabase) -> FastAPI:
             write_coordinator=app.state.write_coordinator,
             **kwargs,
         ),
-        # ``/start`` 的提前校验与注册时的核销共用同一个仓储。
-        InviteCodeRepository(database.connection),
     )
     # ``_providers`` 是 ``dict[provider_id, ConfiguredLoginProvider]``，因此**迭代它得到的是
     # 字符串 key**。原先写成 ``provider.id for provider in ...`` 会对字符串取 ``.id`` 抛
@@ -249,6 +246,9 @@ def run() -> None:
             host=settings.lyra_host,
             port=settings.lyra_port,
             log_level="info",
+            # OAuth 回调 URL 含一次性 code/state；Uvicorn 默认访问日志会打印完整查询串。
+            # 保留运行期日志，关闭会泄漏授权参数的通用 HTTP 访问日志。
+            access_log=False,
         )
     finally:
         database.close()

@@ -19,7 +19,9 @@ message id 会被拼进 API 路径（``/messages/{id}``）。不校验字符集�
 
 from __future__ import annotations
 
+import random
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +30,7 @@ from ...domain.gmail.econfirm import (
     is_schwab_sender,
 )
 from ...domain.gmail.sync_plan import GmailSyncError
+from .base64url import decode_base64url
 
 GMAIL_MESSAGES_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 GMAIL_HISTORY_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/history"
@@ -37,6 +40,12 @@ GMAIL_PROFILE_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/profile
 GMAIL_MAX_PAGE_SIZE = 500
 
 GMAIL_REQUEST_TIMEOUT_MILLISECONDS = 15_000
+
+# messages.get(format=full) 配额消耗较高。只对明确的短期速率限制做有限退避；
+# 日配额、权限和配置错误不能靠快速重试恢复。
+GMAIL_RATE_LIMIT_MAX_RETRIES = 6
+GMAIL_RATE_LIMIT_BASE_DELAY_SECONDS = 1
+GMAIL_RATE_LIMIT_JITTER_SECONDS = 0.25
 
 GMAIL_TEXT_MIME_TYPES: tuple[str, ...] = ("text/plain", "text/html")
 
@@ -222,7 +231,7 @@ def fetch_bounded_gmail_message_ids(
 
     @param access_token: Google 临时令牌。
     @param plan: 有界查询计划（``query`` / ``maximum_messages``）。
-    @param get_json: ``(url, headers, timeout_seconds) -> dict``。
+    @param get_json: ``(url, headers, timeout_seconds) -> (status, payload)``。
     @returns 消息 ID 与是否被截断。
     @raises ValueError: 上限不是正整数或令牌为空。
     @raises GmailSyncError: 响应结构不符或触发守卫。
@@ -250,13 +259,11 @@ def fetch_bounded_gmail_message_ids(
         }
         if page_token is not None:
             params["pageToken"] = page_token
-        page = get_json(
+        page = request_gmail_json(
             f"{GMAIL_MESSAGES_ENDPOINT}?{_urlencode(params)}",
-            {"authorization": f"Bearer {token}"},
-            GMAIL_REQUEST_TIMEOUT_MILLISECONDS / 1000,
+            token,
+            get_json=get_json,
         )
-        if not isinstance(page, dict):
-            raise _invalid_response("messages.list 响应无效")
         page_ids = parse_message_ids(page.get("messages"))
         for message_id in page_ids:
             if message_id in seen_ids:
@@ -347,7 +354,7 @@ def fetch_incremental_gmail_message_ids(
     @param access_token: Google 临时令牌。
     @param start_history_id: 上次同步完成时的游标。
     @param maximum_messages: 本次最多处理的消息数。
-    @param get_json: ``(url, headers, timeout_seconds) -> dict``。
+    @param get_json: ``(url, headers, timeout_seconds) -> (status, payload)``。
     @returns 消息 ID、观察到的游标与是否被截断。
     @raises ValueError: 上限或游标非法。
     @raises GmailSyncError: 响应结构不符或触发守卫。
@@ -384,13 +391,12 @@ def fetch_incremental_gmail_message_ids(
         }
         if page_token is not None:
             params["pageToken"] = page_token
-        page = get_json(
+        page = request_gmail_json(
             f"{GMAIL_HISTORY_ENDPOINT}?{_urlencode(params)}",
-            {"authorization": f"Bearer {token}"},
-            GMAIL_REQUEST_TIMEOUT_MILLISECONDS / 1000,
+            token,
+            get_json=get_json,
+            history_404_means_expired=True,
         )
-        if not isinstance(page, dict):
-            raise _invalid_response("history.list 响应无效")
         # 每一页都覆盖：最终值标记"本次读到了哪个时点"。
         observed_history_id = _require_history_id(page.get("historyId"))
 
@@ -428,17 +434,84 @@ def fetch_incremental_gmail_message_ids(
     )
 
 
-def gmail_http_error(status: int) -> GmailSyncError:
-    """把 Gmail 的 HTTP 状态映射为同步错误。
+def _google_error_reasons(payload: Any) -> set[str]:
+    """从 Google 错误响应中提取稳定 reason，不保留供应商正文。
 
-    **401 / 403 表示授权已失效**：Gmail 用 403 表达"令牌有效但缺少该资源的权限"，
-    与 401 一样需要用户重新授权——当成暂时性故障会无限重试。
+    @param payload: Google 错误响应负载。
+    @returns 有界提取出的 reason 集合；负载结构不符时为空集合。
+    """
+    reasons: set[str] = set()
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        error = payload["error"]
+        for field in ("errors", "details"):
+            items = error.get(field)
+            if isinstance(items, list):
+                for item in items[:50]:
+                    if isinstance(item, dict) and isinstance(item.get("reason"), str):
+                        reasons.add(item["reason"])
+    return reasons
+
+
+def _is_retryable_rate_limit(status: int, payload: Any) -> bool:
+    """判断错误是否为可短暂恢复的 per-user Gmail 速率限制。
+
+    HTTP 429 按临时限流处理；403 仅在 reason 明确为 rateLimitExceeded 或
+    userRateLimitExceeded 时重试。日限额与配额错误优先视为不可通过短暂等待恢复。
 
     @param status: HTTP 状态码。
-    @returns 同步错误。
+    @param payload: Google 错误响应负载。
+    @returns 是否进入有限指数退避。
     """
-    if status in (401, 403):
+    reasons = _google_error_reasons(payload)
+    if reasons & {
+        "dailyLimitExceeded", "quotaExceeded", "insufficientPermissions",
+        "SERVICE_DISABLED", "accessNotConfigured", "domainPolicy",
+    }:
+        return False
+    if status == 429:
+        return True
+    if status != 403:
+        return False
+    return bool(reasons & {"rateLimitExceeded", "userRateLimitExceeded"})
+
+
+def gmail_http_error(status: int, payload: Any = None) -> GmailSyncError:
+    """仅按状态码与 Google 稳定原因区分授权、配置、配额及访问限制。
+
+    明确的 per-user 速率限制可重试；``dailyLimitExceeded`` 与 ``quotaExceeded``
+    仍返回同一错误码，但不重试，也不推断配额周期。
+
+    @param status: HTTP 状态码。
+    @param payload: Google 错误对象，仅检查稳定 reason；原始正文绝不向上返回。
+    @returns 带安全说明的同步错误，不将所有 403 误报成授权失效。
+    """
+    reasons = _google_error_reasons(payload)
+    if reasons & {"SERVICE_DISABLED", "accessNotConfigured"}:
+        return GmailSyncError(
+            "GMAIL_API_DISABLED", "Google Cloud 项目尚未启用 Gmail API，请启用后重试"
+        )
+    if status == 401 or "insufficientPermissions" in reasons:
         return GmailSyncError("GMAIL_AUTH_REVOKED", "Gmail 授权已失效，需要重新授权")
+    if reasons & {"dailyLimitExceeded", "quotaExceeded"}:
+        return GmailSyncError(
+            "GMAIL_RATE_LIMITED",
+            "Gmail 配额已用尽，请检查 Google Cloud 项目配额后重试",
+            retryable=False,
+        )
+    if "domainPolicy" in reasons:
+        return GmailSyncError(
+            "GMAIL_ACCESS_DENIED", "Google 拒绝访问 Gmail，请检查邮箱权限或管理员策略"
+        )
+    if status == 429 or (status == 403 and reasons & {
+        "rateLimitExceeded", "userRateLimitExceeded",
+    }):
+        return GmailSyncError(
+            "GMAIL_RATE_LIMITED", "Gmail 请求达到限额，请稍后再试", retryable=True
+        )
+    if status == 403 or "domainPolicy" in reasons:
+        return GmailSyncError(
+            "GMAIL_ACCESS_DENIED", "Google 拒绝访问 Gmail，请检查邮箱权限或管理员策略"
+        )
     return GmailSyncError(
         "GMAIL_CONNECTION_ERROR", "Gmail 请求失败，请稍后重试",
         retryable=status == 429 or status >= 500,
@@ -458,37 +531,56 @@ def request_gmail_json(
     当成一般的连接错误，会让客户端拿着一个**永久失效的游标**反复重试，而正确的动作是
     让用户确认重扫范围。
 
+    只有 HTTP 429 和明确的 per-user 速率限制做最多六次有界退避；日配额、授权、配置、
+    访问拒绝、格式错误与传输异常不进入此重试循环。
+
     @param url: 完整地址。
     @param access_token: Google 临时令牌。
     @param get_json: ``(url, headers, timeout_seconds) -> (status, payload)``。
     @param history_404_means_expired: 该请求是否为 ``history.list``。
     @returns 响应对象。
-    @raises GmailSyncError: 鉴权失效、游标过期、临时故障或响应结构不符。
+    @raises GmailSyncError: 鉴权失效、游标过期、限流耗尽、临时故障或响应结构不符。
     """
     token = access_token.strip()
     if token == "":
         raise ValueError("Google access token不能为空")
-    try:
-        status, payload = get_json(
-            url, {"authorization": f"Bearer {token}"},
-            GMAIL_REQUEST_TIMEOUT_MILLISECONDS / 1000,
-        )
-    except Exception as error:
-        raise GmailSyncError(
-            "GMAIL_CONNECTION_ERROR", "无法连接 Gmail，请稍后重试", retryable=True
-        ) from error
+    for retry_number in range(GMAIL_RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            status, payload = get_json(
+                url, {"authorization": f"Bearer {token}"},
+                GMAIL_REQUEST_TIMEOUT_MILLISECONDS / 1000,
+            )
+        except Exception as error:
+            raise GmailSyncError(
+                "GMAIL_CONNECTION_ERROR", "无法连接 Gmail，请稍后重试", retryable=True
+            ) from error
 
-    if not 200 <= status < 300:
+        if 200 <= status < 300:
+            if not isinstance(payload, dict):
+                raise _invalid_response("Gmail JSON 根节点不是对象")
+            return payload
+
         if history_404_means_expired and status == 404:
-            # 游标太旧，Google 已经清理了那段历史。
+            # 游标太旧，Google 已经清理了那段历史；不要误当成限流去等待。
             raise GmailSyncError(
                 "GMAIL_HISTORY_EXPIRED", "Gmail 增量游标已过期，必须确认重扫范围"
             )
-        raise gmail_http_error(status)
 
-    if not isinstance(payload, dict):
-        raise _invalid_response("Gmail JSON 根节点不是对象")
-    return payload
+        error = gmail_http_error(status, payload)
+        if error.code != "GMAIL_RATE_LIMITED" or not _is_retryable_rate_limit(
+            status, payload
+        ):
+            raise error
+        if retry_number == GMAIL_RATE_LIMIT_MAX_RETRIES:
+            # 第七次响应仍是临时限流时，保留安全错误分类并交由上层处理。
+            raise error
+
+        base_delay = GMAIL_RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** retry_number)
+        jitter = random.uniform(0, GMAIL_RATE_LIMIT_JITTER_SECONDS)
+        # 只在明确临时限流时等待，且在下一次只读 GET 前退避。
+        time.sleep(base_delay + jitter)
+
+    raise AssertionError("Gmail 限流重试循环应在返回或抛错时结束")  # pragma: no cover
 
 
 def hydrate_gmail_text_attachments(
@@ -563,18 +655,21 @@ def require_attachment_id(value: Any) -> str:
 
 
 def require_base64url_data(value: Any) -> str:
-    """校验 base64url 正文数据。
+    """校验 Gmail 附件的规范 Base64URL 数据并原样返回。
 
-    **长度 ≡ 1 (mod 4) 的 base64 不可能存在**（每 4 个字符编码 3 字节），因此直接
-    拒绝，而不是把畸形数据交给下游解码器去猜。
+    Gmail 可返回带 ``=`` 填充或无填充编码；两者都须符合严格字符集、填充和 pad bits
+    规范，避免把畸形供应商响应交给正文解析器猜测。
+
+    @param value: Gmail attachment.data 中的 Base64URL 字符串。
+    @returns 验证通过的原字符串，供 MIME 层解码。
+    @raises GmailSyncError: 数据为空或不是规范 Base64URL。
     """
-    if (
-        not isinstance(value, str)
-        or value == ""
-        or not _BASE64URL.fullmatch(value)
-        or len(value) % 4 == 1
-    ):
+    if not isinstance(value, str) or value == "":
         raise _invalid_response("Gmail text attachment data 无效")
+    try:
+        decode_base64url(value)
+    except ValueError as error:
+        raise _invalid_response("Gmail text attachment data 无效") from error
     return value
 
 
@@ -591,9 +686,6 @@ def _raise_part_not_object() -> dict:
 
 
 _ATTACHMENT_ID = re.compile(r"^[A-Za-z0-9_-]{1,2048}$")
-_BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
-
-
 def fetch_full_gmail_records(
     message_ids: tuple[str, ...], access_token: str, *, get_json: Any
 ) -> tuple[dict, ...]:

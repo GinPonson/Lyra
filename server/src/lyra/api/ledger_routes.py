@@ -89,6 +89,19 @@ def create_ledger_router() -> APIRouter:
             detail={"code": "INVALID_CURSOR", "message": str(error)},
         )
 
+    def _invalid_query_filter(error: ValueError) -> HTTPException:
+        """把领域查询筛选校验错误翻译成客户端参数错误。
+
+        日期范围与页长仍由领域查询校验；路由只把该结果映射为稳定的 HTTP 契约。
+
+        @param error: 领域查询抛出的筛选校验错误。
+        @returns 状态码为 400、错误码为 ``INVALID_ARGUMENT`` 的 HTTP 异常。
+        """
+        return HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_ARGUMENT", "message": str(error)},
+        )
+
     def _user_id(request: Request) -> str:
         """取出当前请求的用户 UUID。
 
@@ -326,21 +339,48 @@ def create_ledger_router() -> APIRouter:
     def read_trades(
         request: Request,
         scope: str | None = Query(default=None),
+        symbol: str | None = Query(default=None),
+        action: str | None = Query(default=None),
+        from_date: str | None = Query(default=None, alias="fromDate"),
+        to_date: str | None = Query(default=None, alias="toDate"),
+        limit: int | None = Query(default=None),
         cursor: str | None = Query(default=None),
     ) -> Any:
         """交易流水；公开字段不含哈希与来源引用。
 
-        ``cursor`` 是上一次响应里的 ``nextCursor`` 原样回传。**无效游标报 400 而不是
-        回退到第一页**——回退会让客户端把"游标坏了"当成"数据到头了"。
+        ``symbol``、``action`` 与 ``fromDate`` / ``toDate`` 限定领域查询结果；
+        ``limit`` 控制页长。``cursor`` 必须原样回传，并由领域查询校验它仍属于同一组
+        账户范围与筛选条件。**无效游标报 400 而不是回退到第一页**——回退会让客户端
+        把"游标坏了"当成"数据到头了"。
+
+        @param request: 当前认证请求。
+        @param scope: 必填账户范围。
+        @param symbol: 可选标的筛选。
+        @param action: 可选交易动作筛选。
+        @param from_date: 可选起始日期，对外字段名为 ``fromDate``。
+        @param to_date: 可选结束日期，对外字段名为 ``toDate``。
+        @param limit: 可选页长，由领域查询校验范围。
+        @param cursor: 上一页返回的不透明定位游标。
+        @returns 包含筛选后交易页的公开响应。
+        @raises HTTPException: 筛选非法或游标无效时返回 400。
         """
         snapshot, resolved = _resolved(request, scope)
         try:
             result = query_trades(
                 snapshot.transactions, resolved,
-                TradeQueryFilters(cursor=cursor),
+                TradeQueryFilters(
+                    symbol=symbol,
+                    action=action,
+                    from_date=from_date,
+                    to_date=to_date,
+                    limit=limit,
+                    cursor=cursor,
+                ),
             )
         except IngestError as error:
             raise _invalid_cursor(error) from error
+        except ValueError as error:
+            raise _invalid_query_filter(error) from error
         return _envelope(request, scope, project_trade_query(
             result,
             account_id_map(snapshot.accounts),
@@ -351,17 +391,42 @@ def create_ledger_router() -> APIRouter:
     def read_realized(
         request: Request,
         scope: str | None = Query(default=None),
+        symbol: str | None = Query(default=None),
+        from_date: str | None = Query(default=None, alias="fromDate"),
+        to_date: str | None = Query(default=None, alias="toDate"),
+        limit: int | None = Query(default=None),
         cursor: str | None = Query(default=None),
     ) -> Any:
-        """已实现明细；隐藏开平仓交易哈希。"""
+        """已实现明细；按标的与平仓日期筛选，隐藏开平仓交易哈希。
+
+        @param request: 当前认证请求。
+        @param scope: 必填账户范围。
+        @param symbol: 可选标的筛选。
+        @param from_date: 可选起始平仓日期，对外字段名为 ``fromDate``。
+        @param to_date: 可选结束平仓日期，对外字段名为 ``toDate``。
+        @param limit: 可选页长，由领域查询校验范围。
+        @param cursor: 上一页返回的不透明定位游标。
+        @returns 包含筛选后已实现明细与全量合计的公开响应。
+        @raises HTTPException: 筛选非法或游标无效时返回 400。
+        """
         snapshot, resolved = _resolved(request, scope)
         fifo = replay_fifo(snapshot.transactions)
         try:
             result = query_realized(
-                fifo.realized_records, resolved, RealizedQueryFilters(cursor=cursor)
+                fifo.realized_records,
+                resolved,
+                RealizedQueryFilters(
+                    symbol=symbol,
+                    from_date=from_date,
+                    to_date=to_date,
+                    limit=limit,
+                    cursor=cursor,
+                ),
             )
         except IngestError as error:
             raise _invalid_cursor(error) from error
+        except ValueError as error:
+            raise _invalid_query_filter(error) from error
         return _envelope(request, scope, project_realized_query(
             result,
             account_id_map(snapshot.accounts),
@@ -371,16 +436,38 @@ def create_ledger_router() -> APIRouter:
     def read_cashflow(
         request: Request,
         scope: str | None = Query(default=None),
+        from_date: str | None = Query(default=None, alias="fromDate"),
+        to_date: str | None = Query(default=None, alias="toDate"),
+        limit: int | None = Query(default=None),
         cursor: str | None = Query(default=None),
     ) -> Any:
-        """现金流水；附分动作合计。"""
+        """按交易日期查询现金流水；附分动作合计。
+
+        @param request: 当前认证请求。
+        @param scope: 必填账户范围。
+        @param from_date: 可选起始交易日期，对外字段名为 ``fromDate``。
+        @param to_date: 可选结束交易日期，对外字段名为 ``toDate``。
+        @param limit: 可选页长，由领域查询校验范围。
+        @param cursor: 上一页返回的不透明定位游标。
+        @returns 包含筛选后现金流水与全量合计的公开响应。
+        @raises HTTPException: 筛选非法或游标无效时返回 400。
+        """
         snapshot, resolved = _resolved(request, scope)
         try:
             result = query_cashflow(
-                snapshot.transactions, resolved, CashflowQueryFilters(cursor=cursor)
+                snapshot.transactions,
+                resolved,
+                CashflowQueryFilters(
+                    from_date=from_date,
+                    to_date=to_date,
+                    limit=limit,
+                    cursor=cursor,
+                ),
             )
         except IngestError as error:
             raise _invalid_cursor(error) from error
+        except ValueError as error:
+            raise _invalid_query_filter(error) from error
         return _envelope(request, scope, project_cashflow_query(
             result,
             account_id_map(snapshot.accounts),

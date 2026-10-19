@@ -1,7 +1,7 @@
 """Gmail 路由测试。
 
-三处**在路由层**完成的格式校验早于任何业务逻辑：``state`` 形状、UUID 形状、
-``YYYY-MM-DD``。放在这一层的价值是**错误信息能指明是哪一段**，而不是让下游抛一个
+三处**在路由层**完成的格式校验早于任何业务逻辑：UUID 形状、``YYYY-MM-DD`` 日期和
+``scanAll`` 布尔值。放在这一层的价值是**错误信息能指明是哪一段**，而不是让下游抛一个
 笼统的"参数无效"。
 
 多用户下还固定两条：
@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -38,11 +40,11 @@ IDENTITY = LoginIdentity(provider="github", subject="12345", email=None, display
 CONNECTION_ID = "11111111-1111-1111-1111-111111111111"
 MAPPING_ID = "22222222-2222-2222-2222-222222222222"
 ACCOUNT_ID = "33333333-3333-3333-3333-333333333333"
-STATE = "A" * 43
+AUTHORIZATION_ID = "44444444-4444-4444-4444-444444444444"
 
 GMAIL_ROUTE_PATHS = [
     ("post", "/v1/google/authorization-transactions"),
-    ("post", f"/v1/google/authorization-transactions/{STATE}/complete"),
+    ("get", f"/v1/google/authorization-transactions/{AUTHORIZATION_ID}"),
     ("get", "/v1/google/connections"),
     ("get", f"/v1/google/connections/{CONNECTION_ID}/mappings"),
     ("put", f"/v1/google/connections/{CONNECTION_ID}/mappings/{MAPPING_ID}"),
@@ -76,6 +78,11 @@ class FakeGmailService:
         self.scoped_user_ids: list[str] = []
         self._overrides = overrides
 
+    @property
+    def configured(self) -> bool:
+        """桩服务默认表示 OAuth 已配置。"""
+        return self._overrides.get("configured", True)
+
     def for_user(self, user_id: str) -> _FakeGmailUserView:
         """返回用户绑定视图。"""
         self.scoped_user_ids.append(user_id)
@@ -88,6 +95,8 @@ class FakeGmailService:
             self.calls.append((name, kwargs, args))
             override = self._overrides.get(name)
             if override is None:
+                if name == "get_authorization_transaction":
+                    return {"status": "pending"}
                 return {"ok": name}
             return override(*args, **kwargs)
 
@@ -182,7 +191,7 @@ def test_the_real_service_is_wired_by_default(wired) -> None:
         response = client.get("/v1/google/connections", headers=_auth(issued))
 
     assert response.status_code == 200
-    assert response.json() == {"connections": []}
+    assert response.json() == {"configured": False, "connections": []}
 
 
 def test_the_real_service_reports_unconfigured_oauth(wired) -> None:
@@ -206,14 +215,14 @@ def test_the_real_service_reports_unconfigured_oauth(wired) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_creates_an_authorization_transaction(wired) -> None:
-    """创建事务返回 201 并绑定发起设备。"""
+def test_creates_an_authorization_transaction_without_exposing_state(wired) -> None:
+    """创建事务返回轮询合同，不向 App 暴露 state 或 verifier。"""
     application, issued = wired
     service = FakeGmailService(
         create_authorization_transaction=lambda *args, **kwargs: {
-            "state": STATE, "codeChallenge": "B" * 43,
-            "codeChallengeMethod": "S256", "authorizationUrl": "https://accounts.google.com/x",
-            "expiresAt": "2026-10-12T09:10:00.000Z",
+            "authorizationId": AUTHORIZATION_ID,
+            "authorizationUrl": "https://accounts.google.com/x?state=private-state",
+            "expiresAt": "2026-10-12T09:10:00.000Z", "pollIntervalSeconds": 1,
         }
     )
     _with_service(application, service)
@@ -224,11 +233,16 @@ def test_creates_an_authorization_transaction(wired) -> None:
         )
 
     assert response.status_code == 201
-    assert response.json()["state"] == STATE
-    # 事务绑定发起设备：调用带的是设备 ID（位置参数，与参考实现一致）。
+    assert response.json() == {
+        "authorizationId": AUTHORIZATION_ID,
+        "authorizationUrl": "https://accounts.google.com/x?state=private-state",
+        "expiresAt": "2026-10-12T09:10:00.000Z", "pollIntervalSeconds": 1,
+    }
+    assert response.headers["cache-control"] == "no-store"
+    assert "codeVerifier" not in response.text
     name, kwargs, args = service.calls[0]
     assert name == "create_authorization_transaction"
-    assert kwargs == {} and len(args) == 1
+    assert kwargs == {} and args == (issued.device_id,)
 
 
 def test_unconfigured_oauth_reports_503(wired) -> None:
@@ -246,53 +260,43 @@ def test_unconfigured_oauth_reports_503(wired) -> None:
     assert response.status_code == 503
 
 
-@pytest.mark.parametrize("state", ["short", "A" * 44, "A" * 42, "bad!"])
-def test_invalid_state_shape_is_rejected(wired, state: str) -> None:
-    """**``state`` 必须是 43 个 URL 安全字符**——与生成时一致。"""
+@pytest.mark.parametrize("authorization_id", ["not-a-uuid", "short", "1111"])
+def test_invalid_authorization_ids_are_rejected(wired, authorization_id: str) -> None:
+    """轮询 ID 格式非法时隐藏为同一事务不存在错误。"""
     application, issued = wired
     _with_service(application, FakeGmailService())
 
     with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
-        response = client.post(
-            f"/v1/google/authorization-transactions/{state}/complete",
-            json={"code": "c"}, headers=_auth(issued),
+        response = client.get(
+            f"/v1/google/authorization-transactions/{authorization_id}",
+            headers=_auth(issued),
         )
 
-    assert response.status_code == 400
+    assert response.status_code == 404
+    assert response.json()["code"] == "GOOGLE_AUTH_TRANSACTION_INVALID"
 
 
-@pytest.mark.parametrize("code", ["", "   ", 5, None])
-def test_invalid_completion_codes_are_rejected(wired, code: object) -> None:
-    """授权码必须是非空字符串。"""
-    application, issued = wired
-    _with_service(application, FakeGmailService())
-
-    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
-        response = client.post(
-            f"/v1/google/authorization-transactions/{STATE}/complete",
-            json={"code": code}, headers=_auth(issued),
-        )
-
-    assert response.status_code == 400
-
-
-def test_completion_passes_the_state_from_the_path(wired) -> None:
-    """``state`` 取自路径而不是正文。"""
+def test_polls_the_authorization_result_for_current_device(wired) -> None:
+    """授权结果轮询绑定当前设备，并返回 202 pending。"""
     application, issued = wired
     service = FakeGmailService(
-        complete_authorization_transaction=lambda *args, **kwargs: kwargs
+        get_authorization_transaction=lambda **kwargs: {"status": "pending"}
     )
     _with_service(application, service)
 
     with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
-        response = client.post(
-            f"/v1/google/authorization-transactions/{STATE}/complete",
-            json={"code": "auth-code"}, headers=_auth(issued),
+        response = client.get(
+            f"/v1/google/authorization-transactions/{AUTHORIZATION_ID}",
+            headers=_auth(issued),
         )
 
-    assert response.status_code == 200
-    assert response.json()["state"] == STATE
-    assert response.json()["authorization_code"] == "auth-code"
+    assert response.status_code == 202
+    assert response.json() == {"status": "pending"}
+    assert response.headers["cache-control"] == "no-store"
+    name, kwargs, args = service.calls[0]
+    assert name == "get_authorization_transaction"
+    assert kwargs == {"authorization_id": AUTHORIZATION_ID, "device_id": issued.device_id}
+    assert args == ()
 
 
 # --------------------------------------------------------------------------
@@ -308,7 +312,7 @@ def test_lists_connections(wired) -> None:
     with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
         response = client.get("/v1/google/connections", headers=_auth(issued))
 
-    assert response.json() == {"connections": [{"id": CONNECTION_ID}]}
+    assert response.json() == {"configured": True, "connections": [{"id": CONNECTION_ID}]}
 
 
 @pytest.mark.parametrize("identifier", ["not-a-uuid", "short", "1111"])
@@ -408,7 +412,7 @@ def test_sync_accepts_an_empty_body(wired) -> None:
     assert response.status_code == 200
     assert service.calls == [("sync", {
         "connection_id": CONNECTION_ID, "confirmed_rescan_after_date": None,
-        "explicit_account_id": None,
+        "scan_all": False, "explicit_account_id": None,
     }, ())]
 
 
@@ -426,7 +430,59 @@ def test_sync_passes_the_confirmed_rescan_date(wired) -> None:
         )
 
     assert service.calls[0][1]["confirmed_rescan_after_date"] == "2026-01-05"
+    assert service.calls[0][1]["scan_all"] is False
     assert service.calls[0][1]["explicit_account_id"] == ACCOUNT_ID
+
+
+def test_sync_can_explicitly_scan_all_mail(wired) -> None:
+    """全量扫描由显式 ``scanAll=true`` 选择，不由服务端推测。"""
+    application, issued = wired
+    service = FakeGmailService(sync=lambda *args, **kwargs: kwargs)
+    _with_service(application, service)
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = client.post(
+            f"/v1/google/connections/{CONNECTION_ID}/sync",
+            json={"scanAll": True}, headers=_auth(issued),
+        )
+
+    assert response.status_code == 200
+    assert service.calls[0][1]["scan_all"] is True
+    assert service.calls[0][1]["confirmed_rescan_after_date"] is None
+
+
+def test_sync_rejects_all_scan_with_a_custom_start_date(wired) -> None:
+    """全量与自定义起始日互斥，避免客户端意图不明确。"""
+    application, issued = wired
+    service = FakeGmailService()
+    _with_service(application, service)
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = client.post(
+            f"/v1/google/connections/{CONNECTION_ID}/sync",
+            json={"scanAll": True, "confirmedRescanAfterDate": "2026-01-05"},
+            headers=_auth(issued),
+        )
+
+    assert response.status_code == 400
+    assert not service.calls
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_sync_requires_scan_all_to_be_boolean(wired, value: object) -> None:
+    """不对 ``scanAll`` 做真值强制转换，避免误启全量扫描。"""
+    application, issued = wired
+    service = FakeGmailService()
+    _with_service(application, service)
+
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        response = client.post(
+            f"/v1/google/connections/{CONNECTION_ID}/sync",
+            json={"scanAll": value}, headers=_auth(issued),
+        )
+
+    assert response.status_code == 400
+    assert not service.calls
 
 
 @pytest.mark.parametrize("value", ["2026-1-5", "01/05/2026", "", "tomorrow"])
@@ -463,6 +519,37 @@ def test_sync_application_errors_keep_their_status(wired) -> None:
 
     assert response.status_code == 409
     assert response.json()["code"] == "GMAIL_RESYNC_CONFIRMATION_REQUIRED"
+
+
+def test_long_sync_does_not_block_health_or_other_requests(wired) -> None:
+    """Google 同步在工作线程等待时，事件循环仍可响应健康检查。"""
+    application, issued = wired
+    entered = Event()
+    release = Event()
+
+    def slow_sync(*args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("测试未释放 Gmail 同步线程")
+        return {"mode": "incremental"}
+
+    _with_service(application, FakeGmailService(sync=slow_sync))
+    with TestClient(application, headers=CLIENT_PROTOCOL_HEADERS) as client:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending_sync = executor.submit(
+                client.post,
+                f"/v1/google/connections/{CONNECTION_ID}/sync",
+                headers=_auth(issued),
+            )
+            assert entered.wait(timeout=3), "同步没有进入测试服务"
+            try:
+                health = client.get("/v1/health", timeout=2)
+            finally:
+                release.set()
+            sync_response = pending_sync.result(timeout=4)
+
+    assert health.status_code == 200
+    assert sync_response.status_code == 200
 
 
 # --------------------------------------------------------------------------
@@ -568,7 +655,7 @@ def _valid_requests() -> list[tuple[str, str, dict]]:
     """7 条路由各一份**参数合法**的请求，用于验证它们都走到了用户绑定视图。"""
     return [
         ("post", "/v1/google/authorization-transactions", {}),
-        ("post", f"/v1/google/authorization-transactions/{STATE}/complete", {"code": "c"}),
+        ("get", f"/v1/google/authorization-transactions/{AUTHORIZATION_ID}", {}),
         ("get", "/v1/google/connections", {}),
         ("get", f"/v1/google/connections/{CONNECTION_ID}/mappings", {}),
         ("put", f"/v1/google/connections/{CONNECTION_ID}/mappings/{MAPPING_ID}",

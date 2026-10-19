@@ -1,7 +1,6 @@
 """Gmail 有界搜索查询测试。
 
-"有界"是核心：查询必须带时间下界与消息数上限，否则一次同步会把邮箱里的全部历史
-邮件拉下来——既慢又贵，而且绝大多数与账本无关。
+消息数始终有界；日期由用户独立选择，全量查询不带 CSV 推导的日期。
 
 一处细节：**主题必须加引号**，否则含空格的主题会被当成两个独立关键词，
 匹配到无关邮件。
@@ -25,6 +24,17 @@ def test_builds_a_bounded_query() -> None:
     assert "after:" in plan.query
     assert plan.after_date == "2026-01-05"
     assert plan.maximum_messages == 50
+
+
+def test_all_mail_uses_only_sender_and_subject_without_a_date_anchor() -> None:
+    """用户选全部时保留嘉信白名单和数量上限，不虚构最早交易日期。"""
+    plan = build_schwab_econfirm_search(None, 50)
+    assert plan.after_date is None
+    assert plan.maximum_messages == 50
+    assert plan.query == (
+        f"from:{SCHWAB_ECONFIRM_SENDER} "
+        f'subject:"{SCHWAB_ECONFIRM_SUBJECT}"'
+    )
 
 
 def test_after_uses_epoch_seconds() -> None:

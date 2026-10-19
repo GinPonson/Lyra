@@ -23,6 +23,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from google.auth import crypt, jwt
+from google.oauth2 import id_token as google_id_token
 
 from lyra.application.app_error import ApplicationError
 from lyra.infrastructure.auth.google_login_client import (
@@ -269,6 +273,85 @@ def test_exchange_verifies_id_token_and_returns_identity() -> None:
     assert identity.email == "owner@example.com"
     assert fetcher.calls[0]["url"] == "https://oauth2.googleapis.com/token"
     assert b"code_verifier=verifier" in fetcher.calls[0]["body"]
+
+
+def test_default_exchange_uses_real_google_auth_verification_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认生产验签路径验证签名与 audience，且证书读取不触网。"""
+    key_id = "lyra-offline-test-key"
+    trusted_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_pem = trusted_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    certificate_body = json.dumps({key_id: public_pem.decode("ascii")}).encode("utf-8")
+    requested_urls: list[str] = []
+
+    def offline_google_certs(self: object, method: str, url: str, **kwargs: Any) -> Any:
+        """只为 Google certs URL 返回固定公钥响应，禁止其它出网请求。"""
+        _ = self, method, kwargs
+        requested_urls.append(url)
+        assert url == google_id_token._GOOGLE_OAUTH2_CERTS_URL
+        return type(
+            "Response",
+            (),
+            {
+                "status_code": 200,
+                "headers": {"content-type": "application/json"},
+                "content": certificate_body,
+            },
+        )()
+
+    # 仅替换 requests 的 HTTP 调用点；google-auth 的 Request transport、JWT 解码和
+    # RSA 验签都走生产实现。未安装 requests 时，这里会在默认生产依赖处直接失败。
+    monkeypatch.setattr("requests.Session.request", offline_google_certs)
+
+    def signed_token(
+        signing_key: rsa.RSAPrivateKey, *, audience: str = CLIENT_ID
+    ) -> str:
+        """使用临时 RSA 私钥签发带当前时效的合成 Google ID token。"""
+        now = datetime.now(UTC)
+        private_pem = signing_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        signer = crypt.RSASigner.from_string(private_pem)
+        claims = _claims(
+            aud=audience,
+            iat=int(now.timestamp()),
+            exp=int((now + timedelta(hours=1)).timestamp()),
+        )
+        return jwt.encode(signer, claims, key_id=key_id).decode("ascii")
+
+    def exchange(token: str) -> Any:
+        """走默认验签器，只把 OAuth token endpoint 响应替换为合成 token。"""
+        client = GoogleLoginClient(
+            CONFIG,
+            Recorder([_json_response({"id_token": token})]),
+        )
+        return client.exchange_code(
+            code="offline-code",
+            code_verifier="offline-verifier",
+            nonce_hash=NONCE_HASH,
+            now=datetime.now(UTC),
+        )
+
+    identity = exchange(signed_token(trusted_key))
+    assert identity.subject == "112233445566778899000"
+    assert identity.email == "owner@example.com"
+
+    for token in (
+        signed_token(other_key),
+        signed_token(trusted_key, audience="other-client"),
+    ):
+        with pytest.raises(ApplicationError) as raised:
+            exchange(token)
+        assert raised.value.code == "LOGIN_FAILED"
+
+    assert requested_urls == [google_id_token._GOOGLE_OAUTH2_CERTS_URL] * 3
 
 
 def test_exchange_folds_failures_without_leaking_secrets() -> None:

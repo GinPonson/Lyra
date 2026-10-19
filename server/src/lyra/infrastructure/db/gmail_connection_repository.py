@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 import duckdb
 
 from ...application.app_error import ApplicationError
+from ...application.gmail_user_scope import assert_gmail_authorization_active
 from ...infrastructure.gmail.connection_credential import GmailConnectionRecord
 
 
@@ -144,6 +145,96 @@ def _has_connection_for_subject(
     return row is not None
 
 
+def load_gmail_connection_by_subject(
+    connection: duckdb.DuckDBPyConnection, user_id: str, google_subject: str
+) -> PersistedGmailConnectionRow | None:
+    """按 Google subject 读取当前用户的连接。
+
+    @param connection: 数据库连接。
+    @param user_id: 当前用户 UUID。
+    @param google_subject: 已验证的 Google subject。
+    @returns 连接行；没有匹配连接时返回 ``None``。
+    """
+    row = connection.execute(
+        f"""
+        SELECT {_COLUMNS} FROM gmail_connections
+        WHERE user_id = CAST(? AS UUID) AND google_subject = ?
+        """,
+        [user_id, google_subject],
+    ).fetchone()
+    return None if row is None else _row_to_connection(row)
+
+
+def upsert_gmail_connection_row(
+    connection: duckdb.DuckDBPyConnection,
+    user_id: str,
+    record: GmailConnectionRecord,
+    *,
+    device_id: str,
+) -> PersistedGmailConnectionRow:
+    """建立 Gmail 连接，或用新授权凭据更新当前用户的同一 Google 连接。
+
+    更新时保留既有连接 ID、创建时间、同步游标和最近同步时间，因此账户映射与已处理
+    消息仍关联同一连接。调用方需先用既有 ID 加密 refresh token，保证 AAD 一致。
+
+    @param connection: 数据库连接。
+    @param user_id: 连接归属的用户 UUID。
+    @param record: 新授权产生的连接记录。
+    @param device_id: 创建授权事务的设备；必须仍活动并属于该用户。
+    @returns 已持久化连接行。
+    @raises ValueError: 未断开连接缺少 refresh token，或已有连接 ID 与记录不符。
+    @raises ApplicationError: 并发首次授权导致同 subject 冲突。
+    """
+    if record.status != "disconnected" and record.encrypted_refresh_token is None:
+        raise ValueError("未断开的 Gmail 连接必须有 refresh token")
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        # OAuth 网络往返期间不能持有数据库事务；在本事务开始后重验设备/用户，
+        # 让撤销或停用与凭据写入形成明确的先后顺序。
+        assert_gmail_authorization_active(connection, user_id, device_id)
+        existing = load_gmail_connection_by_subject(
+            connection, user_id, record.google_subject
+        )
+        if existing is None:
+            create_gmail_connection_row(connection, user_id, record)
+        else:
+            if existing.id != record.id:
+                raise ApplicationError(
+                    code="GMAIL_CONNECTION_ERROR",
+                    message="Gmail 连接刚刚发生变化，请重新授权",
+                    status_code=409,
+                    retryable=True,
+                )
+            # DuckDB 的 UPDATE ... RETURNING 在父行被外键引用时会触发 FK 限制，即使
+            # 更新的是普通字段。只更新非索引列并省略 RETURNING；同步游标、最近同步时间、
+            # 创建时间以及连接 ID 均留在数据库原行上，消息关联和映射自然保持不变。
+            connection.execute(
+                """
+                UPDATE gmail_connections
+                SET google_email = ?, encrypted_refresh_token = ?, granted_scopes = ?,
+                    status = ?, last_error_code = ?, updated_at = CAST(? AS TIMESTAMPTZ)
+                WHERE user_id = CAST(? AS UUID) AND id = CAST(? AS UUID)
+                  AND google_subject = ?
+                """,
+                [
+                    record.google_email, record.encrypted_refresh_token,
+                    record.granted_scopes, record.status, record.last_error_code,
+                    record.updated_at, user_id, record.id, record.google_subject,
+                ],
+            )
+
+        persisted = load_gmail_connection_by_subject(
+            connection, user_id, record.google_subject
+        )
+        assert persisted is not None
+        connection.execute("COMMIT")
+        return persisted
+    except BaseException:
+        # 保持唯一键、外键及历史数据原子性；异常仍原样向上传递。
+        connection.execute("ROLLBACK")
+        raise
+
+
 def load_gmail_connections(
     connection: duckdb.DuckDBPyConnection, user_id: str
 ) -> tuple[PersistedGmailConnectionRow, ...]:
@@ -237,7 +328,7 @@ def save_gmail_connection_row(
     @param expected_updated_at: 调用方读到的 ``updated_at``。
     @raises ApplicationError: 连接不属于该用户、或已被改动（409，可重试）。
     """
-    row = connection.execute(
+    result = connection.execute(
         """
         UPDATE gmail_connections
         SET encrypted_refresh_token = ?, granted_scopes = ?, history_id = ?,
@@ -245,15 +336,17 @@ def save_gmail_connection_row(
             updated_at = CAST(? AS TIMESTAMPTZ)
         WHERE user_id = CAST(? AS UUID) AND id = CAST(? AS UUID)
           AND updated_at = CAST(? AS TIMESTAMPTZ)
-        RETURNING id
         """,
         [
             record.encrypted_refresh_token, record.granted_scopes, record.history_id,
             record.status, record.last_error_code, record.last_sync_at,
             record.updated_at, user_id, record.id, expected_updated_at,
         ],
-    ).fetchone()
-    if row is None:
+    )
+    # DuckDB UPDATE ... RETURNING 会在连接行被映射或消息外键引用时触发 FK 限制。
+    # 用同一条 CAS UPDATE 的影响行数判断冲突，避免先读后写产生竞态。
+    updated = result.fetchone()
+    if updated is None or int(updated[0]) != 1:
         raise ApplicationError(
             code="GMAIL_CONNECTION_ERROR",
             message="Gmail 连接或映射已变化，请刷新后重试",

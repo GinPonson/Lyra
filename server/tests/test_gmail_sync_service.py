@@ -97,6 +97,42 @@ def test_unknown_connection_is_a_404() -> None:
     assert raised.value.status_code == 404
 
 
+def test_confirmed_all_mail_passes_no_date_to_the_fetcher() -> None:
+    """首次全量使用邮箱自身范围，与 CSV 的起止日期无关。"""
+    dates: list[str | None] = []
+    connection = _Connection(status="pending_initial_scan", history_id=None)
+    dependencies, _ = _deps(
+        connection,
+        fetch_initial=lambda token, after, maximum: (dates.append(after) or _Fetched()),
+    )
+    result = sync_gmail_connection(
+        connection_id=CONNECTION_ID, scan_all=True,
+        confirmed_rescan_after_date=None, explicit_account_id=None,
+        dependencies=dependencies,
+    )
+    assert dates == [None]
+    assert result["connection"]["status"] == "active"
+    assert result["connection"]["lastSyncAt"] == NOW
+
+
+def test_initial_scan_keeps_api_configuration_failure_actionable() -> None:
+    """首扫 API 未启用应给出启用配置提示，不能变成 500 或要求反复重授权。"""
+    def fetch(*args):
+        raise GmailSyncError("GMAIL_API_DISABLED", "safe")
+
+    connection = _Connection(status="pending_initial_scan", history_id=None)
+    dependencies, saves = _deps(connection, fetch_initial=fetch)
+    with pytest.raises(ApplicationError) as raised:
+        sync_gmail_connection(
+            connection_id=CONNECTION_ID, scan_all=True,
+            confirmed_rescan_after_date=None, explicit_account_id=None,
+            dependencies=dependencies,
+        )
+    assert raised.value.code == "GMAIL_API_DISABLED"
+    assert raised.value.status_code == 503
+    assert saves == []
+
+
 # --------------------------------------------------------------------------
 # 令牌刷新失败的两处映射
 # --------------------------------------------------------------------------
@@ -158,6 +194,7 @@ def test_incremental_happy_path_advances_the_cursor() -> None:
     assert result["importedMessages"] == 1
     assert result["connection"]["historyId"] == "99"
     assert result["connection"]["status"] == "active"
+    assert result["connection"]["lastSyncAt"] == NOW
     assert processed == [({"id": "m1"},)]
     # 最后一次保存推进了游标。
     assert saves[-1]["history_id"] == "99"  # type: ignore[attr-defined]

@@ -278,34 +278,75 @@ def test_start_rejects_non_json_body(client) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_callback_returns_html_without_tokens(client) -> None:
-    """**回调页面不含任何令牌**：浏览器只完成验证，凭据经 App 的 POST 返回。"""
+def test_callback_redirects_to_the_fixed_app_uri_without_callback_data(client) -> None:
+    """回调只把浏览器带回固定 App URI，不携带任何 OAuth 参数。"""
     test_client, _ = client
     response = test_client.get(
-        "/v1/auth/github/callback", params={"state": "s" * 43, "code": "c"}
+        "/v1/auth/github/callback",
+        params={"state": "s" * 43, "code": "secret-code"},
+        follow_redirects=False,
     )
 
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/html")
-    body = response.text
-    for leaked in ("token", "accessToken", "refreshToken", "code=", "s" * 43):
-        assert leaked not in body, leaked
+    assert response.status_code == 303
+    assert response.headers["location"] == "com.lyrafinance.lyra://auth/callback"
+    assert response.content == b""
+    assert "secret-code" not in response.headers["location"]
+    assert "s" * 43 not in response.headers["location"]
 
 
-def test_callback_page_is_identical_for_success_and_failure(client) -> None:
-    """**成功与失败返回同一页面。**
+def test_callback_redirect_is_identical_for_unknown_state_and_denial(client) -> None:
+    """未知 state 与用户拒绝都返回相同固定重定向。"""
 
-    区分会让未授权方凭页面内容判断某个 state 是否存在。
-    """
     test_client, _ = client
     unknown = test_client.get(
-        "/v1/auth/github/callback", params={"state": "A" * 43, "code": "c"}
-    ).text
+        "/v1/auth/github/callback",
+        params={"state": "A" * 43, "code": "c"},
+        follow_redirects=False,
+    )
     denied = test_client.get(
-        "/v1/auth/github/callback", params={"state": "A" * 43, "error": "access_denied"}
-    ).text
+        "/v1/auth/github/callback",
+        params={"state": "A" * 43, "error": "access_denied"},
+        follow_redirects=False,
+    )
 
-    assert unknown == denied
+    assert unknown.status_code == denied.status_code == 303
+    assert unknown.headers["location"] == denied.headers["location"]
+    assert unknown.content == denied.content == b""
+
+
+def test_google_callback_dispatches_gmail_state_without_exposing_oauth_values(client) -> None:
+    """已登记 Gmail state 由服务器兑换，浏览器只看到固定原生回跳。"""
+    test_client, _ = client
+    gmail_calls: list[dict[str, str | None]] = []
+    login_calls: list[tuple] = []
+
+    class _GmailCallback:
+        def complete_authorization_callback(self, **kwargs):
+            gmail_calls.append(kwargs)
+            return True
+
+    class _LoginCallback:
+        def complete_callback(self, *args, **kwargs):
+            login_calls.append((args, kwargs))
+
+    test_client.app.state.gmail_service = _GmailCallback()
+    test_client.app.state.login_service = _LoginCallback()
+    state = "private-gmail-state"
+    code = "private-google-authorization-code"
+
+    response = test_client.get(
+        "/v1/auth/google/callback",
+        params={"state": state, "code": code},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "com.lyrafinance.lyra://auth/callback"
+    assert response.content == b""
+    assert state not in response.headers["location"]
+    assert code not in response.headers["location"]
+    assert gmail_calls == [{"state": state, "authorization_code": code, "error": None}]
+    assert login_calls == []
 
 
 # --------------------------------------------------------------------------
@@ -406,25 +447,16 @@ def test_start_success_response_is_not_cacheable(client) -> None:
     assert response.status_code == 503
 
 
-def test_callback_sets_the_full_security_header_set(client) -> None:
-    """**回调页面必须带全套安全响应头。**
-
-    它是返回给浏览器的 HTML，而这些头各自挡住一类真实攻击：
-
-    | 头 | 缺了会怎样 |
-    | --- | --- |
-    | `content-security-policy` 的 `frame-ancestors 'none'` | 页面可被套框（点击劫持） |
-    | `x-content-type-options: nosniff` | 浏览器可 MIME 嗅探，把响应当别的类型执行 |
-    | `cache-control: no-store` | "一次性"的回调页留在缓存里 |
-    | `referrer-policy: no-referrer` | state 随 Referer 泄漏给第三方 |
-
-    参考实现逐项设置了它们；这里用一条测试固定，避免日后被当成冗余删掉。
-    """
+def test_callback_redirect_sets_the_full_security_header_set(client) -> None:
+    """回调重定向保留原有安全响应头，避免后续调整时意外移除。"""
     test_client, _ = client
     response = test_client.get(
-        "/v1/auth/github/callback", params={"state": "A" * 43, "code": "c"}
+        "/v1/auth/github/callback",
+        params={"state": "A" * 43, "code": "c"},
+        follow_redirects=False,
     )
 
+    assert response.status_code == 303
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
     assert response.headers["referrer-policy"] == "no-referrer"
@@ -434,13 +466,16 @@ def test_callback_sets_the_full_security_header_set(client) -> None:
     assert "default-src 'none'" in csp
 
 
-def test_callback_security_headers_apply_to_the_failure_page_too(client) -> None:
-    """失败路径同样带头——**两条路径返回的是同一个响应构造器**。"""
+def test_callback_security_headers_apply_to_the_failure_redirect_too(client) -> None:
+    """失败路径同样带头；成功与失败共用同一个响应构造器。"""
     test_client, _ = client
     response = test_client.get(
-        "/v1/auth/github/callback", params={"state": "A" * 43, "error": "access_denied"}
+        "/v1/auth/github/callback",
+        params={"state": "A" * 43, "error": "access_denied"},
+        follow_redirects=False,
     )
 
+    assert response.status_code == 303
     assert response.headers["content-security-policy"] == (
         "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
     )
@@ -557,6 +592,17 @@ def test_a_non_string_start_field_is_a_400_not_a_500(client, label: str, body: d
     assert response.json()["message"] == "登录参数无效"
 
 
+def test_start_rejects_the_legacy_invite_field(client) -> None:
+    """旧的 start 邀请码路径不再接受，即使字段本身是合法字符串。"""
+    test_client, _ = client
+    response = test_client.post(
+        "/v1/auth/github/start", json={**VALID_START, "inviteCode": "a" * 32}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_ARGUMENT"
+
+
 class _FakeLoginClient:
     """只提供路由层用得到的动作的来源客户端。"""
 
@@ -586,7 +632,6 @@ def configured_client(client):
             )
         ],
         lambda **kwargs: None,
-        InviteCodeRepository(test_client.app.state.database.connection),
     )
     return test_client, issued
 
@@ -614,6 +659,29 @@ def test_a_non_string_exchange_field_is_a_400_not_a_500(
     assert response.status_code == 400, f"{label}: {response.status_code}"
     assert response.json()["code"] == "INVALID_ARGUMENT"
     assert response.json()["message"] == "登录参数无效"
+
+
+@pytest.mark.parametrize(
+    "invite_code",
+    [None, 123, ["code"], {"value": "code"}, "", "   "],
+    ids=["null", "number", "array", "object", "empty", "whitespace"],
+)
+def test_exchange_requires_an_optional_invite_to_be_a_nonempty_trimmed_string(
+    configured_client, invite_code: Any
+) -> None:
+    """exchange 的可选邀请码若出现，必须是 trim 后非空字符串。"""
+    test_client, _ = configured_client
+    response = test_client.post(
+        "/v1/auth/github/exchange",
+        json={
+            "loginId": "11111111-1111-1111-1111-111111111111",
+            "codeVerifier": _VERIFIER,
+            "inviteCode": invite_code,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_ARGUMENT"
 
 
 @pytest.mark.parametrize("payload", [{}, {"refreshToken": ""}, {"refreshToken": 5}])
@@ -679,7 +747,12 @@ class _CompletingLoginService:
         self._identity = identity
 
     async def exchange(
-        self, provider_id: str, *, login_id: str, code_verifier: str
+        self,
+        provider_id: str,
+        *,
+        login_id: str,
+        code_verifier: str,
+        invite_code: str | None = None,
     ) -> dict[str, Any]:
         """返回一份完整的兑换结果（含已解析的用户与身份）。"""
         return {
@@ -871,7 +944,6 @@ def _wired_login_client(test_client: Any, identity: LoginIdentity, provider: str
             )
         ],
         authorize,
-        InviteCodeRepository(test_client.app.state.database.connection),
     )
     return test_client
 
@@ -893,7 +965,6 @@ def _start_login(
     test_client: Any,
     provider: str = "github",
     pem: str = PUBLIC_KEY_PEM,
-    invite_code: str | None = None,
 ) -> dict:
     """发起一次登录并返回 start 响应正文。"""
     body: dict[str, Any] = {
@@ -902,8 +973,6 @@ def _start_login(
         "codeChallenge": _CHALLENGE,
         "codeChallengeMethod": "S256",
     }
-    if invite_code is not None:
-        body["inviteCode"] = invite_code
     response = test_client.post(f"/v1/auth/{provider}/start", json=body)
     # 处理器返回显式构造的 ``JSONResponse``，它的默认状态码是 200——装饰器上的
     # ``status_code=201`` 只在返回普通 dict 时生效。这里固定**实际**行为。
@@ -912,21 +981,32 @@ def _start_login(
 
 
 def _complete_callback(test_client: Any, started: dict, provider: str = "github") -> None:
-    """用授权地址里的 state 走一次浏览器回调。"""
+    """用授权地址里的 state 走一次回调，并保留服务器的原始重定向响应。"""
     from urllib.parse import parse_qs, urlsplit
 
     state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
     response = test_client.get(
-        f"/v1/auth/{provider}/callback", params={"state": state, "code": "auth-code"}
+        f"/v1/auth/{provider}/callback",
+        params={"state": state, "code": "auth-code"},
+        follow_redirects=False,
     )
-    assert response.status_code == 200
+    assert response.status_code == 303
 
 
-def _exchange(test_client: Any, started: dict, provider: str = "github"):
-    """用 App verifier 兑换凭据。"""
+def _exchange(
+    test_client: Any,
+    started: dict,
+    provider: str = "github",
+    invite_code: str | None = None,
+):
+    """用 App verifier 兑换凭据；邀请码只在需要注册时放进兑换正文。"""
+    code = invite_code if invite_code is not None else started.get("_testInviteCode")
+    body = {"loginId": started["loginId"], "codeVerifier": _VERIFIER}
+    if code is not None:
+        body["inviteCode"] = code
     return test_client.post(
         f"/v1/auth/{provider}/exchange",
-        json={"loginId": started["loginId"], "codeVerifier": _VERIFIER},
+        json=body,
     )
 
 
@@ -935,6 +1015,67 @@ def _count(connection: Any, table: str) -> int:
     row = connection.execute(f"SELECT count(*) FROM {table}").fetchone()
     assert row is not None
     return int(row[0])
+
+
+@pytest.mark.parametrize(
+    ("provider", "identity"),
+    [
+        ("google", LoginIdentity("google", "callback-google", None, "Google User")),
+        ("github", LoginIdentity("github", "callback-github", None, "octocat")),
+        ("linuxdo", LoginIdentity("linuxdo", "callback-linuxdo", None, "LINUX DO User")),
+    ],
+)
+def test_callback_redirect_is_constant_for_all_providers_and_outcomes(
+    fresh_client, provider: str, identity: LoginIdentity
+) -> None:
+    """三种来源在成功与失败时均回到同一 URI，且忽略恶意 returnUrl。"""
+    from urllib.parse import parse_qs, urlsplit
+
+    test_client = fresh_client
+    _wired_login_client(test_client, identity, provider)
+    started = _start_login(test_client, provider)
+    state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
+    attacker_url = "https://attacker.example/collect?token=stolen"
+    callback_path = f"/v1/auth/{provider}/callback"
+
+    succeeded = test_client.get(
+        callback_path,
+        params={
+            "state": state,
+            "code": "sensitive-authorization-code",
+            "returnUrl": attacker_url,
+        },
+        follow_redirects=False,
+    )
+    failed = test_client.get(
+        callback_path,
+        params={"state": "X" * 43, "error": "access_denied", "returnUrl": attacker_url},
+        follow_redirects=False,
+    )
+
+    expected_uri = "com.lyrafinance.lyra://auth/callback"
+    assert succeeded.status_code == failed.status_code == 303
+    assert succeeded.headers["location"] == failed.headers["location"] == expected_uri
+    assert succeeded.content == failed.content == b""
+    # request-id 每次请求独立生成；其余响应头必须完全相同。
+    succeeded_headers = {
+        key: value for key, value in succeeded.headers.items() if key != "x-request-id"
+    }
+    failed_headers = {
+        key: value for key, value in failed.headers.items() if key != "x-request-id"
+    }
+    assert succeeded_headers == failed_headers
+    for response in (succeeded, failed):
+        response_payload = response.headers["location"] + response.text
+        for sensitive in (
+            state,
+            "sensitive-authorization-code",
+            started["loginId"],
+            identity.subject,
+            "attacker.example",
+            "stolen",
+        ):
+            assert sensitive not in response_payload
 
 
 @pytest.mark.parametrize(
@@ -958,9 +1099,9 @@ def test_a_new_identity_registers_as_a_member_with_an_empty_ledger(
     connection = test_client.app.state.database.connection
 
     invite = _mint_invite(test_client, label="注册测试")
-    started = _start_login(test_client, provider, invite_code=invite)
+    started = _start_login(test_client, provider)
     _complete_callback(test_client, started, provider)
-    response = _exchange(test_client, started, provider)
+    response = _exchange(test_client, started, provider, invite_code=invite)
 
     assert response.status_code == 200, response.text
     user = response.json()["user"]
@@ -984,6 +1125,35 @@ def test_a_new_identity_registers_as_a_member_with_an_empty_ledger(
     assert version is not None and int(version[0]) == 0
 
 
+@pytest.mark.parametrize(
+    ("provider", "identity"),
+    [
+        ("google", LoginIdentity("google", "9101", None, "Google User")),
+        ("github", LoginIdentity("github", "9102", None, "octocat")),
+        ("linuxdo", LoginIdentity("linuxdo", "9103", None, "LINUX DO User")),
+    ],
+)
+def test_each_provider_can_add_an_invite_after_oauth_on_the_same_transaction(
+    fresh_client, provider: str, identity: LoginIdentity
+) -> None:
+    """三个来源缺码时都保留 OAuth 事务，可在同一 loginId 上补码完成注册。"""
+    test_client = fresh_client
+    _wired_login_client(test_client, identity, provider)
+    started = _start_login(test_client, provider)
+    _complete_callback(test_client, started, provider)
+
+    missing = _exchange(test_client, started, provider)
+    assert missing.status_code == 403
+    assert missing.json()["code"] == "INVITE_CODE_REQUIRED"
+    assert _count(test_client.app.state.database.connection, "users") == 0
+
+    invite = _mint_invite(test_client)
+    completed = _exchange(test_client, started, provider, invite_code=invite)
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["user"]["identity"]["provider"] == provider
+    assert _count(test_client.app.state.database.connection, "users") == 1
+
+
 def test_the_same_identity_logs_in_as_the_same_user(fresh_client) -> None:
     """同一身份再次登录：同一 userId，不新建用户，也不重置账本归属。"""
     test_client = fresh_client
@@ -1003,13 +1173,14 @@ def _after_callback(
 ) -> dict:
     """发起登录并完成回调，返回 start 响应正文。
 
-    默认**自动铸造一枚邀请码**：本文件多数用例只关心"登录流程是否走得通"，注册门禁
-    本身由专门用例覆盖。已有身份的登录不会消耗它（服务端只在新建用户时核销）。
+    默认**自动铸造一枚邀请码并保存在测试私有字段**：多数用例只关心登录是否走得通，
+    兑换 helper 会把码放进 exchange 正文；真实 start 响应仍不含邀请码。
     """
     if invite_code is None:
         invite_code = _mint_invite(test_client)
-    started = _start_login(test_client, provider, invite_code=invite_code or None)
+    started = _start_login(test_client, provider)
     _complete_callback(test_client, started, provider)
+    started["_testInviteCode"] = invite_code
     return started
 
 
@@ -1070,7 +1241,9 @@ def test_a_denied_authorization_does_not_create_a_user(fresh_client) -> None:
 
     state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
     test_client.get(
-        "/v1/auth/github/callback", params={"state": state, "error": "access_denied"}
+        "/v1/auth/github/callback",
+        params={"state": state, "error": "access_denied"},
+        follow_redirects=False,
     )
     response = _exchange(test_client, started)
 

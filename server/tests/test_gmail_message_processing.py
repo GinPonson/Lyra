@@ -16,11 +16,13 @@ import pytest
 
 from lyra.application.app_error import ApplicationError
 from lyra.application.gmail_message_processing import (
+    GmailMessageImportOutcome,
     GmailMessageProcessingDependencies,
     GmailMessageProcessSummary,
     process_gmail_messages,
 )
 from lyra.domain.gmail.econfirm import GmailMessage
+from lyra.domain.ledger.errors import IngestError
 
 SUFFIX = "276"
 ACCOUNT_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -47,12 +49,13 @@ class _Deps:
                         masked_suffix="276", status="active"),
     ))
     resolve_error: Exception | None = None
-    import_outcome: str = "imported"
+    import_outcome: GmailMessageImportOutcome = GmailMessageImportOutcome("imported", 1, 0)
+    parse_trades_action: object | None = None
     calls: list = field(default_factory=list)
 
     def build(self) -> GmailMessageProcessingDependencies:
         """装配依赖集合。"""
-        return GmailMessageProcessingDependencies(
+        values = dict(
             parse_records=lambda record: self.messages,
             load_accounts=lambda: self.accounts,
             load_mappings=lambda: self.mappings,
@@ -63,6 +66,9 @@ class _Deps:
             ),
             import_message=self._import,
         )
+        if self.parse_trades_action is not None:
+            values["parse_trades"] = self.parse_trades_action
+        return GmailMessageProcessingDependencies(**values)
 
     def _resolve(self, **kwargs):
         self.calls.append(("resolve", kwargs.get("suffix")))
@@ -109,12 +115,42 @@ def test_imports_a_valid_message() -> None:
 
 def test_already_imported_is_counted_separately() -> None:
     """已导入与本次导入分开计数。"""
-    deps = _Deps(messages=(_message(),), import_outcome="already_imported")
+    deps = _Deps(
+        messages=(_message(),),
+        import_outcome=GmailMessageImportOutcome("already_imported", 0, 1),
+    )
 
     summary = _run(deps)
 
     assert summary.already_imported_messages == 1
     assert summary.imported_messages == 0
+    assert summary.inserted_transactions == 0
+    assert summary.existing_transactions == 1
+
+
+def test_csv_overlap_counts_existing_rows_in_a_newly_seen_email() -> None:
+    """首次处理的邮件也可能全部对应 CSV 已有交易，不能把处理封数显示为新增笔数。"""
+    deps = _Deps(
+        messages=(_message(),),
+        import_outcome=GmailMessageImportOutcome("imported", 0, 1),
+    )
+    summary = _run(deps)
+    assert summary.imported_messages == 1
+    assert summary.inserted_transactions == 0
+    assert summary.existing_transactions == 1
+
+
+@pytest.mark.parametrize("inserted,existing", [(-1, 0), (0, -1), (True, 0), (1, False)])
+def test_invalid_transaction_counts_are_rejected(inserted: int, existing: int) -> None:
+    """不允许负数或布尔值伪装成成功的金融写入计数。"""
+    with pytest.raises(ValueError):
+        GmailMessageImportOutcome("imported", inserted, existing)
+
+
+def test_archived_message_cannot_claim_new_transactions() -> None:
+    """消息已归档的结果必须明确没有新增账本行。"""
+    with pytest.raises(ValueError):
+        GmailMessageImportOutcome("already_imported", 1, 0)
 
 
 def test_explicit_account_is_passed_through() -> None:
@@ -124,6 +160,22 @@ def test_explicit_account_is_passed_through() -> None:
     _run(deps, explicit=ACCOUNT_ID)
 
     assert _calls(deps, "resolve")[0][1] == SUFFIX
+
+
+def test_injected_parser_receives_message_and_explicit_account() -> None:
+    """可注入解析动作获得本次显式账户，且默认调用仍保持可选。"""
+    received: list[tuple[str, str | None]] = []
+    deps = _Deps(messages=(_message(),))
+
+    def parse_trades(message, explicit_account_id):
+        received.append((message.message_id, explicit_account_id))
+        return (SimpleNamespace(trade_date="2026-01-05"),)
+
+    deps.parse_trades_action = parse_trades
+
+    _run(deps, explicit=ACCOUNT_ID)
+
+    assert received == [("m1", ACCOUNT_ID)]
 
 
 def test_mapping_is_created_when_resolution_asks_for_it() -> None:
@@ -191,6 +243,71 @@ def test_other_application_errors_propagate() -> None:
     )
 
     with pytest.raises(ApplicationError, match="故障"):
+        _run(deps)
+
+
+def test_parse_stage_mapping_conflict_is_archived_as_conflict() -> None:
+    """解析回退所需映射未确认时只归档为账户冲突。"""
+    deps = _Deps(messages=(_message(),))
+
+    def parse_trades(_message, _explicit_account_id):
+        raise ApplicationError(
+            code="ACCOUNT_MAPPING_REQUIRED", message="需要确认映射",
+            status_code=409, retryable=False,
+        )
+
+    deps.parse_trades_action = parse_trades
+
+    summary = _run(deps)
+
+    assert summary.conflict_messages == 1
+    assert summary.rejected_messages == 0
+    assert _calls(deps, "persist_unsuccessful")[0][2] == "ACCOUNT_MAPPING_REQUIRED"
+    assert _calls(deps, "import") == []
+
+
+def test_parse_stage_unrelated_application_error_is_not_swallowed() -> None:
+    """解析回退中的其它业务故障不得伪装为冲突或内容拒绝。"""
+    deps = _Deps(messages=(_message(),))
+
+    def parse_trades(_message, _explicit_account_id):
+        raise ApplicationError(
+            code="ACCOUNT_LOOKUP_FAILED", message="账户读取失败",
+            status_code=500, retryable=False,
+        )
+
+    deps.parse_trades_action = parse_trades
+
+    with pytest.raises(ApplicationError, match="账户读取失败"):
+        _run(deps)
+
+    assert _calls(deps, "persist_unsuccessful") == []
+
+
+def test_unresolved_cash_option_sale_from_import_is_rejected_specifically() -> None:
+    """计划确认无法关联已有期权事实时拒绝邮件，但不掩盖其它导入错误。"""
+    from lyra.domain.gmail.econfirm import UnresolvedCashOptionSaleError
+
+    deps = _Deps(messages=(_message(),))
+    deps.parse_trades_action = lambda _message, _account_id: (
+        SimpleNamespace(trade_date="2026-01-05"),
+    )
+
+    def unresolved_import(_message, _trades, _mapping):
+        raise UnresolvedCashOptionSaleError("需要已确认的期权卖出事实")
+
+    deps._import = unresolved_import  # type: ignore[method-assign]
+    summary = _run(deps)
+
+    assert summary.rejected_messages == 1
+    assert summary.imported_messages == 0
+    assert _calls(deps, "persist_unsuccessful")[0][2] == "GMAIL_MESSAGE_REJECTED"
+
+    def unrelated_import(_message, _trades, _mapping):
+        raise IngestError("其它导入故障")
+
+    deps._import = unrelated_import  # type: ignore[method-assign]
+    with pytest.raises(IngestError, match="其它导入故障"):
         _run(deps)
 
 
@@ -321,6 +438,41 @@ def test_summary_projects_to_camel_case() -> None:
     assert projected == {
         "importedMessages": 1, "alreadyImportedMessages": 2,
         "conflictMessages": 3, "rejectedMessages": 4,
+        "insertedTransactions": 0, "existingTransactions": 0,
+        "replayOrderConflictMessages": 0,
     }
     for key in projected:
         assert "_" not in key, key
+
+
+def test_newest_first_mail_is_processed_by_actual_trade_date() -> None:
+    """日期排序不依赖收信时间或 CSV 范围；同日顺序证明留给金融内核。"""
+    deps = _Deps(messages=(
+        _message("later"),
+        _message("earlier", BODY.replace("1/5/2026", "1/4/2026")),
+    ))
+    _run(deps)
+    assert [call[1] for call in _calls(deps, "import")] == ["earlier", "later"]
+
+
+def test_ambiguous_replay_is_visible_and_does_not_stop_other_messages() -> None:
+    """顺序不明的邮件没有金融写入，单独提示完整 CSV，其他邮件继续处理。"""
+    deps = _Deps(messages=(_message("ambiguous"), _message("good")))
+    original_import = deps._import
+
+    def import_message(message, trades, mapping):
+        if message.message_id == "ambiguous":
+            raise ApplicationError(
+                code="GMAIL_REPLAY_ORDER_AMBIGUOUS", message="需完整 CSV",
+                status_code=409, retryable=False,
+            )
+        return original_import(message, trades, mapping)
+
+    deps._import = import_message
+    summary = _run(deps)
+    assert summary.imported_messages == 1
+    assert summary.inserted_transactions == 1
+    assert summary.conflict_messages == summary.replay_order_conflict_messages == 1
+    assert _calls(deps, "persist_unsuccessful") == [
+        ("persist_unsuccessful", "ambiguous", "GMAIL_REPLAY_ORDER_AMBIGUOUS")
+    ]

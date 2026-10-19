@@ -46,7 +46,10 @@ REDIRECT = "https://lyra.example.com/v1/auth/google/callback"
 
 
 def _transaction():
-    return create_google_oauth_transaction("device-1", NOW, 10 * 60 * 1000)
+    return create_google_oauth_transaction(
+        "device-1", NOW, 10 * 60 * 1000,
+        user_id="user-1", authorization_id="authorization-1",
+    )
 
 
 def _params(url: str) -> dict[str, list[str]]:
@@ -653,7 +656,7 @@ def test_exchange_rejects_an_unverified_email() -> None:
 
 
 def test_exchange_maps_transport_failure_at_the_token_endpoint() -> None:
-    """传输层失败（status=None）报"响应无效"。"""
+    """令牌端点的网络中断映射为安全、可重试错误，不伪装成参数无效。"""
     def post_form(url, form, timeout):
         raise GoogleEndpointFailure(status=None, retryable=True)
 
@@ -664,7 +667,8 @@ def test_exchange_maps_transport_failure_at_the_token_endpoint() -> None:
             get_userinfo=_userinfo_ok(_identity_payload()),
         )
 
-    assert "响应无效" in raised.value.message
+    assert "无法连接 Google" in raised.value.message
+    assert raised.value.retryable is True
 
 
 def test_userinfo_failure_uses_the_userinfo_message() -> None:
@@ -703,6 +707,41 @@ def test_refresh_returns_a_new_access_token() -> None:
     assert result["accessToken"] == "ya29.second"
     assert post_form.calls[0]["form"]["grant_type"] == "refresh_token"
     assert "redirect_uri" not in post_form.calls[0]["form"]
+
+
+def test_refresh_allows_google_to_omit_refresh_token_and_unchanged_scope() -> None:
+    """refresh response can omit the already stored refresh token and unchanged scope."""
+    post_form = _post_form_ok({
+        "access_token": "ya29.second",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    })
+
+    result = refresh_google_access_token(
+        refresh_token="1//refresh", client_id="client-1",
+        granted_scope_text=GMAIL_READONLY_SCOPE, now=NOW, post_form=post_form,
+    )
+
+    assert result["accessToken"] == "ya29.second"
+    assert result["grantedScopeText"] == GMAIL_READONLY_SCOPE
+
+
+def test_refresh_revalidates_scope_when_google_returns_it() -> None:
+    """refresh response scope is validated when present rather than blindly trusted."""
+    post_form = _post_form_ok({
+        "access_token": "ya29.second",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": "openid email",
+    })
+
+    with pytest.raises(GmailOAuthError) as raised:
+        refresh_google_access_token(
+            refresh_token="1//refresh", client_id="client-1",
+            granted_scope_text=GMAIL_READONLY_SCOPE, now=NOW, post_form=post_form,
+        )
+
+    assert raised.value.code == "GMAIL_SCOPE_MISSING"
 
 
 def test_refresh_maps_revoked_credentials_to_auth_revoked() -> None:

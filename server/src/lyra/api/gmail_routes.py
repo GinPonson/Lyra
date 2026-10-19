@@ -5,7 +5,7 @@
 | 路由 | 说明 |
 | --- | --- |
 | ``POST /v1/google/authorization-transactions`` | 创建授权事务（201） |
-| ``POST /v1/google/authorization-transactions/{state}/complete`` | 完成授权 |
+| ``GET /v1/google/authorization-transactions/{authorizationId}`` | 轮询授权结果 |
 | ``GET /v1/google/connections`` | 列出连接 |
 | ``GET /v1/google/connections/{id}/mappings`` | 列出账户映射 |
 | ``PUT /v1/google/connections/{id}/mappings/{mappingId}`` | 改绑映射 |
@@ -21,9 +21,9 @@
 
 三处**在路由层**完成的格式校验（早于任何业务逻辑）：
 
-- ``state`` 必须是 43 个 URL 安全字符（与生成时一致）；
-- ``id`` / ``mappingId`` / ``explicitAccountId`` 必须是 UUID；
-- ``confirmedRescanAfterDate`` 必须是 ``YYYY-MM-DD``。
+- ``authorizationId`` / ``id`` / ``mappingId`` / ``explicitAccountId`` 必须是 UUID；
+- ``confirmedRescanAfterDate`` 必须是 ``YYYY-MM-DD``；
+- ``scanAll`` 必须是布尔值，且不能与 ``confirmedRescanAfterDate`` 同时提供。
 
 放在路由层的价值是**错误信息能指明是哪一段**，而不是让下游抛一个笼统的"参数无效"。
 """
@@ -34,6 +34,8 @@ import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from ..application.app_error import ApplicationError
 from .dependencies import require_user
@@ -41,8 +43,6 @@ from .dependencies import require_user
 _UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
-# 与授权事务生成时一致：32 字节 base64url（无填充）。
-_STATE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _LOCAL_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -68,41 +68,41 @@ def create_gmail_router() -> APIRouter:
                 status_code=503,
                 detail={"code": "GMAIL_CONNECTION_ERROR", "message": "Google OAuth 客户端尚未配置"},
             )
-        return transaction
+        response = JSONResponse(transaction, status_code=201)
+        response.headers["cache-control"] = "no-store"
+        return response
 
-    @router.post("/v1/google/authorization-transactions/{state}/complete")
-    async def complete_authorization_transaction(state: str, request: Request) -> Any:
-        """用授权码完成授权。
+    @router.get("/v1/google/authorization-transactions/{authorization_id}")
+    def read_authorization_transaction(authorization_id: str, request: Request) -> Any:
+        """读取当前用户、设备所发起 Gmail 授权的处理结果。
 
-        建立的连接归属当前认证用户；正文为 ``{"code": "..."}``。
+        pending 与 complete 响应均禁止缓存；授权结果可在事务 TTL 内重复读取。
         """
         auth = _auth(request)
-        if not _STATE.fullmatch(state):
+        if not _UUID.fullmatch(authorization_id):
             raise HTTPException(
-                status_code=400, detail={"code": "INVALID_ARGUMENT", "message": "Google 授权事务标识无效"}
+                status_code=404,
+                detail={"code": "GOOGLE_AUTH_TRANSACTION_INVALID", "message": "Google 授权事务无效"},
             )
-        try:
-            body = await request.json()
-        except Exception as error:
-            raise HTTPException(
-                status_code=400, detail={"code": "INVALID_ARGUMENT"}
-            ) from error
-        code = body.get("code") if isinstance(body, dict) else None
-        if not isinstance(code, str) or not 1 <= len(code.strip()) <= 1_024:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "INVALID_ARGUMENT", "message": "Google 授权完成参数无效"},
-            )
-        return _call(
-            _service(request).for_user(auth.user_id).complete_authorization_transaction,
-            device_id=auth.device_id, state=state, authorization_code=code.strip(),
+        result = _call(
+            _service(request).for_user(auth.user_id).get_authorization_transaction,
+            authorization_id=authorization_id, device_id=auth.device_id,
         )
+        response = JSONResponse(
+            result, status_code=202 if result["status"] == "pending" else 200
+        )
+        response.headers["cache-control"] = "no-store"
+        return response
 
     @router.get("/v1/google/connections")
     def list_connections(request: Request) -> Any:
         """列出当前用户已连接的 Google 账号。"""
         auth = _auth(request)
-        return {"connections": _service(request).for_user(auth.user_id).list_connections()}
+        service = _service(request)
+        return {
+            "configured": service.configured,
+            "connections": service.for_user(auth.user_id).list_connections(),
+        }
 
     @router.get("/v1/google/connections/{connection_id}/mappings")
     def list_mappings(connection_id: str, request: Request) -> Any:
@@ -150,16 +150,23 @@ def create_gmail_router() -> APIRouter:
     async def sync_connection(connection_id: str, request: Request) -> Any:
         """触发一次属于当前用户的同步。
 
-        正文可选：``{"confirmedRescanAfterDate": "YYYY-MM-DD", "explicitAccountId": "<uuid>"}``。
+        正文可选：``{"scanAll": true, "confirmedRescanAfterDate": "YYYY-MM-DD", "explicitAccountId": "<uuid>"}``。
 
-        **``confirmedRescanAfterDate`` 由用户提供**：首次扫描或重扫的起始日期不能由
-        服务端代选（§108.1）。
+        **首次全量扫描与自定义起始日期都必须由用户显式选择**：``scanAll=true`` 表示不
+        限制日期，``confirmedRescanAfterDate`` 表示从用户选定的日期开始；两者互斥。
+        普通增量同步不传这两个字段。
         """
         auth = _auth(request)
         _require_uuid(connection_id, "Gmail 连接 ID 无效")
         raw = await _optional_json(request)
         after_date = raw.get("confirmedRescanAfterDate")
+        scan_all = raw.get("scanAll", False)
         explicit = raw.get("explicitAccountId")
+        if not isinstance(scan_all, bool):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "Gmail 同步参数无效"},
+            )
         if after_date is not None and (
             not isinstance(after_date, str) or not _LOCAL_DATE.fullmatch(after_date)
         ):
@@ -167,13 +174,28 @@ def create_gmail_router() -> APIRouter:
                 status_code=400,
                 detail={"code": "INVALID_ARGUMENT", "message": "Gmail 同步参数无效"},
             )
+        if scan_all and after_date is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_ARGUMENT", "message": "全量扫描不能同时指定起始日期"},
+            )
         if explicit is not None:
             _require_uuid(explicit, "Gmail 同步参数无效")
-        return _call(
-            _service(request).for_user(auth.user_id).sync,
-            connection_id=connection_id,
-            confirmed_rescan_after_date=after_date,
-            explicit_account_id=explicit,
+        coordinator = getattr(request.app.state, "write_coordinator", None)
+        if coordinator is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "GMAIL_CONNECTION_ERROR", "message": "Gmail 同步服务暂不可用"},
+            )
+        return await coordinator.enqueue(
+            lambda: run_in_threadpool(
+                _call,
+                _service(request).for_user(auth.user_id).sync,
+                connection_id=connection_id,
+                confirmed_rescan_after_date=after_date,
+                scan_all=scan_all,
+                explicit_account_id=explicit,
+            )
         )
 
     @router.delete("/v1/google/connections/{connection_id}")

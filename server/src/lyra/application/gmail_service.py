@@ -2,10 +2,10 @@
 
 编排 OAuth 授权事务、连接生命周期、账户映射与（通过 ``GmailSyncService``）同步。
 
-**授权事务存在进程内存里**：它是一次性短时状态（TTL 10 分钟），不该进数据库——
-持久化它等于把"未完成的授权"变成需要清理的历史数据，而进程重启后它本就应当消失。
+**授权事务存在进程内存里**：它是一次性短时状态（TTL 10 分钟），不该进数据库；
+服务重启后待完成的授权自然失效。
 
-**授权事务绑定发起设备**：另一台设备拿到 state 也无法完成兑换。
+**授权事务绑定用户与发起设备**：回调只取服务端保存的归属，只有原用户和设备可轮询。
 
 **用户范围通过 :meth:`GmailService.for_user` 注入，而不是每个方法的参数**：路由持有
 的是一个单例服务（``app.state.gmail_service``），而「当前用户」是**每请求**才确定的。
@@ -21,7 +21,9 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 from ..domain.gmail.sync_plan import GmailSyncError
@@ -36,7 +38,7 @@ from ..infrastructure.gmail.google_oauth_client import (
 )
 from ..infrastructure.gmail.oauth_transaction import (
     GmailOAuthError,
-    consume_google_oauth_transaction,
+    GoogleOAuthTransactionStore,
     create_google_oauth_transaction,
 )
 from .app_error import ApplicationError
@@ -72,7 +74,9 @@ class GmailService:
         *,
         dependencies: Any,
         oauth: GmailOAuthConfig | None,
-        transactions: dict[str, Any] | None = None,
+        transactions: GoogleOAuthTransactionStore | None = None,
+        user_id: str | None = None,
+        connection_lock: Any = None,
     ) -> None:
         self._deps = dependencies
         self._oauth = oauth
@@ -80,7 +84,13 @@ class GmailService:
         #
         # **由 :meth:`for_user` 的副本共享**：创建事务的请求与完成事务的请求是两个
         # 请求，各自拿到自己的服务副本；表若不共享，完成那一步永远找不到事务。
-        self._transactions: dict[str, Any] = {} if transactions is None else transactions
+        self._transactions = (
+            GoogleOAuthTransactionStore() if transactions is None else transactions
+        )
+        self._user_id = user_id
+        # 同一服务进程内串行化重授权的「读已有 ID → 加密凭据 → upsert」步骤，
+        # 确保密文 AAD 使用保留的连接 ID。
+        self._connection_lock = RLock() if connection_lock is None else connection_lock
 
     @property
     def configured(self) -> bool:
@@ -100,6 +110,8 @@ class GmailService:
             dependencies=_UserScopedGmailDependencies(self._deps, user_id),
             oauth=self._oauth,
             transactions=self._transactions,
+            user_id=user_id,
+            connection_lock=self._connection_lock,
         )
 
     # ------------------------------------------------------------------
@@ -109,87 +121,220 @@ class GmailService:
     def create_authorization_transaction(self, device_id: str) -> dict[str, Any] | None:
         """创建一次授权事务。
 
-        **只返回 ``authorizationUrl`` 与 ``expiresAt``，不返回 ``state``**：
-        客户端从 Google 重定向里取 state，不需要（也不该）从本响应里取。
-
-        **不额外绑定用户**：事务已绑定发起设备，而设备归属唯一，因此设备匹配已经
-        蕴含用户匹配——再多存一个 user_id 只是同一约束的第二份副本。
+        浏览器将 state 直接回传服务端，App 只持有授权地址和独立轮询 ID；
+        App 不接收 Google 回调中的授权码，也不复制 state 来完成授权。
 
         @param device_id: 发起授权的设备。
-        @returns 授权地址与过期时间；OAuth 未配置时为 ``None``。
+        @returns authorizationId、授权地址、过期时间与轮询间隔；OAuth 未配置时为 ``None``。
         """
         if self._oauth is None:
             return None
+        if self._user_id is None:
+            raise ApplicationError(
+                code="DEVICE_CREDENTIAL_INVALID", message="设备访问令牌无效",
+                status_code=401, retryable=False,
+            )
+        now = self._deps.now()
+        authorization_id = str(uuid.uuid4())
         transaction = create_google_oauth_transaction(
-            device_id, self._deps.now(), AUTHORIZATION_TRANSACTION_TTL_MILLISECONDS
+            device_id, now, AUTHORIZATION_TRANSACTION_TTL_MILLISECONDS,
+            user_id=self._user_id, authorization_id=authorization_id,
         )
-        self._transactions[transaction.state] = transaction.record
         request = build_google_authorization_request(
             transaction, client_id=self._oauth.client_id,
             redirect_uri=self._oauth.redirect_uri,
         )
+        try:
+            self._transactions.create(transaction.record, now=now)
+        except GmailOAuthError as error:
+            raise ApplicationError(
+                code=error.code, message=error.message,
+                status_code=503, retryable=error.retryable,
+            ) from error
         return {
+            "authorizationId": authorization_id,
             "authorizationUrl": request.authorization_url,
             "expiresAt": request.expires_at,
+            "pollIntervalSeconds": 1,
         }
 
-    def complete_authorization_transaction(
-        self, *, device_id: str, state: str, authorization_code: str
-    ) -> dict[str, Any]:
-        """用授权码完成授权并建立**属于当前用户**的连接。
+    def complete_authorization_callback(
+        self, *, state: str, authorization_code: str | None, error: str | None
+    ) -> bool:
+        """处理 Google 浏览器回调并把安全结果留给原设备轮询。
 
-        @param device_id: 发起授权的设备。
-        @param state: 回调携带的 state。
-        @param authorization_code: Google 授权码。
-        @returns 公开的连接视图。
-        @raises ApplicationError: OAuth 未配置（503）、事务无效/过期/已用（400），
-            或该用户已连接同一个 Google 账号（409）。
+        回调不接受用户或设备标识；归属从短期服务端事务读取。未知 state 返回 ``False``，
+        让共享回调路由继续尝试原有 Google 身份登录流程。
+
+        @param state: Google 回调携带的 state 原文。
+        @param authorization_code: 成功时 Google 返回的授权码。
+        @param error: 用户拒绝等 Google 错误标识。
+        @returns 是否识别为 Gmail 事务；无论结果如何都不把凭据返回浏览器。
+        @raises ApplicationError: OAuth 未配置或连接持久化失败。
         """
         if self._oauth is None:
-            raise ApplicationError(
-                code="GMAIL_CONNECTION_ERROR", message="Google OAuth 客户端尚未配置",
-                status_code=503, retryable=False,
+            return False
+        try:
+            record = self._transactions.claim(state=state, now=self._deps.now())
+        except GmailOAuthError as transaction_error:
+            if transaction_error.code == "GOOGLE_AUTH_TRANSACTION_INVALID":
+                return False
+            # 事务已过期或回调已重放时，不把 state 交给登录回调继续处理。
+            return True
+        if error is not None:
+            denied = error == "access_denied"
+            self._transactions.fail(
+                state_hash=record.state_hash,
+                code="GMAIL_AUTHORIZATION_DENIED" if denied else "GMAIL_CONNECTION_ERROR",
+                message=(
+                    "用户取消了 Gmail 授权"
+                    if denied else "Google 暂时无法完成 Gmail 授权，请稍后重试"
+                ),
+                status_code=400 if denied else 503,
+                retryable=not denied,
             )
-        record = self._transactions.get(state)
-        if record is None:
+            return True
+        if (
+            not isinstance(authorization_code, str)
+            or not 1 <= len(authorization_code.strip()) <= 4_096
+        ):
+            self._transactions.fail(
+                state_hash=record.state_hash,
+                code="GOOGLE_TOKEN_EXCHANGE_FAILED",
+                message="Google 授权响应无效，请重新连接 Gmail",
+                status_code=400,
+                retryable=False,
+            )
+            return True
+        if record.user_id == "":
+            # 创建事务时即验证用户绑定；保留此检查防止错误的内存记录被兑换。
             raise ApplicationError(
                 code="GOOGLE_AUTH_TRANSACTION_INVALID",
                 message="Google 授权事务无效", status_code=400, retryable=False,
             )
         try:
-            consumed = consume_google_oauth_transaction(
-                record, state=state, device_id=device_id, now=self._deps.now()
+            # 浏览器回调没有请求认证上下文，事务中的用户与设备是唯一可信归属。
+            # 已绑定视图（例如单元测试或内部调用）无需再包一层用户适配器。
+            scoped = (
+                self
+                if self._user_id == record.user_id
+                else self.for_user(record.user_id)
+            )
+            scoped._deps.assert_authorization_active(
+                record.user_id, record.device_id
+            )
+            exchanged = scoped._deps.exchange_code(
+                authorization_code=authorization_code.strip(),
+                code_verifier=record.code_verifier,
+                client_id=self._oauth.client_id,
+                redirect_uri=self._oauth.redirect_uri,
+                client_secret=self._oauth.client_secret,
+            )
+            identity = _identity(exchanged["identity"])
+            grant = _grant(exchanged["grant"])
+            # Google 网络请求可能持续十几秒；若用户在等待期间停用账户或撤销设备，
+            # 不应再继续创建连接或恢复旧凭据。
+            scoped._deps.assert_authorization_active(
+                record.user_id, record.device_id
+            )
+            with self._connection_lock:
+                existing = scoped._deps.load_connection_by_subject(identity.subject)
+                connection_id = scoped._deps.new_id() if existing is None else existing.id
+                connection = create_gmail_connection_record(
+                    connection_id=connection_id,
+                    identity=identity,
+                    grant=grant,
+                    cipher=scoped._deps.cipher,
+                    now=scoped._deps.now(),
+                )
+                if existing is not None:
+                    # 原连接已有同步游标或映射时保留它们；重新授权后要求用户明确选定
+                    # 扫描范围，避免凭新 token 静默扩大历史扫描范围。
+                    status = (
+                        "needs_resync"
+                        if existing.status in ("disconnected", "error", "needs_resync")
+                        else existing.status
+                    )
+                    connection = _preserve_connection_history(
+                        connection, existing, status=status
+                    )
+                persisted = scoped._deps.upsert_connection(
+                    connection, device_id=record.device_id
+                )
+            public_connection = create_public_gmail_connection(persisted).to_json()
+            self._transactions.complete(
+                state_hash=record.state_hash, connection=public_connection
+            )
+        except GmailOAuthError as oauth_error:
+            status_code = _oauth_http_status(oauth_error)
+            self._transactions.fail(
+                state_hash=record.state_hash,
+                code=oauth_error.code,
+                message=oauth_error.message,
+                status_code=status_code,
+                retryable=oauth_error.retryable,
+            )
+        except GoogleEndpointFailure as endpoint_error:
+            self._transactions.fail(
+                state_hash=record.state_hash,
+                code="GMAIL_CONNECTION_ERROR",
+                message="无法连接 Google，请稍后重试",
+                status_code=503,
+                retryable=endpoint_error.retryable,
+            )
+        except ApplicationError as application_error:
+            self._transactions.fail(
+                state_hash=record.state_hash,
+                code=application_error.code,
+                message=application_error.message,
+                status_code=application_error.status_code,
+                retryable=application_error.retryable,
+            )
+        return True
+
+    def get_authorization_transaction(
+        self, *, authorization_id: str, device_id: str
+    ) -> dict[str, Any]:
+        """读取原设备 Gmail 授权的结果，直到事务 TTL 到期。
+
+        @param authorization_id: 创建响应中的轮询 ID。
+        @param device_id: 当前认证设备 ID。
+        @returns pending 状态或带公开连接视图的 complete 状态。
+        @raises ApplicationError: 用户/设备不匹配、事务失效或授权失败。
+        """
+        if self._user_id is None:
+            raise ApplicationError(
+                code="DEVICE_CREDENTIAL_INVALID", message="设备访问令牌无效",
+                status_code=401, retryable=False,
+            )
+        try:
+            record = self._transactions.get(
+                authorization_id=authorization_id,
+                user_id=self._user_id,
+                device_id=device_id,
+                now=self._deps.now(),
             )
         except GmailOAuthError as error:
             raise ApplicationError(
                 code=error.code, message=error.message,
-                status_code=400, retryable=False,
+                status_code=410 if error.code == "GOOGLE_AUTH_TRANSACTION_EXPIRED" else 404,
+                retryable=error.retryable,
             ) from error
-        # **消费后立即移除**：同一 state 不能兑换两次。留在表里靠 consumed_at 拦截
-        # 也行，但删掉更彻底——表也不会随时间无限增长。
-        self._transactions.pop(state, None)
-
-        exchanged = self._deps.exchange_code(
-            authorization_code=authorization_code,
-            code_verifier=consumed.code_verifier,
-            client_id=self._oauth.client_id,
-            redirect_uri=self._oauth.redirect_uri,
-            client_secret=self._oauth.client_secret,
-        )
-        connection = create_gmail_connection_record(
-            connection_id=self._deps.new_id(),
-            identity=_identity(exchanged["identity"]),
-            grant=_grant(exchanged["grant"]),
-            cipher=self._deps.cipher,
-            now=self._deps.now(),
-        )
-        # 归属由依赖视图注入：``create_connection`` 落库时带上当前用户的 user_id。
-        #
-        # 同一 Google 账号在**同一用户**下已有连接时插入会冲突（409）；在**另一个
-        # 用户**下则是各自独立的一条连接，不再互相顶掉（唯一键 ``(user_id,
-        # google_subject)``，P0 契约 §3.12）。
-        self._deps.create_connection(connection)
-        return create_public_gmail_connection(connection).to_json()
+        if record.status in ("pending", "processing"):
+            return {"status": "pending"}
+        if record.status == "failed":
+            raise ApplicationError(
+                code=record.failure_code or "GMAIL_CONNECTION_ERROR",
+                message=record.failure_message or "无法完成 Gmail 授权",
+                status_code=record.failure_status_code or 503,
+                retryable=record.failure_retryable,
+            )
+        if record.result is None:
+            raise ApplicationError(
+                code="GMAIL_CONNECTION_ERROR", message="Gmail 授权结果不可用",
+                status_code=503, retryable=False,
+            )
+        return {"status": "complete", "connection": record.result}
 
     # ------------------------------------------------------------------
     # 连接与映射
@@ -280,9 +425,10 @@ class GmailService:
         *,
         connection_id: str,
         confirmed_rescan_after_date: str | None,
+        scan_all: bool = False,
         explicit_account_id: str | None,
     ) -> dict[str, Any]:
-        """执行一次属于当前用户的增量同步或有界重扫。
+        """执行一次属于当前用户的增量同步或有界扫描。
 
         **用户活动状态在真正的执行点再查一次**：请求进入时 ``require_user`` 已经拒绝
         过停用用户（入队检查），但同步是长流程，用户可能在拉取期间被停用。依赖视图里
@@ -292,6 +438,7 @@ class GmailService:
 
         @param connection_id: 连接 ID；必须属于当前用户。
         @param confirmed_rescan_after_date: 用户确认的重扫起始日期。
+        @param scan_all: 用户明确选择不限制首次扫描或重扫日期。
         @param explicit_account_id: 用户显式指定的账户。
         @returns 同步摘要。
         @raises ApplicationError: 连接不存在（404）、用户已停用（403）、
@@ -300,6 +447,7 @@ class GmailService:
         return sync_gmail_connection(
             connection_id=connection_id,
             confirmed_rescan_after_date=confirmed_rescan_after_date,
+            scan_all=scan_all,
             explicit_account_id=explicit_account_id,
             dependencies=self._deps.build_sync_dependencies(),
         )
@@ -341,6 +489,17 @@ class _UserScopedGmailDependencies:
         """新连接 ID。"""
         return self._inner.new_id()
 
+    def assert_authorization_active(self, user_id: str, device_id: str) -> None:
+        """确认等待 OAuth 的用户和设备在回调时仍有效且仍保持归属。"""
+        if user_id != self._user_id:
+            raise ApplicationError(
+                code="GOOGLE_AUTH_TRANSACTION_INVALID",
+                message="Google 授权事务无效",
+                status_code=404,
+                retryable=False,
+            )
+        self._inner.assert_authorization_active(self._user_id, device_id)
+
     def exchange_code(self, **kwargs: Any) -> dict:
         """用授权码换取凭据与身份。"""
         return self._inner.exchange_code(**kwargs)
@@ -356,6 +515,16 @@ class _UserScopedGmailDependencies:
     def load_connection(self, connection_id: str) -> Any:
         """读取一条属于绑定用户的连接。"""
         return self._inner.load_connection(self._user_id, connection_id)
+
+    def load_connection_by_subject(self, google_subject: str) -> Any:
+        """按 Google subject 读取绑定用户的既有连接。"""
+        return self._inner.load_connection_by_subject(self._user_id, google_subject)
+
+    def upsert_connection(self, record: Any, *, device_id: str | None = None) -> Any:
+        """插入或更新绑定用户的连接，并在事务内校验原授权设备仍有效。"""
+        return self._inner.upsert_connection(
+            self._user_id, record, device_id=device_id
+        )
 
     def save_connection(
         self, record: Any, *, expected_updated_at: str, **overrides: Any
@@ -424,6 +593,37 @@ def _to_record(row: Any) -> GmailConnectionRecord:
         last_sync_at=row.last_sync_at, created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+def _preserve_connection_history(
+    fresh: GmailConnectionRecord, existing: Any, *, status: str
+) -> GmailConnectionRecord:
+    """用新凭据覆盖连接，同时保留原连接历史和创建时间。
+
+    @param fresh: 使用原连接 ID 加密的新授权记录。
+    @param existing: 当前用户同 subject 的持久化连接。
+    @param status: 新授权后的同步状态。
+    @returns 保留游标、最近同步时间和创建时间的记录。
+    """
+    from dataclasses import replace
+
+    return replace(
+        fresh,
+        history_id=existing.history_id,
+        status=status,
+        last_error_code=None,
+        last_sync_at=existing.last_sync_at,
+        created_at=existing.created_at,
+    )
+
+
+def _oauth_http_status(error: GmailOAuthError) -> int:
+    """把 OAuth 校验错误映射到安全的轮询状态码。"""
+    if error.code in ("GMAIL_SCOPE_MISSING", "GOOGLE_IDENTITY_UNVERIFIED"):
+        return 403
+    if error.retryable:
+        return 503
+    return 400
 
 
 def load_gmail_google_oauth_config(environment: Any) -> GmailOAuthConfig | None:

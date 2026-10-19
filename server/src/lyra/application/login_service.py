@@ -32,11 +32,7 @@ from ..infrastructure.auth.login_provider import (
     ConfiguredLoginProvider,
     LoginIdentity,
 )
-from ..infrastructure.db.invite_code_repository import (
-    InviteCodeRepository,
-    hash_invite_code,
-    registration_blocked_error,
-)
+from ..infrastructure.db.invite_code_repository import hash_invite_code
 from ..security.device_auth import normalize_device_public_key
 from .app_error import ApplicationError
 
@@ -50,23 +46,19 @@ MAX_STARTS_PER_SOURCE_WINDOW = 20
 
 _CODE_CHALLENGE = re.compile(r"^[A-Za-z\d_-]{43}$")
 _CODE_VERIFIER = re.compile(r"^[A-Za-z\d._~-]{43,128}$")
-# 邀请码是 base64url 文本；长度留出余量，签发端当前是 32 字符。格式不符直接 400，
-# 而不是拿去查库——否则每个畸形输入都会打一次数据库。
-_INVITE_CODE = re.compile(r"^[A-Za-z\d_-]{16,128}$")
 
 
 @dataclass(frozen=True)
 class LoginStartInput:
     """发起登录所需的 App 侧参数。
 
-    ``invite_code`` 是**新身份注册**的凭据；已有身份登录时它被忽略且不会被消耗。
+    这里只包含 OAuth 跳转前需要的信息；邀请码在身份验证后通过 ``exchange`` 提交。
     """
 
     display_name: str
     public_key_pem: str
     code_challenge: str
     code_challenge_method: str
-    invite_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,8 +83,6 @@ class LoginAttempt:
     app_code_challenge: str
     public_key_pem: str
     display_name: str
-    #: 邀请码明文的哈希；``None`` 表示本次登录未提供。明文不出现在事务状态里。
-    invite_code_hash: str | None
     expires_at: float
     terminated_at: float | None = None
     status: str = "pending"
@@ -107,11 +97,13 @@ class UserLoginService:
         self,
         providers: Sequence[ConfiguredLoginProvider],
         device_authorizer: Callable[..., Mapping[str, Any]],
-        invites: InviteCodeRepository,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        """@param providers: 已装配的来源。@param device_authorizer: 签发设备凭据的用例。
-        @param invites: 邀请码仓储；``/start`` 用它提前校验，注册时由签发用例核销。
+        """初始化有来源绑定、PKCE 与过期时间的登录事务服务。
+
+        @param providers: 已装配且来源 ID 唯一的登录提供方。
+        @param device_authorizer: 按已验证身份解析用户并签发设备凭据的用例。
+        @param now: 可选的可信时钟，主要用于事务 TTL 与确定性测试。
         """
         self._providers: dict[str, ConfiguredLoginProvider] = {}
         for provider in providers:
@@ -119,7 +111,6 @@ class UserLoginService:
                 raise ValueError("登录提供方重复或无效")
             self._providers[provider.id] = provider
         self._devices = device_authorizer
-        self._invites = invites
         self._now = now
         self._attempts: dict[str, LoginAttempt] = {}
         self._states: dict[str, str] = {}
@@ -129,11 +120,11 @@ class UserLoginService:
     def catalog(self) -> dict[str, Any]:
         """返回公开的登录来源目录（只含名称与可用性）。
 
-        ``registrationRequiresInvite`` 让客户端知道**要不要显示邀请码输入框**。
-        它是公开信息：邀请码的存在本身不是秘密，码的值才是。
+        ``registrationRequiresInvite`` 描述新身份完成注册时的门禁；邀请码在 OAuth
+        身份验证成功后才提交，因此该标记不决定首页是否显示输入框。
         """
         return {
-            # 新身份注册一律需要邀请码（见 :meth:`UserLoginService.start` 的校验）。
+            # 新身份注册需要邀请码；已解析身份登录不受此门禁影响。
             "registrationRequiresInvite": True,
             "providers": [
                 {
@@ -171,10 +162,6 @@ class UserLoginService:
             or not _CODE_CHALLENGE.fullmatch(start_input.code_challenge)
             or not 1 <= len(start_input.display_name.strip()) <= 64
             or len(start_input.public_key_pem) > 4096
-            or (
-                start_input.invite_code is not None
-                and not _INVITE_CODE.fullmatch(start_input.invite_code)
-            )
         ):
             raise ApplicationError(
                 code="INVALID_ARGUMENT", message="登录参数无效", status_code=400, retryable=False
@@ -189,14 +176,6 @@ class UserLoginService:
                 status_code=400,
                 retryable=False,
             ) from error
-
-        # **提前校验但不核销**：让用户在跳浏览器之前就知道码不对，避免"走完 OAuth
-        # 才发现白跑一趟"。真正的核销发生在注册那一刻（且必须是原子的条件更新）。
-        invite_code_hash: str | None = None
-        if start_input.invite_code is not None:
-            invite_code_hash = hash_invite_code(start_input.invite_code)
-            if not self._invites.is_active(invite_code_hash):
-                raise registration_blocked_error()
 
         self._prune_expired()
         self._assert_source_budget(source_key)
@@ -221,7 +200,6 @@ class UserLoginService:
             app_code_challenge=start_input.code_challenge,
             public_key_pem=public_key_pem,
             display_name=start_input.display_name.strip(),
-            invite_code_hash=invite_code_hash,
             expires_at=now + LOGIN_TTL_MILLISECONDS,
         )
         authorization_url = provider.client.authorization_url(
@@ -307,16 +285,19 @@ class UserLoginService:
         *,
         login_id: str,
         code_verifier: str,
+        invite_code: str | None = None,
     ) -> dict[str, Any]:
         """轮询与最终兑换；两者都必须带 App verifier。
 
         **自动注册发生在本方法的成功路径上**：verifier 与 challenge 比对通过、事务处于
         ``approved`` 之后才调用设备签发用例，而后者按已验证身份解析或创建用户。
-        未完成验证（pending / failed / 已兑换）时不会创建任何用户。
+        新身份的邀请码只在这一步提交；门禁错误会保留已授权事务与身份，使同一事务可
+        在输入正确邀请码后重试。未完成验证（pending / failed / 已兑换）时不会创建用户。
 
         @param provider_id: 来源 ID。
         @param login_id: 登录事务 ID。
         @param code_verifier: App 侧 PKCE verifier。
+        @param invite_code: 新身份注册时可选的非空邀请码；已有身份不会消耗它。
         @returns ``{"status": "pending"}`` 或兑换完成的凭据与用户对象。
         @raises ApplicationError: verifier 不符、事务失败、已用或已过期；
             该身份的用户已停用时返回 ``USER_DISABLED``（403）。
@@ -338,6 +319,14 @@ class UserLoginService:
         if attempt.status != "approved" or attempt.identity is None:
             raise _already_redeemed()
 
+        if invite_code is not None and not invite_code.strip():
+            raise ApplicationError(
+                code="INVALID_ARGUMENT", message="登录参数无效", status_code=400, retryable=False
+            )
+        # 只在 PKCE 已验证且 OAuth 身份已获批后计算哈希；是否有效由签发用例在原子事务
+        # 中确认，避免预查询与并发核销之间出现状态竞态。
+        invite_code_hash = hash_invite_code(invite_code.strip()) if invite_code is not None else None
+
         # 先占用再开始签发凭据；同一事件循环中的并发兑换只能有一个胜者。
         attempt.status = "exchanging"
         identity = attempt.identity
@@ -346,7 +335,7 @@ class UserLoginService:
                 identity=identity,
                 public_key_pem=attempt.public_key_pem,
                 display_name=attempt.display_name,
-                invite_code_hash=attempt.invite_code_hash,
+                invite_code_hash=invite_code_hash,
             )
             attempt.status = "consumed"
             attempt.terminated_at = self._now_ms()
@@ -355,6 +344,14 @@ class UserLoginService:
             # 因此这里不再自己拼一个 user 字段——两处各拼一次必然会在某个字段上漂移。
             return {"status": "complete", **credentials}
         except Exception as error:
+            if isinstance(error, ApplicationError) and error.code in {
+                "INVITE_CODE_REQUIRED",
+                "INVITE_CODE_INVALID",
+            }:
+                # 缺码或错码时签发用例的事务已回滚。保留同一 OAuth 身份供用户补码，
+                # 且不保存错误码输入，让后续正确邀请码可以重试。
+                attempt.status = "approved"
+                raise
             attempt.status = "failed"
             attempt.terminated_at = self._now_ms()
             attempt.identity = None

@@ -16,12 +16,19 @@ from lyra.application.market_data_service import (
     MarketDataService,
     ProviderQuote,
 )
+from lyra.domain.market_data.history import MarketHistoryBar, MarketHistoryResult
+from lyra.domain.market_data.stock_summary import (
+    MarketPreviousClose,
+    MarketStockSummary,
+)
 from lyra.domain.market_data.types import (
     MarketPricePoint,
     MarketQuote,
     MarketTiming,
+    OptionInstrument,
     StockInstrument,
 )
+from lyra.infrastructure.market_data.alpaca_provider import AlpacaMarketDataProvider
 
 NOW = 1_760_000_000_000
 # 超过默认 7 天时效的报价时点（回归用；默认值见 market_data_service.DEFAULT_MAX_QUOTE_AGE_MS）。
@@ -331,3 +338,234 @@ def test_per_call_route_does_not_clear_the_cache() -> None:
     assert len(service._cache) == len(primary_keys) + 1
     # 第二次读命中的是新来源的刷新，而不是主来源的缓存。
     assert catalog.calls == ["primary", "secondary"]
+
+
+def test_history_cache_is_public_bounded_and_preserves_fetch_cutoff() -> None:
+    """历史缓存按公开身份/range 复用、有界，并保留原始抓取时点。"""
+    calls: list[str] = []
+
+    def fetch(instrument, *, history_range, now_ms, consume_page):
+        calls.append(history_range)
+        return MarketHistoryResult(
+            status="available",
+            bars=(MarketHistoryBar(
+                timestamp="2025-10-09T08:00:00.000Z",
+                open="12", high="13", low="11", close="12.5", volume=4,
+            ),),
+            feed="sip",
+            fetched_at="2025-10-09T08:53:20.000Z",
+            cutoff="2025-10-09T08:37:20.000Z",
+        )
+
+    service = MarketDataService(
+        providers={}, history_providers={"primary": fetch},
+        routes={}, policies={"primary": POLICY}, now=lambda: NOW,
+        max_cache_entries=1,
+    )
+
+    first = service.read_history(INSTRUMENT, "1w", ("primary",))
+    cached = service.read_history(INSTRUMENT, "1w", ("primary",))
+    service.read_history(INSTRUMENT, "1m", ("primary",))
+
+    assert first.cached is False
+    assert cached.cached is True
+    assert cached.cutoff == "2025-10-09T08:37:20.000Z"
+    assert cached.fetched_at == "2025-10-09T08:53:20.000Z"
+    assert calls == ["1w", "1m"]
+    assert len(service._history_cache) == 1
+    assert all("user" not in key and "account" not in key for key in service._history_cache)
+
+
+def test_history_and_quote_share_the_provider_budget() -> None:
+    """同一来源的历史请求与报价共用部署级请求预算。"""
+    policy = MarketProviderPolicy(
+        cache_ttl_ms=30_000, max_requests_per_minute=1, max_requests_per_day=None
+    )
+    history_calls: list[str] = []
+
+    def history_fetch(instrument, *, history_range, now_ms, consume_page):
+        history_calls.append(history_range)
+        return MarketHistoryResult(status="unavailable", issue="no_data")
+
+    service = MarketDataService(
+        providers={"primary": lambda instrument, *, now_ms: _available()},
+        history_providers={"primary": history_fetch},
+        routes={"stock": ("primary",)}, policies={"primary": policy},
+        now=lambda: NOW,
+    )
+
+    service.read_quote(INSTRUMENT, ("primary",))
+    history = service.read_history(INSTRUMENT, "1w", ("primary",))
+
+    assert history.status == "unavailable"
+    assert history.issue == "rate_limited"
+    assert history_calls == []
+    assert len(service._budgets["primary"].minute_calls) == 1
+
+
+def test_history_pagination_consumes_each_additional_shared_budget_unit() -> None:
+    """额外历史页通过同一个 ProviderBudget 消费额度。"""
+    policy = MarketProviderPolicy(
+        cache_ttl_ms=30_000, max_requests_per_minute=1, max_requests_per_day=None
+    )
+    page_attempts: list[int] = []
+
+    def history_fetch(instrument, *, history_range, now_ms, consume_page):
+        denial = consume_page()
+        page_attempts.append(now_ms)
+        return MarketHistoryResult(
+            status="unavailable", issue=denial or "invalid_response"
+        )
+
+    service = MarketDataService(
+        providers={}, history_providers={"primary": history_fetch},
+        routes={}, policies={"primary": policy}, now=lambda: NOW,
+    )
+
+    result = service.read_history(INSTRUMENT, "1w", ("primary",))
+
+    assert result.status == "unavailable"
+    assert result.issue == "rate_limited"
+    assert len(page_attempts) == 1
+    assert len(service._budgets["primary"].minute_calls) == 1
+
+
+def test_expired_history_cache_keeps_expiry_cutoff_and_original_fetch_time() -> None:
+    """缓存命中过期合约时保留到期锚点与原始 provider 抓取时间。"""
+    clock = [NOW]
+    calls: list[str] = []
+    symbol = "INTC250321C00100000"
+
+    def fetch(url, *, headers, timeout):
+        calls.append(url)
+        return type("Response", (), {
+            "status": 200,
+            "headers": {},
+            "chunks": lambda self: iter([(
+                '{"bars":{"' + symbol + '":[{"t":"2025-03-21T04:00:00Z",'
+                '"o":1.4,"h":1.7,"l":1.3,"c":1.5,"v":5}]},'
+                '"next_page_token":null}'
+            ).encode()]),
+        })()
+
+    alpaca = AlpacaMarketDataProvider(
+        api_key="key", secret_key="secret", fetch=fetch
+    )
+    service = MarketDataService(
+        providers={}, history_providers={"alpaca": alpaca.fetch_history},
+        routes={}, policies={
+            "alpaca": MarketProviderPolicy(
+                cache_ttl_ms=15 * 60_000, max_requests_per_minute=10,
+                max_requests_per_day=None,
+            )
+        },
+        now=lambda: clock[0],
+    )
+    instrument = OptionInstrument(
+        underlying="INTC", expiry="2025-03-21", strike="100", option_type="C"
+    )
+
+    first = service.read_history(instrument, "1m", ("alpaca",))
+    clock[0] += 30_000
+    cached = service.read_history(instrument, "1m", ("alpaca",))
+
+    assert first.status == "available"
+    assert cached.cached is True
+    assert first.cutoff == cached.cutoff == "2025-03-22T04:00:00.000Z"
+    assert first.fetched_at == cached.fetched_at == "2025-10-09T08:53:20.000Z"
+    assert calls and len(calls) == 1
+
+
+def test_stock_summary_cache_uses_public_stock_identity_and_shared_two_request_budget() -> None:
+    """同一正股摘要跨调用共享缓存；snapshot 与前收盘各消费一次预算。"""
+    calls: list[str] = []
+
+    def fetch(instrument, *, now_ms, consume_request):
+        calls.append(instrument.symbol)
+        assert consume_request() is None
+        return MarketStockSummary(
+            status="available",
+            price=MarketPricePoint("12.5", "2025-10-09T08:30:00.000Z"),
+            previous_close=MarketPreviousClose("12", "2025-10-08"),
+            change_percent="4.166666666666666666666666666666666666666666666666666666666666667",
+            feed="alpaca-test",
+            fetched_at=_iso(now_ms),
+        )
+
+    service = MarketDataService(
+        providers={}, stock_summary_providers={"alpaca": fetch}, routes={},
+        policies={"alpaca": POLICY}, now=lambda: NOW,
+    )
+
+    first = service.read_stock_summary(INSTRUMENT, ("alpaca",))
+    second = service.read_stock_summary(INSTRUMENT, ("alpaca",))
+
+    assert first.status == second.status == "available"
+    assert second.cached is True
+    assert first.fetched_at == second.fetched_at
+    assert first.price == second.price
+    assert calls == ["INTC"]
+    assert len(service._budgets["alpaca"].minute_calls) == 2
+    assert len(service._stock_summary_cache) == 1
+
+
+def test_partial_stock_summary_uses_short_cooldown_and_keeps_original_times() -> None:
+    """缺少前收盘的部分成功只短暂缓存，缓存结果保留原始成交与抓取时间。"""
+    clock = [NOW]
+    calls: list[int] = []
+
+    def fetch(instrument, *, now_ms, consume_request):
+        calls.append(now_ms)
+        assert consume_request() is None
+        return MarketStockSummary(
+            status="available",
+            price=MarketPricePoint("12.5", _iso(now_ms - 60_000)),
+            change_issue="no_previous_close",
+            feed="alpaca-test",
+            fetched_at=_iso(now_ms),
+        )
+
+    service = MarketDataService(
+        providers={}, stock_summary_providers={"alpaca": fetch}, routes={},
+        policies={"alpaca": POLICY}, now=lambda: clock[0],
+    )
+
+    first = service.read_stock_summary(INSTRUMENT, ("alpaca",))
+    clock[0] += 30_000
+    cached = service.read_stock_summary(INSTRUMENT, ("alpaca",))
+    clock[0] += 31_000
+    refreshed = service.read_stock_summary(INSTRUMENT, ("alpaca",))
+
+    assert first.change_issue == cached.change_issue == "no_previous_close"
+    assert cached.cached is True
+    assert cached.price == first.price
+    assert cached.fetched_at == first.fetched_at
+    assert refreshed.cached is False
+    assert len(calls) == 2
+
+
+def test_stock_summary_respects_explicit_fallbacks_and_reports_unsupported_sources() -> None:
+    """只遍历显式路由：quote-only 来源不伪装成摘要能力。"""
+
+    def fetch(instrument, *, now_ms, consume_request):
+        return MarketStockSummary(
+            status="available",
+            price=MarketPricePoint("12.5", _iso(now_ms)),
+            previous_close=MarketPreviousClose("12", "2025-10-08"),
+            change_percent="4.166666666666666666666666666666666666666666666666666666666666667",
+            fetched_at=_iso(now_ms),
+        )
+
+    service = MarketDataService(
+        providers={}, stock_summary_providers={"alpaca": fetch}, routes={},
+        policies={"alpaca": POLICY}, now=lambda: NOW,
+    )
+
+    fallback = service.read_stock_summary(INSTRUMENT, ("marketdata", "alpaca"))
+    unsupported = service.read_stock_summary(INSTRUMENT, ("marketdata",))
+
+    assert fallback.status == "available"
+    assert fallback.provider_id == "alpaca"
+    assert unsupported.status == "unavailable"
+    assert unsupported.issue == "summary_not_supported"
+    assert unsupported.provider_id is None

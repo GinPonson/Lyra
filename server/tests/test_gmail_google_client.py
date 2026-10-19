@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+import lyra.infrastructure.gmail.google_gmail_client as gmail_client
 from lyra.domain.gmail.sync_plan import GmailSyncError
 from lyra.infrastructure.gmail.google_gmail_client import (
     GMAIL_HISTORY_ENDPOINT,
@@ -269,10 +270,10 @@ class _Plan:
 
 
 def _pager(pages: list[dict]):
-    """构造一个按序返回页面的传输层桩。"""
+    """构造一个按序返回 ``(status, payload)`` 的 Gmail 传输层桩。"""
     def get_json(url, headers, timeout):
         get_json.urls.append(url)
-        return pages[len(get_json.urls) - 1]
+        return 200, pages[len(get_json.urls) - 1]
     get_json.urls = []
     return get_json
 
@@ -388,7 +389,7 @@ def test_the_access_token_is_sent_as_a_bearer_header() -> None:
     def get_json(url, headers, timeout):
         captured["url"] = url
         captured["headers"] = headers
-        return {"messages": []}
+        return 200, {"messages": []}
 
     fetch_bounded_gmail_message_ids("ya29.secret", _Plan(), get_json=get_json)
 
@@ -620,7 +621,7 @@ def test_incremental_sends_the_token_in_the_header() -> None:
 
     def get_json(url, headers, timeout):
         captured.append((url, headers))
-        return _history_page("100", [])
+        return 200, _history_page("100", [])
 
     fetch_incremental_gmail_message_ids(
         "ya29.secret", start_history_id="99", maximum_messages=5, get_json=get_json
@@ -638,12 +639,10 @@ def test_incremental_sends_the_token_in_the_header() -> None:
 
 @pytest.mark.parametrize("status", [401, 403])
 def test_auth_failures_map_to_revoked(status: int) -> None:
-    """**401 与 403 都表示授权已失效。**
-
-    Gmail 用 403 表达"令牌有效但缺少该资源的权限"，与 401 一样需要用户重新授权；
-    当成暂时性故障会无限重试。
-    """
-    error = gmail_http_error(status)
+    """401 与明确缺少 scope 的 403 才提示授权；不能把配额错误也归于用户授权。"""
+    error = gmail_http_error(
+        status, {"error": {"errors": [{"reason": "insufficientPermissions"}]}}
+    )
 
     assert error.code == "GMAIL_AUTH_REVOKED"
     assert error.retryable is False
@@ -654,8 +653,29 @@ def test_transient_gmail_failures_are_retryable(status: int) -> None:
     """429 与 5xx 可重试。"""
     error = gmail_http_error(status)
 
-    assert error.code == "GMAIL_CONNECTION_ERROR"
+    assert error.code == ("GMAIL_RATE_LIMITED" if status == 429 else "GMAIL_CONNECTION_ERROR")
     assert error.retryable is True
+
+
+@pytest.mark.parametrize("reason,code", [
+    ("SERVICE_DISABLED", "GMAIL_API_DISABLED"),
+    ("accessNotConfigured", "GMAIL_API_DISABLED"),
+    ("rateLimitExceeded", "GMAIL_RATE_LIMITED"),
+    ("userRateLimitExceeded", "GMAIL_RATE_LIMITED"),
+    ("dailyLimitExceeded", "GMAIL_RATE_LIMITED"),
+    ("domainPolicy", "GMAIL_ACCESS_DENIED"),
+])
+def test_gmail_403_reasons_remain_distinct_without_leaking_payload(reason: str, code: str) -> None:
+    """API 配置、配额与域策略采用安全原因枚举，不返回供应商正文。"""
+    payload = {"error": {"message": "private-provider-text", "details": [{"reason": reason}]}}
+    error = gmail_http_error(403, payload)
+    assert error.code == code
+    assert "private-provider-text" not in error.message
+
+
+def test_unexplained_403_does_not_claim_that_the_gmail_grant_was_revoked() -> None:
+    """没有具体原因的禁止访问需要检查权限，不能断言重新授权就能解决。"""
+    assert gmail_http_error(403).code == "GMAIL_ACCESS_DENIED"
 
 
 @pytest.mark.parametrize("status", [400, 404, 410, 422])
@@ -680,19 +700,154 @@ def test_request_returns_the_payload_on_success() -> None:
     assert result == {"ok": True}
 
 
-def test_history_404_means_the_cursor_expired() -> None:
+def test_request_preserves_the_safe_api_disabled_reason() -> None:
+    """HTTP 适配边界必须转交稳定原因，且不能回传 Google 的原始错误正文。"""
+    with pytest.raises(GmailSyncError) as raised:
+        request_gmail_json(
+            "https://gmail.example/profile", "t",
+            get_json=_json_getter(403, {"error": {
+                "message": "private-provider-text",
+                "details": [{"reason": "SERVICE_DISABLED"}],
+            }}),
+        )
+    assert raised.value.code == "GMAIL_API_DISABLED"
+    assert "private-provider-text" not in raised.value.message
+
+
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    [
+        (429, {"error": {"message": "private quota detail"}}),
+        (403, {"error": {"errors": [{"reason": "rateLimitExceeded"}]}}),
+        (403, {"error": {"details": [{"reason": "userRateLimitExceeded"}]}}),
+    ],
+)
+def test_request_retries_temporary_rate_limits_then_returns_success(
+    status: int, payload: dict, monkeypatch
+) -> None:
+    """短期 429/per-user 403 以指数退避重试，恢复后返回成功响应。"""
+    calls = 0
+    delays: list[float] = []
+    responses = [(status, payload), (status, payload), (200, {"ok": True})]
+
+    def get_json(_url, _headers, _timeout):
+        nonlocal calls
+        response = responses[calls]
+        calls += 1
+        return response
+
+    monkeypatch.setattr(gmail_client.time, "sleep", delays.append)
+    monkeypatch.setattr(gmail_client.random, "uniform", lambda low, high: 0.125)
+
+    result = request_gmail_json("https://gmail.example/messages", "token", get_json=get_json)
+
+    assert result == {"ok": True}
+    assert calls == 3
+    assert delays == [1.125, 2.125]
+
+
+def test_request_stops_after_six_rate_limit_retries(monkeypatch) -> None:
+    """速率限制最多重试六次，耗尽后保留 GMAIL_RATE_LIMITED 错误。"""
+    calls = 0
+    delays: list[float] = []
+
+    def get_json(_url, _headers, _timeout):
+        nonlocal calls
+        calls += 1
+        return 403, {"error": {
+            "message": "private-provider-body",
+            "details": [{"reason": "userRateLimitExceeded"}],
+        }}
+
+    monkeypatch.setattr(gmail_client.time, "sleep", delays.append)
+    monkeypatch.setattr(gmail_client.random, "uniform", lambda low, high: 0.125)
+
+    with pytest.raises(GmailSyncError) as raised:
+        request_gmail_json("https://gmail.example/messages", "token", get_json=get_json)
+
+    assert raised.value.code == "GMAIL_RATE_LIMITED"
+    assert raised.value.retryable is True
+    assert "private-provider-body" not in raised.value.message
+    assert calls == gmail_client.GMAIL_RATE_LIMIT_MAX_RETRIES + 1
+    assert delays == [1.125, 2.125, 4.125, 8.125, 16.125, 32.125]
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected_code"),
+    [
+        (403, "dailyLimitExceeded", "GMAIL_RATE_LIMITED"),
+        (403, "quotaExceeded", "GMAIL_RATE_LIMITED"),
+        (429, "dailyLimitExceeded", "GMAIL_RATE_LIMITED"),
+        (403, "insufficientPermissions", "GMAIL_AUTH_REVOKED"),
+        (403, "SERVICE_DISABLED", "GMAIL_API_DISABLED"),
+        (403, "accessNotConfigured", "GMAIL_API_DISABLED"),
+        (403, "domainPolicy", "GMAIL_ACCESS_DENIED"),
+    ],
+)
+def test_non_temporary_403_reasons_are_not_retried(
+    status: int, reason: str, expected_code: str, monkeypatch
+) -> None:
+    """日配额、授权、API 配置及访问拒绝只调用一次，不做速率退避。"""
+    calls = 0
+    delays: list[float] = []
+
+    def get_json(_url, _headers, _timeout):
+        nonlocal calls
+        calls += 1
+        return status, {"error": {"errors": [{"reason": reason}]}}
+
+    monkeypatch.setattr(gmail_client.time, "sleep", delays.append)
+    monkeypatch.setattr(gmail_client.random, "uniform", lambda low, high: 0.125)
+
+    with pytest.raises(GmailSyncError) as raised:
+        request_gmail_json("https://gmail.example/messages", "token", get_json=get_json)
+
+    assert raised.value.code == expected_code
+    assert raised.value.retryable is False
+    assert calls == 1
+    assert delays == []
+
+
+def test_history_404_means_the_cursor_expired(monkeypatch) -> None:
     """**``history.list`` 的 404 表示游标已过期。**
 
     Google 只保留大约一周的历史；当成一般连接错误会让客户端拿着一个**永久失效的
     游标**反复重试，而正确的动作是让用户确认重扫范围。
     """
+    calls = 0
+    delays: list[float] = []
+
+    def get_json(_url, _headers, _timeout):
+        nonlocal calls
+        calls += 1
+        return 404, {"error": {"reason": "notFound"}}
+
+    monkeypatch.setattr(gmail_client.time, "sleep", delays.append)
+
     with pytest.raises(GmailSyncError) as raised:
         request_gmail_json(
             "https://gmail.example/history", "t",
-            get_json=_json_getter(404), history_404_means_expired=True,
+            get_json=get_json, history_404_means_expired=True,
         )
 
     assert raised.value.code == "GMAIL_HISTORY_EXPIRED"
+    assert calls == 1
+    assert delays == []
+
+
+def test_incremental_history_404_means_the_cursor_expired() -> None:
+    """history 分页器通过共享 tuple 边界保留 404 的游标过期语义。"""
+    def get_json(url, _headers, _timeout):
+        assert url.startswith(f"{GMAIL_HISTORY_ENDPOINT}?")
+        return 404, {"error": {"message": "private provider detail"}}
+
+    with pytest.raises(GmailSyncError) as raised:
+        fetch_incremental_gmail_message_ids(
+            "token", start_history_id="99", maximum_messages=10, get_json=get_json
+        )
+
+    assert raised.value.code == "GMAIL_HISTORY_EXPIRED"
+    assert "private provider detail" not in raised.value.message
 
 
 def test_ordinary_404_is_not_a_cursor_expiry() -> None:
@@ -717,12 +872,25 @@ def test_transport_failure_is_retryable() -> None:
     assert raised.value.retryable is True
 
 
-def test_non_object_root_is_rejected() -> None:
+def test_non_object_root_is_rejected(monkeypatch) -> None:
     """JSON 根节点不是对象必须报错。"""
+    calls = 0
+    delays: list[float] = []
+
+    def get_json(_url, _headers, _timeout):
+        nonlocal calls
+        calls += 1
+        return 200, ["a"]
+
+    monkeypatch.setattr(gmail_client.time, "sleep", delays.append)
+
     with pytest.raises(GmailSyncError, match="根节点不是对象"):
         request_gmail_json(
-            "https://gmail.example/x", "t", get_json=_json_getter(200, ["a"])
+            "https://gmail.example/x", "t", get_json=get_json
         )
+
+    assert calls == 1
+    assert delays == []
 
 
 def test_request_sends_the_token_in_the_header() -> None:
@@ -886,23 +1054,26 @@ def test_invalid_attachment_ids_are_rejected(value: object) -> None:
         require_attachment_id(value)
 
 
-@pytest.mark.parametrize("value", ["SGVsbG8", "YWJjZA", "AAAA", "ab"])
+@pytest.mark.parametrize(
+    "value", ["SGVsbG8", "SGVsbG8=", "YWJjZA", "AAAA", "YQ", "YQ=="]
+)
 def test_valid_base64url_data(value: str) -> None:
-    """合法 base64url 通过（长度 ≠ 1 mod 4）。"""
+    """规范的带填充与无填充 Base64URL 数据都通过。"""
     assert require_base64url_data(value) == value
 
 
 @pytest.mark.parametrize(
     "value",
     [
-        "", "not base64!", "SGVs bG8",
-        "a",          # 长度 1 ≡ 1 (mod 4)：**不可能存在**
-        "abcde",      # 长度 5 ≡ 1 (mod 4)
+        "", "not base64!", "+/8=", "SGVs bG8",
+        "a", "abcde",  # 不可能的长度
+        "YQ=", "YQ===", "Y=Q=", "YQ==\n",  # 填充位置或数量非法
+        "Zh==", "Zh",  # 未使用的 pad bits 非零，重编码后不一致
         5, None,
     ],
 )
 def test_invalid_base64url_data_is_rejected(value: object) -> None:
-    """**长度 ≡ 1 (mod 4) 的 base64 不可能存在**，直接拒绝而不是让下游去猜。"""
+    """拒绝非法字符、空白、长度、填充与非规范 pad bits。"""
     with pytest.raises(GmailSyncError, match="attachment data 无效"):
         require_base64url_data(value)
 

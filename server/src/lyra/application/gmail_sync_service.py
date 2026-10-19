@@ -59,12 +59,14 @@ def sync_gmail_connection(
     confirmed_rescan_after_date: str | None,
     explicit_account_id: str | None,
     dependencies: GmailSyncDependencies,
+    scan_all: bool = False,
 ) -> dict[str, Any]:
     """执行一次 Gmail 同步。
 
     @param connection_id: 连接 ID。
     @param confirmed_rescan_after_date: 用户确认的重扫起始日期。
     @param explicit_account_id: 用户显式指定的账户。
+    @param scan_all: 用户明确选择扫描全部嘉信成交邮件，不从已有账本推导范围。
     @param dependencies: 外部动作集合。
     @returns 同步摘要。
     @raises ApplicationError: 连接不存在（404）、未配置 OAuth（503）、
@@ -80,7 +82,8 @@ def sync_gmail_connection(
     state = _state_of(connection)
     try:
         request = plan_gmail_sync(
-            state, confirmed_rescan_after_date=confirmed_rescan_after_date
+            state, confirmed_rescan_after_date=confirmed_rescan_after_date,
+            scan_all=scan_all,
         )
     except GmailSyncError as error:
         raise map_sync_error(error) from error
@@ -163,16 +166,18 @@ def _run_incremental(
             history_id=connection.history_id,
             ignored=fetched.ignored_message_count,
             status=decision.state.status,
+            last_sync_at=connection.last_sync_at,
         )
 
     summary = dependencies.process_messages(
         connection, fetched.records, explicit_account_id
     )
-    _complete(connection, decision.completion_history_id, dependencies)
+    last_sync_at = _complete(connection, decision.completion_history_id, dependencies)
     return _summary(
         mode="incremental", truncated=False, connection=connection,
         history_id=decision.completion_history_id, ignored=fetched.ignored_message_count,
         summary=summary,
+        last_sync_at=last_sync_at,
     )
 
 
@@ -181,36 +186,49 @@ def _run_bounded_rescan(
     explicit_account_id: str | None, dependencies: GmailSyncDependencies,
 ) -> dict[str, Any]:
     """有界重扫路径。"""
-    fetched = dependencies.fetch_initial(
-        access_token, request.after_date, dependencies.maximum_messages
-    )
+    try:
+        fetched = dependencies.fetch_initial(
+            access_token, request.after_date, dependencies.maximum_messages
+        )
+    except GmailSyncError as error:
+        # 首扫与增量必须保留同样的配置/配额错误，不能让它们变成不明原因的 500。
+        raise map_sync_error(error) from error
     if fetched.kind == "truncated":
         _save(connection, dependencies, status="needs_resync",
               last_error_code="GMAIL_RESYNC_CONFIRMATION_REQUIRED")
         return _summary(
             mode="bounded_rescan", truncated=True, connection=connection,
             history_id=connection.history_id, status="needs_resync", ignored=0,
+            last_sync_at=connection.last_sync_at,
         )
 
     summary = dependencies.process_messages(
         connection, fetched.records, explicit_account_id
     )
-    _complete(connection, fetched.completion_history_id, dependencies)
+    last_sync_at = _complete(connection, fetched.completion_history_id, dependencies)
     return _summary(
         mode="bounded_rescan", truncated=False, connection=connection,
         history_id=fetched.completion_history_id, ignored=0, summary=summary,
+        last_sync_at=last_sync_at,
     )
 
 
 def _complete(
     connection: Any, completion_history_id: str, dependencies: GmailSyncDependencies
-) -> None:
-    """推进游标并保存。"""
+) -> str:
+    """保存完成状态并返回实际写入的 UTC 同步时间，避免响应使用旧快照。
+
+    @param connection: 当前已授权连接快照。
+    @param completion_history_id: 本次已完整处理的 Gmail 增量游标。
+    @param dependencies: 状态保存动作与可信时钟。
+    @returns 此次完成时间，保持与持久化值一致。
+    """
     status, history_id, last_sync_at = completion_state(
         completion_history_id, dependencies.now()
     )
     _save(connection, dependencies, status=status, history_id=history_id,
           last_error_code=None, last_sync_at=last_sync_at)
+    return last_sync_at
 
 
 def _save(
@@ -225,6 +243,7 @@ def _save(
 def _summary(
     *, mode: str, truncated: bool, connection: Any, history_id: str | None,
     ignored: int, summary: dict | None = None, status: str = "active",
+    last_sync_at: str | None,
 ) -> dict[str, Any]:
     """构造同步响应。
 
@@ -234,6 +253,8 @@ def _summary(
     counts = summary or {
         "importedMessages": 0, "alreadyImportedMessages": 0,
         "conflictMessages": 0, "rejectedMessages": 0,
+        "insertedTransactions": 0, "existingTransactions": 0,
+        "replayOrderConflictMessages": 0,
     }
     return {
         "mode": mode,
@@ -245,7 +266,7 @@ def _summary(
             "status": status,
             # 被截断时状态可能是 needs_resync，但游标仍是旧值。
             "historyId": history_id,
-            "lastSyncAt": connection.last_sync_at,
+            "lastSyncAt": last_sync_at,
         },
     }
 

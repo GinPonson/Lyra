@@ -75,6 +75,38 @@ def load_existing_gmail_message_state(
     )
 
 
+def load_gmail_transaction_occurrence_maxima(
+    connection: duckdb.DuckDBPyConnection,
+    user_id: str,
+    account_id: str,
+) -> dict[str, int]:
+    """读取当前用户账户中已由 Gmail 消息链接的业务 occurrence 最大值。
+
+    跨邮件的相同行从已有 Gmail 关联的最大 occurrence 接续；交易规范化与全局哈希规则
+    保持不变。CSV 已有交易仍由 transaction_hash 精确匹配，不由此查询猜测事件数量。
+
+    @param connection: 数据库连接。
+    @param user_id: 当前用户的 UUID 文本。
+    @param account_id: 目标账户 UUID 文本。
+    @returns business_hash 到最大 occurrence 的映射；无关联时为空字典。
+    """
+    rows = connection.execute(
+        """
+        SELECT t.business_hash, MAX(t.occurrence)
+        FROM gmail_message_transactions l
+        JOIN gmail_connections c ON c.id = l.connection_id
+        JOIN transactions t
+          ON t.account_id = l.account_id AND t.transaction_hash = l.transaction_hash
+        WHERE c.user_id = CAST(? AS UUID)
+          AND l.account_id = CAST(? AS UUID)
+          AND t.account_id = CAST(? AS UUID)
+        GROUP BY t.business_hash
+        """,
+        [user_id, account_id, account_id],
+    ).fetchall()
+    return {business_hash: int(maximum) for business_hash, maximum in rows}
+
+
 def persist_unsuccessful_gmail_message(
     connection: duckdb.DuckDBPyConnection,
     user_id: str,
@@ -91,7 +123,106 @@ def persist_unsuccessful_gmail_message(
     @param metadata: 元数据（``parse_status`` 为 rejected 或 conflict）。
     @param synced_at: 服务端可信时间。
     """
-    insert_gmail_message_row(connection, user_id, metadata, synced_at=synced_at)
+    upsert_gmail_message_row(connection, user_id, metadata, synced_at=synced_at)
+
+
+def upsert_gmail_message_row(
+    connection: duckdb.DuckDBPyConnection,
+    user_id: str,
+    metadata: ParsedGmailMessageMetadata,
+    *,
+    synced_at: str,
+) -> None:
+    """插入或更新非已导入消息状态，避免失败邮件在重扫时撞主键。
+
+    失败归档可被重新解析或在账户映射修复后变成成功导入；已导入行由同一条消息的
+    import plan 短路保护，仓储也拒绝将其降级覆盖。连接与账户归属仍在单条语句内验证。
+
+    @param connection: 数据库连接。
+    @param user_id: 当前用户的 UUID 文本。
+    @param metadata: 解析或失败元数据。
+    @param synced_at: 服务端可信同步时间。
+    @raises ApplicationError: 归属无效（404），或已导入行不可被覆盖（409）。
+    """
+    values = [
+        metadata.connection_id, metadata.message_id, metadata.thread_id,
+        metadata.received_at, metadata.content_hash, metadata.account_id,
+        metadata.parse_status, metadata.error_code, metadata.transaction_count,
+        metadata.history_id, synced_at, metadata.connection_id, user_id,
+    ]
+    account_predicate = "TRUE"
+    if metadata.account_id is not None:
+        account_predicate = (
+            "EXISTS (SELECT 1 FROM accounts a "
+            "WHERE a.id = CAST(? AS UUID) AND a.user_id = c.user_id)"
+        )
+        values.append(metadata.account_id)
+    row = connection.execute(
+        f"""
+        INSERT INTO gmail_messages (
+            connection_id, message_id, thread_id, received_at, content_hash,
+            account_id, parse_status, error_code, transaction_count, history_id,
+            synced_at
+        )
+        SELECT
+            CAST(? AS UUID), ?, ?, CAST(? AS TIMESTAMPTZ), ?, CAST(? AS UUID),
+            ?, ?, ?, ?, CAST(? AS TIMESTAMPTZ)
+        FROM gmail_connections c
+        WHERE c.id = CAST(? AS UUID) AND c.user_id = CAST(? AS UUID)
+          AND {account_predicate}
+        ON CONFLICT (connection_id, message_id) DO UPDATE SET
+            thread_id = excluded.thread_id,
+            received_at = excluded.received_at,
+            content_hash = excluded.content_hash,
+            account_id = excluded.account_id,
+            parse_status = excluded.parse_status,
+            error_code = excluded.error_code,
+            transaction_count = excluded.transaction_count,
+            history_id = excluded.history_id,
+            synced_at = excluded.synced_at
+        WHERE gmail_messages.parse_status <> 'imported'
+        RETURNING message_id
+        """,
+        values,
+    ).fetchone()
+    if row is not None:
+        return
+
+    # A zero-row INSERT SELECT means the connection/account is outside this user. The only
+    # valid zero-row upsert is the guard that preserves an already imported message.
+    owner = connection.execute(
+        """
+        SELECT 1 FROM gmail_connections c
+        WHERE c.id = CAST(? AS UUID) AND c.user_id = CAST(? AS UUID)
+          AND (? IS NULL OR EXISTS (
+              SELECT 1 FROM accounts a
+              WHERE a.id = CAST(? AS UUID) AND a.user_id = c.user_id
+          ))
+        """,
+        [metadata.connection_id, user_id, metadata.account_id, metadata.account_id],
+    ).fetchone()
+    if owner is None:
+        raise ApplicationError(
+            code="GMAIL_CONNECTION_ERROR",
+            message="Gmail 连接或目标账户不属于当前用户",
+            status_code=404,
+            retryable=False,
+        )
+    existing = connection.execute(
+        """
+        SELECT parse_status FROM gmail_messages
+        WHERE connection_id = CAST(? AS UUID) AND message_id = ?
+        """,
+        [metadata.connection_id, metadata.message_id],
+    ).fetchone()
+    if existing is not None and existing[0] == "imported":
+        raise ApplicationError(
+            code="GMAIL_MESSAGE_CONFLICT",
+            message="已导入 Gmail 消息不能被失败状态覆盖",
+            status_code=409,
+            retryable=False,
+        )
+    raise RuntimeError("Gmail 消息归档未写入")
 
 
 def insert_gmail_message_row(
@@ -225,7 +356,7 @@ def persist_gmail_message_import(
             # 审计时需要区分交易来自文件还是邮件。
             reason="gmail_import",
         )
-        insert_gmail_message_row(
+        upsert_gmail_message_row(
             connection, user_id, plan.metadata, synced_at=synced_at
         )
         for link in plan.links:
